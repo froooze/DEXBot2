@@ -54,7 +54,7 @@ y = (1-c)^(x*n) = order size
 ```
 
 Definitions:
-- `c` = increment (price step percentage / spacing factor)
+- `c` = increment (price step)
 - `x` = order number (layer index; 0 is closest to market)
 - `n` = weight distribution (controls how sizes scale across layers)
 
