@@ -1,0 +1,22 @@
+# Development files
+
+# Testing directory
+profiles/
+
+# Config files: tracked example files live under examples/ (use profiles/ for real secrets)
+# The actual runtime secrets belong in profiles/ which is already ignored above
+
+# Node.js
+node_modules/
+npm-debug.log*
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log

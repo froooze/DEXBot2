@@ -1,0 +1,36 @@
+{
+  "name": "dexbot2",
+  "version": "1.0.0",
+  "description": "A sophisticated market making bot for the BitShares Decentralized Exchange (DEX), implementing optimized staggered order strategies for automated trading.",
+  "main": "modules/account_orders.js",
+  "bin": {
+    "dexbot": "./dexbot.js"
+  },
+  "scripts": {
+    "bootstrap:profiles": "node scripts/bootstrap-profiles.js",
+    "pm2:start": "pm2 start examples/ecosystem.config.js",
+    "pm2:stop": "pm2 stop examples/ecosystem.config.js",
+    "pm2:reload": "pm2 reload examples/ecosystem.config.js",
+    "pm2:start:profiles": "pm2 start profiles/ecosystem.config.js",
+    "pm2:stop:profiles": "pm2 stop profiles/ecosystem.config.js",
+    "pm2:reload:profiles": "pm2 reload profiles/ecosystem.config.js",
+    "test": "node tests/test_utils.js && node tests/test_order_grid.js && node tests/test_logger.js && node tests/test_manager.js && node tests/connection_test.js && node tests/test_key_validation.js && node tests/test_subscriptions.js && node tests/test_fills.js && node tests/test_account_selection.js && node tests/test_autoderive.js && node tests/test_price_derive.js && node tests/test_price_no_positional.js && node tests/test_price_orientation.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/froooze/DEXBot2.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/froooze/DEXBot2/issues"
+  },
+  "homepage": "https://github.com/froooze/DEXBot2#readme",
+  "dependencies": {
+    "bs58check": "^4.0.0",
+    "btsdex": "^0.7.11",
+    "readline-sync": "^1.4.10"
+  }
+}

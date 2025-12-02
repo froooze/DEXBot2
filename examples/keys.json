@@ -1,0 +1,10 @@
+{
+  "# NOTES": "This file is a tracked example configuration. DO NOT store live secrets here.",
+    "# For live testing": "Copy examples/keys.json to profiles/keys.json and populate with your encrypted data.",
+  "masterPasswordHash": "",
+  "accounts": {
+    "test-account": {
+      "encryptedKey": "<PLACEHOLDER_ENCRYPTED_KEY>"
+    }
+  }
+}
