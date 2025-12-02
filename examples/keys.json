@@ -3,7 +3,7 @@
     "# For live testing": "Copy examples/keys.json to profiles/keys.json and populate with your encrypted data.",
   "masterPasswordHash": "",
   "accounts": {
-    "test-account": {
+    "bitshares-account": {
       "encryptedKey": "<PLACEHOLDER_ENCRYPTED_KEY>"
     }
   }
