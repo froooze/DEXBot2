@@ -1,6 +1,6 @@
 # Development files
 
-# Testing directory
+# Bots, Keys, Orders
 profiles/
 
 # Config files: tracked example files live under examples/ (use profiles/ for real secrets)
