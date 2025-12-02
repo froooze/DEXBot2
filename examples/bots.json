@@ -35,19 +35,19 @@
       "marketPrice": "pool",
       "minPrice": "3x",
       "maxPrice": "6x",
-      "incrementPercent": 4,
-      "targetSpreadPercent": 15,
+      "incrementPercent": 1,
+      "targetSpreadPercent": 5,
       "weightDistribution": {
         "sell": 1,
-        "buy": 2
+        "buy": 1
       },
       "botFunds": {
         "buy": 2000,
         "sell": 0.02
       },
       "activeOrders": {
-        "buy": 1,
-        "sell": 1
+        "buy": 24,
+        "sell": 24
       }
     }
   ]
