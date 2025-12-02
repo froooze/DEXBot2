@@ -4,7 +4,7 @@
  * Add a new entry in `apps` for each bot instance you want to run, or use the pm2 CLI
  * to start instances based on these templates.
  *
- * Each app runs ./modules/bot.js inside the project root; pm2 will set environment variables
+ * Each app runs ./modules/bot_instance.js inside the project root; pm2 will set environment variables
  * which your bot can read to pick the market, instance number and config.
  */
 
@@ -13,7 +13,7 @@ module.exports = {
     // Example placeholder. Duplicate and customize for each bot (or use process manager to launch with args).
     {
       name: "01-BTC-USD",
-  script: "./modules/bot.js",
+  script: "./modules/bot_instance.js",
       cwd: "./",
       max_memory_restart: "300M",
       watch: false,
