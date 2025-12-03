@@ -6,6 +6,7 @@ const accountOrders = require('./modules/account_orders');
 const { OrderManager } = require('./modules/order');
 const accountKeys = require('./modules/account_keys');
 const accountBots = require('./modules/account_bots');
+const { parseJsonWithComments } = accountBots;
 const { IndexDB, createBotKey } = require('./modules/indexdb');
 
 // Primary CLI driver that manages tracked bots and helper utilities such as key/bot editors.
@@ -61,11 +62,7 @@ if (cliArgs.includes(CLI_EXAMPLES_FLAG)) {
     process.exit(0);
 }
 
-// Helper that strips inline comments before parsing bot JSON files.
-function parseJsonWithComments(raw) {
-    const stripped = raw.replace(/\/\*(?:.|[\r\n])*?\*\//g, '').replace(/(^|\s*)\/\/.*$/gm, '');
-    return JSON.parse(stripped);
-}
+// `parseJsonWithComments` is provided by `modules/account_bots.js` (shared single-source)
 
 // Load the tracked bot settings file, handling missing files or parse failures gracefully.
 function loadSettingsFile() {
