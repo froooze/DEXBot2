@@ -4,12 +4,13 @@ const path = require('path');
 const readline = require('readline-sync');
 const { DEFAULT_CONFIG } = require('./order/constants');
 
-const BOTS_FILE = path.join(__dirname, '..', 'profiles', 'bots.json');
-
 function parseJsonWithComments(raw) {
     const stripped = raw.replace(/\/\*(?:.|[\r\n])*?\*\//g, '').replace(/(^|\s*)\/\/.*$/gm, '');
     return JSON.parse(stripped);
 }
+
+const BOTS_FILE = path.join(__dirname, '..', 'profiles', 'bots.json');
+
 
 function ensureProfilesDirectory() {
     const dir = path.dirname(BOTS_FILE);
@@ -248,4 +249,4 @@ async function main() {
     console.log('Bots configuration helper exiting.');
 }
 
-module.exports = { main };
+module.exports = { main, parseJsonWithComments };
