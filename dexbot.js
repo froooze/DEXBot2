@@ -258,6 +258,52 @@ class DEXBot {
         indexDB.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()));
     }
 
+    // Place new orders on-chain (used after fills to create replacement orders)
+    async placeNewOrders(orders) {
+        if (!orders || orders.length === 0) return;
+        if (this.config.dryRun) {
+            this.manager.logger.log(`Dry run: would place ${orders.length} new orders on-chain`, 'info');
+            return;
+        }
+
+        const { assetA, assetB } = this.manager.assets;
+
+        const buildCreateOrderArgs = (order) => {
+            let amountToSell, sellAssetId, minToReceive, receiveAssetId;
+            if (order.type === 'sell') {
+                amountToSell = order.size;
+                sellAssetId = assetA.id;
+                minToReceive = order.size * order.price;
+                receiveAssetId = assetB.id;
+            } else {
+                amountToSell = order.size;
+                sellAssetId = assetB.id;
+                minToReceive = order.size / order.price;
+                receiveAssetId = assetA.id;
+            }
+            return { amountToSell, sellAssetId, minToReceive, receiveAssetId };
+        };
+
+        for (const order of orders) {
+            try {
+                this.manager.logger.log(`Placing ${order.type} order on-chain: size=${order.size.toFixed(8)}, price=${order.price.toFixed(4)}`, 'info');
+                const args = buildCreateOrderArgs(order);
+                const result = await accountOrders.createOrder(
+                    this.account, this.privateKey, args.amountToSell, args.sellAssetId,
+                    args.minToReceive, args.receiveAssetId, null, false
+                );
+                const chainOrderId = result && result[0] && result[0].trx && result[0].trx.operation_results && result[0].trx.operation_results[0] && result[0].trx.operation_results[0][1];
+                if (chainOrderId) {
+                    await this.manager.synchronizeWithChain({ gridOrderId: order.id, chainOrderId }, 'createOrder');
+                } else {
+                    this.manager.logger.log(`Order ${order.id} placement response missing order_id`, 'warn');
+                }
+            } catch (err) {
+                this.manager.logger.log(`Failed to place ${order.type} order ${order.id}: ${err.message}`, 'error');
+            }
+        }
+    }
+
     async start(masterPassword = null) {
         await this.initialize(masterPassword);
         if (!this.manager) {
@@ -312,6 +358,29 @@ class DEXBot {
             }
 
             if (shouldRegenerate) {
+                // Cancel unmatched on-chain orders immediately (before fetching
+                // any account totals). Use the persisted grid to determine which
+                // on-chain orders are expected; any others will be cancelled.
+                if (!this.config.dryRun) {
+                    try {
+                        const persistedIds = new Set((persistedGrid || []).map(o => o.orderId).filter(Boolean));
+                        if (Array.isArray(chainOrders) && chainOrders.length > 0) {
+                            for (const co of chainOrders) {
+                                try {
+                                    if (!persistedIds.has(co.id)) {
+                                        this.manager && this.manager.logger && this.manager.logger.log && this.manager.logger.log(`Cancelling unmatched on-chain order ${co.id} before initializing grid.`, 'info');
+                                        await accountOrders.cancelOrder(this.account, this.privateKey, co.id);
+                                    }
+                                } catch (err) {
+                                    this.manager && this.manager.logger && this.manager.logger.log && this.manager.logger.log(`Failed to cancel order ${co.id}: ${err && err.message ? err.message : err}`, 'error');
+                                }
+                            }
+                        }
+                    } catch (err) {
+                        this.manager && this.manager.logger && this.manager.logger.log && this.manager.logger.log(`Failed to cancel unmatched on-chain orders: ${err && err.message ? err.message : err}`, 'error');
+                    }
+                }
+
                 await this.placeInitialOrders();
             } else {
                 this.manager.logger.log('Found active session. Loading and syncing existing grid.', 'info');
@@ -339,12 +408,18 @@ class DEXBot {
             }
         });
 
-        await accountOrders.listenForFills(this.account || undefined, (fills) => {
+        await accountOrders.listenForFills(this.account || undefined, async (fills) => {
             console.log('On-chain fill detected:', fills);
-            if (this.manager && !this.isResyncing) {
+            if (this.manager && !this.isResyncing && !this.config.dryRun) {
                 for (const fill of fills) {
                     if (fill && fill.op && fill.op[0] === 4) {
-                        this.manager.synchronizeWithChain(fill.op[1], 'listenForFills');
+                        const result = await this.manager.synchronizeWithChain(fill.op[1], 'listenForFills');
+                        
+                        // Place any new orders on-chain
+                        if (result && result.newOrders && result.newOrders.length > 0) {
+                            await this.placeNewOrders(result.newOrders);
+                            indexDB.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()));
+                        }
                     }
                 }
             }

@@ -60,10 +60,46 @@ class OrderManager {
         };
     }
 
-    // Accept new on-chain totals and re-run fund allocation.
+    // Accept new on-chain totals and recalculate available funds.
+    // Only updates available funds based on new totals while preserving committed tracking.
     setAccountTotals(totals = { buy: null, sell: null }) {
         this.accountTotals = { ...this.accountTotals, ...totals };
-        this.resetFunds();
+        
+        // Recalculate available funds based on new totals (for percentage-based botFunds)
+        const resolveValue = (value, total) => {
+            if (typeof value === 'number') return value;
+            if (typeof value === 'string') {
+                const p = parsePercentageString(value);
+                if (p !== null && total !== null && total !== undefined) {
+                    return total * p;
+                }
+                const n = parseFloat(value);
+                return Number.isNaN(n) ? 0 : n;
+            }
+            return 0;
+        };
+
+        const buyTotal = (this.accountTotals && typeof this.accountTotals.buy === 'number') ? this.accountTotals.buy : null;
+        const sellTotal = (this.accountTotals && typeof this.accountTotals.sell === 'number') ? this.accountTotals.sell : null;
+
+        const newAvailableBuy = resolveValue(this.config.botFunds.buy, buyTotal);
+        const newAvailableSell = resolveValue(this.config.botFunds.sell, sellTotal);
+
+        // Update available funds, accounting for already committed amounts
+        if (this.funds) {
+            this.funds.available.buy = Math.max(0, newAvailableBuy - this.funds.committed.buy);
+            this.funds.available.sell = Math.max(0, newAvailableSell - this.funds.committed.sell);
+            this.funds.total.buy = buyTotal || newAvailableBuy;
+            this.funds.total.sell = sellTotal || newAvailableSell;
+        } else {
+            // First time initialization
+            this.funds = {
+                available: { buy: newAvailableBuy, sell: newAvailableSell },
+                committed: { buy: 0, sell: 0 },
+                total: { buy: buyTotal || newAvailableBuy, sell: sellTotal || newAvailableSell }
+            };
+        }
+
         // If someone is waiting for account totals, resolve the waiter once both values are available.
         const haveBuy = this.accountTotals && this.accountTotals.buy !== null && this.accountTotals.buy !== undefined && Number.isFinite(Number(this.accountTotals.buy));
         const haveSell = this.accountTotals && this.accountTotals.sell !== null && this.accountTotals.sell !== undefined && Number.isFinite(Number(this.accountTotals.sell));
@@ -306,9 +342,10 @@ class OrderManager {
     async synchronizeWithChain(chainData, source) {
         if (!this.assets) {
             this.logger.log('Asset metadata not available, cannot synchronize.', 'warn');
-            return;
+            return { newOrders: [] };
         }
         this.logger.log(`Syncing from ${source}`, 'info');
+        let newOrders = [];
         switch (source) {
             case 'createOrder': {
                 const { gridOrderId, chainOrderId } = chainData;
@@ -329,7 +366,7 @@ class OrderManager {
                     gridOrder.state = ORDER_STATES.FILLED;
                     this.orders.set(gridOrder.id, gridOrder);
                     this.logger.log(`Order ${gridOrder.id} (${gridOrder.orderId}) marked as FILLED`, 'info');
-                    await this.processFilledOrders([gridOrder]);
+                    newOrders = await this.processFilledOrders([gridOrder]);
                 }
                 break;
             }
@@ -369,6 +406,7 @@ class OrderManager {
                 break;
             }
         }
+        return { newOrders };
     }
 
     async resyncGridFromChain(readOpenOrdersFn, cancelOrderFn) {
@@ -467,40 +505,113 @@ class OrderManager {
     checkSpreadCondition() { const currentSpread = this.calculateCurrentSpread(); const targetSpread = this.config.targetSpreadPercent + this.config.incrementPercent; if (currentSpread > targetSpread) { this.outOfSpread = true; this.logger.log(`Spread too wide (${currentSpread.toFixed(2)}% > ${targetSpread}%), will add extra orders on next fill`, 'warn'); } else this.outOfSpread = false; }
 
     // React to fills by updating funds, converting orders to spreads, and rebalancing targets.
-    async processFilledOrders(filledOrders) { const filledCounts = { [ORDER_TYPES.BUY]: 0, [ORDER_TYPES.SELL]: 0 }; for (const filledOrder of filledOrders) { filledCounts[filledOrder.type]++; const updatedOrder = { ...filledOrder, state: ORDER_STATES.FILLED, size: 0 }; this.orders.set(filledOrder.id, updatedOrder); if (filledOrder.type === ORDER_TYPES.SELL) { const proceeds = filledOrder.size * filledOrder.price; this.funds.available.buy += proceeds; this.funds.committed.sell -= filledOrder.size; const quoteName = this.config.assetB || 'quote'; const baseName = this.config.assetA || 'base'; this.logger.log(`Sell filled: +${proceeds.toFixed(8)} ${quoteName}, -${filledOrder.size.toFixed(8)} ${baseName} committed`, 'info'); } else { const proceeds = filledOrder.size / filledOrder.price; this.funds.available.sell += proceeds; this.funds.committed.buy -= filledOrder.size; const quoteName = this.config.assetB || 'quote'; const baseName = this.config.assetA || 'base'; this.logger.log(`Buy filled: +${proceeds.toFixed(8)} ${baseName}, -${filledOrder.size.toFixed(8)} ${quoteName} committed`, 'info'); } await this.maybeConvertToSpread(filledOrder.id); } const extraOrderCount = this.outOfSpread ? 1 : 0; if (this.outOfSpread) { this.logger.log(`Adding extra order due to previous wide spread condition`, 'info'); this.outOfSpread = false; } await this.rebalanceOrders(filledCounts, extraOrderCount); this.logFundsStatus(); }
+    async processFilledOrders(filledOrders) { 
+        const filledCounts = { [ORDER_TYPES.BUY]: 0, [ORDER_TYPES.SELL]: 0 }; 
+        for (const filledOrder of filledOrders) { 
+            filledCounts[filledOrder.type]++; 
+            const updatedOrder = { ...filledOrder, state: ORDER_STATES.FILLED, size: 0 }; 
+            this.orders.set(filledOrder.id, updatedOrder); 
+            if (filledOrder.type === ORDER_TYPES.SELL) { 
+                const proceeds = filledOrder.size * filledOrder.price; 
+                this.funds.available.buy += proceeds; 
+                // Prevent negative committed by capping at 0
+                const previousCommitted = this.funds.committed.sell;
+                this.funds.committed.sell = Math.max(0, this.funds.committed.sell - filledOrder.size);
+                if (previousCommitted < filledOrder.size) {
+                    this.logger.log(`Warning: committed.sell (${previousCommitted.toFixed(8)}) was less than filled size (${filledOrder.size.toFixed(8)}). This may indicate a funds tracking issue.`, 'warn');
+                }
+                const quoteName = this.config.assetB || 'quote'; 
+                const baseName = this.config.assetA || 'base'; 
+                this.logger.log(`Sell filled: +${proceeds.toFixed(8)} ${quoteName}, -${filledOrder.size.toFixed(8)} ${baseName} committed`, 'info'); 
+            } else { 
+                const proceeds = filledOrder.size / filledOrder.price; 
+                this.funds.available.sell += proceeds; 
+                // Prevent negative committed by capping at 0
+                const previousCommitted = this.funds.committed.buy;
+                this.funds.committed.buy = Math.max(0, this.funds.committed.buy - filledOrder.size);
+                if (previousCommitted < filledOrder.size) {
+                    this.logger.log(`Warning: committed.buy (${previousCommitted.toFixed(8)}) was less than filled size (${filledOrder.size.toFixed(8)}). This may indicate a funds tracking issue.`, 'warn');
+                }
+                const quoteName = this.config.assetB || 'quote'; 
+                const baseName = this.config.assetA || 'base'; 
+                this.logger.log(`Buy filled: +${proceeds.toFixed(8)} ${baseName}, -${filledOrder.size.toFixed(8)} ${quoteName} committed`, 'info'); 
+            } 
+            await this.maybeConvertToSpread(filledOrder.id); 
+        } 
+        const extraOrderCount = this.outOfSpread ? 1 : 0; 
+        if (this.outOfSpread) { 
+            this.logger.log(`Adding extra order due to previous wide spread condition`, 'info'); 
+            this.outOfSpread = false; 
+        } 
+        const newOrders = await this.rebalanceOrders(filledCounts, extraOrderCount); 
+        this.logFundsStatus();
+        return newOrders;
+    }
 
     // Convert filled orders into spread placeholders so new ones can re-enter later.
     async maybeConvertToSpread(orderId) { const order = this.orders.get(orderId); if (!order || order.type === ORDER_TYPES.SPREAD) return; const updatedOrder = { ...order, type: ORDER_TYPES.SPREAD, state: ORDER_STATES.VIRTUAL }; this.orders.set(orderId, updatedOrder); this.currentSpreadCount++; this.logger.log(`Converted order ${orderId} to SPREAD`, 'debug'); }
 
     // Rebalance orders after fills by activating new buys/sells from spread placeholders.
-    async rebalanceOrders(filledCounts, extraOrderCount = 0) { if (filledCounts[ORDER_TYPES.SELL] > 0 && this.funds.available.buy > 0) { const currentActiveBuy = this.getOrdersByTypeAndState(ORDER_TYPES.BUY, ORDER_STATES.ACTIVE).length; const configuredBuy = Number(this.config.activeOrders && this.config.activeOrders.buy ? this.config.activeOrders.buy : 1); const neededToConfigured = Math.max(0, configuredBuy - currentActiveBuy); const desired = Math.max(filledCounts[ORDER_TYPES.SELL] + extraOrderCount, neededToConfigured); this.logger.log(`Attempting to create ${desired} new BUY orders (${filledCounts[ORDER_TYPES.SELL]} from fills + ${extraOrderCount} extra)`, 'info'); const created = await this.activateSpreadOrders(ORDER_TYPES.BUY, desired); if (created < desired) this.logger.log(`Only created ${created}/${desired} BUY orders due to available funds`, 'warn'); } if (filledCounts[ORDER_TYPES.BUY] > 0 && this.funds.available.sell > 0) { const currentActiveSell = this.getOrdersByTypeAndState(ORDER_TYPES.SELL, ORDER_STATES.ACTIVE).length; const configuredSell = Number(this.config.activeOrders && this.config.activeOrders.sell ? this.config.activeOrders.sell : 1); const neededToConfigured = Math.max(0, configuredSell - currentActiveSell); const desired = Math.max(filledCounts[ORDER_TYPES.BUY] + extraOrderCount, neededToConfigured); this.logger.log(`Attempting to create ${desired} new SELL orders (${filledCounts[ORDER_TYPES.BUY]} from fills + ${extraOrderCount} extra)`, 'info'); const created = await this.activateSpreadOrders(ORDER_TYPES.SELL, desired); if (created < desired) this.logger.log(`Only created ${created}/${desired} SELL orders due to available funds`, 'warn'); } }
+    // Returns an array of newly activated orders that need to be placed on-chain.
+    async rebalanceOrders(filledCounts, extraOrderCount = 0) { 
+        const newOrders = [];
+        if (filledCounts[ORDER_TYPES.SELL] > 0 && this.funds.available.buy > 0) { 
+            const currentActiveBuy = this.getOrdersByTypeAndState(ORDER_TYPES.BUY, ORDER_STATES.ACTIVE).length; 
+            const configuredBuy = Number(this.config.activeOrders && this.config.activeOrders.buy ? this.config.activeOrders.buy : 1); 
+            const neededToConfigured = Math.max(0, configuredBuy - currentActiveBuy); 
+            const desired = Math.max(filledCounts[ORDER_TYPES.SELL] + extraOrderCount, neededToConfigured); 
+            this.logger.log(`Attempting to create ${desired} new BUY orders (${filledCounts[ORDER_TYPES.SELL]} from fills + ${extraOrderCount} extra)`, 'info'); 
+            const activated = await this.activateSpreadOrders(ORDER_TYPES.BUY, desired); 
+            newOrders.push(...activated);
+            if (activated.length < desired) this.logger.log(`Only created ${activated.length}/${desired} BUY orders due to available funds`, 'warn'); 
+        } 
+        if (filledCounts[ORDER_TYPES.BUY] > 0 && this.funds.available.sell > 0) { 
+            const currentActiveSell = this.getOrdersByTypeAndState(ORDER_TYPES.SELL, ORDER_STATES.ACTIVE).length; 
+            const configuredSell = Number(this.config.activeOrders && this.config.activeOrders.sell ? this.config.activeOrders.sell : 1); 
+            const neededToConfigured = Math.max(0, configuredSell - currentActiveSell); 
+            const desired = Math.max(filledCounts[ORDER_TYPES.BUY] + extraOrderCount, neededToConfigured); 
+            this.logger.log(`Attempting to create ${desired} new SELL orders (${filledCounts[ORDER_TYPES.BUY]} from fills + ${extraOrderCount} extra)`, 'info'); 
+            const activated = await this.activateSpreadOrders(ORDER_TYPES.SELL, desired); 
+            newOrders.push(...activated);
+            if (activated.length < desired) this.logger.log(`Only created ${activated.length}/${desired} SELL orders due to available funds`, 'warn'); 
+        }
+        return newOrders;
+    }
 
     // Activate virtual spread orders and transition them to buy or sell as needed.
+    // Returns an array of the newly activated order objects (for on-chain placement).
     async activateSpreadOrders(targetType, count) {
-        if (count <= 0) return 0;
-        const spreadOrders = this.getOrdersByTypeAndState(ORDER_TYPES.SPREAD, ORDER_STATES.VIRTUAL)
+        if (count <= 0) return [];
+        const allSpreadOrders = this.getOrdersByTypeAndState(ORDER_TYPES.SPREAD, ORDER_STATES.VIRTUAL);
+        const spreadOrders = allSpreadOrders
             .filter(o => (targetType === ORDER_TYPES.BUY && o.price < this.config.marketPrice) || (targetType === ORDER_TYPES.SELL && o.price > this.config.marketPrice))
-            .sort((a, b) => targetType === ORDER_TYPES.BUY ? a.price - b.price : b.price - a.price);
+            .sort((a, b) => targetType === ORDER_TYPES.BUY ? b.price - a.price : a.price - b.price);  // Sort closest to market first
         const availableFunds = targetType === ORDER_TYPES.BUY ? this.funds.available.buy : this.funds.available.sell;
-        if (availableFunds <= 0) { this.logger.log(`No available funds to create ${targetType} orders`, 'warn'); return 0; }
+        if (availableFunds <= 0) { this.logger.log(`No available funds to create ${targetType} orders`, 'warn'); return []; }
         let desiredCount = Math.min(count, spreadOrders.length);
-        if (desiredCount <= 0) return 0;
+        if (desiredCount <= 0) {
+            this.logger.log(`No SPREAD orders available for ${targetType} (total spreads: ${allSpreadOrders.length}, eligible at ${targetType === ORDER_TYPES.BUY ? 'below' : 'above'} market price ${this.config.marketPrice}: ${spreadOrders.length})`, 'warn');
+            return [];
+        }
         const minSize = Number(this.config.minOrderSize || 1e-8);
         const maxByFunds = minSize > 0 ? Math.floor(availableFunds / minSize) : desiredCount;
         const ordersToCreate = Math.max(0, Math.min(desiredCount, maxByFunds || desiredCount));
-        if (ordersToCreate === 0) { this.logger.log(`Insufficient funds to create any ${targetType} orders (available=${availableFunds}, minOrderSize=${minSize})`, 'warn'); return 0; }
+        if (ordersToCreate === 0) { this.logger.log(`Insufficient funds to create any ${targetType} orders (available=${availableFunds}, minOrderSize=${minSize})`, 'warn'); return []; }
         const actualOrders = spreadOrders.slice(0, ordersToCreate);
         const fundsPerOrder = availableFunds / actualOrders.length;
-        if (fundsPerOrder < minSize) { this.logger.log(`Available funds insufficient for requested orders after adjustment: fundsPerOrder=${fundsPerOrder} < minOrderSize=${minSize}`, 'warn'); return 0; }
+        if (fundsPerOrder < minSize) { this.logger.log(`Available funds insufficient for requested orders after adjustment: fundsPerOrder=${fundsPerOrder} < minOrderSize=${minSize}`, 'warn'); return []; }
+        const activatedOrders = [];
         actualOrders.forEach(order => {
             if (fundsPerOrder <= 0) return;
-            this.orders.set(order.id, { ...order, type: targetType, size: fundsPerOrder, state: ORDER_STATES.ACTIVE });
+            const activatedOrder = { ...order, type: targetType, size: fundsPerOrder, state: ORDER_STATES.ACTIVE };
+            this.orders.set(order.id, activatedOrder);
+            activatedOrders.push(activatedOrder);
             this.currentSpreadCount--;
             if (targetType === ORDER_TYPES.BUY) { this.funds.available.buy -= fundsPerOrder; this.funds.committed.buy += fundsPerOrder; } 
             else { this.funds.available.sell -= fundsPerOrder; this.funds.committed.sell += fundsPerOrder; }
-            this.logger.log(`Created ${targetType} order at ${order.price.toFixed(2)} (Amount: ${fundsPerOrder.toFixed(8)})`, 'info');
+            this.logger.log(`Prepared ${targetType} order at ${order.price.toFixed(2)} (Amount: ${fundsPerOrder.toFixed(8)})`, 'info');
         });
-        return actualOrders.length;
+        return activatedOrders;
     }
 
     // Compute the percentage spread between top active buy and sell orders.
