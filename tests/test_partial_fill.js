@@ -2,11 +2,11 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 const { OrderManager } = require('../modules/order/manager');
-const { IndexDB } = require('../modules/indexdb');
+const { AccountOrders } = require('../modules/account_orders');
 
 console.log('Running partial-fill unit test (using syncFromOpenOrders)...');
 
-// Prepare a temporary indexdb path for the test
+// Prepare a temporary account_orders path for the test
 const tmpDir = path.join(__dirname, 'tmp');
 if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir);
 const tmpIndexPath = path.join(tmpDir, 'orders.partial.json');
@@ -78,14 +78,14 @@ const fillInfo = {
         const expectedCommittedSell = remainingHuman;
         assert(Math.abs(mgr.funds.committed.sell - expectedCommittedSell) < 1e-9, `committed.sell expected ${expectedCommittedSell}, got ${mgr.funds.committed.sell}`);
 
-        // Persist snapshot using IndexDB and verify file contains updated size
-        const idx = new IndexDB({ profilesPath: tmpIndexPath });
+        // Persist snapshot using AccountOrders and verify file contains updated size
+        const idx = new AccountOrders({ profilesPath: tmpIndexPath });
         const botKey = 'test-bot-0';
         idx.storeMasterGrid(botKey, Array.from(mgr.orders.values()));
 
         const raw = fs.readFileSync(tmpIndexPath, 'utf8');
         const parsed = JSON.parse(raw);
-        assert(parsed.bots && parsed.bots[botKey], 'Expected bot entry in persisted indexdb');
+        assert(parsed.bots && parsed.bots[botKey], 'Expected bot entry in persisted account_orders');
         const persistedOrders = parsed.bots[botKey].grid;
         assert(Array.isArray(persistedOrders), 'Persisted grid should be an array');
         const persisted = persistedOrders.find(o => o.id === gridId);

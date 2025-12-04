@@ -149,7 +149,7 @@ Below is a short summary of the modules in this repository and what they provide
 - `modules/bitshares_client.js`: Shared BitShares client wrapper and helpers (`BitShares`, `createAccountClient`, `waitForConnected`).
 - `modules/bot_instance.js`: PM2-friendly per-bot runner that boots an `OrderManager` for a chosen bot config.
 - `modules/btsdex_event_patch.js`: Small runtime patch for `btsdex` history/account events (improves account history updates when available).
-- `modules/indexdb.js`: Local persistence for per-bot order-grid snapshots and metadata (`profiles/orders.json`).
+- `modules/account_orders.js`: Local persistence for per-bot order-grid snapshots and metadata (`profiles/orders.json`).
 - `modules/order/`: Core order subsystem (see sub-items below).
   - `modules/order/constants.js`: Order constants and `DEFAULT_CONFIG`.
   - `modules/order/index.js`: Public entry: exports `OrderManager` and `runOrderManagerCalculation()` (dry-run helper).

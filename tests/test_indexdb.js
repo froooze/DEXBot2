@@ -2,15 +2,15 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 
-const { IndexDB } = require('../modules/indexdb');
+const { AccountOrders } = require('../modules/account_orders');
 
 async function main() {
-  const tmpFile = path.join(__dirname, 'tmp', 'indexdb_test.json');
+  const tmpFile = path.join(__dirname, 'tmp', 'account_orders_test.json');
   try { fs.rmSync(tmpFile, { force: true }); } catch (e) {}
   // ensure directory
   try { fs.mkdirSync(path.dirname(tmpFile), { recursive: true }); } catch (e) {}
 
-  const db = new IndexDB({ profilesPath: tmpFile });
+  const db = new AccountOrders({ profilesPath: tmpFile });
 
   const bots = [{ name: 'My Bot', assetA: 'ASSET.A', assetB: 'ASSET.B', active: true }];
   db.ensureBotEntries(bots);
@@ -37,7 +37,7 @@ async function main() {
   assert(resByName, 'Expected non-null result for bot name');
   assert.deepStrictEqual(resByKey, resByName);
 
-  console.log('IndexDB getDBAssetBalances tests passed');
+  console.log('AccountOrders getDBAssetBalances tests passed');
   process.exit(0);
 }
 

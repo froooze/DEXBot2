@@ -1,9 +1,9 @@
-// Simple JSON-backed DB that records bot metadata and last-known order grids under profiles/orders.json.
+// Local persistence for per-bot order-grid snapshots and metadata (profiles/orders.json)
 const fs = require('fs');
 const path = require('path');
 const { ORDER_STATES } = require('./order/constants');
 
-const PROFILES_INDEXDB_FILE = path.join(__dirname, '..', 'profiles', 'orders.json');
+const PROFILES_ORDERS_FILE = path.join(__dirname, '..', 'profiles', 'orders.json');
 
 function ensureDirExists(filePath) {
   const dir = path.dirname(filePath);
@@ -32,10 +32,9 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-// Encapsulated access to the JSON store that tracks bot metadata and grid snapshots.
-class IndexDB {
+class AccountOrders {
   constructor(options = {}) {
-    this.profilesPath = options.profilesPath || PROFILES_INDEXDB_FILE;
+    this.profilesPath = options.profilesPath || PROFILES_ORDERS_FILE;
     this._needsBootstrapSave = !fs.existsSync(this.profilesPath);
     this.data = this._loadData() || { bots: {}, lastUpdated: nowIso() };
     if (this._needsBootstrapSave) {
@@ -55,7 +54,7 @@ class IndexDB {
       const parsed = JSON.parse(raw);
       if (typeof parsed === 'object' && parsed !== null) return parsed;
     } catch (err) {
-      console.warn('indexdb: failed to read', filePath, '-', err.message);
+      console.warn('account_orders: failed to read', filePath, '-', err.message);
     }
     return null;
   }
@@ -149,14 +148,6 @@ class IndexDB {
     return null;
   }
 
-  /**
-   * Return the total amount of assetA/assetB present in the stored DB grid
-   * for the given bot key or bot name. Sums sizes separately for active and virtual
-   * orders. The grid is stored as snapshots with { type, state, size }.
-   *
-   * @param {String} botKeyOrName - either the internal bot key or the bot name
-   * @returns {Object|null} { assetA: { active, virtual }, assetB: { active, virtual }, meta } or null if not found
-   */
   getDBAssetBalances(botKeyOrName) {
     if (!botKeyOrName) return null;
     // Find entry by key or by matching meta.name (case-insensitive)
@@ -195,7 +186,6 @@ class IndexDB {
         if (state === 'active') sums.assetB.active += size;
         else if (state === 'virtual') sums.assetB.virtual += size;
       }
-      // spread/other types are ignored because sizes usually 0 or not meaningful
     }
 
     return sums;
@@ -217,6 +207,7 @@ class IndexDB {
 }
 
 module.exports = {
-  IndexDB,
+  AccountOrders,
   createBotKey
 };
+

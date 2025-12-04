@@ -7,7 +7,7 @@ const { OrderManager } = require('./modules/order');
 const accountKeys = require('./modules/chain_keys');
 const accountBots = require('./modules/account_bots');
 const { parseJsonWithComments } = accountBots;
-const { IndexDB, createBotKey } = require('./modules/indexdb');
+const { AccountOrders, createBotKey } = require('./modules/account_orders');
 
 // Primary CLI driver that manages tracked bots and helper utilities such as key/bot editors.
 const PROFILES_BOTS_FILE = path.join(__dirname, 'profiles', 'bots.json');
@@ -106,7 +106,7 @@ function normalizeBotEntries(rawEntries) {
     });
 }
 
-const indexDB = new IndexDB();
+const indexDB = new AccountOrders();
 
 // Connection handled centrally by modules/bitshares_client; use waitForConnected() when needed
 
@@ -742,7 +742,7 @@ async function restartBotByName(botName) {
                 console.warn(`Grid initialization for '${bot.name}' failed: ${e && e.message ? e.message : e}`);
             }
 
-            // Ensure indexDB has metadata for this bot and persist the generated grid
+            // Ensure persisted account-orders metadata exists for this bot and persist the generated grid
             indexDB.ensureBotEntries([bot]);
             indexDB.storeMasterGrid(bot.botKey, Array.from(manager.orders.values()));
             console.log(`Generated and stored grid snapshot for '${bot.name}' to profiles/orders.json`);
