@@ -80,13 +80,13 @@ Define each bot in `profiles/bots.json`. A minimal structure looks like this:
       "assetA": "IOB.XRP",
       "assetB": "BTS",
       "marketPrice": "pool",
-      "minPrice": 525,
-      "maxPrice": 8400,
+      "minPrice": "5x",
+      "maxPrice": "5x",
       "incrementPercent": 1,
       "targetSpreadPercent": 5,
-      "weightDistribution": { "sell": 1, "buy": 2 },
+      "weightDistribution": { "sell": 0.5, "buy": 0.5 },
       "botFunds": { "buy": "100%", "sell": "100%" },
-      "activeOrders": { "buy": 10, "sell": 10 }
+      "activeOrders": { "buy": 24, "sell": 24 }
     },
   ]
 }

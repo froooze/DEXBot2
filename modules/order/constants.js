@@ -24,7 +24,7 @@ const DEFAULT_CONFIG = {
     dryRun: false,
     assetA: null,
     assetB: null,
-    weightDistribution: { sell: 1, buy: 1 },
+    weightDistribution: { sell: 0.5, buy: 0.5 },
     botFunds: { buy: "100%", sell: "100%" },
     activeOrders: { buy: 24, sell: 24 },
 };
