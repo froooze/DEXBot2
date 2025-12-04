@@ -478,6 +478,98 @@ async function cancelOrder(accountName, privateKey, orderId) {
     }
 }
 
+/**
+ * Fetch on-chain balances and locked amounts for the specified account and assets.
+ * This helper only reads on-chain balances and open-order locks and MUST NOT be
+ * mixed with the manager's internal "available for orders" calculations.
+ *
+ * @param {String} accountRef - account name or id
+ * @param {Array<String>} assets - array of asset ids or symbols to query (e.g. ['1.3.0','IOB.XRP'])
+ * @returns {Object} mapping assetRef -> { assetId, symbol, precision, freeRaw, lockedRaw, free, locked, total }
+ */
+async function getOnChainAssetBalances(accountRef, assets) {
+    if (!accountRef) return {};
+    try {
+        await waitForConnected();
+        // Resolve account id if name provided
+        let accountId = accountRef;
+        if (typeof accountRef === 'string' && !/^1\.2\./.test(accountRef)) {
+            const full = await BitShares.db.get_full_accounts([accountRef], false);
+            if (Array.isArray(full) && full[0] && full[0][0]) accountId = full[0][0];
+        }
+
+        // Fetch full account data so we have balances and limit_orders
+        const full = await BitShares.db.get_full_accounts([accountId], false);
+        if (!Array.isArray(full) || !full[0] || !full[0][1]) return {};
+        const accountData = full[0][1] || {};
+        const balances = accountData.balances || [];
+        const limitOrders = accountData.limit_orders || [];
+
+        // Build free balances map by asset id
+        const freeInt = new Map();
+        for (const b of balances) {
+            const aid = String(b.asset_type || b.asset_id || b.asset);
+            const val = Number(b.balance || b.amount || 0);
+            freeInt.set(aid, (freeInt.get(aid) || 0) + val);
+        }
+
+        // Build locked map (for_sale) grouped by base asset id
+        const lockedInt = new Map();
+        for (const o of limitOrders) {
+            if (!o || !o.sell_price || !o.sell_price.base) continue;
+            const baseId = String(o.sell_price.base.asset_id);
+            const forSale = Number(o.for_sale || 0);
+            lockedInt.set(baseId, (lockedInt.get(baseId) || 0) + forSale);
+        }
+
+        // If assets omitted, build list from balances and limit_orders
+        let assetList = assets;
+        if (!assetList || !Array.isArray(assetList) || assetList.length === 0) {
+            assetList = [];
+            for (const b of balances) assetList.push(String(b.asset_type || b.asset_id || b.asset));
+            for (const o of limitOrders) {
+                if (!o || !o.sell_price || !o.sell_price.base) continue;
+                assetList.push(String(o.sell_price.base.asset_id));
+            }
+            // de-duplicate
+            assetList = Array.from(new Set(assetList));
+        }
+
+        const out = {};
+        for (const a of assetList) {
+            // resolve asset id and precision
+            let aid = a;
+            try {
+                if (!/^1\.3\./.test(String(a))) {
+                    // symbol -> asset
+                    const res = await BitShares.db.lookup_asset_symbols([String(a)]).catch(() => null);
+                    if (res && res[0] && res[0].id) aid = res[0].id;
+                }
+            } catch (e) {}
+
+            // try to get precision and symbol
+            let precision = 0; let symbol = String(a);
+            try {
+                const am = await BitShares.db.get_assets([aid]).catch(() => null);
+                if (Array.isArray(am) && am[0]) {
+                    precision = typeof am[0].precision === 'number' ? am[0].precision : precision;
+                    symbol = am[0].symbol || symbol;
+                }
+            } catch (e) {}
+
+            const freeRaw = freeInt.get(String(aid)) || 0;
+            const lockedRaw = lockedInt.get(String(aid)) || 0;
+            const free = blockchainToFloat(freeRaw, precision);
+            const locked = blockchainToFloat(lockedRaw, precision);
+            out[String(a)] = { assetId: String(aid), symbol, precision, freeRaw, lockedRaw, free, locked, total: free + locked };
+        }
+
+        return out;
+    } catch (err) {
+        return {};
+    }
+}
+
 module.exports = {
     authenticate,
     selectAccount,
@@ -488,6 +580,8 @@ module.exports = {
     updateOrder,
     createOrder,
     cancelOrder,
+    getOnChainAssetBalances,
+    
     MasterPasswordError
 };
 
