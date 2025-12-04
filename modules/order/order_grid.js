@@ -1,5 +1,8 @@
 const { ORDER_TYPES, DEFAULT_CONFIG } = require('./constants');
 
+// MIN_SPREAD_FACTOR constant (moved from constants.js)
+const MIN_SPREAD_FACTOR = 2;
+
 // Build the foundational grid of virtual orders based on increments, spread, and funds.
 class OrderGridGenerator {
     static createOrderGrid(config) {
@@ -10,8 +13,8 @@ class OrderGridGenerator {
         const stepDown = 1 - (incrementPercent / 100);  // e.g. 0.98 for -2%
         
         // Ensure targetSpreadPercent is at least `minSpreadFactor * incrementPercent` to guarantee spread orders.
-        // This implementation uses the global default `DEFAULT_CONFIG.minSpreadFactor` (no per-bot overrides).
-        const spreadFactor = Number(DEFAULT_CONFIG.minSpreadFactor);
+        // This implementation uses the constant MIN_SPREAD_FACTOR defined in this module.
+        const spreadFactor = Number(MIN_SPREAD_FACTOR);
         const minSpreadPercent = incrementPercent * spreadFactor;
         const targetSpreadPercent = Math.max(config.targetSpreadPercent, minSpreadPercent);
         if (config.targetSpreadPercent < minSpreadPercent) {

@@ -27,14 +27,6 @@ const DEFAULT_CONFIG = {
     weightDistribution: { sell: 1, buy: 1 },
     botFunds: { buy: "100%", sell: "100%" },
     activeOrders: { buy: 24, sell: 24 },
-    // Factor to multiply the smallest representable unit (based on asset precision)
-    // to determine the minimum order size. E.g., factor=50 with precision=4 => minSize=0.005
-    // Set to 0 or null to disable dynamic minimum (returns 0 when disabled)
-    minOrderSizeFactor: 50,
-    // Minimum spread factor to multiply the configured incrementPercent when
-    // automatically adjusting `targetSpreadPercent`. For example, a factor of 2
-    // means targetSpreadPercent will be at least `2 * incrementPercent`.
-    minSpreadFactor: 2,
 };
 
 module.exports = { ORDER_TYPES, ORDER_STATES, DEFAULT_CONFIG };

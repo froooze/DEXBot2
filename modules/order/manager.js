@@ -3,6 +3,18 @@ const { parsePercentageString, blockchainToFloat, floatToBlockchainInt, resolveR
 const Logger = require('./logger');
 const OrderGridGenerator = require('./order_grid');
 
+// Constants for manager operations
+const SYNC_DELAY_MS = 500;
+const ACCOUNT_TOTALS_TIMEOUT_MS = 10000;
+const EPSILON = 1e-10; // Tolerance for price and size comparisons
+// Factor to multiply the smallest representable unit (based on asset precision)
+// to determine the minimum order size. E.g., factor=50 with precision=4 => minSize=0.005
+const MIN_ORDER_SIZE_FACTOR = 50;
+// Minimum spread factor to multiply the configured incrementPercent when
+// automatically adjusting targetSpreadPercent. E.g., a factor of 2 means
+// targetSpreadPercent will be at least 2 * incrementPercent.
+const MIN_SPREAD_FACTOR = 2;
+
 // Core manager responsible for preparing, tracking, and updating the order grid in memory.
 class OrderManager {
     constructor(config = {}) {
@@ -11,6 +23,17 @@ class OrderManager {
         this.logger = new Logger('info');
         this.logger.marketName = this.marketName;
         this.orders = new Map();
+        // Indices for fast lookup by state and type (optimization)
+        this._ordersByState = {
+            [ORDER_STATES.VIRTUAL]: new Set(),
+            [ORDER_STATES.ACTIVE]: new Set(),
+            [ORDER_STATES.FILLED]: new Set()
+        };
+        this._ordersByType = {
+            [ORDER_TYPES.BUY]: new Set(),
+            [ORDER_TYPES.SELL]: new Set(),
+            [ORDER_TYPES.SPREAD]: new Set()
+        };
         this.resetFunds();
         this.targetSpreadCount = 0;
         this.currentSpreadCount = 0;
@@ -23,37 +46,82 @@ class OrderManager {
         this.ordersNeedingPriceCorrection = [];
     }
 
+    // Helper: Resolve config value (percentage, number, or string)
+    _resolveConfigValue(value, total) {
+        if (typeof value === 'number') return value;
+        if (typeof value === 'string') {
+            const p = parsePercentageString(value);
+            if (p !== null) {
+                if (total === null || total === undefined) {
+                    this.logger?.log(`Cannot resolve percentage-based botFunds '${value}' because account total is not set. Attempting on-chain lookup (will default to 0 while fetching).`, 'warn');
+                    // Kick off an async fetch of account balances if possible; do not block here.
+                    if (!this._isFetchingTotals) {
+                        this._isFetchingTotals = true;
+                        this._fetchAccountBalancesAndSetTotals().finally(() => { this._isFetchingTotals = false; });
+                    }
+                    return 0;
+                }
+                return total * p;
+            }
+            const n = parseFloat(value);
+            return Number.isNaN(n) ? 0 : n;
+        }
+        return 0;
+    }
+
+    // Helper: Adjust funds for order size changes
+    _adjustFunds(type, delta) {
+        if (!this.funds) this.resetFunds();
+        const side = type === ORDER_TYPES.BUY ? 'buy' : 'sell';
+        this.funds.committed[side] = Math.max(0, (this.funds.committed[side] || 0) + delta);
+        this.funds.available[side] = Math.max(0, (this.funds.available[side] || 0) - delta);
+    }
+
+    // Helper: Update order in map and indices
+    _updateOrder(order) {
+        const existing = this.orders.get(order.id);
+        if (existing) {
+            // Remove from old indices
+            this._ordersByState[existing.state]?.delete(order.id);
+            this._ordersByType[existing.type]?.delete(order.id);
+        }
+        // Add to new indices
+        this._ordersByState[order.state]?.add(order.id);
+        this._ordersByType[order.type]?.add(order.id);
+        this.orders.set(order.id, order);
+    }
+
+    // Helper: Find best matching grid order by price tolerance
+    _findBestMatchByPrice(chainOrder, candidates) {
+        let bestMatch = null;
+        let smallestDiff = Infinity;
+
+        for (const gridOrderId of candidates) {
+            const gridOrder = this.orders.get(gridOrderId);
+            if (!gridOrder || gridOrder.type !== chainOrder.type) continue;
+            
+            const priceDiff = Math.abs(gridOrder.price - chainOrder.price);
+            const orderSize = gridOrder.size || chainOrder.size || 0;
+            const tolerance = this.calculatePriceTolerance(gridOrder.price, orderSize, gridOrder.type);
+            
+            if (priceDiff <= tolerance && priceDiff < smallestDiff) {
+                smallestDiff = priceDiff;
+                bestMatch = gridOrder;
+            }
+        }
+        
+        return { match: bestMatch, priceDiff: smallestDiff };
+    }
+
     // Reconcile funds totals based on config, input percentages, and prior committed balances.
     resetFunds() {
         this.accountTotals = this.accountTotals || (this.config.accountTotals ? { ...this.config.accountTotals } : { buy: null, sell: null });
 
-        const resolveValue = (value, total) => {
-            if (typeof value === 'number') return value;
-            if (typeof value === 'string') {
-                const p = parsePercentageString(value);
-                if (p !== null) {
-                    if (total === null || total === undefined) {
-                        this.logger && this.logger.log && this.logger.log(`Cannot resolve percentage-based botFunds '${value}' because account total is not set. Attempting on-chain lookup (will default to 0 while fetching).`, 'warn');
-                        // Kick off an async fetch of account balances if possible; do not block here.
-                        if (!this._isFetchingTotals) {
-                            this._isFetchingTotals = true;
-                            this._fetchAccountBalancesAndSetTotals().finally(() => { this._isFetchingTotals = false; });
-                        }
-                        return 0;
-                    }
-                    return total * p;
-                }
-                const n = parseFloat(value);
-                return Number.isNaN(n) ? 0 : n;
-            }
-            return 0;
-        };
-
         const buyTotal = (this.accountTotals && typeof this.accountTotals.buy === 'number') ? this.accountTotals.buy : (typeof this.config.botFunds.buy === 'number' ? this.config.botFunds.buy : null);
         const sellTotal = (this.accountTotals && typeof this.accountTotals.sell === 'number') ? this.accountTotals.sell : (typeof this.config.botFunds.sell === 'number' ? this.config.botFunds.sell : null);
 
-        const availableBuy = resolveValue(this.config.botFunds.buy, buyTotal);
-        const availableSell = resolveValue(this.config.botFunds.sell, sellTotal);
+        const availableBuy = this._resolveConfigValue(this.config.botFunds.buy, buyTotal);
+        const availableSell = this._resolveConfigValue(this.config.botFunds.sell, sellTotal);
 
         this.funds = {
             available: { buy: availableBuy, sell: availableSell },
@@ -67,25 +135,11 @@ class OrderManager {
     setAccountTotals(totals = { buy: null, sell: null }) {
         this.accountTotals = { ...this.accountTotals, ...totals };
         
-        // Recalculate available funds based on new totals (for percentage-based botFunds)
-        const resolveValue = (value, total) => {
-            if (typeof value === 'number') return value;
-            if (typeof value === 'string') {
-                const p = parsePercentageString(value);
-                if (p !== null && total !== null && total !== undefined) {
-                    return total * p;
-                }
-                const n = parseFloat(value);
-                return Number.isNaN(n) ? 0 : n;
-            }
-            return 0;
-        };
-
         const buyTotal = (this.accountTotals && typeof this.accountTotals.buy === 'number') ? this.accountTotals.buy : null;
         const sellTotal = (this.accountTotals && typeof this.accountTotals.sell === 'number') ? this.accountTotals.sell : null;
 
-        const newAvailableBuy = resolveValue(this.config.botFunds.buy, buyTotal);
-        const newAvailableSell = resolveValue(this.config.botFunds.sell, sellTotal);
+        const newAvailableBuy = this._resolveConfigValue(this.config.botFunds.buy, buyTotal);
+        const newAvailableSell = this._resolveConfigValue(this.config.botFunds.sell, sellTotal);
 
         // Update available funds, accounting for already committed amounts
         if (this.funds) {
@@ -112,7 +166,7 @@ class OrderManager {
     }
 
     // Wait until accountTotals have both buy and sell present, or until timeout elapses.
-    async waitForAccountTotals(timeoutMs = 10000) {
+    async waitForAccountTotals(timeoutMs = ACCOUNT_TOTALS_TIMEOUT_MS) {
         const haveBuy = this.accountTotals && this.accountTotals.buy !== null && this.accountTotals.buy !== undefined && Number.isFinite(Number(this.accountTotals.buy));
         const haveSell = this.accountTotals && this.accountTotals.sell !== null && this.accountTotals.sell !== undefined && Number.isFinite(Number(this.accountTotals.sell));
         if (haveBuy && haveSell) return; // already satisfied
@@ -196,7 +250,7 @@ class OrderManager {
      * @returns {number} - Minimum order size in human-readable units (or 0 if unavailable)
      */
     getMinOrderSize(orderType) {
-        const factor = Number(DEFAULT_CONFIG.minOrderSizeFactor);
+        const factor = Number(MIN_ORDER_SIZE_FACTOR);
 
         // If configured default factor is not set, zero, or invalid, return 0
         if (!factor || !Number.isFinite(factor) || factor <= 0) {
@@ -421,8 +475,20 @@ class OrderManager {
             throw e;
         }
 
-        this.orders.clear(); this.resetFunds();
-        sizedOrders.forEach(order => { this.orders.set(order.id, order); if (order.type === ORDER_TYPES.BUY) { this.funds.committed.buy += order.size; this.funds.available.buy -= order.size; } else if (order.type === ORDER_TYPES.SELL) { this.funds.committed.sell += order.size; this.funds.available.sell -= order.size; } });
+        this.orders.clear();
+        Object.values(this._ordersByState).forEach(set => set.clear());
+        Object.values(this._ordersByType).forEach(set => set.clear());
+        this.resetFunds();
+        sizedOrders.forEach(order => { 
+            this._updateOrder(order);
+            if (order.type === ORDER_TYPES.BUY) { 
+                this.funds.committed.buy += order.size; 
+                this.funds.available.buy -= order.size; 
+            } else if (order.type === ORDER_TYPES.SELL) { 
+                this.funds.committed.sell += order.size; 
+                this.funds.available.sell -= order.size; 
+            } 
+        });
 
         this.targetSpreadCount = initialSpreadCount.buy + initialSpreadCount.sell; this.currentSpreadCount = this.targetSpreadCount;
         this.config.activeOrders = this.config.activeOrders || { buy: 1, sell: 1 };
@@ -436,9 +502,12 @@ class OrderManager {
     loadGrid(grid) {
         if (!grid || !Array.isArray(grid)) return;
         this.orders.clear();
+        // Clear indices
+        Object.values(this._ordersByState).forEach(set => set.clear());
+        Object.values(this._ordersByType).forEach(set => set.clear());
         this.resetFunds();
         grid.forEach(order => {
-            this.orders.set(order.id, order);
+            this._updateOrder(order);
             if (order.state === 'active') {
                 if (order.type === ORDER_TYPES.BUY) {
                     this.funds.committed.buy += order.size;
@@ -507,24 +576,15 @@ class OrderManager {
         const oldSize = Number(gridOrder.size || 0);
         const newSize = Number.isFinite(Number(chainSize)) ? Number(chainSize) : oldSize;
         const delta = newSize - oldSize;
-        if (Math.abs(delta) < 1e-12) {
+        if (Math.abs(delta) < EPSILON) {
             gridOrder.size = newSize; // still ensure normalized numeric
             return;
         }
 
-        if (!this.funds) this.resetFunds();
-
         // Log size adjustment for debugging
         this.logger.log(`Order ${gridOrder.id} size adjustment: ${oldSize.toFixed(8)} -> ${newSize.toFixed(8)} (delta: ${delta.toFixed(8)})`, 'info');
 
-        if (gridOrder.type === ORDER_TYPES.BUY) {
-            this.funds.committed.buy = Math.max(0, (this.funds.committed.buy || 0) + delta);
-            this.funds.available.buy = Math.max(0, (this.funds.available.buy || 0) - delta);
-        } else if (gridOrder.type === ORDER_TYPES.SELL) {
-            this.funds.committed.sell = Math.max(0, (this.funds.committed.sell || 0) + delta);
-            this.funds.available.sell = Math.max(0, (this.funds.available.sell || 0) - delta);
-        }
-
+        this._adjustFunds(gridOrder.type, delta);
         gridOrder.size = newSize;
     }
 
@@ -544,8 +604,8 @@ class OrderManager {
      * @returns {Object} - { filledOrders: [], updatedOrders: [], ordersNeedingCorrection: [] }
      */
     syncFromOpenOrders(chainOrders, fillInfo = null) {
-        if (!Array.isArray(chainOrders)) {
-            this.logger.log('syncFromOpenOrders: No chain orders provided', 'warn');
+        if (!Array.isArray(chainOrders) || chainOrders.length === 0) {
+            this.logger.log('syncFromOpenOrders: No valid chain orders provided', 'debug');
             return { filledOrders: [], updatedOrders: [], ordersNeedingCorrection: [] };
         }
         
@@ -612,20 +672,20 @@ class OrderManager {
                 const oldSize = Number(gridOrder.size || 0);
                 const newSize = Number(chainOrder.size || 0);
                 
-                if (Math.abs(oldSize - newSize) > 1e-10) {
+                if (Math.abs(oldSize - newSize) > EPSILON) {
                     const fillAmount = oldSize - newSize;
                     this.logger.log(`Order ${gridOrder.id} (${gridOrder.orderId}): size changed ${oldSize.toFixed(8)} -> ${newSize.toFixed(8)} (filled: ${fillAmount.toFixed(8)})`, 'info');
                     this._applyChainSizeToGridOrder(gridOrder, newSize);
                     updatedOrders.push(gridOrder);
                 }
-                this.orders.set(gridOrder.id, gridOrder);
+                this._updateOrder(gridOrder);
             } else {
                 // Order no longer exists on chain - it was fully filled
                 this.logger.log(`Order ${gridOrder.id} (${gridOrder.orderId}) no longer on chain - marking as FILLED`, 'info');
                 const filledOrder = { ...gridOrder };
                 gridOrder.state = ORDER_STATES.FILLED;
                 gridOrder.size = 0;
-                this.orders.set(gridOrder.id, gridOrder);
+                this._updateOrder(gridOrder);
                 filledOrders.push(filledOrder);
             }
         }
@@ -678,10 +738,10 @@ class OrderManager {
                 // Update size from chain but NEVER update price
                 const oldSize = Number(bestMatch.size || 0);
                 const newSize = Number(chainOrder.size || 0);
-                if (Math.abs(oldSize - newSize) > 1e-10) {
+                if (Math.abs(oldSize - newSize) > EPSILON) {
                     this._applyChainSizeToGridOrder(bestMatch, newSize);
                 }
-                this.orders.set(bestMatch.id, bestMatch);
+                this._updateOrder(bestMatch);
                 updatedOrders.push(bestMatch);
                 chainOrderIdsOnGrid.add(chainOrderId);
             } else {
@@ -796,7 +856,7 @@ class OrderManager {
             }
             
             // Small delay between corrections to avoid rate limiting
-            await new Promise(resolve => setTimeout(resolve, 500));
+            await new Promise(resolve => setTimeout(resolve, SYNC_DELAY_MS));
         }
         
         this.logger.log(`Price correction complete: ${corrected} corrected, ${failed} failed`, 'info');
@@ -816,10 +876,11 @@ class OrderManager {
             this.logger.log(`_findMatchingGridOrder: orderId ${parsedChainOrder.orderId} NOT found in grid, falling back to price matching (chain price=${parsedChainOrder.price?.toFixed(6)}, type=${parsedChainOrder.type})`, 'info');
         }
         
-        // If no orderId match, try matching by price. Use calculatePriceTolerance
-        // which computes a tolerance based on asset precisions and sizes.
-        for (const gridOrder of this.orders.values()) {
-            if (gridOrder.state === ORDER_STATES.VIRTUAL && !gridOrder.orderId) {
+        // If no orderId match, try matching VIRTUAL orders by price (use indices for optimization)
+        const virtualOrderIds = this._ordersByState[ORDER_STATES.VIRTUAL];
+        for (const gridOrderId of virtualOrderIds) {
+            const gridOrder = this.orders.get(gridOrderId);
+            if (gridOrder && !gridOrder.orderId) {
                 const priceDiff = Math.abs(gridOrder.price - parsedChainOrder.price);
                 const orderSize = (gridOrder.size && Number.isFinite(Number(gridOrder.size))) ? Number(gridOrder.size) : null;
                 const tolerance = this.calculatePriceTolerance(gridOrder.price, orderSize, gridOrder.type);
@@ -830,28 +891,14 @@ class OrderManager {
             }
         }
 
-        // For ACTIVE orders, find the CLOSEST price match that is within the calculated tolerance.
+        // For ACTIVE orders, find the CLOSEST price match that is within tolerance (use indices)
         if (parsedChainOrder.price !== undefined && parsedChainOrder.type) {
-            let bestMatch = null;
-            let smallestDiff = Infinity;
+            const activeOrderIds = this._ordersByState[ORDER_STATES.ACTIVE];
+            const result = this._findBestMatchByPrice(parsedChainOrder, activeOrderIds);
 
-            for (const gridOrder of this.orders.values()) {
-                if (gridOrder.state === ORDER_STATES.ACTIVE && gridOrder.type === parsedChainOrder.type) {
-                    const priceDiff = Math.abs(gridOrder.price - parsedChainOrder.price);
-                    const orderSize = (gridOrder.size && Number.isFinite(Number(gridOrder.size))) ? Number(gridOrder.size) : null;
-                    const tolerance = this.calculatePriceTolerance(gridOrder.price, orderSize, gridOrder.type);
-
-                    // Only consider if within tolerance, then pick the closest
-                    if (priceDiff <= tolerance && priceDiff < smallestDiff) {
-                        smallestDiff = priceDiff;
-                        bestMatch = gridOrder;
-                    }
-                }
-            }
-
-            if (bestMatch) {
-                this.logger.log(`_findMatchingGridOrder: matched ${parsedChainOrder.orderId} to ACTIVE grid order ${bestMatch.id} by closest price (diff=${smallestDiff.toExponential(4)}, old orderId: ${bestMatch.orderId})`, 'debug');
-                return bestMatch;
+            if (result.match) {
+                this.logger.log(`_findMatchingGridOrder: matched ${parsedChainOrder.orderId} to ACTIVE grid order ${result.match.id} by closest price (diff=${result.priceDiff.toExponential(4)}, old orderId: ${result.match.orderId})`, 'debug');
+                return result.match;
             }
         }
         
@@ -916,23 +963,11 @@ class OrderManager {
         
         this.logger.log(`Fill analysis: type=${fillType}, price=${fillPrice.toFixed(4)}`, 'debug');
         
-        // Find matching ACTIVE order by type and price using calculatePriceTolerance
-        let bestMatch = null;
-        let bestPriceDiff = Infinity;
-
-        for (const gridOrder of this.orders.values()) {
-            if (gridOrder.state !== ORDER_STATES.ACTIVE) continue;
-            if (gridOrder.type !== fillType) continue;
-
-            const priceDiff = Math.abs(gridOrder.price - fillPrice);
-            const orderSize = (gridOrder.size && Number.isFinite(Number(gridOrder.size))) ? Number(gridOrder.size) : null;
-            const tolerance = this.calculatePriceTolerance(gridOrder.price, orderSize, gridOrder.type);
-
-            if (priceDiff <= tolerance && priceDiff < bestPriceDiff) {
-                bestMatch = gridOrder;
-                bestPriceDiff = priceDiff;
-            }
-        }
+        // Find matching ACTIVE order by type and price using indices
+        const activeOrderIds = this._ordersByState[ORDER_STATES.ACTIVE];
+        const result = this._findBestMatchByPrice({ type: fillType, price: fillPrice }, activeOrderIds);
+        const bestMatch = result.match;
+        const bestPriceDiff = result.priceDiff;
         
         if (bestMatch) {
             this.logger.log(`_findMatchingGridOrderByFill: MATCHED fill to ${bestMatch.id} by PRICE (fillPrice=${fillPrice.toFixed(4)}, gridPrice=${bestMatch.price.toFixed(4)}, diff=${bestPriceDiff.toFixed(8)})`, 'info');
@@ -961,15 +996,9 @@ class OrderManager {
                 if (gridOrder) {
                     gridOrder.state = ORDER_STATES.ACTIVE;
                     gridOrder.orderId = chainOrderId;
-                    this.orders.set(gridOrder.id, gridOrder);
+                    this._updateOrder(gridOrder);
                     this.logger.log(`Order ${gridOrder.id} activated with on-chain ID ${gridOrder.orderId}`, 'info');
                 }
-                break;
-            }
-            case 'listenForFills': {
-                // DEPRECATED: Fill handling is now done via syncFromOpenOrders() in dexbot.js
-                // This case is kept for backwards compatibility but should not be used
-                this.logger.log(`listenForFills case in synchronizeWithChain is deprecated - use syncFromOpenOrders() instead`, 'warn');
                 break;
             }
             case 'cancelOrder': {
@@ -978,7 +1007,7 @@ class OrderManager {
                 if (gridOrder) {
                     gridOrder.state = ORDER_STATES.VIRTUAL;
                     gridOrder.orderId = null;
-                    this.orders.set(gridOrder.id, gridOrder);
+                    this._updateOrder(gridOrder);
                     this.logger.log(`Order ${gridOrder.id} (${orderId}) cancelled and reverted to VIRTUAL`, 'info');
                 }
                 break;
@@ -1041,7 +1070,7 @@ class OrderManager {
                         } else {
                             this.logger.log(`Chain order ${parsedOrder.orderId} has no valid size (for_sale)`, 'debug');
                         }
-                        this.orders.set(gridOrder.id, gridOrder);
+                        this._updateOrder(gridOrder);
                     } else {
                         this.logger.log(`No matching grid order found for chain order ${parsedOrder.orderId} (type=${parsedOrder.type}, price=${parsedOrder.price.toFixed(4)})`, 'warn');
                     }
@@ -1051,7 +1080,7 @@ class OrderManager {
                         gridOrder.state = ORDER_STATES.VIRTUAL;
                         this.logger.log(`Active order ${gridOrder.id} (${gridOrder.orderId}) not on-chain, reverting to VIRTUAL`, 'warn');
                         gridOrder.orderId = null;
-                        this.orders.set(gridOrder.id, gridOrder);
+                        this._updateOrder(gridOrder);
                     }
                 }
                 
@@ -1103,7 +1132,7 @@ class OrderManager {
                             this._applyChainSizeToGridOrder(gridOrder, parsed.size);
                         }
                     } catch (e) { /* best-effort */ }
-                    this.orders.set(gridOrder.id, gridOrder);
+                    this._updateOrder(gridOrder);
                     matchedChainOrderIds.add(bestMatch.id);
                     this.logger.log(`Matched grid order ${gridOrder.id} to on-chain order ${bestMatch.id}.`, 'debug');
                 }
@@ -1181,8 +1210,30 @@ class OrderManager {
         return [...validSells, ...validBuys];
     }
 
-    // Filter tracked orders by type and state to ease bookkeeping.
-    getOrdersByTypeAndState(type, state) { const ordersArray = Array.from(this.orders.values()); return ordersArray.filter(o => (type === null || o.type === type) && (state === null || o.state === state)); }
+    // Filter tracked orders by type and state to ease bookkeeping (optimized with indices).
+    getOrdersByTypeAndState(type, state) { 
+        let candidateIds;
+        
+        // Use indices for faster lookup when possible
+        if (state !== null && type !== null) {
+            // Intersection of both state and type indices
+            const stateIds = this._ordersByState[state] || new Set();
+            const typeIds = this._ordersByType[type] || new Set();
+            candidateIds = [...stateIds].filter(id => typeIds.has(id));
+            return candidateIds.map(id => this.orders.get(id)).filter(Boolean);
+        } else if (state !== null) {
+            // Use state index only
+            candidateIds = this._ordersByState[state] || new Set();
+            return [...candidateIds].map(id => this.orders.get(id)).filter(Boolean);
+        } else if (type !== null) {
+            // Use type index only
+            candidateIds = this._ordersByType[type] || new Set();
+            return [...candidateIds].map(id => this.orders.get(id)).filter(Boolean);
+        } else {
+            // No filtering, return all orders
+            return Array.from(this.orders.values());
+        }
+    }
 
     // Periodically poll for fills and recalculate orders on demand.
     async fetchOrderUpdates(options = { calculate: false }) {
@@ -1201,7 +1252,7 @@ class OrderManager {
         for (const filledOrder of filledOrders) { 
             filledCounts[filledOrder.type]++; 
             const updatedOrder = { ...filledOrder, state: ORDER_STATES.FILLED, size: 0 }; 
-            this.orders.set(filledOrder.id, updatedOrder); 
+            this._updateOrder(updatedOrder); 
             if (filledOrder.type === ORDER_TYPES.SELL) { 
                 const proceeds = filledOrder.size * filledOrder.price; 
                 this.funds.available.buy += proceeds; 
@@ -1240,7 +1291,14 @@ class OrderManager {
     }
 
     // Convert filled orders into spread placeholders so new ones can re-enter later.
-    async maybeConvertToSpread(orderId) { const order = this.orders.get(orderId); if (!order || order.type === ORDER_TYPES.SPREAD) return; const updatedOrder = { ...order, type: ORDER_TYPES.SPREAD, state: ORDER_STATES.VIRTUAL }; this.orders.set(orderId, updatedOrder); this.currentSpreadCount++; this.logger.log(`Converted order ${orderId} to SPREAD`, 'debug'); }
+    async maybeConvertToSpread(orderId) { 
+        const order = this.orders.get(orderId); 
+        if (!order || order.type === ORDER_TYPES.SPREAD) return; 
+        const updatedOrder = { ...order, type: ORDER_TYPES.SPREAD, state: ORDER_STATES.VIRTUAL }; 
+        this._updateOrder(updatedOrder); 
+        this.currentSpreadCount++; 
+        this.logger.log(`Converted order ${orderId} to SPREAD`, 'debug'); 
+    }
 
     // Rebalance orders after fills by activating new buys/sells from spread placeholders.
     // Returns an array of newly activated orders that need to be placed on-chain.
@@ -1295,11 +1353,10 @@ class OrderManager {
         actualOrders.forEach(order => {
             if (fundsPerOrder <= 0) return;
             const activatedOrder = { ...order, type: targetType, size: fundsPerOrder, state: ORDER_STATES.ACTIVE };
-            this.orders.set(order.id, activatedOrder);
+            this._updateOrder(activatedOrder);
             activatedOrders.push(activatedOrder);
             this.currentSpreadCount--;
-            if (targetType === ORDER_TYPES.BUY) { this.funds.available.buy -= fundsPerOrder; this.funds.committed.buy += fundsPerOrder; } 
-            else { this.funds.available.sell -= fundsPerOrder; this.funds.committed.sell += fundsPerOrder; }
+            this._adjustFunds(targetType, fundsPerOrder);
             this.logger.log(`Prepared ${targetType} order at ${order.price.toFixed(2)} (Amount: ${fundsPerOrder.toFixed(8)})`, 'info');
         });
         return activatedOrders;
