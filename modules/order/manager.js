@@ -573,6 +573,14 @@ class OrderManager {
     // float representing remaining amount to sell for that order.
     _applyChainSizeToGridOrder(gridOrder, chainSize) {
         if (!gridOrder) return;
+        // Only apply chain-reported sizes to orders that are ACTIVE.
+        // Virtual/spread placeholders should keep their configured sizes
+        // until they are explicitly activated; callers that activate an
+        // order set `state = ORDER_STATES.ACTIVE` before calling this.
+        if (gridOrder.state !== ORDER_STATES.ACTIVE) {
+            this.logger && this.logger.log && this.logger.log(`Skipping chain size apply for non-ACTIVE order ${gridOrder.id} (state=${gridOrder.state})`, 'debug');
+            return;
+        }
         const oldSize = Number(gridOrder.size || 0);
         const newSize = Number.isFinite(Number(chainSize)) ? Number(chainSize) : oldSize;
         const delta = newSize - oldSize;
