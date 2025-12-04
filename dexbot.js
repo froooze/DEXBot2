@@ -2,7 +2,7 @@
 const { BitShares, waitForConnected } = require('./modules/bitshares_client');
 const fs = require('fs');
 const path = require('path');
-const accountOrders = require('./modules/chain_orders');
+const chainOrders = require('./modules/chain_orders');
 const { OrderManager } = require('./modules/order');
 const accountKeys = require('./modules/chain_keys');
 const accountBots = require('./modules/account_bots');
@@ -106,7 +106,7 @@ function normalizeBotEntries(rawEntries) {
     });
 }
 
-const indexDB = new AccountOrders();
+const accountOrders = new AccountOrders();
 
 // Connection handled centrally by modules/bitshares_client; use waitForConnected() when needed
 
@@ -128,8 +128,8 @@ class DEXBot {
         let accountData = null;
         if (this.config && this.config.preferredAccount) {
             try {
-                const pwd = masterPassword || accountOrders.authenticate();
-                const privateKey = accountOrders.getPrivateKey(this.config.preferredAccount, pwd);
+                const pwd = masterPassword || chainOrders.authenticate();
+                const privateKey = chainOrders.getPrivateKey(this.config.preferredAccount, pwd);
                 let accId = null;
                 try {
                     const full = await BitShares.db.get_full_accounts([this.config.preferredAccount], false);
@@ -140,14 +140,14 @@ class DEXBot {
                     }
                 } catch (e) { /* best-effort */ }
 
-                if (accId) accountOrders.setPreferredAccount(accId, this.config.preferredAccount);
+                if (accId) chainOrders.setPreferredAccount(accId, this.config.preferredAccount);
                 accountData = { accountName: this.config.preferredAccount, privateKey, id: accId };
             } catch (err) {
                 console.warn('Auto-selection of preferredAccount failed:', err.message);
-                accountData = await accountOrders.selectAccount();
+                accountData = await chainOrders.selectAccount();
             }
         } else {
-            accountData = await accountOrders.selectAccount();
+            accountData = await chainOrders.selectAccount();
         }
         this.account = accountData.accountName;
         this.accountId = accountData.id || null;
@@ -175,7 +175,7 @@ class DEXBot {
 
         if (this.config.dryRun) {
             this.manager.logger.log('Dry run enabled, skipping on-chain order placement.', 'info');
-            indexDB.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()));
+            accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()));
             return;
         }
 
@@ -213,7 +213,7 @@ class DEXBot {
         const createAndSyncOrder = async (order) => {
             this.manager.logger.log(`Placing ${order.type} order: size=${order.size}, price=${order.price}`, 'debug');
             const args = buildCreateOrderArgs(order);
-            const result = await accountOrders.createOrder(
+            const result = await chainOrders.createOrder(
                 this.account, this.privateKey, args.amountToSell, args.sellAssetId,
                 args.minToReceive, args.receiveAssetId, null, false
             );
@@ -252,7 +252,7 @@ class DEXBot {
         for (const group of orderGroups) {
             await placeOrderGroup(group);
         }
-        indexDB.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()));
+        accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()));
     }
 
     // Place new orders on-chain (used after fills to create replacement orders)
@@ -285,7 +285,7 @@ class DEXBot {
             try {
                 this.manager.logger.log(`Placing ${order.type} order on-chain: size=${order.size.toFixed(8)}, price=${order.price.toFixed(4)}`, 'info');
                 const args = buildCreateOrderArgs(order);
-                const result = await accountOrders.createOrder(
+                const result = await chainOrders.createOrder(
                     this.account, this.privateKey, args.amountToSell, args.sellAssetId,
                     args.minToReceive, args.receiveAssetId, null, false
                 );
@@ -311,7 +311,7 @@ class DEXBot {
         }
 
         // Start listening for fills BEFORE any order operations to avoid missing fills
-        await accountOrders.listenForFills(this.account || undefined, async (fills) => {
+        await chainOrders.listenForFills(this.account || undefined, async (fills) => {
             if (this.manager && !this.isResyncing && !this.config.dryRun) {
                 for (const fill of fills) {
                     if (fill && fill.op && fill.op[0] === 4) {
@@ -336,14 +336,14 @@ class DEXBot {
                             console.log(`=========================\n`);
 
                             // Fetch fresh open orders from blockchain and sync by orderId
-                            const chainOrders = await accountOrders.readOpenOrders(this.account);
-                            const syncResult = this.manager.syncFromOpenOrders(chainOrders, fillOp);
+                            const chainOpenOrders = await chainOrders.readOpenOrders(this.account);
+                            const syncResult = this.manager.syncFromOpenOrders(chainOpenOrders, fillOp);
                             
                             // Correct any orders with price mismatches (orderId matched but price outside tolerance)
                             if (syncResult.ordersNeedingCorrection && syncResult.ordersNeedingCorrection.length > 0) {
                                 this.manager.logger.log(`Correcting ${syncResult.ordersNeedingCorrection.length} order(s) with price mismatch...`, 'info');
                                 const correctionResult = await this.manager.correctAllPriceMismatches(
-                                    this.account, this.privateKey, accountOrders
+                                    this.account, this.privateKey, chainOrders
                                 );
                                 if (correctionResult.failed > 0) {
                                     this.manager.logger.log(`${correctionResult.failed} order correction(s) failed`, 'error');
@@ -359,7 +359,7 @@ class DEXBot {
                             }
                             
                             // Always persist snapshot after processing fills
-                            indexDB.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()));
+                            accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()));
                     }
                 }
             }
@@ -373,10 +373,10 @@ class DEXBot {
             this.isResyncing = true;
             try {
                 this.manager.logger.log('Grid regeneration triggered. Performing full grid resync...', 'info');
-                const readFn = () => accountOrders.readOpenOrders(this.accountId);
-                const cancelFn = (orderId) => accountOrders.cancelOrder(this.account, this.privateKey, orderId);
+                const readFn = () => chainOrders.readOpenOrders(this.accountId);
+                const cancelFn = (orderId) => chainOrders.cancelOrder(this.account, this.privateKey, orderId);
                 await this.manager.resyncGridFromChain(readFn, cancelFn);
-                indexDB.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()));
+                accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()));
 
                 if (fs.existsSync(this.triggerFile)) {
                     fs.unlinkSync(this.triggerFile);
@@ -392,8 +392,8 @@ class DEXBot {
         if (fs.existsSync(this.triggerFile)) {
             await performResync();
         } else {
-            const persistedGrid = indexDB.loadBotGrid(this.config.botKey);
-            const chainOrders = this.config.dryRun ? [] : await accountOrders.readOpenOrders(this.accountId);
+            const persistedGrid = accountOrders.loadBotGrid(this.config.botKey);
+            const chainOpenOrders = this.config.dryRun ? [] : await chainOrders.readOpenOrders(this.accountId);
             
             let shouldRegenerate = false;
             if (!persistedGrid || persistedGrid.length === 0) {
@@ -401,7 +401,7 @@ class DEXBot {
                 this.manager.logger.log('No persisted grid found. Generating new grid.', 'info');
             } else {
                 await this.manager._initializeAssets();
-                const chainOrderIds = new Set(chainOrders.map(o => o.id));
+                const chainOrderIds = new Set(chainOpenOrders.map(o => o.id));
                 const hasActiveMatch = persistedGrid.some(order => order.state === 'active' && chainOrderIds.has(order.orderId));
                 if (!hasActiveMatch) {
                     shouldRegenerate = true;
@@ -416,12 +416,12 @@ class DEXBot {
                 if (!this.config.dryRun) {
                     try {
                         const persistedIds = new Set((persistedGrid || []).map(o => o.orderId).filter(Boolean));
-                        if (Array.isArray(chainOrders) && chainOrders.length > 0) {
-                            for (const co of chainOrders) {
+                        if (Array.isArray(chainOpenOrders) && chainOpenOrders.length > 0) {
+                            for (const co of chainOpenOrders) {
                                 try {
                                     if (!persistedIds.has(co.id)) {
                                         this.manager && this.manager.logger && this.manager.logger.log && this.manager.logger.log(`Cancelling unmatched on-chain order ${co.id} before initializing grid.`, 'info');
-                                        await accountOrders.cancelOrder(this.account, this.privateKey, co.id);
+                                        await chainOrders.cancelOrder(this.account, this.privateKey, co.id);
                                     }
                                 } catch (err) {
                                     this.manager && this.manager.logger && this.manager.logger.log && this.manager.logger.log(`Failed to cancel order ${co.id}: ${err && err.message ? err.message : err}`, 'error');
@@ -437,20 +437,20 @@ class DEXBot {
             } else {
                 this.manager.logger.log('Found active session. Loading and syncing existing grid.', 'info');
                 this.manager.loadGrid(persistedGrid);
-                const syncResult = await this.manager.synchronizeWithChain(chainOrders, 'readOpenOrders');
+                const syncResult = await this.manager.synchronizeWithChain(chainOpenOrders, 'readOpenOrders');
                 
                 // Correct any orders with price mismatches at startup
                 if (syncResult.ordersNeedingCorrection && syncResult.ordersNeedingCorrection.length > 0) {
                     this.manager.logger.log(`Startup: Correcting ${syncResult.ordersNeedingCorrection.length} order(s) with price mismatch...`, 'info');
                     const correctionResult = await this.manager.correctAllPriceMismatches(
-                        this.account, this.privateKey, accountOrders
+                        this.account, this.privateKey, chainOrders
                     );
                     if (correctionResult.failed > 0) {
                         this.manager.logger.log(`${correctionResult.failed} startup order correction(s) failed`, 'error');
                     }
                 }
                 
-                indexDB.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()));
+                accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()));
             }
         }
 
@@ -522,14 +522,14 @@ async function runAccountManager({ waitForConnection = false, exitAfter = false,
 // Handle master password prompts and auto-launch key manager when missing.
 async function authenticateMasterPassword() {
     try {
-        return accountOrders.authenticate();
+        return chainOrders.authenticate();
     } catch (err) {
         if (!accountKeysAutostarted && err && err.message && err.message.includes('No master password set')) {
             accountKeysAutostarted = true;
             console.log('no master password set');
             console.log('autostart account keys');
             await runAccountManager();
-            return accountOrders.authenticate();
+            return chainOrders.authenticate();
         }
         throw err;
     }
@@ -590,7 +590,7 @@ async function runBotInstances(botEntries, { forceDryRun = false, sourceName = '
         dryRun: forceDryRun ? true : entry.dryRun,
     }));
 
-    indexDB.ensureBotEntries(prepared);
+    accountOrders.ensureBotEntries(prepared);
 
     const { errors, warnings } = collectValidationIssues(prepared, sourceName);
     if (warnings.length) {
@@ -634,7 +634,7 @@ async function runBotInstances(botEntries, { forceDryRun = false, sourceName = '
             instances.push(bot);
         } catch (err) {
             console.error('Failed to start bot:', err.message);
-            if (err && err instanceof accountOrders.MasterPasswordError) {
+                if (err && err instanceof chainOrders.MasterPasswordError) {
                 console.error('Aborting because the master password failed 3 times.');
                 process.exit(1);
             }
@@ -743,8 +743,8 @@ async function restartBotByName(botName) {
             }
 
             // Ensure persisted account-orders metadata exists for this bot and persist the generated grid
-            indexDB.ensureBotEntries([bot]);
-            indexDB.storeMasterGrid(bot.botKey, Array.from(manager.orders.values()));
+            accountOrders.ensureBotEntries([bot]);
+            accountOrders.storeMasterGrid(bot.botKey, Array.from(manager.orders.values()));
             console.log(`Generated and stored grid snapshot for '${bot.name}' to profiles/orders.json`);
         } catch (err) {
             console.warn(`Failed to generate grid for '${bot.name}': ${err && err.message ? err.message : err}`);
