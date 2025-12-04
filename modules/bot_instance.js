@@ -11,6 +11,7 @@
 const path = require('path');
 const fs = require('fs');
 const ordersModule = require('./chain_orders');
+const chainKeys = require('./chain_keys');
 const { BitShares } = require('./bitshares_client');
 const OrderManagerModule = require('./order');
 
@@ -108,8 +109,8 @@ async function startBot(settings = {}) {
             const effectivePreferredAccount = PREFERRED_ACCOUNT || global.PREFERRED_ACCOUNT_OVERRIDE || null;
             if (effectivePreferredAccount) {
                 try {
-                    const masterPassword = ordersModule.authenticate();
-                    const privateKey = ordersModule.getPrivateKey(effectivePreferredAccount, masterPassword);
+                    const masterPassword = chainKeys.authenticate();
+                    const privateKey = chainKeys.getPrivateKey(effectivePreferredAccount, masterPassword);
                     activeAccountName = effectivePreferredAccount;
                     activePrivateKey = privateKey;
 

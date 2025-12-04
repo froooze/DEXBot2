@@ -5,106 +5,10 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const readlineSync = require('readline-sync');
+const chainKeys = require('./chain_keys');
 
-const PROFILES_KEYS_FILE = path.join(__dirname, '..', 'profiles', 'keys.json');
-
-// Encrypt data with password
-function encrypt(text, password) {
-    const salt = crypto.randomBytes(16);
-    const key = crypto.scryptSync(password, salt, 32);
-    const iv = crypto.randomBytes(16);
-    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-    let encrypted = cipher.update(text, 'utf8', 'hex');
-    encrypted += cipher.final('hex');
-    const authTag = cipher.getAuthTag();
-    return salt.toString('hex') + ':' + iv.toString('hex') + ':' + authTag.toString('hex') + ':' + encrypted;
-}
-
-// Decrypt data with password
-function decrypt(encrypted, password) {
-    const parts = encrypted.split(':');
-    const salt = Buffer.from(parts[0], 'hex');
-    const iv = Buffer.from(parts[1], 'hex');
-    const authTag = Buffer.from(parts[2], 'hex');
-    const encryptedText = parts[3];
-    const key = crypto.scryptSync(password, salt, 32);
-    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
-    decipher.setAuthTag(authTag);
-    let decrypted = decipher.update(encryptedText, 'hex', 'utf8');
-    decrypted += decipher.final('utf8');
-    return decrypted;
-}
-
-// Load accounts data
-function loadAccounts() {
-    try {
-        if (!fs.existsSync(PROFILES_KEYS_FILE)) {
-            return { masterPasswordHash: '', accounts: {} };
-        }
-        const content = fs.readFileSync(PROFILES_KEYS_FILE, 'utf8').trim();
-        if (!content) {
-            return { masterPasswordHash: '', accounts: {} };
-        }
-        return JSON.parse(content);
-    } catch (error) {
-        console.error('Error loading accounts file, resetting to default:', error.message);
-        return { masterPasswordHash: '', accounts: {} };
-    }
-}
-
-// Hash password for verification
-function hashPassword(password) {
-    return crypto.createHash('sha256').update(password).digest('hex');
-}
-
-class MasterPasswordError extends Error {
-    constructor(message) {
-        super(message);
-        this.name = 'MasterPasswordError';
-        this.code = 'MASTER_PASSWORD_FAILED';
-    }
-}
-
-const MASTER_PASSWORD_MAX_ATTEMPTS = 3;
-let masterPasswordAttempts = 0;
-
-// Prompt the user for the master password, limiting the total attempts.
-function _promptPassword() {
-    if (masterPasswordAttempts >= MASTER_PASSWORD_MAX_ATTEMPTS) {
-        throw new MasterPasswordError(`Incorrect master password after ${MASTER_PASSWORD_MAX_ATTEMPTS} attempts.`);
-    }
-    masterPasswordAttempts += 1;
-    return readlineSync.question('Enter master password: ', { hideEchoBack: true });
-}
-
-// Authenticate and get master password
-function authenticate() {
-    const accountsData = loadAccounts();
-    if (!accountsData.masterPasswordHash) {
-        throw new Error('No master password set. Please run modules/chain_keys.js first.');
-    }
-
-    while (true) {
-        const enteredPassword = _promptPassword();
-        if (hashPassword(enteredPassword) === accountsData.masterPasswordHash) {
-            masterPasswordAttempts = 0;
-            return enteredPassword;
-        }
-        if (masterPasswordAttempts < MASTER_PASSWORD_MAX_ATTEMPTS) {
-            console.log('Master password not correct. Please try again.');
-        }
-    }
-}
-
-// Decrypt and return the stored private key for the requested account.
-function getPrivateKey(accountName, masterPassword) {
-    const accountsData = loadAccounts();
-    const account = accountsData.accounts[accountName];
-    if (!account) {
-        throw new Error(`Account '${accountName}' not found.`);
-    }
-    return decrypt(account.encryptedKey, masterPassword);
-}
+// Key/auth helpers provided by modules/chain_keys.js
+// (authenticate(), getPrivateKey(), MasterPasswordError)
 
 // Resolve asset precision from id or symbol via BitShares DB; returns 0 on failure
 async function _getAssetPrecision(assetRef) {
@@ -205,8 +109,8 @@ function _ensureAccountSubscriber(accountName) {
 
 // Prompt user to select an account after authenticating with the master password.
 async function selectAccount() {
-    const masterPassword = authenticate();
-    const accountsData = loadAccounts();
+    const masterPassword = chainKeys.authenticate();
+    const accountsData = chainKeys.loadAccounts();
     const accountNames = Object.keys(accountsData.accounts);
 
     if (accountNames.length === 0) {
@@ -224,7 +128,7 @@ async function selectAccount() {
     }
 
     const selectedAccount = accountNames[choice];
-    const privateKey = getPrivateKey(selectedAccount, masterPassword);
+    const privateKey = chainKeys.getPrivateKey(selectedAccount, masterPassword);
 
     try {
         const full = await BitShares.db.get_full_accounts([selectedAccount], false);
@@ -571,9 +475,9 @@ async function getOnChainAssetBalances(accountRef, assets) {
 }
 
 module.exports = {
-    authenticate,
+    authenticate: chainKeys.authenticate,
     selectAccount,
-    getPrivateKey,
+    getPrivateKey: chainKeys.getPrivateKey,
     setPreferredAccount,
     readOpenOrders,
     listenForFills,
@@ -582,5 +486,5 @@ module.exports = {
     cancelOrder,
     getOnChainAssetBalances,
     
-    MasterPasswordError
+    MasterPasswordError: chainKeys.MasterPasswordError
 };

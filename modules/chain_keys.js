@@ -167,6 +167,53 @@ function loadAccounts() {
 function hashPassword(password) {
     return crypto.createHash('sha256').update(password).digest('hex');
 }
+class MasterPasswordError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = 'MasterPasswordError';
+        this.code = 'MASTER_PASSWORD_FAILED';
+    }
+}
+
+const MASTER_PASSWORD_MAX_ATTEMPTS = 3;
+let masterPasswordAttempts = 0;
+
+function _promptPassword() {
+    if (masterPasswordAttempts >= MASTER_PASSWORD_MAX_ATTEMPTS) {
+        throw new MasterPasswordError(`Incorrect master password after ${MASTER_PASSWORD_MAX_ATTEMPTS} attempts.`);
+    }
+    masterPasswordAttempts += 1;
+    return readlineSync.question('Enter master password: ', { hideEchoBack: true });
+}
+
+// Authenticate and return the master password (throws or prompts)
+function authenticate() {
+    const accountsData = loadAccounts();
+    if (!accountsData.masterPasswordHash) {
+        throw new Error('No master password set. Please run modules/chain_keys.js first.');
+    }
+
+    while (true) {
+        const enteredPassword = _promptPassword();
+        if (hashPassword(enteredPassword) === accountsData.masterPasswordHash) {
+            masterPasswordAttempts = 0;
+            return enteredPassword;
+        }
+        if (masterPasswordAttempts < MASTER_PASSWORD_MAX_ATTEMPTS) {
+            console.log('Master password not correct. Please try again.');
+        }
+    }
+}
+
+// Decrypt and return the stored private key for the requested account.
+function getPrivateKey(accountName, masterPassword) {
+    const accountsData = loadAccounts();
+    const account = accountsData.accounts[accountName];
+    if (!account) {
+        throw new Error(`Account '${accountName}' not found.`);
+    }
+    return decrypt(account.encryptedKey, masterPassword);
+}
 // Display the saved account names to the console and return their ordering.
 function listKeyNames(accounts) {
     if (!accounts || Object.keys(accounts).length === 0) {
@@ -357,4 +404,5 @@ async function main() {
     }
 }
 
-module.exports = { validatePrivateKey, loadAccounts, saveAccounts, encrypt, decrypt, hashPassword, main };
+module.exports = { validatePrivateKey, loadAccounts, saveAccounts, encrypt, decrypt, hashPassword, main,
+    authenticate, getPrivateKey, MasterPasswordError };

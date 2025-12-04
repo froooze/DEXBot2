@@ -3,6 +3,7 @@ const { BitShares, waitForConnected } = require('./modules/bitshares_client');
 const fs = require('fs');
 const path = require('path');
 const chainOrders = require('./modules/chain_orders');
+const chainKeys = require('./modules/chain_keys');
 const { OrderManager } = require('./modules/order');
 const accountKeys = require('./modules/chain_keys');
 const accountBots = require('./modules/account_bots');
@@ -128,8 +129,8 @@ class DEXBot {
         let accountData = null;
         if (this.config && this.config.preferredAccount) {
             try {
-                const pwd = masterPassword || chainOrders.authenticate();
-                const privateKey = chainOrders.getPrivateKey(this.config.preferredAccount, pwd);
+                const pwd = masterPassword || chainKeys.authenticate();
+                const privateKey = chainKeys.getPrivateKey(this.config.preferredAccount, pwd);
                 let accId = null;
                 try {
                     const full = await BitShares.db.get_full_accounts([this.config.preferredAccount], false);
@@ -522,14 +523,14 @@ async function runAccountManager({ waitForConnection = false, exitAfter = false,
 // Handle master password prompts and auto-launch key manager when missing.
 async function authenticateMasterPassword() {
     try {
-        return chainOrders.authenticate();
+        return chainKeys.authenticate();
     } catch (err) {
         if (!accountKeysAutostarted && err && err.message && err.message.includes('No master password set')) {
             accountKeysAutostarted = true;
             console.log('no master password set');
             console.log('autostart account keys');
             await runAccountManager();
-            return chainOrders.authenticate();
+            return chainKeys.authenticate();
         }
         throw err;
     }
@@ -634,7 +635,7 @@ async function runBotInstances(botEntries, { forceDryRun = false, sourceName = '
             instances.push(bot);
         } catch (err) {
             console.error('Failed to start bot:', err.message);
-                if (err && err instanceof chainOrders.MasterPasswordError) {
+                if (err && err instanceof chainKeys.MasterPasswordError) {
                 console.error('Aborting because the master password failed 3 times.');
                 process.exit(1);
             }
