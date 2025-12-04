@@ -44,6 +44,8 @@ async function main() {
 
         const poolP = await derivePoolPrice(mock, assetA, assetB);
         const marketP = await deriveMarketPrice(mock, assetA, assetB);
+        const { derivePrice } = require('../modules/order/price');
+        const derivedP = await derivePrice(mock, assetA, assetB);
 
         // Expected poolP = reserveB/reserveA = 3000000 / 20000 = 150
         assert(Number.isFinite(poolP), 'pool price must be numeric');
@@ -53,7 +55,29 @@ async function main() {
         assert(Number.isFinite(marketP), 'market price must be numeric');
         assert(Math.abs(marketP - (1 / 0.0015)) < 1e-9, `unexpected market price value ${marketP}`);
 
-        console.log('derivePoolPrice and deriveMarketPrice tests passed: poolP=', poolP, 'marketP=', marketP);
+        // derivePrice should prefer pool (since we provide pool reserves)
+        assert(Number.isFinite(derivedP), 'derived price must be numeric');
+        assert(Math.abs(derivedP - poolP) < 1e-9, `derivePrice should choose pool price when pool exists (got ${derivedP}, expected ${poolP})`);
+
+        // Also verify explicit-mode behavior: forcing 'pool' or 'market' modes
+        const derivedForcePool = await derivePrice(mock, assetA, assetB, 'pool');
+        assert(Number.isFinite(derivedForcePool) && Math.abs(derivedForcePool - poolP) < 1e-9, `derivePrice(mode=pool) should return pool price when available (got ${derivedForcePool}, expected ${poolP})`);
+        const derivedForceMarket = await derivePrice(mock, assetA, assetB, 'market');
+        assert(Number.isFinite(derivedForceMarket) && Math.abs(derivedForceMarket - marketP) < 1e-9, `derivePrice(mode=market) should return market price when available (got ${derivedForceMarket}, expected ${marketP})`);
+
+        // Now test fallback: remove pools so pool resolution returns null and derivePrice falls back to market for auto mode
+        mock.db.get_liquidity_pools = async () => [];
+        mock.db.get_objects = async () => [];
+        const derivedMarketFallback = await derivePrice(mock, assetA, assetB);
+        assert(Number.isFinite(derivedMarketFallback), 'derivePrice fallback must be numeric');
+        assert(Math.abs(derivedMarketFallback - marketP) < 1e-9, `derivePrice should fall back to market price when no pool (got ${derivedMarketFallback}, expected ${marketP})`);
+
+        // When pool is removed, forcing 'pool' mode follows derivePoolPrice's semantics
+        // (derivePoolPrice itself falls back to market/orderbook), so expect the same market-derived value
+        const derivedForcePoolMissing = await derivePrice(mock, assetA, assetB, 'pool');
+        assert(Number.isFinite(derivedForcePoolMissing) && Math.abs(derivedForcePoolMissing - derivedMarketFallback) < 1e-9, 'derivePrice(mode=pool) should fall back to market price when no pool present');
+
+        console.log('derivePoolPrice, deriveMarketPrice and derivePrice tests passed: poolP=', poolP, 'marketP=', marketP, 'derivedP=', derivedP);
     } finally {
         bsModule.BitShares = originalBS;
     }

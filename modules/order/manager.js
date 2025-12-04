@@ -367,28 +367,36 @@ class OrderManager {
 
         if (!Number.isFinite(Number(mpRaw)) || mpIsPool || mpIsMarket) {
             try {
-                const { derivePoolPrice, deriveMarketPrice } = require('./price');
+                const { derivePoolPrice, deriveMarketPrice, derivePrice } = require('./price');
                 const { BitShares } = require('../bitshares_client');
                 const symA = this.config.assetA;
                 const symB = this.config.assetB;
 
                 if ((mpIsPool || this.config.pool) && symA && symB) {
                     try {
-                        const p = await derivePoolPrice(BitShares, symA, symB);
+                        const p = await derivePrice(BitShares, symA, symB, 'pool');
                         if (p !== null) this.config.marketPrice = p;
-                    } catch (e) { this.logger && this.logger.log && this.logger.log(`Pool price lookup failed: ${e.message}`, 'warn'); }
+                    } catch (e) { this.logger && this.logger.log && this.logger.log(`Pool price lookup failed: ${e && e.message ? e.message : e}`, 'warn'); }
                 } else if ((mpIsMarket || this.config.market) && symA && symB) {
                     try {
-                        const m = await deriveMarketPrice(BitShares, symA, symB);
+                        const m = await derivePrice(BitShares, symA, symB, 'market');
                         if (m !== null) this.config.marketPrice = m;
                     } catch (e) { this.logger && this.logger.log && this.logger.log(`Market price lookup failed: ${e.message}`, 'warn'); }
                 }
 
                 try {
-                    // final attempt to derive market price from on-chain orderbook/ticker
-                    const m = await deriveMarketPrice(BitShares, symA, symB);
-                    if (m !== null) { this.config.marketPrice = m; console.log('Derived marketPrice from on-chain', this.config.assetA + '/' + this.config.assetB, m); }
-                } catch (e) { this.logger && this.logger.log && this.logger.log(`auto-derive marketPrice failed: ${e.message}`, 'warn'); }
+                    // final attempt to derive price. Respect explicit pool/market preference earlier;
+                    // otherwise use the centralized derivePrice helper which will prefer pool->market->limit-orders.
+                    if (!Number.isFinite(Number(this.config.marketPrice))) {
+                        // honor explicit priceMode config or environment PRICE_MODE (start flag)
+                        const modePref = (this.config && this.config.priceMode) ? String(this.config.priceMode).toLowerCase() : (process && process.env && process.env.PRICE_MODE ? String(process.env.PRICE_MODE).toLowerCase() : 'auto');
+                        const tryP = await derivePrice(BitShares, symA, symB, modePref);
+                        if (tryP !== null) {
+                            this.config.marketPrice = tryP;
+                            console.log('Derived marketPrice from on-chain (derivePrice)', this.config.assetA + '/' + this.config.assetB, tryP);
+                        }
+                    }
+                } catch (e) { this.logger && this.logger.log && this.logger.log(`auto-derive marketPrice failed: ${e && e.message ? e.message : e}`, 'warn'); }
             } catch (err) {
                 this.logger && this.logger.log && this.logger.log(`auto-derive marketPrice failed: ${err.message}`, 'warn');
             }

@@ -35,7 +35,7 @@ async function runOrderManagerCalculation() {
         const tryPool = mpIsPool || !!runtimeConfig.pool;
         const tryMarket = mpIsMarket || !!runtimeConfig.market;
 
-        const { derivePoolPrice, deriveMarketPrice } = require('./price');
+        const { derivePoolPrice, deriveMarketPrice, derivePrice } = require('./price');
         if (tryPool && (runtimeConfig.assetA && runtimeConfig.assetB)) {
             try {
                 const { BitShares } = require('../bitshares_client');
@@ -55,9 +55,12 @@ async function runOrderManagerCalculation() {
         try {
             const { BitShares } = require('../bitshares_client');
             const symA = runtimeConfig.assetA; const symB = runtimeConfig.assetB;
-            const m = await deriveMarketPrice(BitShares, symA, symB);
-            if (m !== null) { runtimeConfig.marketPrice = m; console.log('Derived marketPrice from on-chain', runtimeConfig.assetA + '/' + runtimeConfig.assetB, m); }
-        } catch (err) { console.warn('Failed to auto-derive marketPrice from chain:', err.message); }
+            // Use centralized derivePrice as a final fallback (which may prefer pool->market->limit-orders)
+            // Pass an explicit runtime preference (runtimeConfig.priceMode or env PRICE_MODE) if present
+            const runtimeMode = (runtimeConfig && runtimeConfig.priceMode) ? String(runtimeConfig.priceMode).toLowerCase() : (process && process.env && process.env.PRICE_MODE ? String(process.env.PRICE_MODE).toLowerCase() : 'auto');
+            const m = await derivePrice(BitShares, symA, symB, runtimeMode);
+            if (m !== null) { runtimeConfig.marketPrice = m; console.log('Derived marketPrice from on-chain (derivePrice)', runtimeConfig.assetA + '/' + runtimeConfig.assetB, m); }
+        } catch (err) { console.warn('Failed to auto-derive marketPrice from chain (derivePrice):', err && err.message ? err.message : err); }
     }
 
     try {

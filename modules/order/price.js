@@ -147,4 +147,89 @@ const derivePoolPrice = async (BitShares, symA, symB) => {
     }
 };
 
-module.exports = { lookupAsset, derivePoolPrice, deriveMarketPrice };
+// derivePrice: try pool -> market/orderbook -> aggregated limit orders
+// mode can be undefined|'auto'|'pool'|'market'
+const derivePrice = async (BitShares, symA, symB, mode) => {
+    mode = (mode === undefined || mode === null) ? 'auto' : String(mode).toLowerCase();
+    // if caller forces a mode, honor it
+    if (mode === 'pool') {
+        try { const p = await derivePoolPrice(BitShares, symA, symB); if (p && Number.isFinite(p) && p > 0) return p; } catch (e) { return null; }
+        return null;
+    }
+    if (mode === 'market') {
+        try { const m = await deriveMarketPrice(BitShares, symA, symB); if (m && Number.isFinite(m) && m > 0) return m; } catch (e) { return null; }
+        return null;
+    }
+    try {
+        // pool first
+        try {
+            const p = await derivePoolPrice(BitShares, symA, symB);
+            if (p && Number.isFinite(p) && p > 0) return p;
+        } catch (e) {}
+
+        // market / orderbook next
+        try {
+            const m = await deriveMarketPrice(BitShares, symA, symB);
+            if (m && Number.isFinite(m) && m > 0) return m;
+        } catch (e) {}
+
+        // Final fallback: try aggregating limit orders (weighted by base size)
+        try {
+            // resolve assets to ids
+            const aMeta = await lookupAsset(BitShares, symA);
+            const bMeta = await lookupAsset(BitShares, symB);
+            if (!aMeta || !bMeta) return null;
+            const aId = aMeta.id; const bId = bMeta.id;
+
+            // Fetch orders in both orientations, try direct first
+            let orders = await (BitShares.db && typeof BitShares.db.get_limit_orders === 'function' ? BitShares.db.get_limit_orders(aId, bId, 100) : null).catch(() => null);
+            if (!orders || !orders.length) {
+                const rev = await (BitShares.db && typeof BitShares.db.get_limit_orders === 'function' ? BitShares.db.get_limit_orders(bId, aId, 100) : null).catch(() => null);
+                orders = rev || [];
+            }
+            if (!orders || !orders.length) return null;
+
+            // helper to parse a limit order into { price: quotePerBase, size: baseHuman, baseId, quoteId }
+            const parseOrder = async (order) => {
+                if (!order || !order.sell_price) return null;
+                const { base, quote } = order.sell_price;
+                // get precisions (best-effort)
+                const basePrec = await (BitShares.assets && BitShares.assets[base.asset_id] ? (BitShares.assets[base.asset_id].precision || 0) : (async () => { try { const a = await BitShares.db.get_assets([base.asset_id]); return (a && a[0] && typeof a[0].precision === 'number') ? a[0].precision : 0; } catch (e) { return 0; } })());
+                // basePrec may be a promise, normalize
+                const basePrecision = typeof basePrec === 'number' ? basePrec : await basePrec;
+                const quotePrec = await (BitShares.assets && BitShares.assets[quote.asset_id] ? (BitShares.assets[quote.asset_id].precision || 0) : (async () => { try { const a = await BitShares.db.get_assets([quote.asset_id]); return (a && a[0] && typeof a[0].precision === 'number') ? a[0].precision : 0; } catch (e) { return 0; } })());
+                const quotePrecision = typeof quotePrec === 'number' ? quotePrec : await quotePrec;
+
+                const baseAmt = Number(base.amount || 0);
+                const quoteAmt = Number(quote.amount || 0);
+                if (!baseAmt || !quoteAmt) return null;
+                const price = (quoteAmt / baseAmt) * Math.pow(10, basePrecision - quotePrecision);
+                const size = Number(order.for_sale || 0) / Math.pow(10, basePrecision || 0);
+                return { price, size, baseId: String(base.asset_id), quoteId: String(quote.asset_id) };
+            };
+
+            let sumNum = 0, sumDen = 0;
+            for (const o of orders) {
+                const p = await parseOrder(o);
+                if (!p) continue;
+                // We need quote per base for (aId,bId).
+                let priceInDesired = null;
+                if (p.baseId === String(aId) && p.quoteId === String(bId)) priceInDesired = p.price;
+                else if (p.baseId === String(bId) && p.quoteId === String(aId)) { if (p.price !== 0) priceInDesired = 1 / p.price; }
+                else continue; // skip
+                if (!Number.isFinite(priceInDesired) || priceInDesired <= 0) continue;
+                const weight = Math.max(1e-12, p.size);
+                sumNum += priceInDesired * weight;
+                sumDen += weight;
+            }
+            if (!sumDen) return null;
+            return sumNum / sumDen;
+        } catch (e) {}
+
+        return null;
+    } catch (err) {
+        return null;
+    }
+};
+
+module.exports = { lookupAsset, derivePoolPrice, deriveMarketPrice, derivePrice };
