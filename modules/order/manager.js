@@ -921,7 +921,11 @@ class OrderManager {
         const allSpreadOrders = this.getOrdersByTypeAndState(ORDER_TYPES.SPREAD, ORDER_STATES.VIRTUAL);
         const spreadOrders = allSpreadOrders
             .filter(o => (targetType === ORDER_TYPES.BUY && o.price < this.config.marketPrice) || (targetType === ORDER_TYPES.SELL && o.price > this.config.marketPrice))
-            .sort((a, b) => targetType === ORDER_TYPES.BUY ? b.price - a.price : a.price - b.price);  // Sort closest to market first
+            // Selection rule:
+            // - For BUY activation: choose the SPREAD entries with the lowest prices first (furthest from market below price)
+            // - For SELL activation: choose the SPREAD entries with the highest prices first (furthest from market above price)
+            // This ensures newly created buy orders use the lowest available spread price and sells use the highest.
+            .sort((a, b) => targetType === ORDER_TYPES.BUY ? a.price - b.price : b.price - a.price);
         const availableFunds = targetType === ORDER_TYPES.BUY ? this.funds.available.buy : this.funds.available.sell;
         if (availableFunds <= 0) { this.logger.log(`No available funds to create ${targetType} orders`, 'warn'); return []; }
         let desiredCount = Math.min(count, spreadOrders.length);
