@@ -134,16 +134,13 @@ class OrderManager {
         this.orders.set(order.id, order);
     }
 
-    // Note: findBestMatchByPrice is available from utils; callers should
-    // invoke utils.findBestMatchByPrice(chainOrder, candidates, this.orders, this._calcTolerance.bind(this))
-    // when needed. The inline helper was removed to avoid duplicating wrapper logic.
+    // Note: findBestMatchByPrice is available from utils; callers should pass
+    // a tolerance function that includes the manager's assets, for example:
+    // utils.findBestMatchByPrice(chainOrder, candidates, this.orders, (p,s,t) => calculatePriceTolerance(p,s,t,this.assets))
 
-    // Manager-level shared tolerance computation. Centralizes the
-    // calculatePriceTolerance(...) call so hot-paths do not redefine
-    // identical closures repeatedly.
-    _calcTolerance(gridPrice, orderSize, orderType) {
-        return calculatePriceTolerance(gridPrice, orderSize, orderType, this.assets);
-    }
+    // NOTE: _calcTolerance shim removed — callers should call
+    // calculatePriceTolerance(gridPrice, orderSize, orderType, this.assets)
+    // or pass a small bound closure when a function is required by utils.
 
     // Reconcile funds totals based on config, input percentages, and prior committed balances.
     resetFunds() {
@@ -496,9 +493,9 @@ class OrderManager {
 
                 // Compute tolerance using the same formula used elsewhere in the manager
                 let tolerance = null;
-                try {
+                            try {
                         if (orderSize !== null && orderSize > 0) {
-                            tolerance = this._calcTolerance(gridOrder.price, orderSize, gridOrder.type);
+                            tolerance = calculatePriceTolerance(gridOrder.price, orderSize, gridOrder.type, this.assets);
                         }
                 } catch (e) {
                     tolerance = null;
@@ -506,7 +503,7 @@ class OrderManager {
 
                 // Ensure we have a usable tolerance from calculatePriceTolerance (it provides a fallback)
                     if (!tolerance || !Number.isFinite(tolerance)) {
-                        tolerance = this._calcTolerance(gridOrder.price, orderSize, gridOrder.type);
+                        tolerance = calculatePriceTolerance(gridOrder.price, orderSize, gridOrder.type, this.assets);
                     }
 
                 if (priceDiff <= tolerance && priceDiff < bestPriceDiff) {
@@ -732,7 +729,7 @@ class OrderManager {
             }
             case 'cancelOrder': {
                 const orderId = chainData;
-                const gridOrder = findMatchingGridOrderByOpenOrder({ orderId }, { orders: this.orders, ordersByState: this._ordersByState, assets: this.assets, calcToleranceFn: this._calcTolerance.bind(this), logger: this.logger });
+                const gridOrder = findMatchingGridOrderByOpenOrder({ orderId }, { orders: this.orders, ordersByState: this._ordersByState, assets: this.assets, calcToleranceFn: (p,s,t) => calculatePriceTolerance(p,s,t,this.assets), logger: this.logger });
                 if (gridOrder) {
                     gridOrder.state = ORDER_STATES.VIRTUAL;
                     gridOrder.orderId = null;
@@ -750,7 +747,7 @@ class OrderManager {
                         continue;
                     }
                     seenOnChain.add(parsedOrder.orderId);
-                    const gridOrder = findMatchingGridOrderByOpenOrder(parsedOrder, { orders: this.orders, ordersByState: this._ordersByState, assets: this.assets, calcToleranceFn: this._calcTolerance.bind(this), logger: this.logger });
+                    const gridOrder = findMatchingGridOrderByOpenOrder(parsedOrder, { orders: this.orders, ordersByState: this._ordersByState, assets: this.assets, calcToleranceFn: (p,s,t) => calculatePriceTolerance(p,s,t,this.assets), logger: this.logger });
                     if (gridOrder) {
                         const wasActive = gridOrder.state === ORDER_STATES.ACTIVE;
                         const oldOrderId = gridOrder.orderId;
