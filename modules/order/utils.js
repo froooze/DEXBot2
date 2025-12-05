@@ -6,13 +6,40 @@
  * matching, reconciliation, and price derivation.
  */
 
-const { ORDER_TYPES, ORDER_STATES } = require('./constants');
+const { ORDER_TYPES, ORDER_STATES, TIMING } = require('./constants');
 
 // ---------------------------------------------------------------------------
 // Parsing helpers
 // ---------------------------------------------------------------------------
 function isPercentageString(v) {
     return typeof v === 'string' && v.trim().endsWith('%');
+}
+
+/**
+ * Correct all orders that have been flagged for price mismatches on-chain.
+ * Accepts a manager instance and iterates its ordersNeedingPriceCorrection.
+ */
+async function correctAllPriceMismatches(manager, accountName, privateKey, accountOrders) {
+    if (!manager) throw new Error('manager required');
+    const results = [];
+    let corrected = 0;
+    let failed = 0;
+
+    // Copy the list because it may be mutated during processing
+    const ordersToCorrect = Array.isArray(manager.ordersNeedingPriceCorrection) ? [...manager.ordersNeedingPriceCorrection] : [];
+
+    for (const correctionInfo of ordersToCorrect) {
+        const result = await correctOrderPriceOnChain(manager, correctionInfo, accountName, privateKey, accountOrders);
+        results.push({ ...correctionInfo, result });
+
+        if (result && result.success) corrected++; else failed++;
+
+        // Small delay between corrections to avoid rate limiting
+        await new Promise(resolve => setTimeout(resolve, TIMING.SYNC_DELAY_MS));
+    }
+
+    manager.logger?.log?.(`Price correction complete: ${corrected} corrected, ${failed} failed`, 'info');
+    return { corrected, failed, results };
 }
 
 function parsePercentageString(v) {
@@ -518,6 +545,7 @@ module.exports = {
     // Reconciliation
     applyChainSizeToGridOrder,
     correctOrderPriceOnChain,
+    correctAllPriceMismatches,
     getMinOrderSize,
 
     // Price derivation

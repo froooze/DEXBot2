@@ -574,57 +574,6 @@ class OrderManager {
         return { filledOrders, updatedOrders, partialFill };
     }
 
-    /**
-     * Correct an order on the blockchain to match the grid price.
-     * This uses limit_order_update to change the price without canceling.
-     * The orderId remains the same after the update.
-     * 
-     * Since BitShares stores orders as amount_to_sell and min_to_receive,
-     * we calculate the new min_to_receive based on the grid price and current size.
-     * 
-     * @param {Object} correctionInfo - Info about the order to correct
-     * @param {string} accountName - Account name for signing
-     * @param {string} privateKey - Private key for signing
-     * @param {Object} accountOrders - Module with updateOrder function
-     * @returns {Object} - { success: boolean, error: string|null }
-     */
-    // correctOrderPriceOnChain is implemented in utils and accepts (manager, correctionInfo, ...)
-
-    /**
-     * Correct all orders that have price mismatches.
-     * @param {string} accountName - Account name for signing
-     * @param {string} privateKey - Private key for signing  
-     * @param {Object} accountOrders - Module with createOrder/cancelOrder functions
-     * @returns {Object} - { corrected: number, failed: number, results: Array }
-     */
-    async correctAllPriceMismatches(accountName, privateKey, accountOrders) {
-        const results = [];
-        let corrected = 0;
-        let failed = 0;
-        
-        // Make a copy since we modify the list during iteration
-        const ordersToCorrect = [...this.ordersNeedingPriceCorrection];
-        
-        for (const correctionInfo of ordersToCorrect) {
-            const result = await correctOrderPriceOnChain(this, correctionInfo, accountName, privateKey, accountOrders);
-            results.push({ ...correctionInfo, result });
-            
-            if (result.success) {
-                corrected++;
-            } else {
-                failed++;
-            }
-            
-            // Small delay between corrections to avoid rate limiting
-            await new Promise(resolve => setTimeout(resolve, TIMING.SYNC_DELAY_MS));
-        }
-        
-        this.logger.log(`Price correction complete: ${corrected} corrected, ${failed} failed`, 'info');
-        return { corrected, failed, results };
-    }
-
-    // Matching helpers have been moved to utils and are used directly in code.
-
     async synchronizeWithChain(chainData, source) {
         if (!this.assets) {
             this.logger.log('Asset metadata not available, cannot synchronize.', 'warn');

@@ -18,7 +18,7 @@ const fs = require('fs');
 const path = require('path');
 const chainOrders = require('./modules/chain_orders');
 const chainKeys = require('./modules/chain_keys');
-const { OrderManager, grid: Grid } = require('./modules/order');
+const { OrderManager, grid: Grid, utils: OrderUtils } = require('./modules/order');
 const accountKeys = require('./modules/chain_keys');
 const accountBots = require('./modules/account_bots');
 const { parseJsonWithComments } = accountBots;
@@ -415,8 +415,8 @@ class DEXBot {
                             // Only applicable in 'open' mode
                             if (syncResult.ordersNeedingCorrection && syncResult.ordersNeedingCorrection.length > 0) {
                                 this.manager.logger.log(`Correcting ${syncResult.ordersNeedingCorrection.length} order(s) with price mismatch...`, 'info');
-                                const correctionResult = await this.manager.correctAllPriceMismatches(
-                                    this.account, this.privateKey, chainOrders
+                                const correctionResult = await OrderUtils.correctAllPriceMismatches(
+                                    this.manager, this.account, this.privateKey, chainOrders
                                 );
                                 if (correctionResult.failed > 0) {
                                     this.manager.logger.log(`${correctionResult.failed} order correction(s) failed`, 'error');
@@ -519,8 +519,8 @@ class DEXBot {
                 // Correct any orders with price mismatches at startup
                 if (syncResult.ordersNeedingCorrection && syncResult.ordersNeedingCorrection.length > 0) {
                     this.manager.logger.log(`Startup: Correcting ${syncResult.ordersNeedingCorrection.length} order(s) with price mismatch...`, 'info');
-                    const correctionResult = await this.manager.correctAllPriceMismatches(
-                        this.account, this.privateKey, chainOrders
+                    const correctionResult = await OrderUtils.correctAllPriceMismatches(
+                        this.manager, this.account, this.privateKey, chainOrders
                     );
                     if (correctionResult.failed > 0) {
                         this.manager.logger.log(`${correctionResult.failed} startup order correction(s) failed`, 'error');
