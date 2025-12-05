@@ -283,61 +283,6 @@ class OrderManager {
         }
     }
 
-    // Initialization is provided by Grid.initializeGrid(manager)
-    // to avoid duplicating grid logic in the manager. Callers should use
-    // Grid.initializeGrid(manager) directly.
-
-    /**
-     * Initialize the virtual order grid.
-     * This method:
-     * 1. Resolves asset metadata from the chain
-     * 2. Derives marketPrice from pool/orderbook if not specified
-     * 3. Resolves min/max price bounds (handles '5x' relative notation)
-     * 4. Waits for account balances if botFunds are percentage-based
-    * 5. Creates the grid using Grid
-     * 6. Allocates order sizes based on available funds
-     * 7. Validates that no orders are below minimum size
-     * 
-     * @throws {Error} If marketPrice is invalid or outside bounds
-     * @throws {Error} If any allocated order is below minimum size
-     */
-    
-        
-
-    /**
-     * Load a persisted grid snapshot and restore state.
-     * Used when resuming from a previous session instead of
-     * generating a new grid from scratch.
-     * 
-     * @param {Array} grid - Array of order objects from profiles/orders.json
-     */
-    // NOTE: loadGrid was moved to Grid.loadGrid to centralize grid persistence
-
-
-
-    /**
-     * Parse a raw blockchain order into a normalized format.
-     * Determines order type (BUY/SELL) based on asset configuration
-     * and converts amounts to human-readable units.
-     * 
-     * @param {Object} chainOrder - Raw order from BitShares API
-     * @returns {Object|null} Parsed order { orderId, price, type, size } or null if invalid
-     */
-    // parseChainOrder has been moved to utils — call parseChainOrder(chainOrder, this.assets) directly
-
-    /**
-     * Apply the on-chain reported size to a tracked grid order.
-     * Reconciles funds (committed/available) to prevent drift when
-     * chain size differs from grid size (e.g., partial fills).
-     * 
-     * Only applies to ACTIVE orders - virtual/spread orders keep
-     * their configured sizes until explicitly activated.
-     * 
-     * @param {Object} gridOrder - The grid order to update
-     * @param {number} chainSize - Human-readable size from blockchain
-     */
-    // applyChainSizeToGridOrder moved to utils — call applyChainSizeToGridOrder(this, gridOrder, chainSize) directly
-
     /**
      * Sync grid orders from fresh blockchain open orders after a fill event.
      * This is the preferred way to handle fills:

@@ -48,5 +48,8 @@ assert(joined.includes('hello world'), 'should include the info message');
 assert(joined.includes('debug message'), 'should include debug message');
 assert(joined.includes('ORDER GRID') || joined.includes('ORDER GRID'), 'should include ORDER GRID header');
 assert(joined.includes('TEST/PAIR'), 'should include market name in grid');
+// Ensure both grid and chain available funds are displayed
+assert(joined.includes('Available (grid)') || joined.includes('Available Funds (grid)'), 'should include Available (grid) funds label');
+assert(joined.includes('Available (chain)') || joined.includes('Available Funds (chain)'), 'should include Available (chain) funds label');
 
 console.log('logger tests passed');
