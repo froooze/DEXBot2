@@ -268,7 +268,7 @@ class OrderManager {
     async _initializeAssets() {
         if (this.assets) return; // Already initialized
         try {
-            const { lookupAsset } = require('./price');
+            const { lookupAsset } = require('./utils');
             const { BitShares } = require('../bitshares_client');
             this.assets = {
                 assetA: await lookupAsset(BitShares, this.config.assetA),

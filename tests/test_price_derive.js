@@ -40,11 +40,11 @@ async function main() {
     bsModule.BitShares = mock;
 
     try {
-        const { derivePoolPrice, deriveMarketPrice } = require('../modules/order/price');
+        const { derivePoolPrice, deriveMarketPrice } = require('../modules/order/utils');
 
         const poolP = await derivePoolPrice(mock, assetA, assetB);
         const marketP = await deriveMarketPrice(mock, assetA, assetB);
-        const { derivePrice } = require('../modules/order/price');
+        const { derivePrice } = require('../modules/order/utils');
         const derivedP = await derivePrice(mock, assetA, assetB);
 
         // Expected poolP = reserveB/reserveA = 3000000 / 20000 = 150

@@ -231,7 +231,7 @@ OrderGridGenerator.initializeGrid = async function(manager) {
 
     if (!Number.isFinite(Number(mpRaw)) || mpIsPool || mpIsMarket) {
         try {
-            const { derivePoolPrice, deriveMarketPrice, derivePrice } = require('./price');
+            const { derivePoolPrice, deriveMarketPrice, derivePrice } = require('./utils');
             const { BitShares } = require('../bitshares_client');
             const symA = manager.config.assetA;
             const symB = manager.config.assetB;

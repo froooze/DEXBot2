@@ -105,7 +105,7 @@ async function main() {
     async function derivePriceInBTS(assetId) {
         if (assetId === BTS_ID) return 1;
         try {
-            const derivePrice = require('../modules/order/price').derivePrice;
+            const derivePrice = require('../modules/order/utils').derivePrice;
             if (typeof derivePrice === 'function') {
                 // derivePrice expects symbols or ids; we pass assetId and BTS_ID
                 return await derivePrice(BitShares, assetId, BTS_ID);

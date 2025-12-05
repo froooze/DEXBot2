@@ -51,7 +51,7 @@ async function runOrderManagerCalculation() {
         const tryPool = mpIsPool || !!runtimeConfig.pool;
         const tryMarket = mpIsMarket || !!runtimeConfig.market;
 
-        const { derivePoolPrice, deriveMarketPrice, derivePrice } = require('./price');
+        const { derivePoolPrice, deriveMarketPrice, derivePrice } = require('./utils');
         if (tryPool && (runtimeConfig.assetA && runtimeConfig.assetB)) {
             try {
                 const { BitShares } = require('../bitshares_client');
