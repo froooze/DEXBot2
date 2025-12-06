@@ -999,8 +999,15 @@ class OrderManager {
 
     /**
      * Find the furthest ACTIVE orders and prepare them for rotation.
-     * Rotation means: cancel the old order, then create a new order at a new price.
-     * The new price comes from the closest SPREAD placeholder.
+     * Rotation means: cancel the old order, then update it to a new price from a SPREAD slot.
+     * 
+     * For BUY rotation (when SELL fills):
+     *   - Furthest active BUY (lowest price) → becomes VIRTUAL
+     *   - LOWEST SPREAD price → becomes the new BUY order
+     * 
+     * For SELL rotation (when BUY fills):
+     *   - Furthest active SELL (highest price) → becomes VIRTUAL  
+     *   - HIGHEST SPREAD price → becomes the new SELL order
      * 
      * @param {string} targetType - ORDER_TYPES.BUY or SELL (type of orders to rotate)
      * @param {number} count - Number of orders to rotate
@@ -1056,13 +1063,16 @@ class OrderManager {
             return [];
         }
         
-        // Find new prices from SPREAD placeholders (closest to market)
+        // Find new prices from SPREAD orders
+        // For BUY rotation (when SELL fills): use LOWEST spread (closest to buy side)
+        // For SELL rotation (when BUY fills): use HIGHEST spread (closest to sell side)
+        // No market price filtering - spread orders are always in the middle zone
         const spreadOrders = this.getOrdersByTypeAndState(ORDER_TYPES.SPREAD, ORDER_STATES.VIRTUAL);
         const eligibleSpreadOrders = spreadOrders
-            .filter(o => (targetType === ORDER_TYPES.BUY && o.price < this.config.marketPrice) || 
-                        (targetType === ORDER_TYPES.SELL && o.price > this.config.marketPrice))
-            // Closest spread to market first
-            .sort((a, b) => targetType === ORDER_TYPES.BUY ? b.price - a.price : a.price - b.price);
+            // Sort to get the right edge of spread zone:
+            // For BUY: lowest price first (edge closest to buy orders)
+            // For SELL: highest price first (edge closest to sell orders)
+            .sort((a, b) => targetType === ORDER_TYPES.BUY ? a.price - b.price : b.price - a.price);
         
         for (let i = 0; i < ordersToProcess.length && i < eligibleSpreadOrders.length; i++) {
             const oldOrder = ordersToProcess[i];
@@ -1086,9 +1096,9 @@ class OrderManager {
             // Move funds from available to committed for the new order
             this._adjustFunds(targetType, fundsPerOrder);
             
-            // Convert the spread placeholder to the target type (will become ACTIVE after chain confirm)
-            const updatedSpread = { ...newPriceSource, type: targetType, size: fundsPerOrder, state: ORDER_STATES.VIRTUAL };
-            this._updateOrder(updatedSpread);
+            // Convert the spread to the target type (will become ACTIVE after chain confirm)
+            const updatedOrder = { ...newPriceSource, type: targetType, size: fundsPerOrder, state: ORDER_STATES.VIRTUAL };
+            this._updateOrder(updatedOrder);
             this.currentSpreadCount--;
             
             // Track this orderId as being rotated to prevent double-rotation
@@ -1097,7 +1107,7 @@ class OrderManager {
             }
             
             rotations.push(rotation);
-            this.logger.log(`Prepared ${targetType} rotation: old ${oldOrder.orderId} @ ${oldOrder.price.toFixed(4)} -> new @ ${newPriceSource.price.toFixed(4)}, size ${fundsPerOrder.toFixed(8)}`, 'info');
+            this.logger.log(`Prepared ${targetType} rotation: old ${oldOrder.orderId} @ ${oldOrder.price.toFixed(4)} -> new spread @ ${newPriceSource.price.toFixed(4)}, size ${fundsPerOrder.toFixed(8)}`, 'info');
         }
         
         return rotations;
