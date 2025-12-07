@@ -961,7 +961,23 @@ class OrderManager {
     async calculateOrderUpdates() { const marketPrice = this.config.marketPrice; const spreadRange = marketPrice * (this.config.targetSpreadPercent / 100); const activeOrders = this.getOrdersByTypeAndState(null, ORDER_STATES.ACTIVE); const activeSells = activeOrders.filter(o => o.type === ORDER_TYPES.SELL).sort((a, b) => Math.abs(a.price - this.config.marketPrice) - Math.abs(b.price - this.config.marketPrice)); const activeBuys = activeOrders.filter(o => o.type === ORDER_TYPES.BUY).sort((a, b) => Math.abs(a.price - this.config.marketPrice) - Math.abs(b.price - this.config.marketPrice)); const filledOrders = []; if (activeSells.length > 0) filledOrders.push({ ...activeSells[0], state: ORDER_STATES.FILLED }); else if (activeBuys.length > 0) filledOrders.push({ ...activeBuys[0], state: ORDER_STATES.FILLED }); const remaining = activeOrders.filter(o => !filledOrders.some(f => f.id === o.id)); return { remaining, filled: filledOrders }; }
 
     // Flag whether the spread has widened beyond configured limits so we can rebalance.
-    checkSpreadCondition() { const currentSpread = this.calculateCurrentSpread(); const targetSpread = this.config.targetSpreadPercent + this.config.incrementPercent; if (currentSpread > targetSpread) { this.outOfSpread = true; this.logger.log(`Spread too wide (${currentSpread.toFixed(2)}% > ${targetSpread}%), will add extra orders on next fill`, 'warn'); } else this.outOfSpread = false; }
+    // Flag whether the spread has widened beyond configured limits so we can rebalance.
+    checkSpreadCondition() {
+        const currentSpread = this.calculateCurrentSpread();
+        const targetSpread = this.config.targetSpreadPercent + this.config.incrementPercent;
+
+        // Only trigger spread warning if we have at least one active order on BOTH sides.
+        const activeBuys = this.getOrdersByTypeAndState(ORDER_TYPES.BUY, ORDER_STATES.ACTIVE);
+        const activeSells = this.getOrdersByTypeAndState(ORDER_TYPES.SELL, ORDER_STATES.ACTIVE);
+        const hasBothSides = activeBuys.length > 0 && activeSells.length > 0;
+
+        if (hasBothSides && currentSpread > targetSpread) {
+            this.outOfSpread = true;
+            this.logger.log(`Spread too wide (${currentSpread.toFixed(2)}% > ${targetSpread}%), will add extra orders on next fill`, 'warn');
+        } else {
+            this.outOfSpread = false;
+        }
+    }
 
     /**
      * Process filled orders and trigger rebalancing.
