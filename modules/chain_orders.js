@@ -44,7 +44,7 @@ async function _getAssetPrecision(assetRef) {
                 if (Array.isArray(res) && res[0] && typeof res[0].precision === 'number') return res[0].precision;
             }
         }
-    } catch (e) {}
+    } catch (e) { }
     return 0;
 }
 
@@ -132,7 +132,7 @@ function _ensureAccountSubscriber(accountName) {
 
     try {
         BitShares.subscribe('account', bsCallback, accountName);
-    } catch (e) {}
+    } catch (e) { }
 
     const entry = { userCallbacks, bsCallback };
     accountSubscriptions.set(accountName, entry);
@@ -145,7 +145,7 @@ function _ensureAccountSubscriber(accountName) {
  * @returns {Promise<Object>} { accountName, privateKey, id }
  */
 async function selectAccount() {
-    const masterPassword = chainKeys.authenticate();
+    const masterPassword = await chainKeys.authenticate();
     const accountsData = chainKeys.loadAccounts();
     const accountNames = Object.keys(accountsData.accounts);
 
@@ -173,7 +173,7 @@ async function selectAccount() {
             if (candidateId && String(candidateId).startsWith('1.2.')) setPreferredAccount(candidateId, selectedAccount);
             else if (full[0][1] && full[0][1].account && full[0][1].account.id) setPreferredAccount(full[0][1].account.id, selectedAccount);
         }
-    } catch (e) {}
+    } catch (e) { }
 
     console.log(`Selected account: ${selectedAccount} (ID: ${preferredAccountId})`);
     return { accountName: selectedAccount, privateKey: privateKey, id: preferredAccountId };
@@ -223,7 +223,7 @@ async function listenForFills(accountRef, callback) {
 
     if (typeof userCallback !== 'function') {
         console.error('listenForFills requires a callback function');
-        return () => {};
+        return () => { };
     }
 
     let accountName = accountToken || preferredAccountName;
@@ -236,7 +236,7 @@ async function listenForFills(accountRef, callback) {
 
     if (!accountName) {
         console.error('listenForFills requires an account name or a preferredAccount to be set');
-        return () => {};
+        return () => { };
     }
 
     let accountId = /^1\.2\./.test(accountToken || '') ? accountToken : preferredAccountId;
@@ -263,7 +263,7 @@ async function listenForFills(accountRef, callback) {
                     if (typeof BitShares.unsubscribe === 'function') {
                         BitShares.unsubscribe('account', entry.bsCallback, accountName);
                     }
-                } catch (e) {}
+                } catch (e) { }
                 accountSubscriptions.delete(accountName);
             }
         } catch (e) {
@@ -303,7 +303,7 @@ async function updateOrder(accountName, privateKey, orderId, newParams) {
         // Current values from the order (for_sale is the remaining amount to sell)
         const currentSellInt = order.for_sale;
         const currentSellFloat = blockchainToFloat(currentSellInt, sellPrecision);
-        
+
         // Calculate current min_to_receive from price ratio and for_sale
         // price ratio = quote.amount / base.amount from sell_price
         const priceRatioBase = order.sell_price.base.amount;
@@ -312,11 +312,11 @@ async function updateOrder(accountName, privateKey, orderId, newParams) {
         const currentReceiveFloat = blockchainToFloat(currentReceiveInt, receivePrecision);
 
         // Determine new desired values
-        const newSellFloat = (newParams.amountToSell !== undefined && newParams.amountToSell !== null) 
-            ? newParams.amountToSell 
+        const newSellFloat = (newParams.amountToSell !== undefined && newParams.amountToSell !== null)
+            ? newParams.amountToSell
             : currentSellFloat;
-        const newReceiveFloat = (newParams.minToReceive !== undefined && newParams.minToReceive !== null) 
-            ? newParams.minToReceive 
+        const newReceiveFloat = (newParams.minToReceive !== undefined && newParams.minToReceive !== null)
+            ? newParams.minToReceive
             : currentReceiveFloat;
 
         // Convert to blockchain integers
@@ -336,7 +336,7 @@ async function updateOrder(accountName, privateKey, orderId, newParams) {
         // Build the new_price as the ratio between the new amounts
         // Adjust newSellInt to match the delta we're actually sending
         const adjustedSellInt = currentSellInt + deltaSellInt;
-        
+
         const updateParams = {
             fee: { amount: 0, asset_id: '1.3.0' },
             seller: acc.account.id,
@@ -524,7 +524,7 @@ async function getOnChainAssetBalances(accountRef, assets) {
                     const res = await BitShares.db.lookup_asset_symbols([String(a)]).catch(() => null);
                     if (res && res[0] && res[0].id) aid = res[0].id;
                 }
-            } catch (e) {}
+            } catch (e) { }
 
             // try to get precision and symbol
             let precision = 0; let symbol = String(a);
@@ -534,7 +534,7 @@ async function getOnChainAssetBalances(accountRef, assets) {
                     precision = typeof am[0].precision === 'number' ? am[0].precision : precision;
                     symbol = am[0].symbol || symbol;
                 }
-            } catch (e) {}
+            } catch (e) { }
 
             const freeRaw = freeInt.get(String(aid)) || 0;
             const lockedRaw = lockedInt.get(String(aid)) || 0;
@@ -568,6 +568,6 @@ module.exports = {
     getOnChainAssetBalances,
     getFillProcessingMode,
     FILL_PROCESSING_MODE,
-    
+
     // Note: authentication and key retrieval moved to modules/chain_keys.js
 };

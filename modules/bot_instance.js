@@ -109,7 +109,7 @@ async function startBot(settings = {}) {
             const effectivePreferredAccount = PREFERRED_ACCOUNT || global.PREFERRED_ACCOUNT_OVERRIDE || null;
             if (effectivePreferredAccount) {
                 try {
-                    const masterPassword = chainKeys.authenticate();
+                    const masterPassword = await chainKeys.authenticate();
                     const privateKey = chainKeys.getPrivateKey(effectivePreferredAccount, masterPassword);
                     activeAccountName = effectivePreferredAccount;
                     activePrivateKey = privateKey;
@@ -123,7 +123,7 @@ async function startBot(settings = {}) {
                                 if (maybe && String(maybe).startsWith('1.2.')) accId = maybe;
                                 else if (full[0][1] && full[0][1].account && full[0][1].account.id) accId = full[0][1].account.id;
                             }
-                        } catch (e) {}
+                        } catch (e) { }
                         activeAccountId = accId;
                         ordersModule.setPreferredAccount(accId, effectivePreferredAccount);
                         log('Authenticated and set preferred account', effectivePreferredAccount, accId);
@@ -131,9 +131,9 @@ async function startBot(settings = {}) {
                         async function lookupAssetBySymbol(symbol) {
                             if (!symbol) return null;
                             const cleaned = String(symbol).trim();
-                            try { if (BitShares.assets && BitShares.assets[cleaned.toLowerCase()]) { const a = await BitShares.assets[cleaned.toLowerCase()]; if (a && a.id) return { id: a.id, precision: a.precision, symbol: a.symbol || cleaned }; } } catch (e) {}
-                            try { if (BitShares.db && typeof BitShares.db.lookup_asset_symbols === 'function') { const r = await BitShares.db.lookup_asset_symbols([cleaned]); if (Array.isArray(r) && r[0] && r[0].id) return { id: r[0].id, precision: r[0].precision, symbol: r[0].symbol || cleaned }; } } catch (e) {}
-                            try { if (BitShares.db && typeof BitShares.db.get_assets === 'function') { const g = await BitShares.db.get_assets([cleaned]); if (Array.isArray(g) && g[0] && g[0].id) return { id: g[0].id, precision: g[0].precision, symbol: g[0].symbol || cleaned }; } } catch (e) {}
+                            try { if (BitShares.assets && BitShares.assets[cleaned.toLowerCase()]) { const a = await BitShares.assets[cleaned.toLowerCase()]; if (a && a.id) return { id: a.id, precision: a.precision, symbol: a.symbol || cleaned }; } } catch (e) { }
+                            try { if (BitShares.db && typeof BitShares.db.lookup_asset_symbols === 'function') { const r = await BitShares.db.lookup_asset_symbols([cleaned]); if (Array.isArray(r) && r[0] && r[0].id) return { id: r[0].id, precision: r[0].precision, symbol: r[0].symbol || cleaned }; } } catch (e) { }
+                            try { if (BitShares.db && typeof BitShares.db.get_assets === 'function') { const g = await BitShares.db.get_assets([cleaned]); if (Array.isArray(g) && g[0] && g[0].id) return { id: g[0].id, precision: g[0].precision, symbol: g[0].symbol || cleaned }; } } catch (e) { }
                             return null;
                         }
 

@@ -74,6 +74,23 @@ function readPassword(prompt) {
                     continue;
                 }
 
+                // Handle Delete key escape sequence (\x1b[3~)
+                if (ch === '\x1b') {
+                    // Peek ahead purely for Delete sequence detection if possible, or just wait for next chars buffer
+                    // Since specific buffering is hard in this loop, we track state or just checking if next chars match
+                    // For simplicity in this raw loop, we might need a small state machine or just read ahead if we can.
+                    // A simpler way for this specific loop is to check if we have enough length remaining in `s` for [3~
+                    // But `s` is a chunk.
+                    // Given the constraint, let's just handle it if it comes in one chunk or handle individual chars if we track state.
+                    // Actually, often arrow keys/delete come as a burst.
+                    if (i + 3 < s.length && s[i + 1] === '[' && s[i + 2] === '3' && s[i + 3] === '~') {
+                        if (password.length > 0) password = password.slice(0, -1);
+                        stdout.write('\r\x1b[K' + prompt + '*'.repeat(password.length));
+                        i += 3; // Skip the sequence
+                        continue;
+                    }
+                }
+
                 // Accept typical printable characters for keys (avoid newlines/control)
                 const code = ch.charCodeAt(0);
                 if (code >= 32 && code <= 126 && ch !== '\t') {
@@ -224,29 +241,30 @@ class MasterPasswordError extends Error {
 const MASTER_PASSWORD_MAX_ATTEMPTS = 3;
 let masterPasswordAttempts = 0;
 
-function _promptPassword() {
+async function _promptPassword() {
     if (masterPasswordAttempts >= MASTER_PASSWORD_MAX_ATTEMPTS) {
         throw new MasterPasswordError(`Incorrect master password after ${MASTER_PASSWORD_MAX_ATTEMPTS} attempts.`);
     }
     masterPasswordAttempts += 1;
-    return readlineSync.question('Enter master password: ', { hideEchoBack: true });
+    // Use readPassword instead of readlineSync to support Delete key and consistent masking
+    return await readPassword('Enter master password: ');
 }
 
 /**
  * Authenticate and return the master password.
  * Prompts user interactively with limited retry attempts.
- * @returns {string} The verified master password
+ * @returns {Promise<string>} The verified master password
  * @throws {Error} If no master password is set
  * @throws {MasterPasswordError} If max attempts exceeded
  */
-function authenticate() {
+async function authenticate() {
     const accountsData = loadAccounts();
     if (!accountsData.masterPasswordHash) {
         throw new Error('No master password set. Please run modules/chain_keys.js first.');
     }
 
     while (true) {
-        const enteredPassword = _promptPassword();
+        const enteredPassword = await _promptPassword();
         if (hashPassword(enteredPassword) === accountsData.masterPasswordHash) {
             masterPasswordAttempts = 0;
             return enteredPassword;

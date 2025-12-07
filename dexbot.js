@@ -167,7 +167,7 @@ class DEXBot {
         let accountData = null;
         if (this.config && this.config.preferredAccount) {
             try {
-                const pwd = masterPassword || chainKeys.authenticate();
+                const pwd = masterPassword || await chainKeys.authenticate();
                 const privateKey = chainKeys.getPrivateKey(this.config.preferredAccount, pwd);
                 let accId = null;
                 try {
@@ -846,14 +846,14 @@ async function runAccountManager({ waitForConnection = false, exitAfter = false,
  */
 async function authenticateMasterPassword() {
     try {
-        return chainKeys.authenticate();
+        return await chainKeys.authenticate();
     } catch (err) {
         if (!accountKeysAutostarted && err && err.message && err.message.includes('No master password set')) {
             accountKeysAutostarted = true;
             console.log('no master password set');
             console.log('autostart account keys');
             await runAccountManager();
-            return chainKeys.authenticate();
+            return await chainKeys.authenticate();
         }
         throw err;
     }
