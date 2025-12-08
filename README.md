@@ -174,7 +174,7 @@ MIT License - see LICENSE file for details
 
 ## Links
 
-- https://deepwiki.com/froooze/DEXBot2
+- [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/froooze/DEXBot2)
 - https://t.me/DEXBot_2
 - https://dexbot.org/
 
