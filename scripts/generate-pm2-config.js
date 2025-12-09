@@ -57,7 +57,7 @@ function generateAppConfig(bot, index) {
         name: botName,
         script: path.join(repoRoot, 'bot.js'),
         cwd: repoRoot,
-        max_memory_restart: '250M',
+        max_memory_restart: '200M',
         watch: false,
         autorestart: true,
         error_file: path.join(repoRoot, 'profiles', 'logs', `${botName}-error.log`),
