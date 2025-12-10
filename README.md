@@ -247,14 +247,42 @@ Committed: Buy 8676.13 USD | Sell 0.12420407 BTC
 
 ## 🔍 Advanced Features
 
-### Partial Order State Management
-When an order fills partially, DEXBot tracks the remaining portion in a `PARTIAL` state instead of cancelling it outright. Partial orders can be moved to new price levels atomically (in a single transaction batch), improving execution efficiency and reducing blockchain operations.
+### Atomic Updates & Partial Order State Management
+DEXBot handles filled orders and partial fills with atomic transactions across all operations:
+- **Partial Fills**: Remaining portion tracked in `PARTIAL` state instead of cancellation
+- **Atomic Moves**: Partial orders moved to new price levels in single transaction
+- **Fill Detection**: Automatically detects filled orders via blockchain history or open orders snapshot
+- **State Synchronization**: Grid state immediately reflects filled orders, proceeds credited to available funds
+- **Batch Execution**: All updates submitted as **single atomic operation** (creates + updates + cancellations)
+- **Consistency Guarantee**: Either all operations succeed or all fail - no partial blockchain states
+- **No Manual Intervention**: Fully automatic fill processing, state updates, and rebalancing
+
+This comprehensive fill handling ensures capital efficiency, eliminates orphaned orders or stuck funds, and guarantees consistency across all order state changes.
 
 ### Fill Deduplication
 Fills are tracked with a 5-second deduplication window to prevent duplicate order processing. This ensures reliable fill detection even if the same fill event arrives multiple times.
 
 ### Price Tolerance & Integer Rounding
 The bot calculates price tolerances to account for blockchain integer rounding discrepancies. This ensures reliable matching of on-chain orders with grid orders despite minor precision differences.
+
+### Persistent Grid & Price Caching
+DEXBot intelligently caches grid calculations and order prices to avoid unnecessary recalculation:
+- **Grid state persists** in `profiles/orders.json` across bot restarts
+- **Order prices preserved** from the last successful synchronization
+- **No recalculation on startup** if grid matches on-chain state
+- **Automatic resync only when** on-chain state differs (fills, cancellations)
+
+This optimization significantly reduces startup time and blockchain queries, especially for bots running 20+ orders.
+
+### Offline Filled Order Detection
+The bot automatically detects orders that were filled while offline:
+- **Compares persisted grid** with current on-chain open orders on startup
+- **Identifies missing orders** (orders from grid that are no longer on-chain)
+- **Marks them as FILLED** and credits proceeds to available funds
+- **Immediate rebalancing** - replaces filled orders on next cycle
+- **No manual intervention needed** - fully automatic synchronization
+
+This ensures seamless resumption after being offline without missing fill proceeds.
 
 ### Trigger-File Grid Regeneration
 Create a trigger file `profiles/recalculate.<bot-key>.trigger` to request immediate grid regeneration on the next polling cycle. This allows external scripts to request recalculation without restarting the bot.
