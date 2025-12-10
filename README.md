@@ -11,7 +11,7 @@ A sophisticated market making bot for the BitShares Decentralized Exchange (DEX)
 
 ⚠️ Warning — Use At Your Own Risk
 
-- This software is in very early stage and provided "as‑is" without warranty.
+- This software is in alpha stage and provided "as‑is" without warranty.
 - Always test configurations in `dryRun` mode.
 - Secure your keys and secrets. Do not commit private keys or passwords to anyone — use `profiles/` for live configuration and keep it out of source control.
 - The authors and maintainers are not responsible for losses.
