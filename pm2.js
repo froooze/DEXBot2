@@ -275,15 +275,8 @@ async function main(botNameFilter = null) {
 
     console.log();
     console.log('='.repeat(50));
-    console.log('PM2 started successfully!');
+    console.log('DEXBot2 started successfully!');
     console.log('='.repeat(50));
-    console.log();
-    console.log('Commands:');
-    console.log('  pm2 status        - Show running bots');
-    console.log('  pm2 logs          - View all logs');
-    console.log('  pm2 logs <name>   - View specific bot logs');
-    console.log('  pm2 stop all      - Stop all bots');
-    console.log('  pm2 restart all   - Restart all bots');
     console.log();
 }
 
