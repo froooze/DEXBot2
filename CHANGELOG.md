@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.1] - 2025-12-10 - Minimum Delta Enforcement
+
+### Features
+- **Minimum Delta Enforcement**: Enforce meaningful blockchain updates for price-only order moves
+  - When price changes but amount delta is zero, automatically set delta to ±1
+  - Only applies when order moves toward market center (economically beneficial)
+  - Prevents wasted on-chain transactions for imperceptible price changes
+  - Maintains grid integrity by pushing orders toward spread
+
+### Fixed
+- Eliminated zero-delta price-only updates that had no economic effect
+- Improved order update efficiency for partial order price adjustments
+
 ## [0.1.0] - 2025-12-10 - Initial Release
 
 ### Features
