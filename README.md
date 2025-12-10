@@ -100,10 +100,8 @@ After startup via `node pm2.js`:
 # View bot status and resource usage
 pm2 status
 
-# View real-time logs from all bots
+# View real-time logs from all bots (or specific bot)
 pm2 logs
-
-# View logs from specific bot
 pm2 logs <bot-name>
 
 # Stop all bots (or specific bot)
