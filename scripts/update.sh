@@ -112,8 +112,8 @@ fi
 
 log_info "Updates available, pulling changes..."
 
-# Step 6: Pull latest code
-if git pull origin "$REPO_BRANCH"; then
+# Step 6: Pull latest code (use --rebase to avoid merge prompts)
+if git pull --rebase origin "$REPO_BRANCH"; then
     log_success "Successfully pulled latest code"
 else
     log_error "Failed to pull latest code"
