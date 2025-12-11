@@ -77,9 +77,9 @@ log_info "Current branch: $CURRENT_BRANCH"
 log_info "Step 2: Protecting profiles directory..."
 if [ -d "$PROJECT_ROOT/profiles" ]; then
     # Ensure profiles is properly ignored by git
-    if ! grep -q "^/profiles$" "$PROJECT_ROOT/.gitignore" 2>/dev/null; then
+    if ! grep -q "profiles/" "$PROJECT_ROOT/.gitignore" 2>/dev/null; then
         log_warning "Warning: profiles/ not in .gitignore, adding it..."
-        echo "/profiles" >> "$PROJECT_ROOT/.gitignore"
+        echo "profiles/" >> "$PROJECT_ROOT/.gitignore"
     fi
     log_success "Profiles directory is protected and will not be modified"
 else
