@@ -37,9 +37,9 @@ node dexbot bots
 
 ### Single Bot (Direct)
 
-Use the `dexbot` wrapper or run `node dexbot.js` directly:
+You can run bots directly via `node dexbot.js` or using the `dexbot` CLI wrapper (installed via `npm link` or run with `npx dexbot`):
 
-- `node dexbot.js` — starts all active bots defined in `profiles/bots.json` (use `examples/bots.json` as a template).
+- `node dexbot.js` or `dexbot` — starts all active bots defined in `profiles/bots.json` (use `examples/bots.json` as a template).
 - `dexbot start [bot_name]` — start a specific bot (or all active bots if omitted). Respects each bot's `dryRun` setting.
 - `dexbot drystart [bot_name]` — same as `start` but forces `dryRun=true` for safe simulation.
 - `dexbot stop [bot_name]` — mark a bot (or all bots) inactive; the config file is used the next time the process launches.
@@ -351,6 +351,3 @@ MIT License - see LICENSE file for details
 - [![Awesome BitShares](https://camo.githubusercontent.com/9d49598b873146ec650fb3f275e8a532c765dabb1f61d5afa25be41e79891aa7/68747470733a2f2f617765736f6d652e72652f62616467652e737667)](https://github.com/bitshares/awesome-bitshares)
 - [![Reddit](https://img.shields.io/badge/Reddit-r%2FBitShares-ff4500?logo=reddit&logoColor=white)](https://www.reddit.com/r/BitShares/)
 
-## ⚠️ Disclaimer
-
-This software is for educational and research purposes. Use at your own risk. Always test with small amounts and understand the risks of automated trading.
