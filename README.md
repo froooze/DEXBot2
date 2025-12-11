@@ -33,6 +33,57 @@ node dexbot keys
 node dexbot bots
 ```
 
+## 🔧 Configuration
+
+Define each bot in `profiles/bots.json`. A minimal structure looks like this:
+
+```json
+{
+  "bots": [
+    {
+      "name": "your-name",
+      "active": true,
+      "dryRun": true,
+      "preferredAccount": "example-account",
+      "assetA": "IOB.XRP",
+      "assetB": "BTS",
+      "marketPrice": "pool",
+      "minPrice": "4x",
+      "maxPrice": "4x",
+      "incrementPercent": 1,
+      "targetSpreadPercent": 5,
+      "weightDistribution": { "sell": 0.5, "buy": 0.5 },
+      "botFunds": { "sell": "100%", "buy": "100%" },
+      "activeOrders": { "sell": 20, "buy": 20 }
+    },
+  ]
+}
+```
+
+## ⚙️ Configuration Options
+
+Below is a concise description of each configuration option you may set per-bot (use these keys inside each `bots` entry in `examples/bots.json` / `profiles/bots.json`):
+
+- **`name`**: string — optional friendly name for the bot. Used for logging and selection when calling CLI commands (e.g. `dexbot start my-bot`).
+- **`active`**: boolean — if `false`, the bot is kept in the config but not started. Use this to keep templates in your file without running them.
+- **`dryRun`**: boolean — when `true` the bot simulates orders and does not broadcast transactions on-chain. Use `false` only after you have verified your settings and secured keys.
+- **`preferredAccount`**: string — the account name to use for on-chain operations; dexbot will prompt once for the master password and reuse it for all bots needing this value.
+- **`assetA`**: string — human-friendly name or symbol of the base asset (the asset you are selling on a sell order). Example: `"BTC"`, `"BTS"`.
+- **`assetB`**: string — human-friendly name or symbol of the quote asset (the asset you receive on a sell order). Example: `"USD"`, `"IOB.XRP"`.
+- **`marketPrice`**: number | string — preferred market price. You may provide a numeric value (e.g. `42000`) or let the bot derive it by setting `"pool"` (use liquidity pool) or `"market"` (use order book/ticker). If omitted the runtime will attempt to derive it from `assetA`/`assetB`.
+- **`minPrice`**: number | string — lower bound for allowed order prices. You may provide a concrete numeric value (e.g. `525`) or a multiplier string like `"5x"`. When given as a multiplier the runtime resolves it relative to `marketPrice` (e.g. `"5x"` -> `marketPrice / 5`). Choose values that meaningfully bracket your expected market range to avoid accidental order placement far from the current price.
+- **`maxPrice`**: number | string — upper bound for allowed order prices. You may provide a concrete numeric value (e.g. `8400`) or a multiplier string like `"5x"`. When given as a multiplier the runtime resolves it relative to `marketPrice` (e.g. `"5x"` -> `marketPrice * 5`). Choose values that meaningfully bracket your expected market range to avoid accidental order placement far from the current price.
+- **`incrementPercent`**: number — percent step between adjacent order price levels (e.g. `1` means 1% steps). Smaller values produce denser grids.
+- **`targetSpreadPercent`**: number — target spread (in percent) around the market price that the grid should cover. The manager uses this to place buy/sell layers around the market.
+- **`weightDistribution`**: object — `{ "sell": <number>, "buy": <number> }`. Controls order sizing shape. Values are the distribution coefficient (examples below):
+  - Typical values: `-1` = Super Valley (more weight far from market), `0` = Valley, `0.5` = Neutral, `1` = Mountain (more weight near market), `2` = Super Mountain.
+- **`botFunds`**: object — `{ "sell": <number|string>, "buy": <number|string> }`.
+  - `sell`: amount of base asset allocated for selling (absolute like `0.1` or percentage string like `"100%"`).
+  - `buy`: amount of quote asset allocated for buying (can be an absolute number like `10000` or a percentage string like `"50%"`).
+  - `buy` refers to the quote-side (what you spend to buy base); `sell` refers to the base-side (what you sell). Provide human-readable units (not blockchain integer units).
+  - If you supply percentages (e.g. `"50%"`) the manager needs `accountTotals` to resolve them to absolute amounts before placing orders; otherwise provide absolute numbers.
+- **`activeOrders`**: object — `{ "sell": <integer>, "buy": <integer> }` number of sell/buy orders to keep active in the grid for each side.
+
 ## ⚙️ CLI & Running
 
 ### Single Bot (Direct)
@@ -146,6 +197,14 @@ Example - Run a specific bot with custom polling interval:
 BOT_NAME=my-bot RUN_LOOP_MS=3000 node dexbot.js
 ```
 
+## 🔄 How It Works
+
+1. **Grid Creation**: Generates buy/sell orders in geometric progression.
+2. **Order Sizing**: Applies weight distribution for optimal capital allocation.
+3. **Activation**: Converts virtual orders to active state.
+4. **Rebalancing**: Creates new orders from filled positions.
+5. **Spread Control**: Adds extra orders if the spread becomes too wide.
+
 ## 📐 Order Calculation
 
 The order sizing follows a compact formula:
@@ -165,65 +224,6 @@ Weight distribution examples (set `n` via `weightDistribution`):
 - `0.5` = Neutral (balanced distribution)
 - `1` = Mountain (order increase linearly towards center)
 - `2` = Super Mountain (aggressive concentration towards center)
-
-## 🔧 Configuration
-
-Define each bot in `profiles/bots.json`. A minimal structure looks like this:
-
-```json
-{
-  "bots": [
-    {
-      "name": "your-name",
-      "active": true,
-      "dryRun": true,
-      "preferredAccount": "example-account",
-      "assetA": "IOB.XRP",
-      "assetB": "BTS",
-      "marketPrice": "pool",
-      "minPrice": "4x",
-      "maxPrice": "4x",
-      "incrementPercent": 1,
-      "targetSpreadPercent": 5,
-      "weightDistribution": { "sell": 0.5, "buy": 0.5 },
-      "botFunds": { "sell": "100%", "buy": "100%" },
-      "activeOrders": { "sell": 20, "buy": 20 }
-    },
-  ]
-}
-```
-
-## ⚙️ Configuration Options
-
-Below is a concise description of each configuration option you may set per-bot (use these keys inside each `bots` entry in `examples/bots.json` / `profiles/bots.json`):
-
-- **`name`**: string — optional friendly name for the bot. Used for logging and selection when calling CLI commands (e.g. `dexbot start my-bot`).
-- **`active`**: boolean — if `false`, the bot is kept in the config but not started. Use this to keep templates in your file without running them.
-- **`dryRun`**: boolean — when `true` the bot simulates orders and does not broadcast transactions on-chain. Use `false` only after you have verified your settings and secured keys.
-- **`preferredAccount`**: string — the account name to use for on-chain operations; dexbot will prompt once for the master password and reuse it for all bots needing this value.
-- **`assetA`**: string — human-friendly name or symbol of the base asset (the asset you are selling on a sell order). Example: `"BTC"`, `"BTS"`.
-- **`assetB`**: string — human-friendly name or symbol of the quote asset (the asset you receive on a sell order). Example: `"USD"`, `"IOB.XRP"`.
-- **`marketPrice`**: number | string — preferred market price. You may provide a numeric value (e.g. `42000`) or let the bot derive it by setting `"pool"` (use liquidity pool) or `"market"` (use order book/ticker). If omitted the runtime will attempt to derive it from `assetA`/`assetB`.
-- **`minPrice`**: number | string — lower bound for allowed order prices. You may provide a concrete numeric value (e.g. `525`) or a multiplier string like `"5x"`. When given as a multiplier the runtime resolves it relative to `marketPrice` (e.g. `"5x"` -> `marketPrice / 5`). Choose values that meaningfully bracket your expected market range to avoid accidental order placement far from the current price.
-- **`maxPrice`**: number | string — upper bound for allowed order prices. You may provide a concrete numeric value (e.g. `8400`) or a multiplier string like `"5x"`. When given as a multiplier the runtime resolves it relative to `marketPrice` (e.g. `"5x"` -> `marketPrice * 5`). Choose values that meaningfully bracket your expected market range to avoid accidental order placement far from the current price.
-- **`incrementPercent`**: number — percent step between adjacent order price levels (e.g. `1` means 1% steps). Smaller values produce denser grids.
-- **`targetSpreadPercent`**: number — target spread (in percent) around the market price that the grid should cover. The manager uses this to place buy/sell layers around the market.
-- **`weightDistribution`**: object — `{ "sell": <number>, "buy": <number> }`. Controls order sizing shape. Values are the distribution coefficient (examples below):
-  - Typical values: `-1` = Super Valley (more weight far from market), `0` = Valley, `0.5` = Neutral, `1` = Mountain (more weight near market), `2` = Super Mountain.
-- **`botFunds`**: object — `{ "sell": <number|string>, "buy": <number|string> }`.
-  - `sell`: amount of base asset allocated for selling (absolute like `0.1` or percentage string like `"100%"`).
-  - `buy`: amount of quote asset allocated for buying (can be an absolute number like `10000` or a percentage string like `"50%"`).
-  - `buy` refers to the quote-side (what you spend to buy base); `sell` refers to the base-side (what you sell). Provide human-readable units (not blockchain integer units).
-  - If you supply percentages (e.g. `"50%"`) the manager needs `accountTotals` to resolve them to absolute amounts before placing orders; otherwise provide absolute numbers.
-- **`activeOrders`**: object — `{ "sell": <integer>, "buy": <integer> }` number of sell/buy orders to keep active in the grid for each side.
-
-## 🔄 How It Works
-
-1. **Grid Creation**: Generates buy/sell orders in geometric progression.
-2. **Order Sizing**: Applies weight distribution for optimal capital allocation.
-3. **Activation**: Converts virtual orders to active state.
-4. **Rebalancing**: Creates new orders from filled positions.
-5. **Spread Control**: Adds extra orders if the spread becomes too wide.
 
 ## Output Example
 
