@@ -254,7 +254,7 @@ DEXBot handles filled orders and partial fills with atomic transactions across a
 
 This comprehensive fill handling ensures capital efficiency, eliminates orphaned orders or stuck funds, and guarantees consistency across all order state changes.
 
-### 🔗 Fill Deduplication
+### ⏱️ Fill Deduplication
 Fills are tracked with a 5-second deduplication window to prevent duplicate order processing. This ensures reliable fill detection even if the same fill event arrives multiple times.
 
 ### 🔢 Price Tolerance & Integer Rounding
@@ -279,7 +279,7 @@ The bot automatically detects orders that were filled while offline:
 
 This ensures seamless resumption after being offline without missing fill proceeds.
 
-### 🎯 Trigger-File Grid Regeneration
+### 📌 Trigger-File Grid Regeneration
 Create a trigger file `profiles/recalculate.<bot-key>.trigger` to request immediate grid regeneration on the next polling cycle. This allows external scripts to request recalculation without restarting the bot.
 
 Example:
