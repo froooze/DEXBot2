@@ -667,6 +667,22 @@ class Grid {
                     'info'
                 );
                 Grid.updateGridOrderSizesForSide(manager, ORDER_TYPES.BUY, cacheFunds);
+                // Clear persisted cacheFunds for buy side since we regenerated sizes
+                try {
+                    // ensure manager.funds.cacheFunds exists
+                    manager.funds.cacheFunds = manager.funds.cacheFunds || { buy: 0, sell: 0 };
+                    manager.funds.cacheFunds.buy = 0;
+                    const { AccountOrders } = require('../account_orders');
+                    if (manager.config && manager.config.botKey) {
+                        const db = new AccountOrders();
+                        db.updateCacheFunds(manager.config.botKey, manager.funds.cacheFunds);
+                        manager.logger?.log && manager.logger.log(`Cleared persisted cacheFunds.buy after regeneration`, 'info');
+                    } else {
+                        manager.logger?.log && manager.logger.log(`Cleared in-memory cacheFunds.buy after regeneration (no botKey)`, 'info');
+                    }
+                } catch (e) {
+                    manager.logger?.log && manager.logger.log(`Failed to clear/persist cacheFunds after buy regeneration: ${e.message}`, 'warn');
+                }
                 result.buyUpdated = true;
             } else {
                 manager.logger?.log(
@@ -685,6 +701,21 @@ class Grid {
                     'info'
                 );
                 Grid.updateGridOrderSizesForSide(manager, ORDER_TYPES.SELL, cacheFunds);
+                // Clear persisted cacheFunds for sell side since we regenerated sizes
+                try {
+                    manager.funds.cacheFunds = manager.funds.cacheFunds || { buy: 0, sell: 0 };
+                    manager.funds.cacheFunds.sell = 0;
+                    const { AccountOrders } = require('../account_orders');
+                    if (manager.config && manager.config.botKey) {
+                        const db = new AccountOrders();
+                        db.updateCacheFunds(manager.config.botKey, manager.funds.cacheFunds);
+                        manager.logger?.log && manager.logger.log(`Cleared persisted cacheFunds.sell after regeneration`, 'info');
+                    } else {
+                        manager.logger?.log && manager.logger.log(`Cleared in-memory cacheFunds.sell after regeneration (no botKey)`, 'info');
+                    }
+                } catch (e) {
+                    manager.logger?.log && manager.logger.log(`Failed to clear/persist cacheFunds after sell regeneration: ${e.message}`, 'warn');
+                }
                 result.sellUpdated = true;
             } else {
                 manager.logger?.log(
