@@ -352,35 +352,6 @@ class OrderManager {
         const pendingSell = this.funds.pendingProceeds?.sell || 0;
         this.funds.available.buy = Math.max(0, chainFreeBuy - virtuelBuy) + pendingBuy;
         this.funds.available.sell = Math.max(0, chainFreeSell - virtuelSell) + pendingSell;
-
-        // Deduct BTS creation fees from available funds if BTS is in the trading pair
-        const assetA = this.config?.assetA;
-        const assetB = this.config?.assetB;
-        const hasBtsPair = (assetA === 'BTS' || assetB === 'BTS');
-
-        if (hasBtsPair) {
-            try {
-                const { getAssetFees } = require('./utils');
-                const targetBuy = Math.max(0, Number.isFinite(Number(this.config?.activeOrders?.buy)) ? Number(this.config.activeOrders.buy) : 1);
-                const targetSell = Math.max(0, Number.isFinite(Number(this.config?.activeOrders?.sell)) ? Number(this.config.activeOrders.sell) : 1);
-                const totalOrdersToCreate = targetBuy + targetSell;
-
-                if (totalOrdersToCreate > 0) {
-                    const btsFeeData = getAssetFees('BTS', 1);
-                    const btsFeesForCreation = btsFeeData.createFee * totalOrdersToCreate;
-
-                    // Reduce available by BTS fees based on which asset is BTS
-                    if (assetB === 'BTS') {
-                        this.funds.available.buy = Math.max(0, this.funds.available.buy - btsFeesForCreation);
-                    } else if (assetA === 'BTS') {
-                        this.funds.available.sell = Math.max(0, this.funds.available.sell - btsFeesForCreation);
-                    }
-                }
-            } catch (err) {
-                // Silently ignore fee calculation errors to avoid blocking fund recalculation
-                // The fee deduction will still happen via applyBotFundsAllocation when available
-            }
-        }
     }
 
     _updateOrder(order) {
