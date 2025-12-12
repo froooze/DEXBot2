@@ -576,7 +576,7 @@ class Grid {
         if (!manager) throw new Error('checkAndUpdateGridIfNeeded requires a manager instance');
 
         const { GRID_LIMITS } = require('./constants');
-        const threshold = GRID_LIMITS.GRID_REGENERATION_PERCENTAGE || 5;
+        const threshold = GRID_LIMITS.GRID_REGENERATION_PERCENTAGE || 1;
 
         const snap = Grid._getFundSnapshot(manager);
         const gridBuy = snap.gridBuy;
