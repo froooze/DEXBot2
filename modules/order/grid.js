@@ -523,6 +523,14 @@ class Grid {
         }
         await Grid.initializeGrid(manager);
         manager.logger.log('Virtual grid has been regenerated.', 'debug');
+        // Clear persisted cacheFunds for both sides after a full grid regeneration
+        // so persisted leftovers do not remain after the grid was rebuilt.
+        try {
+            Grid._clearAndPersistCacheFunds(manager, 'buy');
+            Grid._clearAndPersistCacheFunds(manager, 'sell');
+        } catch (e) {
+            manager.logger?.log && manager.logger.log && manager.logger.log(`Warning: failed to clear persisted cacheFunds during recalc: ${e.message}`, 'warn');
+        }
 
         const chainOpenOrders = await readOpenOrdersFn();
         if (!Array.isArray(chainOpenOrders)) {
