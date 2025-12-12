@@ -1652,9 +1652,10 @@ class OrderManager {
         const orderCount = Math.min(ordersToProcess.length, eligibleSpreadOrders.length);
         const simpleDistribution = orderCount > 0 ? availableFunds / orderCount : 0;
 
-        // Calculate geometric distribution for comparison
+        // Calculate geometric distribution. Cap only on the total value by scaling if needed.
         let geometricSizes = [];
-        let totalGeometric = 0;
+        let allocatedSizes = [];
+        let allocatedSum = 0;
         if (orderCount > 0) {
             const Grid = require('./grid');
             geometricSizes = Grid.calculateRotationOrderSizes(
@@ -1666,20 +1667,39 @@ class OrderManager {
                 0, // no min size
                 side === 'buy' ? (this.assets?.assetB?.precision ?? 8) : (this.assets?.assetA?.precision ?? 8)
             );
-            totalGeometric = geometricSizes.reduce((a, b) => a + b, 0);
+
+            const totalGeometric = geometricSizes.reduce((s, v) => s + (Number(v) || 0), 0);
+
+            if (totalGeometric > 0 && totalGeometric > availableFunds) {
+                // Scale down all geometric sizes proportionally so the total equals availableFunds
+                const scale = availableFunds / totalGeometric;
+                for (let i = 0; i < orderCount; i++) {
+                    const g = geometricSizes[i] !== undefined ? geometricSizes[i] : 0;
+                    const allocated = g * scale;
+                    allocatedSizes.push(allocated);
+                    allocatedSum += allocated;
+                }
+            } else {
+                // Use geometric sizes as-is (may sum to less than availableFunds)
+                for (let i = 0; i < orderCount; i++) {
+                    const g = geometricSizes[i] !== undefined ? geometricSizes[i] : 0;
+                    allocatedSizes.push(g);
+                    allocatedSum += g;
+                }
+            }
         }
 
-        // Compare distributions and handle surplus/shortage
+        // Determine surplus (availableFunds unallocated after sizing) and add to cacheFunds only if positive
         let surplus = 0;
-        if (geometricSizes.length > 0 && totalGeometric < availableFunds) {
-            // Geometric sizes are smaller: use them and add surplus to cacheFunds
-            surplus = availableFunds - totalGeometric;
+        const EPS = 1e-12;
+        if (availableFunds - allocatedSum > EPS) {
+            surplus = availableFunds - allocatedSum;
             this.funds.cacheFunds[side] = (this.funds.cacheFunds[side] || 0) + surplus;
-            this.logger.log(`Geometric distribution (${totalGeometric.toFixed(8)}) smaller than available (${availableFunds.toFixed(8)}). Adding surplus ${surplus.toFixed(8)} to cacheFunds.${side}`, 'info');
+            this.logger.log(`Allocated sum (${allocatedSum.toFixed(8)}) smaller than available (${availableFunds.toFixed(8)}). Adding surplus ${surplus.toFixed(8)} to cacheFunds.${side}`, 'info');
         }
 
         // Track remaining funds locally since this.funds.available gets reset by recalculateFunds
-        let remainingFunds = availableFunds;
+        let remainingFunds = Math.max(0, availableFunds - allocatedSum - surplus);
 
         for (let i = 0; i < ordersToProcess.length; i++) {
             const oldOrder = ordersToProcess[i];
@@ -1690,13 +1710,8 @@ class OrderManager {
             const targetGridId = priceSource.id;
             const targetPrice = priceSource.price;
 
-            // Use geometric sizes if available, otherwise cap at simple distribution
-            let newSize;
-            if (geometricSizes.length > i) {
-                newSize = Math.min(geometricSizes[i], simpleDistribution);
-            } else {
-                newSize = simpleDistribution;
-            }
+            // Use precomputed allocatedSizes (capped geometric or simple distribution)
+            let newSize = (allocatedSizes.length > i) ? allocatedSizes[i] : simpleDistribution;
             if (newSize <= 0) {
                 this.logger.log(`No available funds for rotation, skipping`, 'warn');
                 continue;
