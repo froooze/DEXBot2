@@ -87,6 +87,8 @@ class Logger {
         const totalGridSell = manager.funds?.total?.grid?.sell ?? 0;
         const virtuelBuy = manager.funds?.virtuel?.buy ?? 0;
         const virtuelSell = manager.funds?.virtuel?.sell ?? 0;
+        const cacheBuy = manager.funds?.cacheFunds?.buy ?? 0;
+        const cacheSell = manager.funds?.cacheFunds?.sell ?? 0;
         const committedGridBuy = manager.funds?.committed?.grid?.buy ?? 0;
         const committedGridSell = manager.funds?.committed?.grid?.sell ?? 0;
         const committedChainBuy = manager.funds?.committed?.chain?.buy ?? 0;
@@ -96,6 +98,7 @@ class Logger {
         console.log(`total.chain: Buy ${totalChainBuy.toFixed(8)} ${buyName} | Sell ${totalChainSell.toFixed(8)} ${sellName}`);
         console.log(`total.grid: Buy ${totalGridBuy.toFixed(8)} ${buyName} | Sell ${totalGridSell.toFixed(8)} ${sellName}`);
         console.log(`virtuel.grid: Buy ${virtuelBuy.toFixed(8)} ${buyName} | Sell ${virtuelSell.toFixed(8)} ${sellName}`);
+        console.log(`cacheFunds: Buy ${cacheBuy.toFixed(8)} ${buyName} | Sell ${cacheSell.toFixed(8)} ${sellName}`);
         console.log(`committed.grid: Buy ${committedGridBuy.toFixed(8)} ${buyName} | Sell ${committedGridSell.toFixed(8)} ${sellName}`);
         console.log(`committed.chain: Buy ${committedChainBuy.toFixed(8)} ${buyName} | Sell ${committedChainSell.toFixed(8)} ${sellName}`);
     }
@@ -121,6 +124,8 @@ class Logger {
         const totalGridSell = manager.funds?.total?.grid?.sell ?? 0;
         const virtuelBuy = manager.funds?.virtuel?.buy ?? 0;
         const virtuelSell = manager.funds?.virtuel?.sell ?? 0;
+        const cacheBuy = manager.funds?.cacheFunds?.buy ?? 0;
+        const cacheSell = manager.funds?.cacheFunds?.sell ?? 0;
         const committedGridBuy = manager.funds?.committed?.grid?.buy ?? 0;
         const committedGridSell = manager.funds?.committed?.grid?.sell ?? 0;
         const committedChainBuy = manager.funds?.committed?.chain?.buy ?? 0;
@@ -130,6 +135,7 @@ class Logger {
         console.log(`total.chain: Buy ${totalChainBuy.toFixed(8)} ${buyName} | Sell ${totalChainSell.toFixed(8)} ${sellName}`);
         console.log(`total.grid: Buy ${totalGridBuy.toFixed(8)} ${buyName} | Sell ${totalGridSell.toFixed(8)} ${sellName}`);
         console.log(`virtuel.grid: Buy ${virtuelBuy.toFixed(8)} ${buyName} | Sell ${virtuelSell.toFixed(8)} ${sellName}`);
+        console.log(`cacheFunds: Buy ${cacheBuy.toFixed(8)} ${buyName} | Sell ${cacheSell.toFixed(8)} ${sellName}`);
         console.log(`committed.grid: Buy ${committedGridBuy.toFixed(8)} ${buyName} | Sell ${committedGridSell.toFixed(8)} ${sellName}`);
         console.log(`committed.chain: Buy ${committedChainBuy.toFixed(8)} ${buyName} | Sell ${committedChainSell.toFixed(8)} ${sellName}`);
         console.log(`Orders: Virtual ${virtualOrders.length} | Active ${activeOrders.length} | Partial ${partialOrders.length}`);
