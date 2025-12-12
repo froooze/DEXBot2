@@ -26,8 +26,12 @@ REPO_URL="https://github.com/froooze/DEXBot2.git"
 REPO_BRANCH="main"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-LOG_FILE="${PROJECT_ROOT}/update.log"
+LOGS_DIR="${PROJECT_ROOT}/profiles/logs"
+LOG_FILE="${LOGS_DIR}/update.log"
 TIMESTAMP=$(date '+%Y-%m-%d_%H-%M-%S')
+
+# Ensure logs directory exists
+mkdir -p "$LOGS_DIR"
 
 # Functions
 log_info() {
