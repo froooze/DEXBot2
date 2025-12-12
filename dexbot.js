@@ -239,7 +239,7 @@ class DEXBot {
 
         if (this.config.dryRun) {
             this.manager.logger.log('Dry run enabled, skipping on-chain order placement.', 'info');
-            accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()));
+            accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()), this.manager.funds.cacheFunds);
             return;
         }
 
@@ -316,7 +316,7 @@ class DEXBot {
         for (const group of orderGroups) {
             await placeOrderGroup(group);
         }
-        accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()));
+        accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()), this.manager.funds.cacheFunds);
     }
 
     /**
@@ -726,7 +726,7 @@ class DEXBot {
 
                     // Always persist snapshot after processing fills if we did anything
                     if (validFills.length > 0) {
-                        accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()));
+                        accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()), this.manager.funds.cacheFunds);
                     }
                 } catch (err) {
                     this.manager?.logger?.log(`Error processing fill: ${err.message}`, 'error');
@@ -765,7 +765,7 @@ class DEXBot {
                     privateKey: this.privateKey,
                     config: this.config,
                 });
-                accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()));
+                accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()), this.manager.funds.cacheFunds);
 
                 if (fs.existsSync(this.triggerFile)) {
                     fs.unlinkSync(this.triggerFile);
@@ -782,6 +782,11 @@ class DEXBot {
             await performResync();
         } else {
             const persistedGrid = accountOrders.loadBotGrid(this.config.botKey);
+            const persistedCacheFunds = accountOrders.loadCacheFunds(this.config.botKey);
+            // Restore cacheFunds to manager if found
+            if (persistedCacheFunds) {
+                this.manager.funds.cacheFunds = { ...persistedCacheFunds };
+            }
             const chainOpenOrders = this.config.dryRun ? [] : await chainOrders.readOpenOrders(this.accountId);
 
             let shouldRegenerate = false;
@@ -795,7 +800,7 @@ class DEXBot {
                     chainOpenOrders,
                     manager: this.manager,
                     logger: this.manager.logger,
-                    storeGrid: (orders) => accountOrders.storeMasterGrid(this.config.botKey, orders),
+                    storeGrid: (orders) => accountOrders.storeMasterGrid(this.config.botKey, orders, this.manager.funds.cacheFunds),
                     attemptResumeFn: attemptResumePersistedGridByPriceMatch,
                 });
                 shouldRegenerate = decision.shouldRegenerate;
@@ -835,7 +840,7 @@ class DEXBot {
                     await this.placeInitialOrders();
                 }
 
-                accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()));
+                accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()), this.manager.funds.cacheFunds);
             } else {
                 this.manager.logger.log('Found active session. Loading and syncing existing grid.', 'info');
 
@@ -920,7 +925,7 @@ class DEXBot {
                     this.manager.logger.logFundsStatus(this.manager);
                 }
 
-                accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()));
+                accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()), this.manager.funds.cacheFunds);
             }
         }
 
@@ -1299,7 +1304,7 @@ async function restartBotByName(botName) {
 
             // Ensure persisted account-orders metadata exists for this bot and persist the generated grid
             accountOrders.ensureBotEntries([bot]);
-            accountOrders.storeMasterGrid(bot.botKey, Array.from(manager.orders.values()));
+            accountOrders.storeMasterGrid(bot.botKey, Array.from(manager.orders.values()), manager.funds.cacheFunds);
             console.log(`Generated and stored grid snapshot for '${bot.name}' to profiles/orders.json`);
         } catch (err) {
             console.warn(`Failed to generate grid for '${bot.name}': ${err && err.message ? err.message : err}`);

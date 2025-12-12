@@ -445,6 +445,7 @@ class OrderManager {
                 chain: { buy: 0, sell: 0 }
             },
             pendingProceeds: { buy: 0, sell: 0 },  // Proceeds from fills awaiting rotation
+            cacheFunds: { buy: 0, sell: 0 },     // Leftover funds from rotation sizing (below precision threshold)
             btsFeesOwed: 0  // BTS blockchain fees from filled orders (only if BTS is in pair)
         };
         // Make reserved an alias for virtuel
