@@ -188,7 +188,7 @@ async function selectAccount() {
  * @param {number} timeoutMs - Connection timeout in milliseconds
  * @returns {Promise<Array>} Array of raw order objects from chain
  */
-async function readOpenOrders(accountId = null, timeoutMs = 30000) {
+async function readOpenOrders(accountId = null, timeoutMs = 30000, suppress_log = false) {
     await waitForConnected(timeoutMs);
     try {
         const accId = accountId || preferredAccountId;
@@ -198,7 +198,9 @@ async function readOpenOrders(accountId = null, timeoutMs = 30000) {
         const fullAccount = await BitShares.db.get_full_accounts([accId], false);
         const orders = fullAccount[0][1].limit_orders || [];
 
-        console.log(`Found ${orders.length} open orders for account ${accId}`);
+        if (!suppress_log) {
+            console.log(`Found ${orders.length} open orders for account ${accId}`);
+        }
         return orders;
     } catch (error) {
         console.error('Error reading open orders:', error.message);
@@ -248,7 +250,7 @@ async function listenForFills(accountRef, callback) {
     }
 
     if (accountId) {
-        readOpenOrders(accountId).catch(error => console.error('Error loading account for listening:', error.message));
+        readOpenOrders(accountId, 30000, true).catch(error => console.error('Error loading account for listening:', error.message));
     } else {
         console.warn('Unable to derive account id before listening for fills; skipping open-order prefetch.');
     }
@@ -302,34 +304,40 @@ async function buildUpdateOrderOp(accountName, orderId, newParams) {
     const currentReceiveInt = Math.round((currentSellInt * priceRatioQuote) / priceRatioBase);
     const currentReceiveFloat = blockchainToFloat(currentReceiveInt, receivePrecision);
 
-    // Calculate newReceiveFloat based on newPrice if provided (for price-only updates)
-    let calculatedReceiveFloat = currentReceiveFloat;
-    if (newParams.newPrice !== undefined && newParams.newPrice !== null) {
-        // newPrice is the market price (quote/base ratio)
-        // For SELL orders: we sell base asset, receive quote asset -> receive = sell * price
-        // For BUY orders: we sell quote asset, receive base asset -> receive = sell / price
-        if (newParams.orderType === 'sell') {
-            calculatedReceiveFloat = currentSellFloat * newParams.newPrice;
-        } else {
-            calculatedReceiveFloat = currentSellFloat / newParams.newPrice;
-        }
+    // Determine target sell amount first.
+    const newSellFloat = (newParams.amountToSell !== undefined && newParams.amountToSell !== null)
+        ? newParams.amountToSell
+        : currentSellFloat;
+    const newSellInt = floatToBlockchainInt(newSellFloat, sellPrecision);
+
+    // Determine an initial receive amount for price-change detection.
+    // Policy:
+    // - If minToReceive is provided: use it as an absolute override.
+    // - Else if newPrice is provided: compute receive from the new sell amount.
+    // - Else: keep the existing on-chain price by scaling receive with sell.
+    let candidateReceiveInt;
+    if (newParams.minToReceive !== undefined && newParams.minToReceive !== null) {
+        candidateReceiveInt = floatToBlockchainInt(newParams.minToReceive, receivePrecision);
+    } else if (newParams.newPrice !== undefined && newParams.newPrice !== null) {
+        const price = Number(newParams.newPrice);
+        const receiveFloat = (newParams.orderType === 'sell')
+            ? (newSellFloat * price)
+            : (newSellFloat / price);
+        candidateReceiveInt = floatToBlockchainInt(receiveFloat, receivePrecision);
+    } else {
+        candidateReceiveInt = Math.round((newSellInt * priceRatioQuote) / priceRatioBase);
     }
 
-    const newSellFloat = (newParams.amountToSell !== undefined && newParams.amountToSell !== null) ? newParams.amountToSell : currentSellFloat;
-    const newReceiveFloat = (newParams.minToReceive !== undefined && newParams.minToReceive !== null) ? newParams.minToReceive : calculatedReceiveFloat;
-
-    // Validate amounts before converting to blockchain integers
-    if (!validateOrderAmountsWithinLimits(newSellFloat, newReceiveFloat, sellPrecision, receivePrecision)) {
+    // Validate amounts before converting to blockchain integers / computing deltas
+    const candidateReceiveFloat = blockchainToFloat(candidateReceiveInt, receivePrecision);
+    if (!validateOrderAmountsWithinLimits(newSellFloat, candidateReceiveFloat, sellPrecision, receivePrecision)) {
         throw new Error(
             `Cannot update order: calculated amounts exceed blockchain limits. ` +
-            `Sell: ${newSellFloat}, Receive: ${newReceiveFloat}. ` +
+            `Sell: ${newSellFloat}, Receive: ${candidateReceiveFloat}. ` +
             `This typically happens with extreme price values or mixed absolute/relative price bounds that diverge too far. ` +
             `Consider adjusting minPrice/maxPrice configuration.`
         );
     }
-
-    const newSellInt = floatToBlockchainInt(newSellFloat, sellPrecision);
-    const newReceiveInt = floatToBlockchainInt(newReceiveFloat, receivePrecision);
 
     // Calculate delta (new - current)
     // IMPORTANT: BitShares limit_order_update takes a delta for amount_to_sell
@@ -340,7 +348,7 @@ async function buildUpdateOrderOp(accountName, orderId, newParams) {
     // Current price ratio: base/quote = priceRatioBase/priceRatioQuote
     // New price ratio: newSellInt/newReceiveInt
     // They're different if: currentSellInt * newReceiveInt != newSellInt * currentReceiveInt
-    const priceChanged = (currentSellInt * newReceiveInt) !== (newSellInt * currentReceiveInt);
+    const priceChanged = (currentSellInt * candidateReceiveInt) !== (newSellInt * currentReceiveInt);
 
     // Skip update only if BOTH amount and price are unchanged
     if (deltaSellInt === 0 && !priceChanged) {
@@ -353,26 +361,52 @@ async function buildUpdateOrderOp(accountName, orderId, newParams) {
         // Determine direction toward market center:
         // For SELL orders: newReceiveInt < currentReceiveInt means moving down toward market (lower price = better for selling)
         // For BUY orders: newReceiveInt < currentReceiveInt means moving down toward market (lower price = better for buying, get more BTC for same USD)
-        const isMovingTowardMarket = newReceiveInt < currentReceiveInt;
+        const isMovingTowardMarket = candidateReceiveInt < currentReceiveInt;
 
         if (isMovingTowardMarket) {
             // Adjust delta by +1 to push order size slightly (toward market center)
             deltaSellInt = 1;
             console.log(
                 `[buildUpdateOrderOp] Delta was 0 but price changed toward market. Enforcing minimum delta: +1 ` +
-                `(order ${orderId}, ${newParams.orderType}, receive ${currentReceiveInt} → ${newReceiveInt})`
+                `(order ${orderId}, ${newParams.orderType}, receive ${currentReceiveInt} → ${candidateReceiveInt})`
             );
         } else {
             // Moving away from market - allow zero delta but log it
             console.log(
                 `[buildUpdateOrderOp] Delta is 0 and price moving away from market. Allowing zero delta. ` +
-                `(order ${orderId}, ${newParams.orderType}, receive ${currentReceiveInt} → ${newReceiveInt})`
+                `(order ${orderId}, ${newParams.orderType}, receive ${currentReceiveInt} → ${candidateReceiveInt})`
             );
         }
     }
 
     // Adjust newSellInt to strict logic: current + delta
     const adjustedSellInt = currentSellInt + deltaSellInt;
+
+    // Compute the final receive amount consistent with the final sell amount.
+    let newReceiveInt;
+    if (newParams.minToReceive !== undefined && newParams.minToReceive !== null) {
+        newReceiveInt = floatToBlockchainInt(newParams.minToReceive, receivePrecision);
+    } else if (newParams.newPrice !== undefined && newParams.newPrice !== null) {
+        const price = Number(newParams.newPrice);
+        const adjustedSellFloat = blockchainToFloat(adjustedSellInt, sellPrecision);
+        const receiveFloat = (newParams.orderType === 'sell')
+            ? (adjustedSellFloat * price)
+            : (adjustedSellFloat / price);
+        newReceiveInt = floatToBlockchainInt(receiveFloat, receivePrecision);
+    } else {
+        // Keep existing on-chain price ratio.
+        newReceiveInt = Math.round((adjustedSellInt * priceRatioQuote) / priceRatioBase);
+    }
+
+    const adjustedSellFloat = blockchainToFloat(adjustedSellInt, sellPrecision);
+    const finalReceiveFloat = blockchainToFloat(newReceiveInt, receivePrecision);
+    if (!validateOrderAmountsWithinLimits(adjustedSellFloat, finalReceiveFloat, sellPrecision, receivePrecision)) {
+        throw new Error(
+            `Cannot update order: calculated amounts exceed blockchain limits. ` +
+            `Sell: ${adjustedSellFloat}, Receive: ${finalReceiveFloat}. ` +
+            `Consider adjusting minPrice/maxPrice configuration.`
+        );
+    }
 
     const op = {
         op_name: 'limit_order_update',

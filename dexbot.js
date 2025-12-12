@@ -21,6 +21,7 @@ const chainOrders = require('./modules/chain_orders');
 const chainKeys = require('./modules/chain_keys');
 const { OrderManager, grid: Grid, utils: OrderUtils } = require('./modules/order');
 const { ORDER_STATES } = require('./modules/order/constants');
+const { reconcileStartupOrders, attemptResumePersistedGridByPriceMatch, decideStartupGridAction } = require('./modules/order/startup_reconcile');
 const accountKeys = require('./modules/chain_keys');
 const accountBots = require('./modules/account_bots');
 const { parseJsonWithComments } = accountBots;
@@ -615,7 +616,6 @@ class DEXBot {
                     return;
                 }
                 this._processingFill = true;
-
                 try {
                     const allFills = [...fills, ...this._pendingFills];
                     this._pendingFills = [];
@@ -697,27 +697,7 @@ class DEXBot {
                         this.manager.logger.log(`Processing batch of ${validFills.length} fills using 'open' mode`, 'info');
                         const chainOpenOrders = await chainOrders.readOpenOrders(this.account);
 
-                        // We need to accumulate results. 
-                        // Note: syncFromOpenOrders might return the SAME filled orders if we call it multiple times 
-                        // without updating the grid state in between?
-                        // Actually, syncFromOpenOrders DOES update the grid (marking as filled).
-                        // So subsequent calls with same open orders list will work fine?
-                        // Yes, if Order A is missing, first call marks it filled. Second call Order A is filled? 
-                        // Wait, syncFromOpenOrders iterates order grid and checks against chain.
-                        // If chainOpenOrders is constant, and grid is updated...
-                        // Re-running it is redundant but safe if implementation is idempotent-ish.
-                        // But why run it multiple times? Just run it ONCE without fillOp specific logging, 
-                        // or run it once and pass the last fillOp?
-                        // The fillOp arg is only used for:
-                        // "Order ${gridOrder.id} ... matched fill ${fillOp.order_id}"
-                        // If we want detailed logs for each, we'd need to loop.
-                        // But fundamentally, we just need to know what's missing.
-
                         const result = this.manager.syncFromOpenOrders(chainOpenOrders, validFills[0].op[1]);
-                        // ^ This detects ALL missing orders at once.
-                        // If validFills has 5 fills, and open orders is missing 5 orders, this one call catches them all.
-                        // The only downside is the log message might only reference the first fill ID or be generic.
-
                         if (result.filledOrders) allFilledOrders.push(...result.filledOrders);
                         if (result.ordersNeedingCorrection) ordersNeedingCorrection = result.ordersNeedingCorrection;
                     }
@@ -778,8 +758,13 @@ class DEXBot {
             try {
                 this.manager.logger.log('Grid regeneration triggered. Performing full grid resync...', 'info');
                 const readFn = () => chainOrders.readOpenOrders(this.accountId);
-                const cancelFn = (orderId) => chainOrders.cancelOrder(this.account, this.privateKey, orderId);
-                await Grid.recalculateGrid(this.manager, readFn, cancelFn);
+                await Grid.recalculateGrid(this.manager, {
+                    readOpenOrdersFn: readFn,
+                    chainOrders,
+                    account: this.account,
+                    privateKey: this.privateKey,
+                    config: this.config,
+                });
                 accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()));
 
                 if (fs.existsSync(this.triggerFile)) {
@@ -805,39 +790,52 @@ class DEXBot {
                 this.manager.logger.log('No persisted grid found. Generating new grid.', 'info');
             } else {
                 await this.manager._initializeAssets();
-                const chainOrderIds = new Set(chainOpenOrders.map(o => o.id));
-                const hasActiveMatch = persistedGrid.some(order => order.state === 'active' && chainOrderIds.has(order.orderId));
-                if (!hasActiveMatch) {
-                    shouldRegenerate = true;
+                const decision = await decideStartupGridAction({
+                    persistedGrid,
+                    chainOpenOrders,
+                    manager: this.manager,
+                    logger: this.manager.logger,
+                    storeGrid: (orders) => accountOrders.storeMasterGrid(this.config.botKey, orders),
+                    attemptResumeFn: attemptResumePersistedGridByPriceMatch,
+                });
+                shouldRegenerate = decision.shouldRegenerate;
+
+                if (shouldRegenerate && chainOpenOrders.length === 0) {
                     this.manager.logger.log('Persisted grid found, but no matching active orders on-chain. Generating new grid.', 'info');
                 }
             }
 
             if (shouldRegenerate) {
-                // Cancel unmatched on-chain orders immediately (before fetching
-                // any account totals). Use the persisted grid to determine which
-                // on-chain orders are expected; any others will be cancelled.
-                if (!this.config.dryRun) {
-                    try {
-                        const persistedIds = new Set((persistedGrid || []).map(o => o.orderId).filter(Boolean));
-                        if (Array.isArray(chainOpenOrders) && chainOpenOrders.length > 0) {
-                            for (const co of chainOpenOrders) {
-                                try {
-                                    if (!persistedIds.has(co.id)) {
-                                        this.manager && this.manager.logger && this.manager.logger.log && this.manager.logger.log(`Cancelling unmatched on-chain order ${co.id} before initializing grid.`, 'info');
-                                        await chainOrders.cancelOrder(this.account, this.privateKey, co.id);
-                                    }
-                                } catch (err) {
-                                    this.manager && this.manager.logger && this.manager.logger.log && this.manager.logger.log(`Failed to cancel order ${co.id}: ${err && err.message ? err.message : err}`, 'error');
-                                }
-                            }
-                        }
-                    } catch (err) {
-                        this.manager && this.manager.logger && this.manager.logger.log && this.manager.logger.log(`Failed to cancel unmatched on-chain orders: ${err && err.message ? err.message : err}`, 'error');
-                    }
+                // Initialize assets first
+                await this.manager._initializeAssets();
+
+                // Always generate a full virtual grid so orders.json contains the complete grid
+                // (virtual + spread placeholders), not only currently active on-chain orders.
+                this.manager.logger.log('Generating new grid.', 'info');
+                await Grid.initializeGrid(this.manager);
+
+                // If there are existing on-chain orders, sync them onto the new grid
+                // using price+size matching, then reconcile counts by updating/cancelling/creating.
+                if (Array.isArray(chainOpenOrders) && chainOpenOrders.length > 0) {
+                    this.manager.logger.log(`Found ${chainOpenOrders.length} existing chain orders. Syncing them onto the new grid (price+size matching).`, 'info');
+                    const syncResult = await this.manager.synchronizeWithChain(chainOpenOrders, 'readOpenOrders');
+
+                    await reconcileStartupOrders({
+                        manager: this.manager,
+                        config: this.config,
+                        account: this.account,
+                        privateKey: this.privateKey,
+                        chainOrders,
+                        chainOpenOrders,
+                        syncResult,
+                    });
+                } else {
+                    // No existing orders: place initial orders on-chain
+                    this.manager.logger.log('No existing chain orders found. Placing initial orders.', 'info');
+                    await this.placeInitialOrders();
                 }
 
-                await this.placeInitialOrders();
+                accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()));
             } else {
                 this.manager.logger.log('Found active session. Loading and syncing existing grid.', 'info');
 
@@ -890,6 +888,20 @@ class DEXBot {
                             this.manager.logger.log(`Dry run: would execute startup rebalancing (${ordersToPlace.length} new, ${ordersToRotate.length} rotated)`, 'info');
                         }
                     }
+                }
+
+                // Reconcile existing on-chain orders to the configured target counts.
+                // This logic is shared with the "regenerate" startup path and lives in one place.
+                if (syncResult && (syncResult.unmatchedChainOrders || syncResult.unmatchedGridOrders)) {
+                    await reconcileStartupOrders({
+                        manager: this.manager,
+                        config: this.config,
+                        account: this.account,
+                        privateKey: this.privateKey,
+                        chainOrders,
+                        chainOpenOrders,
+                        syncResult,
+                    });
                 }
 
                 // Correct any orders with price mismatches at startup
@@ -1104,6 +1116,15 @@ async function runBotInstances(botEntries, { forceDryRun = false, sourceName = '
         }
     }
 
+    // Fee cache is required for fill processing (getAssetFees), including offline fill reconciliation at startup.
+    // Initialize it once per process for the assets used by active bots.
+    try {
+        await waitForConnected();
+        await OrderUtils.initializeFeeCache(prepared.filter(b => b.active), BitShares);
+    } catch (err) {
+        console.warn(`Fee cache initialization failed: ${err.message}`);
+    }
+
     const instances = [];
     for (const entry of prepared) {
         if (!entry.active) {
@@ -1210,8 +1231,8 @@ async function stopBotByName(botName) {
  * This method:
  * 1. Generates a new order grid from current configuration
  * 2. Persists the grid snapshot to profiles/orders.json
- * 3. Starts the bot with the new grid
- * 
+ * 3. Starts the bot with the new grid (password authentication happens during startup)
+ *
  * @param {string|null} botName - Name of the bot to restart, or null for all active
  */
 async function restartBotByName(botName) {
@@ -1236,6 +1257,38 @@ async function restartBotByName(botName) {
         try {
             // Build an OrderManager with the bot config and initialize the order grid
             const manager = new OrderManager(bot);
+
+            // Set account info on the manager so _fetchAccountBalancesAndSetTotals can work
+            if (bot.preferredAccount) {
+                manager.account = bot.preferredAccount;
+                // Try to look up the account ID from the blockchain
+                try {
+                    const { BitShares } = require('./modules/bitshares_client');
+                    const full = await BitShares.db.get_full_accounts([bot.preferredAccount], false);
+                    if (full && full[0] && full[0][1] && full[0][1].account && full[0][1].account.id) {
+                        manager.accountId = full[0][1].account.id;
+                    } else if (full && full[0] && String(full[0][0]).startsWith('1.2.')) {
+                        manager.accountId = full[0][0];
+                    }
+                } catch (err) {
+                    console.warn(`[dexbot restart] Could not look up account ID for '${bot.preferredAccount}': ${err.message}`);
+                }
+            }
+
+            // If botFunds are percentage-based and account info is available, try to
+            // fetch on-chain balances first so percentages resolve correctly.
+            try {
+                const botFunds = bot && bot.botFunds ? bot.botFunds : {};
+                const needsPercent = (v) => typeof v === 'string' && v.includes('%');
+                if ((needsPercent(botFunds.buy) || needsPercent(botFunds.sell)) && (manager.accountId || manager.account)) {
+                    if (typeof manager._fetchAccountBalancesAndSetTotals === 'function') {
+                        await manager._fetchAccountBalancesAndSetTotals();
+                    }
+                }
+            } catch (errFetch) {
+                console.warn(`[dexbot restart] Could not fetch account totals before initializing grid for '${bot.name}': ${errFetch && errFetch.message ? errFetch.message : errFetch}`);
+            }
+
             // Populate assets/marketPrice and compute the virtual grid (best-effort)
             try {
                 await Grid.initializeGrid(manager);

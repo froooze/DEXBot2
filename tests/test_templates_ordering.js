@@ -4,7 +4,8 @@ console.log('Running templates ordering tests');
 
 function containsSellFirst(filePath, keyName) {
   const raw = fs.readFileSync(filePath, 'utf8');
-  const re = new RegExp(`"${keyName}"\s*:\s*\{\s*"sell"`, 'i');
+  // Note: in JS string literals, `\s` must be escaped as `\\s` to reach RegExp.
+  const re = new RegExp(`"${keyName}"\\s*:\\s*\\{\\s*"sell"`, 'i');
   return re.test(raw);
 }
 

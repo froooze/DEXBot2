@@ -62,6 +62,7 @@ const chainKeys = require('./modules/chain_keys');
 const chainOrders = require('./modules/chain_orders');
 const { OrderManager, grid: Grid, utils: OrderUtils } = require('./modules/order');
 const { ORDER_STATES } = require('./modules/order/constants');
+const { attemptResumePersistedGridByPriceMatch, decideStartupGridAction } = require('./modules/order/startup_reconcile');
 const { AccountOrders, createBotKey } = require('./modules/account_orders');
 const accountBots = require('./modules/account_bots');
 const { parseJsonWithComments } = accountBots;
@@ -507,6 +508,14 @@ class DEXBot {
             this.manager.accountId = this.accountId;
         }
 
+        // Ensure fee cache is initialized before any fill processing that calls getAssetFees().
+        // This must run after we have a BitShares connection and before we can process offline fills.
+        try {
+            await OrderUtils.initializeFeeCache([this.config || {}], BitShares);
+        } catch (err) {
+            console.warn(`[bot.js] Fee cache initialization failed: ${err.message}`);
+        }
+
         // Start listening for fills
         await chainOrders.listenForFills(this.account || undefined, async (fills) => {
             if (this.manager && !this.isResyncing && !this.config.dryRun) {
@@ -641,7 +650,14 @@ class DEXBot {
         });
 
         const persistedGrid = accountOrders.loadBotGrid(this.config.botKey);
+        // Use this.accountId which was set during initialize()
         const chainOpenOrders = this.config.dryRun ? [] : await chainOrders.readOpenOrders(this.accountId);
+
+        const debugStartup = process.env.DEBUG_STARTUP === '1';
+        if (debugStartup) {
+            console.log(`[bot.js] DEBUG STARTUP: chainOpenOrders.length = ${chainOpenOrders.length}`);
+            console.log(`[bot.js] DEBUG STARTUP: persistedGrid.length = ${persistedGrid ? persistedGrid.length : 0}`);
+        }
 
         let shouldRegenerate = false;
         if (!persistedGrid || persistedGrid.length === 0) {
@@ -649,10 +665,21 @@ class DEXBot {
             console.log('[bot.js] No persisted grid found. Generating new grid.');
         } else {
             await this.manager._initializeAssets();
-            const chainOrderIds = new Set(chainOpenOrders.map(o => o.id));
-            const hasActiveMatch = persistedGrid.some(order => order.state === 'active' && chainOrderIds.has(order.orderId));
-            if (!hasActiveMatch) {
-                shouldRegenerate = true;
+            const decision = await decideStartupGridAction({
+                persistedGrid,
+                chainOpenOrders,
+                manager: this.manager,
+                logger: { log: (msg) => console.log(`[bot.js] ${msg}`) },
+                storeGrid: (orders) => accountOrders.storeMasterGrid(this.config.botKey, orders),
+                attemptResumeFn: attemptResumePersistedGridByPriceMatch,
+            });
+            shouldRegenerate = decision.shouldRegenerate;
+
+            if (debugStartup) {
+                console.log(`[bot.js] DEBUG STARTUP: hasActiveMatch = ${decision.hasActiveMatch}`);
+            }
+
+            if (shouldRegenerate && chainOpenOrders.length === 0) {
                 console.log('[bot.js] Persisted grid found, but no matching active orders on-chain. Generating new grid.');
             }
         }

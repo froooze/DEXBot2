@@ -13,7 +13,7 @@
     "pm2:start": "pm2 start profiles/ecosystem.config.js",
     "pm2:stop": "pm2 stop profiles/ecosystem.config.js",
     "pm2:reload": "pm2 reload profiles/ecosystem.config.js",
-    "test": "node tests/test_utils.js && node tests/test_order_grid.js && node tests/test_logger.js && node tests/test_manager.js && node tests/test_account_totals.js && node tests/connection_test.js && node tests/test_key_validation.js && node tests/test_subscriptions.js && node tests/test_fills.js && node tests/test_account_selection.js && node tests/test_autoderive.js && node tests/test_price_derive.js && node tests/test_price_no_positional.js && node tests/test_price_orientation.js && node tests/test_price_tolerance.js && node tests/test_chain_helpers.js && node tests/test_templates_ordering.js"
+    "test": "node tests/test_utils.js && node tests/test_order_grid.js && node tests/test_logger.js && node tests/test_manager.js && node tests/test_account_totals.js && node tests/connection_test.js && node tests/test_key_validation.js && node tests/test_subscriptions.js && node tests/test_fills.js && node tests/test_account_selection.js && node tests/test_autoderive.js && node tests/test_price_derive.js && node tests/test_price_no_positional.js && node tests/test_price_orientation.js && node tests/test_price_tolerance.js && node tests/test_chain_helpers.js && node tests/test_templates_ordering.js && node tests/test_startup_decision.js"
   },
   "repository": {
     "type": "git",

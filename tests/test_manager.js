@@ -177,10 +177,11 @@ assert.strictEqual(mgr.funds.available.sell, 10);
     const activatedBuys = await rotateMgr.activateClosestVirtualOrdersForPlacement(ORDER_TYPES.BUY, 1);
     assert.strictEqual(activatedBuys.length, 1, 'Should activate 1 buy');
     assert.strictEqual(activatedBuys[0].id, 'vbuy1', 'Should activate the closest virtual buy (95)');
-    assert.strictEqual(activatedBuys[0].state, ORDER_STATES.ACTIVE, 'Should be marked as ACTIVE');
+    assert.strictEqual(activatedBuys[0].state, ORDER_STATES.VIRTUAL, 'Prepared orders remain VIRTUAL until confirmed on-chain');
 
-    // Reset available funds for rotation test (activation consumed funds)
-    rotateMgr.funds.available.sell = 5;
+    // Provide proceeds for rotation sizing (rotation now uses pendingProceeds)
+    rotateMgr.funds.pendingProceeds = rotateMgr.funds.pendingProceeds || { buy: 0, sell: 0 };
+    rotateMgr.funds.pendingProceeds.sell = 1;
 
     // Test prepareFurthestOrdersForRotation: should select the furthest active order for rotation
     const rotations = await rotateMgr.prepareFurthestOrdersForRotation(ORDER_TYPES.SELL, 1);

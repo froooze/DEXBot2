@@ -385,20 +385,38 @@ class Grid {
         const precA = manager.assets?.assetA?.precision;
         const precB = manager.assets?.assetB?.precision;
 
-        // Capture the funds being used for sizing
-        const inputFundsSell = manager.funds.available.sell;
-        const inputFundsBuy = manager.funds.available.buy;
-        manager.logger.log(`DEBUG Grid Sizing Input: buyFunds=${inputFundsBuy.toFixed(8)}, sellFunds=${inputFundsSell.toFixed(8)}`, 'info');
+        // Determine total funds on-chain for sizing.
+        // Centralized in OrderManager to avoid duplicating chainFree/free+locked/chainTotal logic.
+        if (!manager.getChainFundsSnapshot || typeof manager.getChainFundsSnapshot !== 'function') {
+            throw new Error('Grid.initializeGrid requires manager.getChainFundsSnapshot()');
+        }
+        const snapshot = manager.getChainFundsSnapshot();
+
+        const chainFreeBuy = snapshot.chainFreeBuy;
+        const chainFreeSell = snapshot.chainFreeSell;
+        const chainTotalBuy = snapshot.chainTotalBuy;
+        const chainTotalSell = snapshot.chainTotalSell;
+        const allocatedBuy = snapshot.allocatedBuy;
+        const allocatedSell = snapshot.allocatedSell;
+
+        const inputFundsBuy = allocatedBuy;
+        const inputFundsSell = allocatedSell;
+
+        manager.logger.log(
+            `DEBUG Grid Sizing Input: buyFunds=${inputFundsBuy.toFixed(8)} (allocated=${allocatedBuy.toFixed(8)}, total=${chainTotalBuy.toFixed(8)}, free=${chainFreeBuy.toFixed(8)}), ` +
+            `sellFunds=${inputFundsSell.toFixed(8)} (allocated=${allocatedSell.toFixed(8)}, total=${chainTotalSell.toFixed(8)}, free=${chainFreeSell.toFixed(8)})`,
+            'info'
+        );
 
         let sizedOrders = Grid.calculateOrderSizes(
             orders, manager.config, inputFundsSell, inputFundsBuy, minSellSize, minBuySize, precA, precB
         );
 
         // Calculate total allocated by the sizing algorithm
-        const allocatedBuy = sizedOrders.filter(o => o.type === ORDER_TYPES.BUY).reduce((sum, o) => sum + (Number(o.size) || 0), 0);
-        const allocatedSell = sizedOrders.filter(o => o.type === ORDER_TYPES.SELL).reduce((sum, o) => sum + (Number(o.size) || 0), 0);
-        manager.logger.log(`DEBUG Grid Sizing Output: allocatedBuy=${allocatedBuy.toFixed(8)}, allocatedSell=${allocatedSell.toFixed(8)}`, 'info');
-        manager.logger.log(`DEBUG Grid Sizing Discrepancy: buy=${(inputFundsBuy - allocatedBuy).toFixed(8)}, sell=${(inputFundsSell - allocatedSell).toFixed(8)}`, 'info');
+        const sizedAllocatedBuy = sizedOrders.filter(o => o.type === ORDER_TYPES.BUY).reduce((sum, o) => sum + (Number(o.size) || 0), 0);
+        const sizedAllocatedSell = sizedOrders.filter(o => o.type === ORDER_TYPES.SELL).reduce((sum, o) => sum + (Number(o.size) || 0), 0);
+        manager.logger.log(`DEBUG Grid Sizing Output: allocatedBuy=${sizedAllocatedBuy.toFixed(8)}, allocatedSell=${sizedAllocatedSell.toFixed(8)}`, 'info');
+        manager.logger.log(`DEBUG Grid Sizing Discrepancy: buy=${(inputFundsBuy - sizedAllocatedBuy).toFixed(8)}, sell=${(inputFundsSell - sizedAllocatedSell).toFixed(8)}`, 'info');
 
         try {
             const sellsAfter = sizedOrders.filter(o => o.type === ORDER_TYPES.SELL).map(o => Number(o.size || 0));
@@ -408,17 +426,29 @@ class Grid {
             if (minSellSize > 0) {
                 if (precA !== undefined && precA !== null && Number.isFinite(precA)) {
                     const minSellInt = floatToBlockchainInt(minSellSize, precA);
-                    anySellBelow = sellsAfter.some(sz => !Number.isFinite(sz) || floatToBlockchainInt(sz, precA) < minSellInt);
+                    anySellBelow = sellsAfter.some(sz =>
+                        (!Number.isFinite(sz)) ||
+                        (Number.isFinite(sz) && sz > 0 && floatToBlockchainInt(sz, precA) < minSellInt)
+                    );
                 } else {
-                    anySellBelow = sellsAfter.some(sz => !Number.isFinite(sz) || sz < (minSellSize - 1e-8));
+                    anySellBelow = sellsAfter.some(sz =>
+                        (!Number.isFinite(sz)) ||
+                        (Number.isFinite(sz) && sz > 0 && sz < (minSellSize - 1e-8))
+                    );
                 }
             }
             if (minBuySize > 0) {
                 if (precB !== undefined && precB !== null && Number.isFinite(precB)) {
                     const minBuyInt = floatToBlockchainInt(minBuySize, precB);
-                    anyBuyBelow = buysAfter.some(sz => !Number.isFinite(sz) || floatToBlockchainInt(sz, precB) < minBuyInt);
+                    anyBuyBelow = buysAfter.some(sz =>
+                        (!Number.isFinite(sz)) ||
+                        (Number.isFinite(sz) && sz > 0 && floatToBlockchainInt(sz, precB) < minBuyInt)
+                    );
                 } else {
-                    anyBuyBelow = buysAfter.some(sz => !Number.isFinite(sz) || sz < (minBuySize - 1e-8));
+                    anyBuyBelow = buysAfter.some(sz =>
+                        (!Number.isFinite(sz)) ||
+                        (Number.isFinite(sz) && sz > 0 && sz < (minBuySize - 1e-8))
+                    );
                 }
             }
             if (anySellBelow || anyBuyBelow) {
@@ -437,9 +467,9 @@ class Grid {
                 const warningSellSize = getMinOrderSize(ORDER_TYPES.SELL, manager.assets, GRID_LIMITS.MIN_ORDER_SIZE_FACTOR * 2);
                 if (precA !== undefined && precA !== null && Number.isFinite(precA)) {
                     const warnSellInt = floatToBlockchainInt(warningSellSize, precA);
-                    anySellNearMin = sellsAfter.some(sz => Number.isFinite(sz) && floatToBlockchainInt(sz, precA) < warnSellInt);
+                    anySellNearMin = sellsAfter.some(sz => Number.isFinite(sz) && sz > 0 && floatToBlockchainInt(sz, precA) < warnSellInt);
                 } else {
-                    anySellNearMin = sellsAfter.some(sz => Number.isFinite(sz) && sz < (warningSellSize - 1e-8));
+                    anySellNearMin = sellsAfter.some(sz => Number.isFinite(sz) && sz > 0 && sz < (warningSellSize - 1e-8));
                 }
             }
 
@@ -447,9 +477,9 @@ class Grid {
                 const warningBuySize = getMinOrderSize(ORDER_TYPES.BUY, manager.assets, GRID_LIMITS.MIN_ORDER_SIZE_FACTOR * 2);
                 if (precB !== undefined && precB !== null && Number.isFinite(precB)) {
                     const warnBuyInt = floatToBlockchainInt(warningBuySize, precB);
-                    anyBuyNearMin = buysAfter.some(sz => Number.isFinite(sz) && floatToBlockchainInt(sz, precB) < warnBuyInt);
+                    anyBuyNearMin = buysAfter.some(sz => Number.isFinite(sz) && sz > 0 && floatToBlockchainInt(sz, precB) < warnBuyInt);
                 } else {
-                    anyBuyNearMin = buysAfter.some(sz => Number.isFinite(sz) && sz < (warningBuySize - 1e-8));
+                    anyBuyNearMin = buysAfter.some(sz => Number.isFinite(sz) && sz > 0 && sz < (warningBuySize - 1e-8));
                 }
             }
 
@@ -478,8 +508,6 @@ class Grid {
         manager.config.activeOrders.sell = Number.isFinite(Number(manager.config.activeOrders.sell)) ? Number(manager.config.activeOrders.sell) : 1;
 
         // Debug: Compare chainFree with allocated grid funds
-        const chainFreeBuy = manager.accountTotals?.buyFree || 0;
-        const chainFreeSell = manager.accountTotals?.sellFree || 0;
         const virtuelBuy = manager.funds?.virtuel?.buy || 0;
         const virtuelSell = manager.funds?.virtuel?.sell || 0;
         const discrepancyBuy = chainFreeBuy - virtuelBuy;
@@ -495,68 +523,57 @@ class Grid {
     /**
      * Perform a full grid resynchronization from blockchain state (moved from manager)
      * @param {Object} manager - OrderManager instance
-     * @param {Function} readOpenOrdersFn - async function to fetch open orders
-     * @param {Function} cancelOrderFn - async function to cancel an order
+     * @param {Object} opts
+     * @param {Function} opts.readOpenOrdersFn - async function to fetch open orders
+     * @param {Object} opts.chainOrders - chain orders API (must support updateOrder/createOrder/cancelOrder)
+     * @param {string} opts.account - account name
+     * @param {string} opts.privateKey - WIF private key
+     * @param {Object} [opts.config] - bot config (defaults to manager.config)
      */
-    static async recalculateGrid(manager, readOpenOrdersFn, cancelOrderFn) {
+    static async recalculateGrid(manager, opts) {
         if (!manager) throw new Error('recalculateGrid requires a manager instance');
+
+        const readOpenOrdersFn = opts && typeof opts.readOpenOrdersFn === 'function' ? opts.readOpenOrdersFn : null;
+        const chainOrders = opts ? opts.chainOrders : null;
+        const account = opts ? opts.account : null;
+        const privateKey = opts ? opts.privateKey : null;
+        const config = (opts && opts.config) ? opts.config : (manager.config || {});
+
+        if (!readOpenOrdersFn) throw new Error('recalculateGrid requires opts.readOpenOrdersFn');
+        if (!chainOrders || typeof chainOrders.updateOrder !== 'function' || typeof chainOrders.createOrder !== 'function' || typeof chainOrders.cancelOrder !== 'function') {
+            throw new Error('recalculateGrid requires opts.chainOrders with updateOrder/createOrder/cancelOrder');
+        }
+        if (!account || !privateKey) throw new Error('recalculateGrid requires opts.account and opts.privateKey');
+
         manager.logger.log('Starting full grid resynchronization from blockchain...', 'info');
+        if (typeof manager._initializeAssets === 'function') {
+            await manager._initializeAssets();
+        }
         await Grid.initializeGrid(manager);
         manager.logger.log('Virtual grid has been regenerated.', 'debug');
-        const chainOrders = await readOpenOrdersFn();
-        if (!Array.isArray(chainOrders)) {
+
+        const chainOpenOrders = await readOpenOrdersFn();
+        if (!Array.isArray(chainOpenOrders)) {
             manager.logger.log('Could not fetch open orders for resync.', 'error');
             return;
         }
-        manager.logger.log(`Found ${chainOrders.length} open orders on-chain.`, 'info');
-        const assetAPrecision = manager.assets?.assetA?.precision;
-        const assetBPrecision = manager.assets?.assetB?.precision;
-        const calcTol = (p, s, t) => {
-            const { calculatePriceTolerance } = require('./utils');
-            return calculatePriceTolerance(p, s, t, manager.assets);
-        };
-        const matchedChainOrderIds = new Set();
-        for (const gridOrder of manager.orders.values()) {
-            let bestMatch = null;
-            let smallestDiff = Infinity;
-            for (const chainOrder of chainOrders) {
-                if (matchedChainOrderIds.has(chainOrder.id)) continue;
-                const parsedChainOrder = require('./utils').parseChainOrder(chainOrder, manager.assets);
-                if (!parsedChainOrder || parsedChainOrder.type !== gridOrder.type) continue;
-                const priceDiff = Math.abs(parsedChainOrder.price - gridOrder.price);
-                if (priceDiff < smallestDiff) {
-                    smallestDiff = priceDiff;
-                    bestMatch = chainOrder;
-                }
-            }
-            if (bestMatch) {
-                const orderSize = (gridOrder.size && Number.isFinite(Number(gridOrder.size))) ? Number(gridOrder.size) : null;
-                const tolerance = calcTol(gridOrder.price, orderSize, gridOrder.type);
-                if (smallestDiff <= tolerance) {
-                    gridOrder.state = 'active';
-                    gridOrder.orderId = bestMatch.id;
-                    try {
-                        const parsed = require('./utils').parseChainOrder(bestMatch, manager.assets);
-                        if (parsed && parsed.size !== null && parsed.size !== undefined && Number.isFinite(Number(parsed.size))) {
-                            require('./utils').applyChainSizeToGridOrder(manager, gridOrder, parsed.size);
-                        }
-                    } catch (e) { /* best-effort */ }
-                    manager._updateOrder(gridOrder);
-                    matchedChainOrderIds.add(bestMatch.id);
-                    manager.logger.log(`Matched grid order ${gridOrder.id} to on-chain order ${bestMatch.id}.`, 'debug');
-                }
-            }
-        }
-        for (const chainOrder of chainOrders) {
-            if (!matchedChainOrderIds.has(chainOrder.id)) {
-                manager.logger.log(`Cancelling unmatched on-chain order ${chainOrder.id}.`, 'info');
-                try {
-                    await cancelOrderFn(chainOrder.id);
-                } catch (err) {
-                    manager.logger.log(`Failed to cancel order ${chainOrder.id}: ${err.message}`, 'error');
-                }
-            }
-        }
+        manager.logger.log(`Found ${chainOpenOrders.length} open orders on-chain.`, 'info');
+
+        // Reuse the same reconciliation policy as startup:
+        // 1) match chain orders onto grid (price+size)
+        // 2) update/create/cancel to reach configured target activeOrders
+        const { reconcileStartupOrders } = require('./startup_reconcile');
+        const syncResult = await manager.synchronizeWithChain(chainOpenOrders, 'readOpenOrders');
+        await reconcileStartupOrders({
+            manager,
+            config,
+            account,
+            privateKey,
+            chainOrders,
+            chainOpenOrders,
+            syncResult,
+        });
+
         manager.logger.log('Full grid resynchronization complete.', 'info');
         manager.logger && manager.logger.logFundsStatus && manager.logger.logFundsStatus(manager);
         manager.logger.logOrderGrid(Array.from(manager.orders.values()), manager.config.marketPrice);

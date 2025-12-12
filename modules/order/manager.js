@@ -35,7 +35,7 @@
  * 4. After rotation: pendingProceeds cleared as funds are consumed by new orders
  */
 const { ORDER_TYPES, ORDER_STATES, DEFAULT_CONFIG, TIMING, GRID_LIMITS } = require('./constants');
-const { parsePercentageString, blockchainToFloat, floatToBlockchainInt, resolveRelativePrice, calculatePriceTolerance, checkPriceWithinTolerance, parseChainOrder, findMatchingGridOrderByOpenOrder, findMatchingGridOrderByHistory, applyChainSizeToGridOrder, correctOrderPriceOnChain, getMinOrderSize } = require('./utils');
+const { parsePercentageString, blockchainToFloat, floatToBlockchainInt, resolveRelativePrice, calculatePriceTolerance, checkPriceWithinTolerance, parseChainOrder, findMatchingGridOrderByOpenOrder, findMatchingGridOrderByHistory, applyChainSizeToGridOrder, correctOrderPriceOnChain, getMinOrderSize, getAssetFees } = require('./utils');
 const Logger = require('./logger');
 // Grid functions (initialize/recalculate) are intended to be
 // called directly via require('./grid').initializeGrid(manager) by callers.
@@ -158,6 +158,47 @@ class OrderManager {
         return 0;
     }
 
+    _computeChainFundTotals() {
+        const chainFreeBuy = Number.isFinite(Number(this.accountTotals?.buyFree)) ? Number(this.accountTotals.buyFree) : 0;
+        const chainFreeSell = Number.isFinite(Number(this.accountTotals?.sellFree)) ? Number(this.accountTotals.sellFree) : 0;
+        const committedChainBuy = Number(this.funds?.committed?.chain?.buy) || 0;
+        const committedChainSell = Number(this.funds?.committed?.chain?.sell) || 0;
+
+        const freePlusLockedBuy = chainFreeBuy + committedChainBuy;
+        const freePlusLockedSell = chainFreeSell + committedChainSell;
+
+        // Prefer accountTotals.buy/sell (free + locked in open orders) when available, but ensure
+        // we don't regress to free-only by treating totals as at least (free + locked).
+        const chainTotalBuy = Number.isFinite(Number(this.accountTotals?.buy))
+            ? Math.max(Number(this.accountTotals.buy), freePlusLockedBuy)
+            : freePlusLockedBuy;
+        const chainTotalSell = Number.isFinite(Number(this.accountTotals?.sell))
+            ? Math.max(Number(this.accountTotals.sell), freePlusLockedSell)
+            : freePlusLockedSell;
+
+        return {
+            chainFreeBuy,
+            chainFreeSell,
+            committedChainBuy,
+            committedChainSell,
+            freePlusLockedBuy,
+            freePlusLockedSell,
+            chainTotalBuy,
+            chainTotalSell
+        };
+    }
+
+    getChainFundsSnapshot() {
+        const totals = this._computeChainFundTotals();
+        const allocatedBuy = Number.isFinite(Number(this.funds?.allocated?.buy)) ? Number(this.funds.allocated.buy) : totals.chainTotalBuy;
+        const allocatedSell = Number.isFinite(Number(this.funds?.allocated?.sell)) ? Number(this.funds.allocated.sell) : totals.chainTotalSell;
+        return {
+            ...totals,
+            allocatedBuy,
+            allocatedSell
+        };
+    }
+
     /**
      * Apply botFunds allocation constraints to available funds.
      * Called at grid initialization to respect percentage-based botFunds when multiple bots share an account.
@@ -172,12 +213,13 @@ class OrderManager {
     applyBotFundsAllocation() {
         if (!this.config.botFunds || !this.accountTotals) return;
 
-        const chainFreeBuy = this.accountTotals.buyFree || 0;
-        const chainFreeSell = this.accountTotals.sellFree || 0;
+        const { chainTotalBuy, chainTotalSell } = this._computeChainFundTotals();
 
-        // Calculate what this bot is allocated based on chainFree
-        const allocatedBuy = this._resolveConfigValue(this.config.botFunds.buy, chainFreeBuy);
-        const allocatedSell = this._resolveConfigValue(this.config.botFunds.sell, chainFreeSell);
+        const allocatedBuy = this._resolveConfigValue(this.config.botFunds.buy, chainTotalBuy);
+        const allocatedSell = this._resolveConfigValue(this.config.botFunds.sell, chainTotalSell);
+
+        // Expose allocation for grid sizing (and diagnostics)
+        this.funds.allocated = { buy: allocatedBuy, sell: allocatedSell };
 
         // Cap available to not exceed allocation
         if (allocatedBuy > 0) {
@@ -188,8 +230,8 @@ class OrderManager {
         }
 
         this.logger?.log(
-            `Applied botFunds allocation: buy=${allocatedBuy.toFixed(8)} (available=${this.funds.available.buy.toFixed(8)}), ` +
-            `sell=${allocatedSell.toFixed(8)} (available=${this.funds.available.sell.toFixed(8)})`,
+            `Applied botFunds allocation (based on total): buy=${allocatedBuy.toFixed(8)} (total=${chainTotalBuy.toFixed(8)}, available=${this.funds.available.buy.toFixed(8)}), ` +
+            `sell=${allocatedSell.toFixed(8)} (total=${chainTotalSell.toFixed(8)}, available=${this.funds.available.sell.toFixed(8)})`,
             'info'
         );
     }
@@ -250,7 +292,16 @@ class OrderManager {
         this.funds.reserved = this.funds.virtuel; // backwards compat alias
 
         // Set totals
-        this.funds.total.chain = { buy: chainFreeBuy + chainBuy, sell: chainFreeSell + chainSell };
+        // Prefer on-chain totals (free + locked in open orders) when available.
+        // Fallback to inferred totals based on grid orders that have an orderId.
+        const inferredChainTotalBuy = chainFreeBuy + chainBuy;
+        const inferredChainTotalSell = chainFreeSell + chainSell;
+        const onChainTotalBuy = Number.isFinite(Number(this.accountTotals?.buy)) ? Number(this.accountTotals.buy) : null;
+        const onChainTotalSell = Number.isFinite(Number(this.accountTotals?.sell)) ? Number(this.accountTotals.sell) : null;
+        this.funds.total.chain = {
+            buy: onChainTotalBuy !== null ? Math.max(onChainTotalBuy, inferredChainTotalBuy) : inferredChainTotalBuy,
+            sell: onChainTotalSell !== null ? Math.max(onChainTotalSell, inferredChainTotalSell) : inferredChainTotalSell
+        };
         this.funds.total.grid = { buy: gridBuy + virtuelBuy, sell: gridSell + virtuelSell };
 
         // Set available = chainFree - virtuel + pendingProceeds
@@ -351,7 +402,8 @@ class OrderManager {
                 grid: { buy: 0, sell: 0 },
                 chain: { buy: 0, sell: 0 }
             },
-            pendingProceeds: { buy: 0, sell: 0 }  // Proceeds from fills awaiting rotation
+            pendingProceeds: { buy: 0, sell: 0 },  // Proceeds from fills awaiting rotation
+            btsFeesOwed: 0  // BTS blockchain fees from filled orders (only if BTS is in pair)
         };
         // Make reserved an alias for virtuel
         this.funds.reserved = this.funds.virtuel;
@@ -885,107 +937,85 @@ class OrderManager {
                 break;
             }
             case 'readOpenOrders': {
-                const seenOnChain = new Set();
+                const matchedChainOrders = new Set();  // chainOrderIds that matched a grid order
+                const seenOnChain = new Set();         // all chain orderIds seen during this sync
+                const relevantChainOrders = [];        // only chain orders in THIS market pair
                 this.logger.log(`DEBUG: readOpenOrders: ${chainData.length} chain orders to process, ${this.orders.size} grid orders loaded.`, 'info');
                 let parsedCount = 0;
+
+                // Step 1: Match chain orders to grid orders
                 for (const chainOrder of chainData) {
                     const parsedOrder = parseChainOrder(chainOrder, this.assets);
                     if (!parsedOrder) {
                         this.logger.log(`DEBUG: Could not parse chain order ${chainOrder.id}`, 'warn');
                         continue;
                     }
+                    relevantChainOrders.push(chainOrder);
+                    seenOnChain.add(parsedOrder.orderId);
                     parsedCount++;
                     this.logger.log(`DEBUG: Parsed chain order ${parsedOrder.orderId}: type=${parsedOrder.type}, price=${parsedOrder.price?.toFixed(6)}, size=${parsedOrder.size?.toFixed(8)}`, 'info');
 
-                    seenOnChain.add(parsedOrder.orderId);
                     const gridOrder = findMatchingGridOrderByOpenOrder(parsedOrder, { orders: this.orders, ordersByState: this._ordersByState, assets: this.assets, calcToleranceFn: (p, s, t) => calculatePriceTolerance(p, s, t, this.assets), logger: this.logger });
                     if (gridOrder) {
-                        this.logger.log(`DEBUG: Matched chain order ${parsedOrder.orderId} to grid order ${gridOrder.id} (state=${gridOrder.state})`, 'info');
-                        const wasActive = gridOrder.state === ORDER_STATES.ACTIVE;
-                        const oldOrderId = gridOrder.orderId;
+                        matchedChainOrders.add(parsedOrder.orderId);
+                        this.logger.log(`Matched chain ${parsedOrder.orderId} to grid ${gridOrder.id} (state was ${gridOrder.state})`, 'info');
 
-                        // Build updated order object to avoid mutation bug
-                        let updatedGridOrder = { ...gridOrder };
+                        // IMPORTANT: do NOT mutate the existing order object in-place.
+                        // _updateOrder uses the previously stored object's state/type to update indices.
+                        // If we mutate first, old indices won't be cleaned up.
+                        const updatedOrder = {
+                            ...gridOrder,
+                            orderId: parsedOrder.orderId,
+                            state: ORDER_STATES.ACTIVE
+                        };
+                        this.logger.log(`Grid ${updatedOrder.id} now ACTIVE with orderId ${parsedOrder.orderId}`, 'info');
 
-                        // Always update the orderId from chain - it may have changed
-                        if (gridOrder.orderId !== parsedOrder.orderId) {
-                            this.logger.log(`Updating orderId for ${gridOrder.id}: ${oldOrderId} -> ${parsedOrder.orderId}`, 'info');
-                            // Modify in place
-                            gridOrder.orderId = parsedOrder.orderId;
-                        }
-
-                        if (!wasActive) {
-                            // Modify in place
-                            gridOrder.state = ORDER_STATES.ACTIVE;
-                            this.logger.log(`Order ${gridOrder.id} transitioned to ACTIVE with orderId ${gridOrder.orderId}`, 'info');
-                        }
-
-                        // Check price tolerance - if chain price differs too much, flag for correction
-                        const toleranceCheck = checkPriceWithinTolerance(gridOrder, parsedOrder, this.assets);
-
-                        if (!toleranceCheck.isWithinTolerance) {
-                            this.logger.log(
-                                `Price mismatch ${gridOrder.id}: gridPrice=${toleranceCheck.gridPrice.toFixed(8)}, ` +
-                                `chainPrice=${toleranceCheck.chainPrice.toFixed(8)}, diff=${toleranceCheck.priceDiff.toFixed(6)}, ` +
-                                `maxTolerance=${toleranceCheck.tolerance.toFixed(6)} - flagging for correction`,
-                                'warn'
-                            );
-                            this.ordersNeedingPriceCorrection.push({
-                                gridOrder: gridOrder,
-                                chainOrderId: parsedOrder.orderId,
-                                expectedPrice: gridOrder.price,
-                                actualPrice: parsedOrder.price,
-                                size: Number(gridOrder.size || parsedOrder.size || 0),
-                                type: gridOrder.type
-                            });
-                        }
-
-                        // Reconcile sizes to avoid funds drift when on-chain size differs
+                        // Apply chain size to updated order (reconcile sizes)
                         if (parsedOrder.size !== null && parsedOrder.size !== undefined && Number.isFinite(Number(parsedOrder.size))) {
-                            const gridSize = Number(gridOrder.size || 0);
-                            const chainSize = Number(parsedOrder.size);
-                            // Compare integers so we only log significant (on-chain) differences
-                            const precision = (gridOrder.type === ORDER_TYPES.SELL) ? assetAPrecision : assetBPrecision;
-                            const gridInt = floatToBlockchainInt(gridSize, precision);
-                            const chainInt = floatToBlockchainInt(chainSize, precision);
-                            if (gridInt !== chainInt) {
-                                this.logger.log(`Size sync ${gridOrder.id}: chain orderId=${parsedOrder.orderId}, chainPrice=${parsedOrder.price.toFixed(6)}, gridPrice=${gridOrder.price.toFixed(6)}, gridSize=${gridSize} -> chainSize=${chainSize}`, 'info');
+                            try {
+                                applyChainSizeToGridOrder(this, updatedOrder, parsedOrder.size);
+                            } catch (e) {
+                                this.logger.log(`Error applying chain size: ${e.message}`, 'warn');
                             }
-                            try { applyChainSizeToGridOrder(this, gridOrder, parsedOrder.size); } catch (e) {
-                                this.logger.log(`Error applying chain size to grid order: ${e.message}`, 'warn');
-                            }
-                        } else {
-                            this.logger.log(`Chain order ${parsedOrder.orderId} has no valid size (for_sale)`, 'debug');
                         }
-                        this._updateOrder(gridOrder);
+
+                        this._updateOrder(updatedOrder);
                     } else {
-                        this.logger.log(`No matching grid order found for chain order ${parsedOrder.orderId} (type=${parsedOrder.type}, price=${parsedOrder.price.toFixed(4)})`, 'warn');
+                        this.logger.log(`No grid match for chain ${parsedOrder.orderId} (type=${parsedOrder.type}, price=${parsedOrder.price.toFixed(4)}, size=${parsedOrder.size?.toFixed(8)})`, 'warn');
                     }
                 }
-                const missingActiveOrders = [];
+
+                // Step 2: Find grid orders not on-chain (treat as filled)
+                const unmatchedGridOrders = [];
                 for (const gridOrder of this.orders.values()) {
-                    if ((gridOrder.state === ORDER_STATES.ACTIVE || gridOrder.state === ORDER_STATES.PARTIAL) && !seenOnChain.has(gridOrder.orderId)) {
-                        this.logger.log(`Active/Partial order ${gridOrder.id} (${gridOrder.orderId}) not on-chain - treating as FILLED`, 'info');
-                        missingActiveOrders.push(gridOrder);
+                    // A grid order is missing only if its orderId is NOT present on chain.
+                    if ((gridOrder.state === ORDER_STATES.ACTIVE || gridOrder.state === ORDER_STATES.PARTIAL) && gridOrder.orderId && !seenOnChain.has(gridOrder.orderId)) {
+                        this.logger.log(`Grid order ${gridOrder.id} (${gridOrder.orderId}) not found on-chain - treating as FILLED`, 'info');
+                        unmatchedGridOrders.push(gridOrder);
                     }
                 }
 
-                // If we found missing orders, process them as fills
+                // Step 3: Find chain orders that don't match any grid order
+                // IMPORTANT: only consider orders in this market pair.
+                const unmatchedChainOrders = relevantChainOrders.filter(co => !matchedChainOrders.has(co.id));
+
+                // Summary
+                this.logger.log(`Sync summary: ${parsedCount} chain orders, ${this.orders.size} grid orders, matched=${matchedChainOrders.size}, unmatched_chain=${unmatchedChainOrders.length}, unmatched_grid=${unmatchedGridOrders.length}`, 'info');
+
+                // Process unmatched grid orders as fills
                 let rebalanceResult = { ordersToPlace: [], ordersToRotate: [] };
-                if (missingActiveOrders.length > 0) {
-                    // Create minimal order objects for processing (size/price/type/id)
-                    // we don't need full fill ops for this, just the fact they are filled
-                    // processFilledOrders expects array of order objects
-                    rebalanceResult = await this.processFilledOrders(missingActiveOrders, new Set(this.ordersNeedingPriceCorrection.map(c => c.chainOrderId)));
+                if (unmatchedGridOrders.length > 0) {
+                    rebalanceResult = await this.processFilledOrders(unmatchedGridOrders, new Set(this.ordersNeedingPriceCorrection.map(c => c.chainOrderId)));
                 }
 
-                // Log summary of orders needing correction
-                if (this.ordersNeedingPriceCorrection.length > 0) {
-                    this.logger.log(`${this.ordersNeedingPriceCorrection.length} order(s) need price correction on blockchain`, 'warn');
-                }
-
-                // Return rebalance instructions so caller can execute them if desired
-                return { newOrders, ordersNeedingCorrection: this.ordersNeedingPriceCorrection, rebalanceResult };
+                // Return results
+                return {
+                    newOrders,
+                    ordersNeedingCorrection: this.ordersNeedingPriceCorrection,
+                    rebalanceResult,
+                    unmatchedChainOrders,  // Chain orders that don't match any grid (candidates for cancel or reuse)
+                    unmatchedGridOrders    // Grid orders not on-chain (treated as filled, trigger rebalancing)
+                };
             }
         }
         return { newOrders, ordersNeedingCorrection: this.ordersNeedingPriceCorrection };
@@ -1141,9 +1171,13 @@ class OrderManager {
         let deltaBuyTotal = 0;
         let deltaSellTotal = 0;
 
+        // Check if BTS is in the trading pair and track BTS fees only if it is
+        const hasBtsPair = this.config.assetA === 'BTS' || this.config.assetB === 'BTS';
+        let btsFeesDuedThisFill = 0;
+
         for (const filledOrder of filledOrders) {
             filledCounts[filledOrder.type]++;
-            
+
             // Calculate proceeds before converting to SPREAD
             if (filledOrder.type === ORDER_TYPES.SELL) {
                 const proceeds = filledOrder.size * filledOrder.price;
@@ -1156,6 +1190,13 @@ class OrderManager {
                 const quoteName = this.config.assetB || 'quote';
                 const baseName = this.config.assetA || 'base';
                 this.logger.log(`Sell filled: +${proceeds.toFixed(8)} ${quoteName}, -${filledOrder.size.toFixed(8)} ${baseName} committed`, 'info');
+
+                // Add BTS blockchain fees if BTS is in pair (quote asset fee only when selling)
+                if (hasBtsPair && this.config.assetB === 'BTS') {
+                    const btsFee = getAssetFees('BTS', filledOrder.size);
+                    btsFeesDuedThisFill += btsFee;
+                    this.logger.log(`BTS blockchain fee for sell order: ${btsFee.toFixed(8)} BTS`, 'debug');
+                }
             } else {
                 const proceeds = filledOrder.size / filledOrder.price;
                 proceedsSell += proceeds;  // Collect, don't add yet
@@ -1167,8 +1208,15 @@ class OrderManager {
                 const quoteName = this.config.assetB || 'quote';
                 const baseName = this.config.assetA || 'base';
                 this.logger.log(`Buy filled: +${proceeds.toFixed(8)} ${baseName}, -${filledOrder.size.toFixed(8)} ${quoteName} committed`, 'info');
+
+                // Add BTS blockchain fees if BTS is in pair (base asset fee only when buying)
+                if (hasBtsPair && this.config.assetA === 'BTS') {
+                    const btsFee = getAssetFees('BTS', filledOrder.size);
+                    btsFeesDuedThisFill += btsFee;
+                    this.logger.log(`BTS blockchain fee for buy order: ${btsFee.toFixed(8)} BTS`, 'debug');
+                }
             }
-            
+
             // Convert directly to SPREAD placeholder (one step: ACTIVE -> VIRTUAL/SPREAD)
             // Create copy for update
             const updatedOrder = { ...filledOrder, type: ORDER_TYPES.SPREAD, state: ORDER_STATES.VIRTUAL, size: 0, orderId: null };
@@ -1176,6 +1224,12 @@ class OrderManager {
 
             this.currentSpreadCount++;
             this.logger.log(`Converted order ${filledOrder.id} to SPREAD`, 'debug');
+        }
+
+        // Accumulate BTS fees if applicable
+        if (hasBtsPair && btsFeesDuedThisFill > 0) {
+            this.funds.btsFeesOwed += btsFeesDuedThisFill;
+            this.logger.log(`Total BTS fees owed accumulated: ${this.funds.btsFeesOwed.toFixed(8)} BTS`, 'info');
         }
 
         // Apply proceeds directly to accountTotals so availability reflects fills immediately (no waiting for a chain refresh)
@@ -1528,7 +1582,22 @@ class OrderManager {
         // Calculate new order size using proceeds from this rotation cycle
         // Prefer pendingProceeds so sizes match the just-filled funds, not unrelated chainFree
         const side = targetType === ORDER_TYPES.BUY ? 'buy' : 'sell';
-        const availableFunds = this.funds.pendingProceeds?.[side] ?? 0;
+        let availableFunds = this.funds.pendingProceeds?.[side] ?? 0;
+
+        // Reduce available funds by BTS blockchain fees if BTS is in the pair
+        // BTS fees are deducted from the buy side (quote asset) when BTS is assetB
+        // BTS fees are deducted from the sell side (base asset) when BTS is assetA
+        const hasBtsPair = this.config.assetA === 'BTS' || this.config.assetB === 'BTS';
+        if (hasBtsPair && this.funds.btsFeesOwed > 0) {
+            const isBtsOnThisSide = (side === 'buy' && this.config.assetB === 'BTS') || (side === 'sell' && this.config.assetA === 'BTS');
+            if (isBtsOnThisSide) {
+                const feesOwedThisSide = Math.min(this.funds.btsFeesOwed, availableFunds);
+                availableFunds -= feesOwedThisSide;
+                this.funds.btsFeesOwed -= feesOwedThisSide;
+                this.logger.log(`Reducing ${side}-side order by BTS fees: ${feesOwedThisSide.toFixed(8)} BTS. Remaining fees: ${this.funds.btsFeesOwed.toFixed(8)} BTS`, 'info');
+            }
+        }
+
         const orderCount = Math.min(ordersToProcess.length, eligibleSpreadOrders.length);
         const fundsPerOrder = orderCount > 0 ? availableFunds / orderCount : 0;
 
