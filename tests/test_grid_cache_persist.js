@@ -29,7 +29,7 @@ if (!rawBefore.bots[botKey] || rawBefore.bots[botKey].cacheFunds.buy !== 123.456
 const ORDER_TYPES = require('../modules/order/constants').ORDER_TYPES;
 const manager = {
   funds: { total: { grid: { buy: 100 } }, cacheFunds: { buy: 123.456, sell: 0 } },
-  config: { botKey, incrementPercent: 1, weightDistribution: { buy: 0.5, sell: 0.5 }, profilesPath: tmpFile },
+  config: { botKey, incrementPercent: 1, weightDistribution: { buy: 0.5, sell: 0.5 } },
   logger: { log: () => {}, logFundsStatus: () => {}, logOrderGrid: () => {} },
   orders: new Map(),
   assets: { assetA: { precision: 8 }, assetB: { precision: 8 } },
@@ -47,6 +47,8 @@ for (let i = 0; i < 4; i++) {
 }
 
 // Call the function which should clear & persist cacheFunds when threshold exceeded
+// inject the AccountOrders instance so Grid uses the test DB instead of creating a new one
+manager.accountOrders = db;
 const result = Grid.checkAndUpdateGridIfNeeded(manager, manager.funds.cacheFunds);
 
 // Read back persisted file

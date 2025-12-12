@@ -674,8 +674,8 @@ class Grid {
                     manager.funds.cacheFunds.buy = 0;
                     const { AccountOrders } = require('../account_orders');
                     if (manager.config && manager.config.botKey) {
-                        const db = new AccountOrders();
-                        db.updateCacheFunds(manager.config.botKey, manager.funds.cacheFunds);
+                        const accountDb = manager.accountOrders || new AccountOrders({ profilesPath: manager.config.profilesPath });
+                        accountDb.updateCacheFunds(manager.config.botKey, manager.funds.cacheFunds);
                         manager.logger?.log && manager.logger.log(`Cleared persisted cacheFunds.buy after regeneration`, 'info');
                     } else {
                         manager.logger?.log && manager.logger.log(`Cleared in-memory cacheFunds.buy after regeneration (no botKey)`, 'info');
@@ -707,8 +707,8 @@ class Grid {
                     manager.funds.cacheFunds.sell = 0;
                     const { AccountOrders } = require('../account_orders');
                     if (manager.config && manager.config.botKey) {
-                        const db = new AccountOrders();
-                        db.updateCacheFunds(manager.config.botKey, manager.funds.cacheFunds);
+                        const accountDb = manager.accountOrders || new AccountOrders({ profilesPath: manager.config.profilesPath });
+                        accountDb.updateCacheFunds(manager.config.botKey, manager.funds.cacheFunds);
                         manager.logger?.log && manager.logger.log(`Cleared persisted cacheFunds.sell after regeneration`, 'info');
                     } else {
                         manager.logger?.log && manager.logger.log(`Cleared in-memory cacheFunds.sell after regeneration (no botKey)`, 'info');
