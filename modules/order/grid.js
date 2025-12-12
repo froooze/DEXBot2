@@ -165,89 +165,11 @@ class Grid {
         const { incrementPercent, weightDistribution: { sell: sellWeight, buy: buyWeight } } = config;
         const incrementFactor = incrementPercent / 100;
 
-        // Validate weight distribution is within acceptable range (-1 to 2)
-        const MIN_WEIGHT = -1;
-        const MAX_WEIGHT = 2;
-        if (!Number.isFinite(sellWeight) || sellWeight < MIN_WEIGHT || sellWeight > MAX_WEIGHT) {
-            throw new Error(`Invalid sell weight distribution: ${sellWeight}. Must be between ${MIN_WEIGHT} and ${MAX_WEIGHT}.`);
-        }
-        if (!Number.isFinite(buyWeight) || buyWeight < MIN_WEIGHT || buyWeight > MAX_WEIGHT) {
-            throw new Error(`Invalid buy weight distribution: ${buyWeight}. Must be between ${MIN_WEIGHT} and ${MAX_WEIGHT}.`);
-        }
-
-        // side: 'sell' or 'buy' - explicit instead of comparing weights
-        // minSize: enforce a minimum human-unit size per order; allocations below
-        // minSize are removed and their funds redistributed among remaining orders.
-        const calculateSizes = (ordersForSide, weight, totalFunds, side, minSize) => {
-            if (!Array.isArray(ordersForSide) || ordersForSide.length === 0) return [];
-            const n = ordersForSide.length;
-            // Validate totalFunds to avoid NaN propagation
-            if (!Number.isFinite(totalFunds) || totalFunds <= 0) return new Array(n).fill(0);
-
-            const reverse = (side === 'sell');
-            const base = 1 - incrementFactor;
-            // Precompute per-index raw weights
-            const rawWeights = new Array(n);
-            for (let i = 0; i < n; i++) {
-                const idx = reverse ? (n - 1 - i) : i;
-                rawWeights[i] = Math.pow(base, idx * weight);
-            }
-
-            // Compute sizes (single-pass). `remaining`/`fundsLeft` not needed
-            // since we abort the whole allocation when a per-order minimum
-            // cannot be satisfied.
-            let sizes = new Array(n).fill(0);
-
-            // Single-pass allocation. If no minSize is enforced, allocate once.
-            // If minSize is enforced, perform the allocation and abort (return zeros)
-            // when any allocated order would be below the minimum. This keeps
-            // grid-generation simple and allows the caller to abort creating
-            // the grid when the per-order minimum cannot be satisfied.
-            if (!Number.isFinite(minSize) || minSize <= 0) {
-                const totalWeight = rawWeights.reduce((s, w) => s + w, 0) || 1;
-                for (let i = 0; i < n; i++) sizes[i] = (rawWeights[i] / totalWeight) * totalFunds;
-            } else {
-                const totalWeight = rawWeights.reduce((s, w) => s + w, 0) || 1;
-                for (let i = 0; i < n; i++) sizes[i] = (rawWeights[i] / totalWeight) * totalFunds;
-                // If any allocated size is below the minimum, try a fallback:
-                // - If there are totalFunds available, retry the allocation without
-                //   enforcing the per-order minimum (i.e. minSize=0).
-                // - If totalFunds is zero or not finite, signal failure with
-                //   a zero-filled array so the caller can decide how to proceed.
-                // If precision provided for this side, compare integer representations
-                const precision = (side === 'sell') ? precisionA : precisionB;
-                let anyBelow = false;
-                if (precision !== null && precision !== undefined && Number.isFinite(precision)) {
-                    const minInt = floatToBlockchainInt(minSize, precision);
-                    anyBelow = sizes.some(sz => floatToBlockchainInt(sz, precision) < minInt);
-                } else {
-                    anyBelow = sizes.some(sz => sz < minSize - 1e-8);
-                }
-                if (anyBelow) {
-                    if (Number.isFinite(totalFunds) && totalFunds > 0) {
-                        // Retry allocation without min-size (single-pass)
-                        const fallbackTotalWeight = rawWeights.reduce((s, w) => s + w, 0) || 1;
-                        for (let i = 0; i < n; i++) sizes[i] = (rawWeights[i] / fallbackTotalWeight) * totalFunds;
-                    } else {
-                        return new Array(n).fill(0);
-                    }
-                }
-            }
-
-            // Note: intentionally not applying a residual correction here.
-            // Small floating-point rounding differences are accepted and will
-            // be handled at higher-level logic (e.g. when converting to
-            // integer chain units) rather than by altering individual
-            // allocation amounts here.
-
-            return sizes;
-        };
-
         const sellOrders = orders.filter(o => o.type === ORDER_TYPES.SELL);
         const buyOrders = orders.filter(o => o.type === ORDER_TYPES.BUY);
 
-        const sellSizes = calculateSizes(sellOrders, sellWeight, sellFunds, 'sell', minSellSize);
-        const buySizes = calculateSizes(buyOrders, buyWeight, buyFunds, 'buy', minBuySize);
+        const sellSizes = Grid._allocateByWeights(sellFunds, sellOrders.length, sellWeight, incrementFactor, true, minSellSize, precisionA);
+        const buySizes = Grid._allocateByWeights(buyFunds, buyOrders.length, buyWeight, incrementFactor, false, minBuySize, precisionB);
 
         const sizeMap = { [ORDER_TYPES.SELL]: { sizes: sellSizes, index: 0 }, [ORDER_TYPES.BUY]: { sizes: buySizes, index: 0 } };
         return orders.map(order => ({
@@ -402,11 +324,8 @@ class Grid {
         const inputFundsBuy = allocatedBuy;
         const inputFundsSell = allocatedSell;
 
-        manager.logger.log(
-            `DEBUG Grid Sizing Input: buyFunds=${inputFundsBuy.toFixed(8)} (allocated=${allocatedBuy.toFixed(8)}, total=${chainTotalBuy.toFixed(8)}, free=${chainFreeBuy.toFixed(8)}), ` +
-            `sellFunds=${inputFundsSell.toFixed(8)} (allocated=${allocatedSell.toFixed(8)}, total=${chainTotalSell.toFixed(8)}, free=${chainFreeSell.toFixed(8)})`,
-            'info'
-        );
+        const sizingSnap = Grid._getFundSnapshot(manager);
+        Grid._logSizingInput(manager, sizingSnap);
 
         // Deduct BTS createFee for orders that will be created during grid initialization
         // Only if BTS is in the trading pair
@@ -651,75 +570,34 @@ class Grid {
         const { GRID_LIMITS } = require('./constants');
         const threshold = GRID_LIMITS.GRID_REGENERATION_PERCENTAGE || 5;
 
-        const gridBuy = manager.funds?.total?.grid?.buy || 0;
-        const gridSell = manager.funds?.total?.grid?.sell || 0;
-        const cacheBuy = Number(cacheFunds?.buy || 0);
-        const cacheSell = Number(cacheFunds?.sell || 0);
+        const snap = Grid._getFundSnapshot(manager);
+        const gridBuy = snap.gridBuy;
+        const gridSell = snap.gridSell;
+        const cacheBuy = Number(cacheFunds?.buy || snap.cacheBuy || 0);
+        const cacheSell = Number(cacheFunds?.sell || snap.cacheSell || 0);
 
         const result = { buyUpdated: false, sellUpdated: false };
 
-        // Check buy side independently
-        if (gridBuy > 0) {
-            const buyRatio = (cacheBuy / gridBuy) * 100;
-            if (buyRatio >= threshold) {
-                manager.logger?.log(
-                    `Cache funds ratio for buy side: ${buyRatio.toFixed(2)}% >= ${threshold}% threshold. Updating buy order sizes.`,
-                    'info'
-                );
-                Grid.updateGridOrderSizesForSide(manager, ORDER_TYPES.BUY, cacheFunds);
-                // Clear persisted cacheFunds for buy side since we regenerated sizes
-                try {
-                    // ensure manager.funds.cacheFunds exists
-                    manager.funds.cacheFunds = manager.funds.cacheFunds || { buy: 0, sell: 0 };
-                    manager.funds.cacheFunds.buy = 0;
-                    const { AccountOrders } = require('../account_orders');
-                    if (manager.config && manager.config.botKey) {
-                        const accountDb = manager.accountOrders || new AccountOrders({ profilesPath: manager.config.profilesPath });
-                        accountDb.updateCacheFunds(manager.config.botKey, manager.funds.cacheFunds);
-                        manager.logger?.log && manager.logger.log(`Cleared persisted cacheFunds.buy after regeneration`, 'info');
-                    } else {
-                        manager.logger?.log && manager.logger.log(`Cleared in-memory cacheFunds.buy after regeneration (no botKey)`, 'info');
-                    }
-                } catch (e) {
-                    manager.logger?.log && manager.logger.log(`Failed to clear/persist cacheFunds after buy regeneration: ${e.message}`, 'warn');
-                }
-                result.buyUpdated = true;
-            } else {
-                manager.logger?.log(
-                    `Cache funds ratio for buy side: ${buyRatio.toFixed(2)}% < ${threshold}% threshold. No update needed.`,
-                    'debug'
-                );
-            }
-        }
+        const sides = [
+            { name: 'buy', grid: gridBuy, cache: cacheBuy, orderType: ORDER_TYPES.BUY },
+            { name: 'sell', grid: gridSell, cache: cacheSell, orderType: ORDER_TYPES.SELL }
+        ];
 
-        // Check sell side independently
-        if (gridSell > 0) {
-            const sellRatio = (cacheSell / gridSell) * 100;
-            if (sellRatio >= threshold) {
+        for (const s of sides) {
+            if (s.grid <= 0) continue;
+            const ratio = (s.cache / s.grid) * 100;
+            if (ratio >= threshold) {
                 manager.logger?.log(
-                    `Cache funds ratio for sell side: ${sellRatio.toFixed(2)}% >= ${threshold}% threshold. Updating sell order sizes.`,
+                    `Cache funds ratio for ${s.name} side: ${ratio.toFixed(2)}% >= ${threshold}% threshold. Updating ${s.name} order sizes.`,
                     'info'
                 );
-                Grid.updateGridOrderSizesForSide(manager, ORDER_TYPES.SELL, cacheFunds);
-                // Clear persisted cacheFunds for sell side since we regenerated sizes
-                try {
-                    manager.funds.cacheFunds = manager.funds.cacheFunds || { buy: 0, sell: 0 };
-                    manager.funds.cacheFunds.sell = 0;
-                    const { AccountOrders } = require('../account_orders');
-                    if (manager.config && manager.config.botKey) {
-                        const accountDb = manager.accountOrders || new AccountOrders({ profilesPath: manager.config.profilesPath });
-                        accountDb.updateCacheFunds(manager.config.botKey, manager.funds.cacheFunds);
-                        manager.logger?.log && manager.logger.log(`Cleared persisted cacheFunds.sell after regeneration`, 'info');
-                    } else {
-                        manager.logger?.log && manager.logger.log(`Cleared in-memory cacheFunds.sell after regeneration (no botKey)`, 'info');
-                    }
-                } catch (e) {
-                    manager.logger?.log && manager.logger.log(`Failed to clear/persist cacheFunds after sell regeneration: ${e.message}`, 'warn');
-                }
-                result.sellUpdated = true;
+                Grid.updateGridOrderSizesForSide(manager, s.orderType, cacheFunds);
+                // Clear persisted cacheFunds for this side since we regenerated sizes
+                Grid._clearAndPersistCacheFunds(manager, s.name);
+                if (s.name === 'buy') result.buyUpdated = true; else result.sellUpdated = true;
             } else {
                 manager.logger?.log(
-                    `Cache funds ratio for sell side: ${sellRatio.toFixed(2)}% < ${threshold}% threshold. No update needed.`,
+                    `Cache funds ratio for ${s.name} side: ${ratio.toFixed(2)}% < ${threshold}% threshold. No update needed.`,
                     'debug'
                 );
             }
@@ -773,17 +651,7 @@ class Grid {
         );
 
         // Update orders with new sizes
-        orders.forEach((order, i) => {
-            const newSize = newSizes[i] || 0;
-            if (Math.abs(order.size - newSize) > 1e-8) {
-                manager.logger?.log(
-                    `${sideName.charAt(0).toUpperCase() + sideName.slice(1)} ${order.id} @ ${order.price.toFixed(6)}: ${order.size.toFixed(8)} → ${newSize.toFixed(8)}`,
-                    'debug'
-                );
-                const updatedOrder = { ...order, size: newSize };
-                manager._updateOrder(updatedOrder);
-            }
-        });
+        Grid._updateOrdersForSide(manager, orderType, newSizes, orders);
 
         // Recalculate funds after updating this side
         manager.recalculateFunds();
@@ -856,30 +724,10 @@ class Grid {
         );
 
         // Update buy orders with new sizes
-        buyOrders.forEach((order, i) => {
-            const newSize = buyNewSizes[i] || 0;
-            if (Math.abs(order.size - newSize) > 1e-8) {
-                manager.logger?.log(
-                    `Buy ${order.id} @ ${order.price.toFixed(6)}: ${order.size.toFixed(8)} → ${newSize.toFixed(8)}`,
-                    'debug'
-                );
-                const updatedOrder = { ...order, size: newSize };
-                manager._updateOrder(updatedOrder);
-            }
-        });
+        Grid._updateOrdersForSide(manager, ORDER_TYPES.BUY, buyNewSizes, buyOrders);
 
         // Update sell orders with new sizes
-        sellOrders.forEach((order, i) => {
-            const newSize = sellNewSizes[i] || 0;
-            if (Math.abs(order.size - newSize) > 1e-8) {
-                manager.logger?.log(
-                    `Sell ${order.id} @ ${order.price.toFixed(6)}: ${order.size.toFixed(8)} → ${newSize.toFixed(8)}`,
-                    'debug'
-                );
-                const updatedOrder = { ...order, size: newSize };
-                manager._updateOrder(updatedOrder);
-            }
-        });
+        Grid._updateOrdersForSide(manager, ORDER_TYPES.SELL, sellNewSizes, sellOrders);
 
         // Recalculate funds after updating sizes
         manager.recalculateFunds();
@@ -887,6 +735,133 @@ class Grid {
         manager.logger?.log('Grid order sizes updated', 'info');
         manager.logger?.logFundsStatus && manager.logger.logFundsStatus(manager);
         manager.logger?.logOrderGrid && manager.logger.logOrderGrid(Array.from(manager.orders.values()), config.marketPrice);
+    }
+
+    /**
+     * Clear and persist cacheFunds for a given side ('buy' or 'sell').
+     * Centralizes duplicated logic used after grid regeneration.
+     */
+    static _clearAndPersistCacheFunds(manager, side) {
+        try {
+            manager.funds.cacheFunds = manager.funds.cacheFunds || { buy: 0, sell: 0 };
+            manager.funds.cacheFunds[side] = 0;
+            const { AccountOrders } = require('../account_orders');
+            if (manager.config && manager.config.botKey) {
+                const accountDb = manager.accountOrders || new AccountOrders({ profilesPath: manager.config.profilesPath });
+                accountDb.updateCacheFunds(manager.config.botKey, manager.funds.cacheFunds);
+                manager.logger?.log && manager.logger.log(`Cleared persisted cacheFunds.${side} after regeneration`, 'info');
+            } else {
+                manager.logger?.log && manager.logger.log(`Cleared in-memory cacheFunds.${side} after regeneration (no botKey)`, 'info');
+            }
+        } catch (e) {
+            manager.logger?.log && manager.logger.log(`Failed to clear/persist cacheFunds after ${side} regeneration: ${e.message}`, 'warn');
+        }
+    }
+
+    /**
+     * Update a collection of orders for a specific side using provided sizes.
+     * Centralizes duplicated buy/sell update loops.
+     * @param {Object} manager
+     * @param {string} orderType
+     * @param {Array<number>} newSizes
+     * @param {Array<Object>} [orders] - optional pre-fetched orders
+     */
+    static _updateOrdersForSide(manager, orderType, newSizes, orders = null) {
+        const isBuy = orderType === ORDER_TYPES.BUY;
+        const sideName = isBuy ? 'buy' : 'sell';
+        const ords = Array.isArray(orders) ? orders : Array.from(manager.orders.values()).filter(o => o.type === orderType);
+        if (ords.length === 0) {
+            manager.logger?.log(`No ${sideName} orders found to update`, 'warn');
+            return;
+        }
+
+        ords.forEach((order, i) => {
+            const newSize = newSizes[i] || 0;
+            if (Math.abs(order.size - newSize) > 1e-8) {
+                manager.logger?.log(
+                    `${sideName.charAt(0).toUpperCase() + sideName.slice(1)} ${order.id} @ ${order.price.toFixed(6)}: ${order.size.toFixed(8)} → ${newSize.toFixed(8)}`,
+                    'debug'
+                );
+                const updatedOrder = { ...order, size: newSize };
+                manager._updateOrder(updatedOrder);
+            }
+        });
+    }
+
+    /**
+     * Allocate `totalFunds` across `n` slots using geometric weights.
+     * Handles reverse ordering, min-size checks with precision-aware integer
+     * comparison, and a fallback retry without min-size enforcement.
+     *
+     * @returns {Array<number>} sizes
+     */
+    static _allocateByWeights(totalFunds, n, weight, incrementFactor, reverse = false, minSize = 0, precision = null) {
+        if (n <= 0) return [];
+        if (!Number.isFinite(totalFunds) || totalFunds <= 0) return new Array(n).fill(0);
+
+        const MIN_WEIGHT = -1;
+        const MAX_WEIGHT = 2;
+        if (!Number.isFinite(weight) || weight < MIN_WEIGHT || weight > MAX_WEIGHT) {
+            throw new Error(`Invalid weight distribution: ${weight}. Must be between ${MIN_WEIGHT} and ${MAX_WEIGHT}.`);
+        }
+
+        const base = 1 - incrementFactor;
+        const rawWeights = new Array(n);
+        for (let i = 0; i < n; i++) {
+            const idx = reverse ? (n - 1 - i) : i;
+            rawWeights[i] = Math.pow(base, idx * weight);
+        }
+
+        const sizes = new Array(n).fill(0);
+        const totalWeight = rawWeights.reduce((s, w) => s + w, 0) || 1;
+        for (let i = 0; i < n; i++) sizes[i] = (rawWeights[i] / totalWeight) * totalFunds;
+
+        if (Number.isFinite(minSize) && minSize > 0) {
+            let anyBelow = false;
+            if (precision !== null && precision !== undefined && Number.isFinite(precision)) {
+                const minInt = floatToBlockchainInt(minSize, precision);
+                anyBelow = sizes.some(sz => floatToBlockchainInt(sz, precision) < minInt);
+            } else {
+                anyBelow = sizes.some(sz => sz < minSize - 1e-8);
+            }
+
+            if (anyBelow && Number.isFinite(totalFunds) && totalFunds > 0) {
+                const fallbackTotalWeight = rawWeights.reduce((s, w) => s + w, 0) || 1;
+                for (let i = 0; i < n; i++) sizes[i] = (rawWeights[i] / fallbackTotalWeight) * totalFunds;
+            }
+        }
+
+        return sizes;
+    }
+
+    /**
+     * Return a normalized funds snapshot for the manager.
+     * Includes chain/allocated/grid/cache/virtuel totals used across sizing.
+     */
+    static _getFundSnapshot(manager) {
+        const mgrSnap = (manager.getChainFundsSnapshot && typeof manager.getChainFundsSnapshot === 'function') ? manager.getChainFundsSnapshot() : {};
+        return {
+            chainFreeBuy: Number(mgrSnap.chainFreeBuy || 0),
+            chainFreeSell: Number(mgrSnap.chainFreeSell || 0),
+            chainTotalBuy: Number(mgrSnap.chainTotalBuy || 0),
+            chainTotalSell: Number(mgrSnap.chainTotalSell || 0),
+            allocatedBuy: Number(mgrSnap.allocatedBuy || 0),
+            allocatedSell: Number(mgrSnap.allocatedSell || 0),
+            gridBuy: Number(manager.funds?.total?.grid?.buy || 0),
+            gridSell: Number(manager.funds?.total?.grid?.sell || 0),
+            cacheBuy: Number(manager.funds?.cacheFunds?.buy || 0),
+            cacheSell: Number(manager.funds?.cacheFunds?.sell || 0),
+            virtuelBuy: Number(manager.funds?.virtuel?.buy || 0),
+            virtuelSell: Number(manager.funds?.virtuel?.sell || 0),
+        };
+    }
+
+    static _logSizingInput(manager, snap) {
+        manager.logger.log(
+            `DEBUG Grid Sizing Input: buyFunds=${Number(snap.allocatedBuy).toFixed(8)} (allocated=${Number(snap.allocatedBuy).toFixed(8)}, total=${Number(snap.chainTotalBuy).toFixed(8)}, free=${Number(snap.chainFreeBuy).toFixed(8)}), ` +
+            `sellFunds=${Number(snap.allocatedSell).toFixed(8)} (allocated=${Number(snap.allocatedSell).toFixed(8)}, total=${Number(snap.chainTotalSell).toFixed(8)}, free=${Number(snap.chainFreeSell).toFixed(8)})`,
+            'info'
+        );
     }
 
     /**
@@ -927,56 +902,11 @@ class Grid {
         }
 
         const { incrementPercent, weightDistribution } = config;
-        const weight = (orderType === ORDER_TYPES.SELL) ? weightDistribution.sell : weightDistribution.buy;
         const incrementFactor = incrementPercent / 100;
 
-        // Validate weight is within acceptable range
-        const MIN_WEIGHT = -1;
-        const MAX_WEIGHT = 2;
-        if (!Number.isFinite(weight) || weight < MIN_WEIGHT || weight > MAX_WEIGHT) {
-            throw new Error(`Invalid weight distribution: ${weight}. Must be between ${MIN_WEIGHT} and ${MAX_WEIGHT}.`);
-        }
-
-        const n = orderCount;
+        const weight = (orderType === ORDER_TYPES.SELL) ? weightDistribution.sell : weightDistribution.buy;
         const reverse = (orderType === ORDER_TYPES.SELL);
-        const base = 1 - incrementFactor;
-
-        // Precompute raw weights using geometric formula
-        const rawWeights = new Array(n);
-        for (let i = 0; i < n; i++) {
-            const idx = reverse ? (n - 1 - i) : i;
-            rawWeights[i] = Math.pow(base, idx * weight);
-        }
-
-        // Allocate funds based on weights
-        let sizes = new Array(n).fill(0);
-        const totalWeight = rawWeights.reduce((s, w) => s + w, 0) || 1;
-
-        // Single-pass allocation
-        for (let i = 0; i < n; i++) {
-            sizes[i] = (rawWeights[i] / totalWeight) * totalFunds;
-        }
-
-        // Check if any size is below minimum threshold
-        if (Number.isFinite(minSize) && minSize > 0) {
-            let anyBelow = false;
-            if (precision !== null && precision !== undefined && Number.isFinite(precision)) {
-                const minInt = floatToBlockchainInt(minSize, precision);
-                anyBelow = sizes.some(sz => floatToBlockchainInt(sz, precision) < minInt);
-            } else {
-                anyBelow = sizes.some(sz => sz < minSize - 1e-8);
-            }
-
-            // If any size is below minimum and we have funds, retry without minimum enforcement
-            if (anyBelow && Number.isFinite(totalFunds) && totalFunds > 0) {
-                const fallbackTotalWeight = rawWeights.reduce((s, w) => s + w, 0) || 1;
-                for (let i = 0; i < n; i++) {
-                    sizes[i] = (rawWeights[i] / fallbackTotalWeight) * totalFunds;
-                }
-            }
-        }
-
-        return sizes;
+        return Grid._allocateByWeights(totalFunds, orderCount, weight, incrementFactor, reverse, minSize, precision);
     }
 }
 
