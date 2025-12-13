@@ -77,6 +77,12 @@ const Logger = require('./logger');
  * ├─────────────────────────────────────────────────────────────────────────┤
  * │ pendingProceeds = Temporary fill proceeds awaiting rotation            │
  * │                   Cleared after rotation consumes the funds            │
+ * ├─────────────────────────────────────────────────────────────────────────┤
+ * │ cacheFunds   = Leftover funds from rotation sizing (below precision)   │
+ * │               Persisted per-bot for consistent grid rebuilding         │
+ * ├─────────────────────────────────────────────────────────────────────────┤
+ * │ btsFeesOwed  = BTS blockchain fees from filled orders                  │
+ * │               Only tracked if BTS is in the trading pair               │
  * └─────────────────────────────────────────────────────────────────────────┘
  * 
  * Fund lifecycle:
