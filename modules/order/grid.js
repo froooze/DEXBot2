@@ -128,7 +128,7 @@ class Grid {
         try {
             await manager._initializeAssets();
         } catch (e) {
-            manager.logger && manager.logger.log && manager.logger.log(`Warning: Failed to initialize assets during loadGrid: ${e.message}`, 'warn');
+            manager.logger?.log?.(`Warning: Failed to initialize assets during loadGrid: ${e.message}`, 'warn');
         }
 
         // Clear manager state and indices then load the grid entries
@@ -141,7 +141,7 @@ class Grid {
             // Note: recalculateFunds() is called by _updateOrder, so funds are auto-updated
         });
         manager.logger.log(`Loaded ${manager.orders.size} orders from persisted grid state.`, 'info');
-        manager.logger && manager.logger.logFundsStatus && manager.logger.logFundsStatus(manager);
+        manager.logger?.logFundsStatus?.(manager);
     }
 
     /**
@@ -204,12 +204,12 @@ class Grid {
                     try {
                         const p = await derivePrice(BitShares, symA, symB, 'pool');
                         if (p !== null) manager.config.marketPrice = p;
-                    } catch (e) { manager.logger && manager.logger.log && manager.logger.log(`Pool price lookup failed: ${e && e.message ? e.message : e}`, 'warn'); }
+                    } catch (e) { manager.logger?.log?.(`Pool price lookup failed: ${e?.message || e}`, 'warn'); }
                 } else if ((mpIsMarket || manager.config.market) && symA && symB) {
                     try {
                         const m = await derivePrice(BitShares, symA, symB, 'market');
                         if (m !== null) manager.config.marketPrice = m;
-                    } catch (e) { manager.logger && manager.logger.log && manager.logger.log(`Market price lookup failed: ${e && e.message ? e.message : e}`, 'warn'); }
+                    } catch (e) { manager.logger?.log?.(`Market price lookup failed: ${e?.message || e}`, 'warn'); }
                 }
 
                 try {
@@ -221,9 +221,9 @@ class Grid {
                             console.log('Derived marketPrice from on-chain (derivePrice)', manager.config.assetA + '/' + manager.config.assetB, tryP);
                         }
                     }
-                } catch (e) { manager.logger && manager.logger.log && manager.logger.log(`auto-derive marketPrice failed: ${e && e.message ? e.message : e}`, 'warn'); }
+                } catch (e) { manager.logger?.log?.(`auto-derive marketPrice failed: ${e?.message || e}`, 'warn'); }
             } catch (err) {
-                manager.logger && manager.logger.log && manager.logger.log(`auto-derive marketPrice failed: ${err && err.message ? err.message : err}`, 'warn');
+                manager.logger?.log?.(`auto-derive marketPrice failed: ${err?.message || err}`, 'warn');
             }
         }
 
@@ -275,16 +275,16 @@ class Grid {
                 const haveBuy = manager.accountTotals && manager.accountTotals.buy !== null && manager.accountTotals.buy !== undefined && Number.isFinite(Number(manager.accountTotals.buy));
                 const haveSell = manager.accountTotals && manager.accountTotals.sell !== null && manager.accountTotals.sell !== undefined && Number.isFinite(Number(manager.accountTotals.sell));
                 if (haveBuy && haveSell) {
-                    manager.logger && manager.logger.log && manager.logger.log('Account totals already available; skipping blocking fetch.', 'debug');
+                    manager.logger?.log?.('Account totals already available; skipping blocking fetch.', 'debug');
                 } else {
                     const timeoutMs = Number.isFinite(Number(manager.config.waitForAccountTotalsMs)) ? Number(manager.config.waitForAccountTotalsMs) : 10000;
-                    manager.logger && manager.logger.log && manager.logger.log(`Waiting up to ${timeoutMs}ms for on-chain account totals to resolve percentage-based botFunds...`, 'info');
+                    manager.logger?.log?.(`Waiting up to ${timeoutMs}ms for on-chain account totals to resolve percentage-based botFunds...`, 'info');
                     try {
                         if (!manager._isFetchingTotals) { manager._isFetchingTotals = true; manager._fetchAccountBalancesAndSetTotals().finally(() => { manager._isFetchingTotals = false; }); }
                         await manager.waitForAccountTotals(timeoutMs);
-                        manager.logger && manager.logger.log && manager.logger.log('Account totals fetch completed (or timed out).', 'info');
+                        manager.logger?.log?.('Account totals fetch completed (or timed out).', 'info');
                     } catch (err) {
-                        manager.logger && manager.logger.log && manager.logger.log(`Account totals fetch failed: ${err && err.message ? err.message : err}`, 'warn');
+                        manager.logger?.log?.(`Account totals fetch failed: ${err?.message || err}`, 'warn');
                     }
                 }
             }
@@ -303,7 +303,7 @@ class Grid {
 
         const diagMsg = `Allocating sizes: sellFunds=${String(manager.funds.available.sell)}, buyFunds=${String(manager.funds.available.buy)}, ` +
             `minSellSize=${String(minSellSize)}, minBuySize=${String(minBuySize)}`;
-        manager.logger && manager.logger.log && manager.logger.log(diagMsg, 'debug');
+        manager.logger?.log?.(diagMsg, 'debug');
 
         const precA = manager.assets?.assetA?.precision;
         const precB = manager.assets?.assetB?.precision;
@@ -354,7 +354,7 @@ class Grid {
                     );
                 }
             } catch (err) {
-                manager.logger && manager.logger.log && manager.logger.log(
+                manager.logger?.log?.(
                     `Warning: Could not calculate BTS creation fees: ${err.message}`,
                     'warn'
                 );
@@ -429,7 +429,7 @@ class Grid {
                 if (anySellBelow) parts.push(`sell.min=${String(minSellSize)}`);
                 if (anyBuyBelow) parts.push(`buy.min=${String(minBuySize)}`);
                 const msg = `Order grid contains orders below minimum size (${parts.join(', ')}). Aborting startup to avoid placing undersized orders.`;
-                manager.logger && manager.logger.log && manager.logger.log(msg, 'error');
+                manager.logger?.log?.(msg, 'error');
                 throw new Error(msg);
             }
 
@@ -489,8 +489,8 @@ class Grid {
         manager.logger.log(`DEBUG Grid Init: chainFree.sell=${chainFreeSell.toFixed(8)}, virtuel.sell=${virtuelSell.toFixed(8)}, discrepancy=${discrepancySell.toFixed(8)}`, 'info');
 
         manager.logger.log(`Initialized order grid with ${orders.length} orders`, 'info'); manager.logger.log(`Configured activeOrders: buy=${manager.config.activeOrders.buy}, sell=${manager.config.activeOrders.sell}`, 'info');
-        manager.logger && manager.logger.logFundsStatus && manager.logger.logFundsStatus(manager);
-        manager.logger && manager.logger.logOrderGrid && manager.logger.logOrderGrid(Array.from(manager.orders.values()), manager.config.marketPrice);
+        manager.logger?.logFundsStatus?.(manager);
+        manager.logger?.logOrderGrid?.(Array.from(manager.orders.values()), manager.config.marketPrice);
     }
 
     /**
@@ -530,7 +530,7 @@ class Grid {
             Grid._clearAndPersistCacheFunds(manager, 'buy');
             Grid._clearAndPersistCacheFunds(manager, 'sell');
         } catch (e) {
-            manager.logger?.log && manager.logger.log && manager.logger.log(`Warning: failed to clear persisted cacheFunds during recalc: ${e.message}`, 'warn');
+            manager.logger?.log?.(`Warning: failed to clear persisted cacheFunds during recalc: ${e.message}`, 'warn');
         }
 
         const chainOpenOrders = await readOpenOrdersFn();
@@ -556,7 +556,7 @@ class Grid {
         });
 
         manager.logger.log('Full grid resynchronization complete.', 'info');
-        manager.logger && manager.logger.logFundsStatus && manager.logger.logFundsStatus(manager);
+        manager.logger?.logFundsStatus?.(manager);
         manager.logger.logOrderGrid(Array.from(manager.orders.values()), manager.config.marketPrice);
     }
 
@@ -945,12 +945,12 @@ class Grid {
             if (manager.config && manager.config.botKey) {
                 const accountDb = manager.accountOrders || new AccountOrders({ profilesPath: manager.config.profilesPath });
                 accountDb.updateCacheFunds(manager.config.botKey, manager.funds.cacheFunds);
-                manager.logger?.log && manager.logger.log(`Cleared persisted cacheFunds.${side} after regeneration`, 'info');
+                manager.logger?.log?.(`Cleared persisted cacheFunds.${side} after regeneration`, 'info');
             } else {
-                manager.logger?.log && manager.logger.log(`Cleared in-memory cacheFunds.${side} after regeneration (no botKey)`, 'info');
+                manager.logger?.log?.(`Cleared in-memory cacheFunds.${side} after regeneration (no botKey)`, 'info');
             }
         } catch (e) {
-            manager.logger?.log && manager.logger.log(`Failed to clear/persist cacheFunds after ${side} regeneration: ${e.message}`, 'warn');
+            manager.logger?.log?.(`Failed to clear/persist cacheFunds after ${side} regeneration: ${e.message}`, 'warn');
         }
     }
 
@@ -1011,21 +1011,6 @@ class Grid {
         const sizes = new Array(n).fill(0);
         const totalWeight = rawWeights.reduce((s, w) => s + w, 0) || 1;
         for (let i = 0; i < n; i++) sizes[i] = (rawWeights[i] / totalWeight) * totalFunds;
-
-        if (Number.isFinite(minSize) && minSize > 0) {
-            let anyBelow = false;
-            if (precision !== null && precision !== undefined && Number.isFinite(precision)) {
-                const minInt = floatToBlockchainInt(minSize, precision);
-                anyBelow = sizes.some(sz => floatToBlockchainInt(sz, precision) < minInt);
-            } else {
-                anyBelow = sizes.some(sz => sz < minSize - 1e-8);
-            }
-
-            if (anyBelow && Number.isFinite(totalFunds) && totalFunds > 0) {
-                const fallbackTotalWeight = rawWeights.reduce((s, w) => s + w, 0) || 1;
-                for (let i = 0; i < n; i++) sizes[i] = (rawWeights[i] / fallbackTotalWeight) * totalFunds;
-            }
-        }
 
         return sizes;
     }
