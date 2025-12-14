@@ -132,6 +132,7 @@ class AccountOrders {
           meta,
           grid: [],
           cacheFunds: { buy: 0, sell: 0 },
+          pendingProceeds: { buy: 0, sell: 0 },
           createdAt: meta.createdAt,
           lastUpdated: meta.updatedAt
         };
@@ -141,6 +142,12 @@ class AccountOrders {
         // Ensure cacheFunds exists even for existing bots
         if (!entry.cacheFunds || typeof entry.cacheFunds.buy !== 'number') {
           entry.cacheFunds = { buy: 0, sell: 0 };
+          changed = true;
+        }
+
+        // Ensure pendingProceeds exists even for existing bots
+        if (!entry.pendingProceeds || typeof entry.pendingProceeds.buy !== 'number' || typeof entry.pendingProceeds.sell !== 'number') {
+          entry.pendingProceeds = { buy: 0, sell: 0 };
           changed = true;
         }
 
