@@ -100,13 +100,13 @@ class Logger {
         const buy = c.buy;
         const sell = c.sell;
 
-        console.log(`${debug}funds.available:${reset} ${buy}Buy ${gridBuy} ${buyName}${reset} | ${sell}Sell ${gridSell} ${sellName}${reset}`);
-        console.log(`${debug}total.chain:${reset} ${buy}Buy ${totalChainBuy.toFixed(8)} ${buyName}${reset} | ${sell}Sell ${totalChainSell.toFixed(8)} ${sellName}${reset}`);
-        console.log(`${debug}total.grid:${reset} ${buy}Buy ${totalGridBuy.toFixed(8)} ${buyName}${reset} | ${sell}Sell ${totalGridSell.toFixed(8)} ${sellName}${reset}`);
-        console.log(`${debug}virtuel.grid:${reset} ${buy}Buy ${virtuelBuy.toFixed(8)} ${buyName}${reset} | ${sell}Sell ${virtuelSell.toFixed(8)} ${sellName}${reset}`);
-        console.log(`${debug}cacheFunds:${reset} ${buy}Buy ${cacheBuy.toFixed(8)} ${buyName}${reset} | ${sell}Sell ${cacheSell.toFixed(8)} ${sellName}${reset}`);
-        console.log(`${debug}committed.grid:${reset} ${buy}Buy ${committedGridBuy.toFixed(8)} ${buyName}${reset} | ${sell}Sell ${committedGridSell.toFixed(8)} ${sellName}${reset}`);
-        console.log(`${debug}committed.chain:${reset} ${buy}Buy ${committedChainBuy.toFixed(8)} ${buyName}${reset} | ${sell}Sell ${committedChainSell.toFixed(8)} ${sellName}${reset}`);
+        console.log(`funds.available: ${buy}Buy ${gridBuy}${reset} ${buyName} | ${sell}Sell ${gridSell}${reset} ${sellName}`);
+        console.log(`total.chain: ${buy}Buy ${totalChainBuy.toFixed(8)}${reset} ${buyName} | ${sell}Sell ${totalChainSell.toFixed(8)}${reset} ${sellName}`);
+        console.log(`total.grid: ${buy}Buy ${totalGridBuy.toFixed(8)}${reset} ${buyName} | ${sell}Sell ${totalGridSell.toFixed(8)}${reset} ${sellName}`);
+        console.log(`virtuel.grid: ${buy}Buy ${virtuelBuy.toFixed(8)}${reset} ${buyName} | ${sell}Sell ${virtuelSell.toFixed(8)}${reset} ${sellName}`);
+        console.log(`cacheFunds: ${buy}Buy ${cacheBuy.toFixed(8)}${reset} ${buyName} | ${sell}Sell ${cacheSell.toFixed(8)}${reset} ${sellName}`);
+        console.log(`committed.grid: ${buy}Buy ${committedGridBuy.toFixed(8)}${reset} ${buyName} | ${sell}Sell ${committedGridSell.toFixed(8)}${reset} ${sellName}`);
+        console.log(`committed.chain: ${buy}Buy ${committedChainBuy.toFixed(8)}${reset} ${buyName} | ${sell}Sell ${committedChainSell.toFixed(8)}${reset} ${sellName}`);
     }
 
     // Print a comprehensive status summary using manager state.
@@ -143,13 +143,13 @@ class Logger {
         const buy = c.buy;
         const sell = c.sell;
 
-        console.log(`${debug}funds.available:${reset} ${buy}Buy ${gridBuy} ${buyName}${reset} | ${sell}Sell ${gridSell} ${sellName}${reset}`);
-        console.log(`${debug}total.chain:${reset} ${buy}Buy ${totalChainBuy.toFixed(8)} ${buyName}${reset} | ${sell}Sell ${totalChainSell.toFixed(8)} ${sellName}${reset}`);
-        console.log(`${debug}total.grid:${reset} ${buy}Buy ${totalGridBuy.toFixed(8)} ${buyName}${reset} | ${sell}Sell ${totalGridSell.toFixed(8)} ${sellName}${reset}`);
-        console.log(`${debug}virtuel.grid:${reset} ${buy}Buy ${virtuelBuy.toFixed(8)} ${buyName}${reset} | ${sell}Sell ${virtuelSell.toFixed(8)} ${sellName}${reset}`);
-        console.log(`${debug}cacheFunds:${reset} ${buy}Buy ${cacheBuy.toFixed(8)} ${buyName}${reset} | ${sell}Sell ${cacheSell.toFixed(8)} ${sellName}${reset}`);
-        console.log(`${debug}committed.grid:${reset} ${buy}Buy ${committedGridBuy.toFixed(8)} ${buyName}${reset} | ${sell}Sell ${committedGridSell.toFixed(8)} ${sellName}${reset}`);
-        console.log(`${debug}committed.chain:${reset} ${buy}Buy ${committedChainBuy.toFixed(8)} ${buyName}${reset} | ${sell}Sell ${committedChainSell.toFixed(8)} ${sellName}${reset}`);
+        console.log(`funds.available: ${buy}Buy ${gridBuy}${reset} ${buyName} | ${sell}Sell ${gridSell}${reset} ${sellName}`);
+        console.log(`total.chain: ${buy}Buy ${totalChainBuy.toFixed(8)}${reset} ${buyName} | ${sell}Sell ${totalChainSell.toFixed(8)}${reset} ${sellName}`);
+        console.log(`total.grid: ${buy}Buy ${totalGridBuy.toFixed(8)}${reset} ${buyName} | ${sell}Sell ${totalGridSell.toFixed(8)}${reset} ${sellName}`);
+        console.log(`virtuel.grid: ${buy}Buy ${virtuelBuy.toFixed(8)}${reset} ${buyName} | ${sell}Sell ${virtuelSell.toFixed(8)}${reset} ${sellName}`);
+        console.log(`cacheFunds: ${buy}Buy ${cacheBuy.toFixed(8)}${reset} ${buyName} | ${sell}Sell ${cacheSell.toFixed(8)}${reset} ${sellName}`);
+        console.log(`committed.grid: ${buy}Buy ${committedGridBuy.toFixed(8)}${reset} ${buyName} | ${sell}Sell ${committedGridSell.toFixed(8)}${reset} ${sellName}`);
+        console.log(`committed.chain: ${buy}Buy ${committedChainBuy.toFixed(8)}${reset} ${buyName} | ${sell}Sell ${committedChainSell.toFixed(8)}${reset} ${sellName}`);
         console.log(`Orders: Virtual ${virtualOrders.length} | Active ${activeOrders.length} | Partial ${partialOrders.length}`);
         console.log(`Spreads: ${manager.currentSpreadCount}/${manager.targetSpreadCount}`);
         // calculateCurrentSpread may exist on manager

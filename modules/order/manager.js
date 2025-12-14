@@ -34,7 +34,7 @@
  * 3. Order fill: pendingProceeds set with fill value, available increases temporarily
  * 4. After rotation: pendingProceeds cleared as funds are consumed by new orders
  */
-const { ORDER_TYPES, ORDER_STATES, DEFAULT_CONFIG, TIMING, GRID_LIMITS } = require('./constants');
+const { ORDER_TYPES, ORDER_STATES, DEFAULT_CONFIG, TIMING, GRID_LIMITS, LOG_LEVEL } = require('./constants');
 const { parsePercentageString, blockchainToFloat, floatToBlockchainInt, resolveRelativePrice, calculatePriceTolerance, checkPriceWithinTolerance, parseChainOrder, findMatchingGridOrderByOpenOrder, findMatchingGridOrderByHistory, applyChainSizeToGridOrder, correctOrderPriceOnChain, getMinOrderSize, getAssetFees } = require('./utils');
 const Logger = require('./logger');
 // Grid functions (initialize/recalculate) are intended to be
@@ -113,7 +113,7 @@ class OrderManager {
     constructor(config = {}) {
         this.config = { ...DEFAULT_CONFIG, ...config };
         this.marketName = this.config.market || (this.config.assetA && this.config.assetB ? `${this.config.assetA}/${this.config.assetB}` : null);
-        this.logger = new Logger('info');
+        this.logger = new Logger(LOG_LEVEL);
         this.logger.marketName = this.marketName;
         this.orders = new Map();
         // Indices for fast lookup by state and type (optimization)
@@ -599,11 +599,11 @@ class OrderManager {
             return { filledOrders: [], updatedOrders: [], ordersNeedingCorrection: [] };
         }
 
-        this.logger.log(`syncFromOpenOrders: Processing ${chainOrders.length} open orders from blockchain`, 'info');
+        this.logger.log(`syncFromOpenOrders: Processing ${chainOrders.length} open orders from blockchain`, 'debug');
 
         // DEBUG: Check assets
         if (this.assets) {
-            this.logger.log(`DEBUG: Assets loaded: A=${this.assets.assetA?.symbol}(${this.assets.assetA?.id}), B=${this.assets.assetB?.symbol}(${this.assets.assetB?.id})`, 'info');
+            this.logger.log(`DEBUG: Assets loaded: A=${this.assets.assetA?.symbol}(${this.assets.assetA?.id}), B=${this.assets.assetB?.symbol}(${this.assets.assetB?.id})`, 'debug');
         } else {
             this.logger.log(`DEBUG: ERROR - this.assets is missing!`, 'error');
         }
@@ -629,7 +629,7 @@ class OrderManager {
                 this.logger.log(`DEBUG: Failed to parse chain order ${chainOrder.id}`, 'warn');
             }
         }
-        this.logger.log(`DEBUG: Parsed ${parsedChainOrders.size} valid chain orders.`, 'info');
+        this.logger.log(`DEBUG: Parsed ${parsedChainOrders.size} valid chain orders.`, 'debug');
 
         const filledOrders = [];
         const updatedOrders = [];
@@ -792,7 +792,7 @@ class OrderManager {
 
         // Log fill info if provided
         if (fillInfo && fillInfo.pays && fillInfo.receives) {
-            this.logger.log(`Fill event: pays ${fillInfo.pays.amount} (${fillInfo.pays.asset_id}), receives ${fillInfo.receives.amount} (${fillInfo.receives.asset_id})`, 'info');
+            this.logger.log(`Fill event: pays ${fillInfo.pays.amount} (${fillInfo.pays.asset_id}), receives ${fillInfo.receives.amount} (${fillInfo.receives.asset_id})`, 'debug');
         }
 
         // Log summary of orders needing correction
@@ -829,8 +829,8 @@ class OrderManager {
         const receivesAmount = fillOp.receives ? Number(fillOp.receives.amount) : 0;
         const receivesAssetId = fillOp.receives ? fillOp.receives.asset_id : null;
 
-        this.logger.log(`syncFromFillHistory: Processing fill for order_id=${orderId}`, 'info');
-        this.logger.log(`  Pays: ${paysAmount} (${paysAssetId}), Receives: ${receivesAmount} (${receivesAssetId})`, 'info');
+        this.logger.log(`syncFromFillHistory: Processing fill for order_id=${orderId}`, 'debug');
+        this.logger.log(`  Pays: ${paysAmount} (${paysAssetId}), Receives: ${receivesAmount} (${receivesAssetId})`, 'debug');
 
         const filledOrders = [];
         const updatedOrders = [];
@@ -850,7 +850,7 @@ class OrderManager {
             return { filledOrders, updatedOrders, partialFill };
         }
 
-        this.logger.log(`syncFromFillHistory: Matched order_id=${orderId} to grid order ${matchedGridOrder.id} (type=${matchedGridOrder.type})`, 'info');
+        this.logger.log(`syncFromFillHistory: Matched order_id=${orderId} to grid order ${matchedGridOrder.id} (type=${matchedGridOrder.type})`, 'debug');
 
         // Determine the fill amount based on order type and which asset was paid
         // For SELL orders: pays is assetA (what we're selling)
@@ -880,8 +880,6 @@ class OrderManager {
 
         const newSize = Math.max(0, currentSize - filledAmount);
 
-        this.logger.log(`syncFromFillHistory: Order ${matchedGridOrder.id} filled ${filledAmount.toFixed(8)}, size ${currentSize.toFixed(8)} -> ${newSize.toFixed(8)}`, 'info');
-
         // Check if fully filled or partially filled
         // Use blockchain integer comparison for precision
         const precision = (orderType === ORDER_TYPES.SELL) ? assetAPrecision : assetBPrecision;
@@ -889,7 +887,7 @@ class OrderManager {
 
         if (newSizeInt <= 0) {
             // Fully filled
-            this.logger.log(`syncFromFillHistory: Order ${matchedGridOrder.id} (${orderId}) FULLY FILLED`, 'info');
+            this.logger.log(`Order ${matchedGridOrder.id} (${orderId}) FULLY FILLED (filled ${filledAmount.toFixed(8)})`, 'info');
             const filledOrder = { ...matchedGridOrder };
 
             // Create copy for update
@@ -899,7 +897,7 @@ class OrderManager {
             filledOrders.push(filledOrder);
         } else {
             // Partially filled - transition to PARTIAL state
-            this.logger.log(`syncFromFillHistory: Order ${matchedGridOrder.id} (${orderId}) PARTIALLY FILLED, remaining=${newSize.toFixed(8)}`, 'info');
+            this.logger.log(`Order ${matchedGridOrder.id} (${orderId}) PARTIALLY FILLED: ${filledAmount.toFixed(8)} filled, remaining ${newSize.toFixed(8)}`, 'info');
 
             // Create copy for update
             const updatedOrder = { ...matchedGridOrder };
@@ -929,7 +927,7 @@ class OrderManager {
             this.logger.log('Asset metadata not available, cannot synchronize.', 'warn');
             return { newOrders: [], ordersNeedingCorrection: [] };
         }
-        this.logger.log(`Syncing from ${source}`, 'info');
+        this.logger.log(`Syncing from ${source}`, 'debug');
         // Cache asset precisions for hot paths
         const assetAPrecision = this.assets?.assetA?.precision;
         const assetBPrecision = this.assets?.assetB?.precision;
@@ -938,7 +936,7 @@ class OrderManager {
         if (source === 'readOpenOrders') {
             this.ordersNeedingPriceCorrection = [];
         }
-        this.logger.log(`DEBUG: synchronizeWithChain entering switch, source=${source}, chainData.length=${Array.isArray(chainData) ? chainData.length : 'N/A'}`, 'info');
+        this.logger.log(`DEBUG: synchronizeWithChain entering switch, source=${source}, chainData.length=${Array.isArray(chainData) ? chainData.length : 'N/A'}`, 'debug');
         switch (source) {
             case 'createOrder': {
                 const { gridOrderId, chainOrderId } = chainData;
@@ -989,7 +987,7 @@ class OrderManager {
                 const matchedChainOrders = new Set();  // chainOrderIds that matched a grid order
                 const seenOnChain = new Set();         // all chain orderIds seen during this sync
                 const relevantChainOrders = [];        // only chain orders in THIS market pair
-                this.logger.log(`DEBUG: readOpenOrders: ${chainData.length} chain orders to process, ${this.orders.size} grid orders loaded.`, 'info');
+                this.logger.log(`DEBUG: readOpenOrders: ${chainData.length} chain orders to process, ${this.orders.size} grid orders loaded.`, 'debug');
                 let parsedCount = 0;
 
                 // Step 1: Match chain orders to grid orders
@@ -1057,7 +1055,7 @@ class OrderManager {
                 const unmatchedChainOrders = relevantChainOrders.filter(co => !matchedChainOrders.has(co.id));
 
                 // Summary
-                this.logger.log(`Sync summary: ${parsedCount} chain orders, ${this.orders.size} grid orders, matched=${matchedChainOrders.size}, unmatched_chain=${unmatchedChainOrders.length}, unmatched_grid=${unmatchedGridOrders.length}`, 'info');
+                this.logger.log(`Sync summary: ${parsedCount} chain orders, ${this.orders.size} grid orders, matched=${matchedChainOrders.size}, unmatched_chain=${unmatchedChainOrders.length}, unmatched_grid=${unmatchedGridOrders.length}`, 'debug');
 
                 // Process unmatched grid orders as fills
                 let rebalanceResult = { ordersToPlace: [], ordersToRotate: [] };
@@ -1133,7 +1131,7 @@ class OrderManager {
         validBuys.sort((a, b) => a.price - b.price);
 
         if (validSells.length < futureActiveSells.length || validBuys.length < futureActiveBuys.length) {
-            this.logger.log(`Filtered ${futureActiveSells.length - validSells.length} sell and ${futureActiveBuys.length - validBuys.length} buy orders below minimum size threshold`, 'info');
+            this.logger.log(`Filtered ${futureActiveSells.length - validSells.length} sell and ${futureActiveBuys.length - validBuys.length} buy orders below minimum size threshold`, 'debug');
         }
 
         return [...validSells, ...validBuys];
@@ -1274,7 +1272,7 @@ class OrderManager {
             const totalFillCount = filledOrders.length;
             const btsFeesForFills = totalFillCount * btsFeeData.total;
             this.funds.btsFeesOwed += btsFeesForFills;
-            this.logger.log(`BTS fees for ${totalFillCount} fill(s): ${btsFeesForFills.toFixed(8)} BTS (total owed: ${this.funds.btsFeesOwed.toFixed(8)} BTS)`, 'info');
+            this.logger.log(`BTS fees for ${totalFillCount} fill(s): ${btsFeesForFills.toFixed(8)} BTS (total owed: ${this.funds.btsFeesOwed.toFixed(8)} BTS)`, 'debug');
         }
 
         // Apply proceeds directly to accountTotals so availability reflects fills immediately (no waiting for a chain refresh)
@@ -1298,8 +1296,8 @@ class OrderManager {
         this.funds.pendingProceeds.buy = (this.funds.pendingProceeds.buy || 0) + proceedsBuy;
         this.funds.pendingProceeds.sell = (this.funds.pendingProceeds.sell || 0) + proceedsSell;
         this.recalculateFunds();
-        this.logger.log(`Proceeds applied: Buy +${proceedsBuy.toFixed(8)}, Sell +${proceedsSell.toFixed(8)}`, 'info');
-        this._logAvailable('after proceeds apply');
+        this.logger.log(`Proceeds applied: Buy +${(this.funds.pendingProceeds.buy || 0).toFixed(8)}, Sell +${(this.funds.pendingProceeds.sell || 0).toFixed(8)}`, 'debug');
+        if (this.logger.level === 'debug') this._logAvailable('after proceeds apply');
         const extraOrderCount = this.outOfSpread ? 1 : 0;
         if (this.outOfSpread) {
             this.logger.log(`Adding extra order due to previous wide spread condition`, 'info');
@@ -1354,7 +1352,7 @@ class OrderManager {
      * Returns { ordersToPlace, ordersToRotate } for blockchain operations.
      * @param {Object} filledCounts - Count of filled orders by type { buy: n, sell: n }
      * @param {number} extraOrderCount - Extra orders to create (for spread widening)
-     * @param {Set} excludeOrderIds - Set of chain orderIds to exclude from rotation
+     * @param {Set} excludeOrderIds - Set of chain orderIds to exclude from rotation (e.g., just corrected)
      * @returns {Object} { ordersToPlace: [], ordersToRotate: [], partialMoves: [] }
      */
     async rebalanceOrders(filledCounts, extraOrderCount = 0, excludeOrderIds = new Set()) {
@@ -1510,7 +1508,7 @@ class OrderManager {
 
             // Do not mutate grid state yet; placement will set ACTIVE once the chain returns an orderId
             activated.push({ ...order });
-            this.logger.log(`Prepared virtual ${targetType} ${order.id} at price ${order.price.toFixed(4)}, size ${orderSize.toFixed(8)} for on-chain placement (state unchanged until confirmed)`, 'info');
+            this.logger.log(`Prepared virtual ${order.type} ${order.orderId || order.id} at price ${order.price.toFixed(4)}, size ${orderSize.toFixed(8)} for on-chain placement (state unchanged until confirmed)`, 'debug');
         }
 
         return activated;
@@ -1787,7 +1785,7 @@ class OrderManager {
             }
 
             rotations.push(rotation);
-            this.logger.log(`Prepared ${targetType} rotation: old ${oldOrder.orderId} @ ${oldOrder.price.toFixed(4)} -> ${targetGridId} @ ${targetPrice.toFixed(4)}, size ${newSize.toFixed(8)}`, 'info');
+            this.logger.log(`Prepared ${targetType} rotation: old ${oldOrder.orderId} @ ${oldOrder.price.toFixed(4)} -> ${targetGridId} @ ${targetPrice.toFixed(4)}, size ${newSize.toFixed(8)}`, 'debug');
         }
 
         // Set final available funds (after recalculateFunds might have reset it)

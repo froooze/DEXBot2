@@ -67,7 +67,7 @@ const GRID_LIMITS = Object.freeze({
         // Metric: sum of ((calculated - persisted) / persisted)^2 / count
         // Represents average squared relative error across non-spread orders
         SUMMED_RELATIVE_SQUARED_DIFFERENCE: 'summedRelativeSquaredDiff',
-        
+
         // Divergence threshold for automatic grid regeneration (as percentage)
         // When compareGrids() metric exceeds this value, updateGridOrderSizes will be triggered
         // Default: 1 = 1% average relative error threshold
@@ -76,5 +76,13 @@ const GRID_LIMITS = Object.freeze({
     })
 });
 
-module.exports = { ORDER_TYPES, ORDER_STATES, DEFAULT_CONFIG, TIMING, GRID_LIMITS };
+// Logging Level Configuration
+// Options:
+// - 'debug': Verbose output including calculation details, API calls, and flow tracing.
+// - 'info':  Standard production output. State changes (Active/Filled), keys confirmations, and errors.
+// - 'warn':  Warnings (non-critical issues) and errors only.
+// - 'error': Critical errors only.
+const LOG_LEVEL = 'info';
+
+module.exports = { ORDER_TYPES, ORDER_STATES, DEFAULT_CONFIG, TIMING, GRID_LIMITS, LOG_LEVEL };
 

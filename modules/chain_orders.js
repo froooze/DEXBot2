@@ -608,7 +608,7 @@ async function executeBatch(accountName, privateKey, operations) {
     if (!operations || operations.length === 0) return { success: true, operations: 0 };
 
     try {
-        console.log(`Executing batch of ${operations.length} operations for ${accountName}...`);
+        // console.log(`Executing batch of ${operations.length} operations for ${accountName}...`);
         const acc = createAccountClient(accountName, privateKey);
         await acc.initPromise;
         const tx = acc.newTx();
@@ -623,7 +623,7 @@ async function executeBatch(accountName, privateKey, operations) {
         }
 
         const result = await tx.broadcast();
-        console.log(`Batch transaction broadcasted successfully.`);
+        // console.log(`Batch transaction broadcasted successfully.`);
         return result;
     } catch (error) {
         console.error('Error executing batch transaction:', error.message);

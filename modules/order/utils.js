@@ -361,7 +361,7 @@ function applyChainSizeToGridOrder(manager, gridOrder, chainSize) {
     const oldInt = floatToBlockchainInt(oldSize, precision);
     const newInt = floatToBlockchainInt(newSize, precision);
     if (oldInt === newInt) { gridOrder.size = newSize; return; }
-    manager.logger?.log?.(`Order ${gridOrder.id} size adjustment: ${oldSize.toFixed(8)} -> ${newSize.toFixed(8)} (delta: ${delta.toFixed(8)})`, 'info');
+    manager.logger?.log?.(`Order ${gridOrder.id} size adjustment: ${oldSize.toFixed(8)} -> ${newSize.toFixed(8)} (delta: ${delta.toFixed(8)})`, 'debug');
     try { manager._adjustFunds(gridOrder, delta); } catch (e) { /* best-effort */ }
     gridOrder.size = newSize;
     try { manager._updateOrder(gridOrder); } catch (e) { /* best-effort */ }
