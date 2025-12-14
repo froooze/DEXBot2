@@ -206,7 +206,10 @@ class DEXBot {
     }
 
     async placeInitialOrders() {
-        if (!this.manager) this.manager = new OrderManager(this.config);
+        if (!this.manager) {
+            this.manager = new OrderManager(this.config);
+            this.manager.accountOrders = accountOrders;  // Enable pendingProceeds persistence
+        }
         try {
             const botFunds = this.config && this.config.botFunds ? this.config.botFunds : {};
             const needsPercent = (v) => typeof v === 'string' && v.includes('%');
@@ -223,7 +226,7 @@ class DEXBot {
 
         if (this.config.dryRun) {
             this.manager.logger.log('Dry run enabled, skipping on-chain order placement.', 'info');
-            accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()), this.manager.funds.cacheFunds);
+            accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()), this.manager.funds.cacheFunds, this.manager.funds.pendingProceeds);
             return;
         }
 
@@ -299,7 +302,7 @@ class DEXBot {
         for (const group of orderGroups) {
             await placeOrderGroup(group);
         }
-        accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()), this.manager.funds.cacheFunds);
+        accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()), this.manager.funds.cacheFunds, this.manager.funds.pendingProceeds);
     }
 
     async updateOrdersOnChainBatch(rebalanceResult) {
@@ -506,6 +509,7 @@ class DEXBot {
             this.manager = new OrderManager(this.config || {});
             this.manager.account = this.account;
             this.manager.accountId = this.accountId;
+            this.manager.accountOrders = accountOrders;  // Enable pendingProceeds persistence
         }
 
         // Ensure fee cache is initialized before any fill processing that calls getAssetFees().
@@ -630,7 +634,7 @@ class DEXBot {
 
                     // Always persist snapshot after processing fills if we did anything
                     if (validFills.length > 0) {
-                        accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()), this.manager.funds.cacheFunds);
+                        accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()), this.manager.funds.cacheFunds, this.manager.funds.pendingProceeds);
                     }
                 } catch (err) {
                     this.manager?.logger?.log(`Error processing fill: ${err.message}`, 'error');
@@ -651,10 +655,22 @@ class DEXBot {
 
         const persistedGrid = accountOrders.loadBotGrid(this.config.botKey);
         const persistedCacheFunds = accountOrders.loadCacheFunds(this.config.botKey);
+        const persistedPendingProceeds = accountOrders.loadPendingProceeds(this.config.botKey);
+        
         // Restore cacheFunds to manager if found
         if (persistedCacheFunds) {
             this.manager.funds.cacheFunds = { ...persistedCacheFunds };
         }
+        
+        // CRITICAL: Restore pendingProceeds from partial fills
+        // This ensures fill proceeds from before the restart are not lost
+        if (persistedPendingProceeds) {
+            this.manager.funds.pendingProceeds = { ...persistedPendingProceeds };
+            console.log(`[bot.js] ✓ Restored pendingProceeds from startup: Buy ${(persistedPendingProceeds.buy || 0).toFixed(8)}, Sell ${(persistedPendingProceeds.sell || 0).toFixed(8)}`);
+        } else {
+            console.log(`[bot.js] ℹ No pendingProceeds to restore (fresh start or no partial fills)`);
+        }
+        
         // Use this.accountId which was set during initialize()
         const chainOpenOrders = this.config.dryRun ? [] : await chainOrders.readOpenOrders(this.accountId);
 
@@ -675,7 +691,7 @@ class DEXBot {
                 chainOpenOrders,
                 manager: this.manager,
                 logger: { log: (msg) => console.log(`[bot.js] ${msg}`) },
-                storeGrid: (orders) => accountOrders.storeMasterGrid(this.config.botKey, orders, this.manager.funds.cacheFunds),
+                storeGrid: (orders) => accountOrders.storeMasterGrid(this.config.botKey, orders, this.manager.funds.cacheFunds, this.manager.funds.pendingProceeds),
                 attemptResumeFn: attemptResumePersistedGridByPriceMatch,
             });
             shouldRegenerate = decision.shouldRegenerate;
@@ -695,7 +711,7 @@ class DEXBot {
             console.log('[bot.js] Found active session. Loading and syncing existing grid.');
             await Grid.loadGrid(this.manager, persistedGrid);
             await this.manager.synchronizeWithChain(chainOpenOrders, 'readOpenOrders');
-            accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()), this.manager.funds.cacheFunds);
+            accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()), this.manager.funds.cacheFunds, this.manager.funds.pendingProceeds);
         }
 
         // Main loop

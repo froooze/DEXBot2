@@ -199,7 +199,7 @@ class AccountOrders {
    * @param {Array} orders - Array of order objects from OrderManager
    * @param {Object} cacheFunds - Optional cached funds { buy: number, sell: number }
    */
-  storeMasterGrid(botKey, orders = [], cacheFunds = null) {
+  storeMasterGrid(botKey, orders = [], cacheFunds = null, pendingProceeds = null) {
     if (!botKey) return;
     const snapshot = Array.isArray(orders) ? orders.map(order => this._serializeOrder(order)) : [];
     if (!this.data.bots[botKey]) {
@@ -208,6 +208,7 @@ class AccountOrders {
         meta,
         grid: snapshot,
         cacheFunds: cacheFunds || { buy: 0, sell: 0 },
+        pendingProceeds: pendingProceeds || { buy: 0, sell: 0 },
         createdAt: meta.createdAt,
         lastUpdated: meta.updatedAt
       };
@@ -215,6 +216,9 @@ class AccountOrders {
       this.data.bots[botKey].grid = snapshot;
       if (cacheFunds) {
         this.data.bots[botKey].cacheFunds = cacheFunds;
+      }
+      if (pendingProceeds) {
+        this.data.bots[botKey].pendingProceeds = pendingProceeds;
       }
       const timestamp = nowIso();
       this.data.bots[botKey].lastUpdated = timestamp;
@@ -263,6 +267,38 @@ class AccountOrders {
       return;
     }
     this.data.bots[botKey].cacheFunds = cacheFunds || { buy: 0, sell: 0 };
+    this.data.lastUpdated = nowIso();
+    this._persist();
+  }
+
+  /**
+   * Load pending proceeds for a bot (funds from partial fills awaiting rotation).
+   * @param {string} botKey - Bot identifier key
+   * @returns {Object|null} Pending proceeds { buy, sell } or { buy: 0, sell: 0 } if not found
+   */
+  loadPendingProceeds(botKey) {
+    if (this.data && this.data.bots && this.data.bots[botKey]) {
+      const botData = this.data.bots[botKey];
+      const pp = botData.pendingProceeds;
+      if (pp && typeof pp.buy === 'number' && typeof pp.sell === 'number') {
+        return pp;
+      }
+    }
+    return { buy: 0, sell: 0 };
+  }
+
+  /**
+   * Update (persist) pending proceeds for a bot.
+   * Pending proceeds are temporary funds from partial order fills that are awaiting consumption
+   * during the next rotation. They must persist across restarts so fills aren't lost.
+   * @param {string} botKey - Bot identifier key
+   * @param {Object} pendingProceeds - Pending proceeds { buy, sell }
+   */
+  updatePendingProceeds(botKey, pendingProceeds) {
+    if (!botKey || !this.data || !this.data.bots || !this.data.bots[botKey]) {
+      return;
+    }
+    this.data.bots[botKey].pendingProceeds = pendingProceeds || { buy: 0, sell: 0 };
     this.data.lastUpdated = nowIso();
     this._persist();
   }

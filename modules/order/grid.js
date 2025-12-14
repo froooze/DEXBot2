@@ -135,7 +135,13 @@ class Grid {
         manager.orders.clear();
         Object.values(manager._ordersByState).forEach(set => set.clear());
         Object.values(manager._ordersByType).forEach(set => set.clear());
+        
+        // CRITICAL: Preserve pendingProceeds before reset, as they contain fill proceeds awaiting rotation
+        const savedPendingProceeds = { ...manager.funds.pendingProceeds };
         manager.resetFunds();
+        // Restore preserved pendingProceeds after reset
+        manager.funds.pendingProceeds = { ...savedPendingProceeds };
+        
         grid.forEach(order => {
             manager._updateOrder(order);
             // Note: recalculateFunds() is called by _updateOrder, so funds are auto-updated
@@ -469,7 +475,13 @@ class Grid {
         manager.orders.clear();
         Object.values(manager._ordersByState).forEach(set => set.clear());
         Object.values(manager._ordersByType).forEach(set => set.clear());
+        
+        // CRITICAL: Preserve pendingProceeds before reset, as they contain fill proceeds awaiting rotation
+        const savedPendingProceeds = { ...manager.funds.pendingProceeds };
         manager.resetFunds();
+        // Restore preserved pendingProceeds after reset
+        manager.funds.pendingProceeds = { ...savedPendingProceeds };
+        
         sizedOrders.forEach(order => {
             manager._updateOrder(order);
             // Note: recalculateFunds() is called by _updateOrder, so funds are auto-updated
@@ -629,14 +641,23 @@ class Grid {
 
         const config = manager.config || {};
         const isBuy = orderType === ORDER_TYPES.BUY;
+        const sideName = isBuy ? 'buy' : 'sell';
+
+        // Get funds components
         const cacheFundsValue = isBuy ? Number(cacheFunds?.buy || 0) : Number(cacheFunds?.sell || 0);
         const gridValue = isBuy
             ? manager.funds?.total?.grid?.buy || 0
             : manager.funds?.total?.grid?.sell || 0;
+        const availableValue = isBuy
+            ? manager.funds?.available?.buy || 0
+            : manager.funds?.available?.sell || 0;
 
-        const sideName = isBuy ? 'buy' : 'sell';
+        // Total Input = Cache + Grid + Available
+        // We use ALL available funds to resize the grid, attempting to "reset available to 0".
+        const totalInput = cacheFundsValue + gridValue + availableValue;
+
         manager.logger?.log(
-            `Updating ${sideName} side order sizes: cache=${cacheFundsValue.toFixed(8)} + grid=${gridValue.toFixed(8)} = ${(cacheFundsValue + gridValue).toFixed(8)}`,
+            `Updating ${sideName} side order sizes: cache=${cacheFundsValue.toFixed(8)} + grid=${gridValue.toFixed(8)} + available=${availableValue.toFixed(8)} = ${totalInput.toFixed(8)}`,
             'info'
         );
 
@@ -653,9 +674,12 @@ class Grid {
 
         // Calculate new sizes for this side only
         const precision = isBuy ? manager.assets?.assetB?.precision : manager.assets?.assetA?.precision;
+
+        // Note: we pass 0 for 'availableFunds' arg to calculateRotationOrderSizes because we've already
+        // summed it into our totalInput (passed as the first arg).
         const newSizes = Grid.calculateRotationOrderSizes(
-            cacheFundsValue,
-            gridValue,
+            totalInput, // Use total input as the "fund context" for sizing
+            0,          // Treat gridValue as 0 here because totalInput covers everything
             orders.length,
             orderType,
             config,
@@ -669,7 +693,26 @@ class Grid {
         // Update orders with new sizes
         Grid._updateOrdersForSide(manager, orderType, newSizes, orders);
 
+        // CLEAR Pending Proceeds for this side
+        // Since we included 'available' (which includes pendingProceeds) in the sizing,
+        // we must effectively "consume" them by clearing the pending bucket.
+        // The funds are now represented by the increased order sizes (Virtual/Active).
+        if (manager.funds && manager.funds.pendingProceeds) {
+            manager.funds.pendingProceeds[sideName] = 0;
+        }
+        
+        // Persist cleared pendingProceeds for this side so cleared state survives restart
+        try {
+            if (manager.config && manager.config.botKey && manager.accountOrders) {
+                manager.accountOrders.updatePendingProceeds(manager.config.botKey, manager.funds.pendingProceeds);
+                manager.logger?.log?.(`Persisted cleared pendingProceeds.${sideName} after side update`, 'debug');
+            }
+        } catch (e) {
+            manager.logger?.log?.(`Warning: Failed to persist cleared pendingProceeds: ${e.message}`, 'warn');
+        }
+
         // Recalculate funds after updating this side
+        // This will update 'available', which should now be near 0 (minus dust)
         manager.recalculateFunds();
 
         manager.logger?.log(`${sideName} side order sizes updated`, 'info');
@@ -677,7 +720,7 @@ class Grid {
         // Calculate surplus (totalInput - totalAllocated) to be recycled into cacheFunds
         // Ensure we compare apples to apples using blockchain integer precision
         if (precision !== undefined && precision !== null) {
-            const totalInputInt = floatToBlockchainInt(cacheFundsValue + gridValue, precision);
+            const totalInputInt = floatToBlockchainInt(totalInput, precision);
             let totalAllocatedInt = 0;
 
             // Sum up the actual allocated sizes (quantized)
@@ -693,7 +736,7 @@ class Grid {
             manager.funds.cacheFunds[sideName] = surplus;
 
             manager.logger?.log(
-                `DEBUG Recalc Surplus: input=${(cacheFundsValue + gridValue).toFixed(8)}, allocated=${blockchainToFloat(totalAllocatedInt, precision).toFixed(8)}, surplus=${surplus.toFixed(8)} added to cache`,
+                `DEBUG Recalc Surplus: input=${totalInput.toFixed(8)}, allocated=${blockchainToFloat(totalAllocatedInt, precision).toFixed(8)}, surplus=${surplus.toFixed(8)} added to cache`,
                 'debug'
             );
         }
@@ -720,20 +763,24 @@ class Grid {
         const cacheBuy = Number(cacheFunds?.buy || 0);
         const cacheSell = Number(cacheFunds?.sell || 0);
 
-        // Get grid allocation (NOT available funds)
+        // Get grid allocation
         const gridBuy = manager.funds?.total?.grid?.buy || 0;
         const gridSell = manager.funds?.total?.grid?.sell || 0;
 
-        // Total to distribute: cache + grid only
-        const totalBuy = cacheBuy + gridBuy;
-        const totalSell = cacheSell + gridSell;
+        // Get available funds
+        const availableBuy = manager.funds?.available?.buy || 0;
+        const availableSell = manager.funds?.available?.sell || 0;
+
+        // Total to distribute: cache + grid + available
+        const totalBuy = cacheBuy + gridBuy + availableBuy;
+        const totalSell = cacheSell + gridSell + availableSell;
 
         manager.logger?.log(
-            `Updating grid order sizes - Buy: cache=${cacheBuy.toFixed(8)} + grid=${gridBuy.toFixed(8)} = ${totalBuy.toFixed(8)}`,
+            `Updating grid order sizes - Buy: cache=${cacheBuy.toFixed(8)} + grid=${gridBuy.toFixed(8)} + available=${availableBuy.toFixed(8)} = ${totalBuy.toFixed(8)}`,
             'info'
         );
         manager.logger?.log(
-            `Updating grid order sizes - Sell: cache=${cacheSell.toFixed(8)} + grid=${gridSell.toFixed(8)} = ${totalSell.toFixed(8)}`,
+            `Updating grid order sizes - Sell: cache=${cacheSell.toFixed(8)} + grid=${gridSell.toFixed(8)} + available=${availableSell.toFixed(8)} = ${totalSell.toFixed(8)}`,
             'info'
         );
 
@@ -741,26 +788,31 @@ class Grid {
         const buyOrders = Array.from(manager.orders.values()).filter(o => o.type === ORDER_TYPES.BUY);
         const sellOrders = Array.from(manager.orders.values()).filter(o => o.type === ORDER_TYPES.SELL);
 
+        // Required utils for precision handling
+        const { floatToBlockchainInt, blockchainToFloat } = require('./utils');
+        const precA = manager.assets?.assetA?.precision;
+        const precB = manager.assets?.assetB?.precision;
+
         // Calculate new sizes using same weighting algorithm
-        // Pass 0 as availableFunds since we only want cache + grid
+        // Pass 0 as availableFunds since we use totalBuy/totalSell as input context
         const buyNewSizes = Grid.calculateRotationOrderSizes(
-            cacheBuy,
-            gridBuy,
+            totalBuy,
+            0,
             buyOrders.length,
             ORDER_TYPES.BUY,
             config,
             0,
-            manager.assets?.assetB?.precision
+            precB
         );
 
         const sellNewSizes = Grid.calculateRotationOrderSizes(
-            cacheSell,
-            gridSell,
+            totalSell,
+            0,
             sellOrders.length,
             ORDER_TYPES.SELL,
             config,
             0,
-            manager.assets?.assetA?.precision
+            precA
         );
 
         // Update buy orders with new sizes
@@ -769,8 +821,46 @@ class Grid {
         // Update sell orders with new sizes
         Grid._updateOrdersForSide(manager, ORDER_TYPES.SELL, sellNewSizes, sellOrders);
 
+        // CLEAR Pending Proceeds for both sides
+        if (manager.funds && manager.funds.pendingProceeds) {
+            manager.funds.pendingProceeds.buy = 0;
+            manager.funds.pendingProceeds.sell = 0;
+        }
+        
+        // Persist cleared pendingProceeds so cleared state survives restart
+        try {
+            if (manager.config && manager.config.botKey && manager.accountOrders) {
+                manager.accountOrders.updatePendingProceeds(manager.config.botKey, manager.funds.pendingProceeds);
+                manager.logger?.log?.(`Persisted cleared pendingProceeds after grid update`, 'debug');
+            }
+        } catch (e) {
+            manager.logger?.log?.(`Warning: Failed to persist cleared pendingProceeds: ${e.message}`, 'warn');
+        }
+
         // Recalculate funds after updating sizes
         manager.recalculateFunds();
+
+        // Calculate and cache surplus for Buy side
+        if (precB !== undefined && precB !== null) {
+            const totalInput = floatToBlockchainInt(totalBuy, precB);
+            let totalAllocated = 0;
+            buyNewSizes.forEach(s => totalAllocated += floatToBlockchainInt(s, precB));
+            const surplus = blockchainToFloat(totalInput - totalAllocated, precB);
+
+            if (!manager.funds.cacheFunds) manager.funds.cacheFunds = { buy: 0, sell: 0 };
+            manager.funds.cacheFunds.buy = surplus;
+        }
+
+        // Calculate and cache surplus for Sell side
+        if (precA !== undefined && precA !== null) {
+            const totalInput = floatToBlockchainInt(totalSell, precA);
+            let totalAllocated = 0;
+            sellNewSizes.forEach(s => totalAllocated += floatToBlockchainInt(s, precA));
+            const surplus = blockchainToFloat(totalInput - totalAllocated, precA);
+
+            if (!manager.funds.cacheFunds) manager.funds.cacheFunds = { buy: 0, sell: 0 };
+            manager.funds.cacheFunds.sell = surplus;
+        }
 
         manager.logger?.log('Grid order sizes updated', 'info');
         manager.logger?.logFundsStatus && manager.logger.logFundsStatus(manager);
@@ -819,15 +909,58 @@ class Grid {
             return { buy: { metric: 0, updated: false }, sell: { metric: 0, updated: false }, totalMetric: 0 };
         }
 
-        // Separate orders by type for independent comparison
+        // Separate orders by type
         const calculatedBuys = calculatedGrid.filter(o => o && o.type === ORDER_TYPES.BUY);
         const calculatedSells = calculatedGrid.filter(o => o && o.type === ORDER_TYPES.SELL);
         const persistedBuys = persistedGrid.filter(o => o && o.type === ORDER_TYPES.BUY);
         const persistedSells = persistedGrid.filter(o => o && o.type === ORDER_TYPES.SELL);
 
+        // Helper: Calculate ideal orders if manager is present
+        // This ensures the comparison reflects what the grid SHOULD be (with available funds included)
+        // rather than what it IS (potentially stale sizes).
+        const getIdealOrders = (orders, type) => {
+            if (!manager || orders.length === 0) return orders;
+
+            const isBuy = type === ORDER_TYPES.BUY;
+            const cache = isBuy ? Number(cacheFunds?.buy || 0) : Number(cacheFunds?.sell || 0);
+            const grid = isBuy
+                ? manager.funds?.total?.grid?.buy || 0
+                : manager.funds?.total?.grid?.sell || 0;
+            const available = isBuy
+                ? manager.funds?.available?.buy || 0
+                : manager.funds?.available?.sell || 0;
+
+            const totalInput = cache + grid + available;
+            const precision = isBuy ? manager.assets?.assetB?.precision : manager.assets?.assetA?.precision;
+            const config = manager.config || {};
+
+            try {
+                const idealSizes = Grid.calculateRotationOrderSizes(
+                    totalInput,
+                    0, // gridValue is covered by totalInput
+                    orders.length,
+                    type,
+                    config,
+                    0,
+                    precision
+                );
+
+                // Return clones with ideal sizes
+                return orders.map((o, i) => ({ ...o, size: idealSizes[i] }));
+            } catch (e) {
+                manager.logger?.log?.(`Warning: failed to calc ideal sizes for comparison: ${e.message}`, 'warn');
+                return orders; // Fallback to original
+            }
+        };
+
+        // If manager is provided, compare "Ideal" vs "Persisted"
+        // If not, compare "Calculated" (current) vs "Persisted"
+        const idealBuys = manager ? getIdealOrders(calculatedBuys, ORDER_TYPES.BUY) : calculatedBuys;
+        const idealSells = manager ? getIdealOrders(calculatedSells, ORDER_TYPES.SELL) : calculatedSells;
+
         // Compare each side independently
-        const buyMetric = Grid._compareGridSide(calculatedBuys, persistedBuys);
-        const sellMetric = Grid._compareGridSide(calculatedSells, persistedSells);
+        const buyMetric = Grid._compareGridSide(idealBuys, persistedBuys);
+        const sellMetric = Grid._compareGridSide(idealSells, persistedSells);
 
         // Calculate average metric
         let totalMetric = 0;

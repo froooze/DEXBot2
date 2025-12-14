@@ -220,7 +220,10 @@ class DEXBot {
      * 5. Persists the grid snapshot to profiles/orders.json
      */
     async placeInitialOrders() {
-        if (!this.manager) this.manager = new OrderManager(this.config);
+        if (!this.manager) {
+            this.manager = new OrderManager(this.config);
+            this.manager.accountOrders = accountOrders;  // Enable pendingProceeds persistence
+        }
         // If botFunds are percentage-based and account info is available, try to
         // fetch on-chain balances first so percentages resolve correctly.
         try {
@@ -239,7 +242,10 @@ class DEXBot {
 
         if (this.config.dryRun) {
             this.manager.logger.log('Dry run enabled, skipping on-chain order placement.', 'info');
-            accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()), this.manager.funds.cacheFunds);
+            // CRITICAL: Reset pendingProceeds when initial grid is placed
+            // Fresh start means no prior partial fills exist
+            this.manager.funds.pendingProceeds = { buy: 0, sell: 0 };
+            accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()), this.manager.funds.cacheFunds, this.manager.funds.pendingProceeds);
             return;
         }
 
@@ -316,7 +322,7 @@ class DEXBot {
         for (const group of orderGroups) {
             await placeOrderGroup(group);
         }
-        accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()), this.manager.funds.cacheFunds);
+        accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()), this.manager.funds.cacheFunds, this.manager.funds.pendingProceeds);
     }
 
     /**
@@ -604,6 +610,7 @@ class DEXBot {
             // Attach account identifiers so OrderManager can fetch on-chain totals when needed
             this.manager.account = this.account;
             this.manager.accountId = this.accountId;
+            this.manager.accountOrders = accountOrders;  // Enable pendingProceeds persistence
         }
 
         // Start listening for fills BEFORE any order operations to avoid missing fills
@@ -726,7 +733,7 @@ class DEXBot {
 
                     // Always persist snapshot after processing fills if we did anything
                     if (validFills.length > 0) {
-                        accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()), this.manager.funds.cacheFunds);
+                        accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()), this.manager.funds.cacheFunds, this.manager.funds.pendingProceeds);
                     }
                 } catch (err) {
                     this.manager?.logger?.log(`Error processing fill: ${err.message}`, 'error');
@@ -765,7 +772,10 @@ class DEXBot {
                     privateKey: this.privateKey,
                     config: this.config,
                 });
-                accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()), this.manager.funds.cacheFunds);
+                // CRITICAL: Reset pendingProceeds when grid is regenerated
+                // New grid means old partial fill proceeds are no longer relevant
+                this.manager.funds.pendingProceeds = { buy: 0, sell: 0 };
+                accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()), this.manager.funds.cacheFunds, this.manager.funds.pendingProceeds);
 
                 if (fs.existsSync(this.triggerFile)) {
                     fs.unlinkSync(this.triggerFile);
@@ -783,10 +793,22 @@ class DEXBot {
         } else {
             const persistedGrid = accountOrders.loadBotGrid(this.config.botKey);
             const persistedCacheFunds = accountOrders.loadCacheFunds(this.config.botKey);
+            const persistedPendingProceeds = accountOrders.loadPendingProceeds(this.config.botKey);
+            
             // Restore cacheFunds to manager if found
             if (persistedCacheFunds) {
                 this.manager.funds.cacheFunds = { ...persistedCacheFunds };
             }
+            
+            // CRITICAL: Restore pendingProceeds from partial fills
+            // This ensures fill proceeds from before the restart are not lost
+            if (persistedPendingProceeds) {
+                this.manager.funds.pendingProceeds = { ...persistedPendingProceeds };
+                this.manager.logger.log(`✓ Restored pendingProceeds from startup: Buy ${(persistedPendingProceeds.buy || 0).toFixed(8)}, Sell ${(persistedPendingProceeds.sell || 0).toFixed(8)}`, 'info');
+            } else {
+                this.manager.logger.log(`ℹ No pendingProceeds to restore (fresh start or no partial fills)`, 'info');
+            }
+            
             const chainOpenOrders = this.config.dryRun ? [] : await chainOrders.readOpenOrders(this.accountId);
 
             let shouldRegenerate = false;
@@ -800,7 +822,7 @@ class DEXBot {
                     chainOpenOrders,
                     manager: this.manager,
                     logger: this.manager.logger,
-                    storeGrid: (orders) => accountOrders.storeMasterGrid(this.config.botKey, orders, this.manager.funds.cacheFunds),
+                    storeGrid: (orders) => accountOrders.storeMasterGrid(this.config.botKey, orders, this.manager.funds.cacheFunds, this.manager.funds.pendingProceeds),
                     attemptResumeFn: attemptResumePersistedGridByPriceMatch,
                 });
                 shouldRegenerate = decision.shouldRegenerate;
@@ -818,6 +840,10 @@ class DEXBot {
                 // (virtual + spread placeholders), not only currently active on-chain orders.
                 this.manager.logger.log('Generating new grid.', 'info');
                 await Grid.initializeGrid(this.manager);
+
+                // CRITICAL: Reset pendingProceeds when grid is regenerated during startup
+                // New grid means old partial fill proceeds are no longer relevant
+                this.manager.funds.pendingProceeds = { buy: 0, sell: 0 };
 
                 // If there are existing on-chain orders, sync them onto the new grid
                 // using price+size matching, then reconcile counts by updating/cancelling/creating.
@@ -840,7 +866,7 @@ class DEXBot {
                     await this.placeInitialOrders();
                 }
 
-                accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()), this.manager.funds.cacheFunds);
+                accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()), this.manager.funds.cacheFunds, this.manager.funds.pendingProceeds);
             } else {
                 this.manager.logger.log('Found active session. Loading and syncing existing grid.', 'info');
 
@@ -925,7 +951,7 @@ class DEXBot {
                     this.manager.logger.logFundsStatus(this.manager);
                 }
 
-                accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()), this.manager.funds.cacheFunds);
+                accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()), this.manager.funds.cacheFunds, this.manager.funds.pendingProceeds);
             }
         }
 
@@ -1304,7 +1330,10 @@ async function restartBotByName(botName) {
 
             // Ensure persisted account-orders metadata exists for this bot and persist the generated grid
             accountOrders.ensureBotEntries([bot]);
-            accountOrders.storeMasterGrid(bot.botKey, Array.from(manager.orders.values()), manager.funds.cacheFunds);
+            // CRITICAL: Reset pendingProceeds when grid is regenerated (restart command)
+            // New grid means old partial fill proceeds are no longer relevant
+            manager.funds.pendingProceeds = { buy: 0, sell: 0 };
+            accountOrders.storeMasterGrid(bot.botKey, Array.from(manager.orders.values()), manager.funds.cacheFunds, manager.funds.pendingProceeds);
             console.log(`Generated and stored grid snapshot for '${bot.name}' to profiles/orders.json`);
         } catch (err) {
             console.warn(`Failed to generate grid for '${bot.name}': ${err && err.message ? err.message : err}`);

@@ -352,12 +352,13 @@ class OrderManager {
         };
         this.funds.total.grid = { buy: gridBuy + virtuelBuy, sell: gridSell + virtuelSell };
 
-        // Set available = chainFree - virtuel + pendingProceeds
+        // Set available = chainFree - virtuel - gridBuy/gridSell + pendingProceeds
         // pendingProceeds tracks fill proceeds that haven't been consumed by rotation yet
+        // gridBuy/gridSell are funds locked in active/partial orders and should not be in available
         const pendingBuy = this.funds.pendingProceeds?.buy || 0;
         const pendingSell = this.funds.pendingProceeds?.sell || 0;
-        this.funds.available.buy = Math.max(0, chainFreeBuy - virtuelBuy) + pendingBuy;
-        this.funds.available.sell = Math.max(0, chainFreeSell - virtuelSell) + pendingSell;
+        this.funds.available.buy = Math.max(0, chainFreeBuy - virtuelBuy - gridBuy) + pendingBuy;
+        this.funds.available.sell = Math.max(0, chainFreeSell - virtuelSell - gridSell) + pendingSell;
     }
 
     _updateOrder(order) {
@@ -401,25 +402,26 @@ class OrderManager {
             this.accountTotals[key] = next < 0 ? 0 : next;
         };
 
-        // Partial proceeds: credit chain totals/free and pendingProceeds (so availability updates immediately and persists)
+        // Partial proceeds: ONLY update chain totals/free, NOT pendingProceeds
+        // (pendingProceeds will be calculated once by processFilledOrders to avoid double-counting)
         if (gridOrder.type === ORDER_TYPES.SELL) {
             // SELL partial: receive quote asset; free balance rises, base total drops
             const proceeds = fillSize * price;
-            this.funds.pendingProceeds.buy = (this.funds.pendingProceeds.buy || 0) + proceeds;
             bumpTotal('buyFree', proceeds);
             bumpTotal('buy', proceeds);
             bumpTotal('sell', -fillSize);
             this.recalculateFunds();
-            this._logAvailable('after partial SELL');
+            // Note: Don't log available here - proceeds not yet added to pendingProceeds
+            // They will be added later by processFilledOrders()
         } else if (gridOrder.type === ORDER_TYPES.BUY) {
             // BUY partial: receive base asset; free base rises, quote total drops
             const proceeds = fillSize / price;
-            this.funds.pendingProceeds.sell = (this.funds.pendingProceeds.sell || 0) + proceeds;
             bumpTotal('sellFree', proceeds);
             bumpTotal('sell', proceeds);
             bumpTotal('buy', -fillSize);
             this.recalculateFunds();
-            this._logAvailable('after partial BUY');
+            // Note: Don't log available here - proceeds not yet added to pendingProceeds
+            // They will be added later by processFilledOrders()
         }
     }
 
@@ -887,7 +889,7 @@ class OrderManager {
 
         if (newSizeInt <= 0) {
             // Fully filled
-            this.logger.log(`Order ${matchedGridOrder.id} (${orderId}) FULLY FILLED (filled ${filledAmount.toFixed(8)})`, 'info');
+            this.logger.log(`Order ${matchedGridOrder.id} (${orderId}) FULLY FILLED (filled ${filledAmount.toFixed(8)}), pendingProceeds: Buy ${(this.funds.pendingProceeds.buy || 0).toFixed(8)} | Sell ${(this.funds.pendingProceeds.sell || 0).toFixed(8)}`, 'info');
             const filledOrder = { ...matchedGridOrder };
 
             // Create copy for update
@@ -897,9 +899,14 @@ class OrderManager {
             filledOrders.push(filledOrder);
         } else {
             // Partially filled - transition to PARTIAL state
-            this.logger.log(`Order ${matchedGridOrder.id} (${orderId}) PARTIALLY FILLED: ${filledAmount.toFixed(8)} filled, remaining ${newSize.toFixed(8)}`, 'info');
+            this.logger.log(`Order ${matchedGridOrder.id} (${orderId}) PARTIALLY FILLED: ${filledAmount.toFixed(8)} filled, remaining ${newSize.toFixed(8)}, pendingProceeds: Buy ${(this.funds.pendingProceeds.buy || 0).toFixed(8)} | Sell ${(this.funds.pendingProceeds.sell || 0).toFixed(8)}`, 'info');
 
-            // Create copy for update
+            // Create a "virtual" filled order with just the filled amount for proceeds calculation
+            // Mark as partial so processFilledOrders knows NOT to trigger rebalancing
+            const filledPortion = { ...matchedGridOrder, size: filledAmount, isPartial: true };
+            filledOrders.push(filledPortion);
+
+            // Create copy for update with remaining size
             const updatedOrder = { ...matchedGridOrder };
 
             // Update state to PARTIAL first to ensure correct index updates
@@ -1215,7 +1222,9 @@ class OrderManager {
      * @returns {Array} Newly activated orders that need on-chain placement
      */
     async processFilledOrders(filledOrders, excludeOrderIds = new Set()) {
+        this.logger.log(`>>> processFilledOrders() called with ${filledOrders.length} filled orders`, 'info');
         const filledCounts = { [ORDER_TYPES.BUY]: 0, [ORDER_TYPES.SELL]: 0 };
+        const partialFillCount = { [ORDER_TYPES.BUY]: 0, [ORDER_TYPES.SELL]: 0 };
         // Collect proceeds to add AFTER all maybeConvertToSpread calls
         // (because maybeConvertToSpread calls _updateOrder which runs recalculateFunds and would overwrite)
         let proceedsBuy = 0;
@@ -1230,7 +1239,13 @@ class OrderManager {
         const hasBtsPair = this.config.assetA === 'BTS' || this.config.assetB === 'BTS';
 
         for (const filledOrder of filledOrders) {
-            filledCounts[filledOrder.type]++;
+            // Track if this is a partial fill (remaining amount still locked on-chain)
+            const isPartial = filledOrder.isPartial === true;
+            if (isPartial) {
+                partialFillCount[filledOrder.type]++;
+            } else {
+                filledCounts[filledOrder.type]++;
+            }
 
             // Calculate proceeds before converting to SPREAD
             if (filledOrder.type === ORDER_TYPES.SELL) {
@@ -1243,7 +1258,7 @@ class OrderManager {
                 deltaSellTotal -= filledOrder.size;
                 const quoteName = this.config.assetB || 'quote';
                 const baseName = this.config.assetA || 'base';
-                this.logger.log(`Sell filled: +${proceeds.toFixed(8)} ${quoteName}, -${filledOrder.size.toFixed(8)} ${baseName} committed`, 'info');
+                this.logger.log(`Sell filled: +${proceeds.toFixed(8)} ${quoteName}, -${filledOrder.size.toFixed(8)} ${baseName} committed (orderId=${filledOrder.id}, size=${filledOrder.size.toFixed(8)}, price=${filledOrder.price}, isPartial=${filledOrder.isPartial})`, 'info');
             } else {
                 const proceeds = filledOrder.size / filledOrder.price;
                 proceedsSell += proceeds;  // Collect, don't add yet
@@ -1254,16 +1269,23 @@ class OrderManager {
                 deltaBuyTotal -= filledOrder.size;
                 const quoteName = this.config.assetB || 'quote';
                 const baseName = this.config.assetA || 'base';
-                this.logger.log(`Buy filled: +${proceeds.toFixed(8)} ${baseName}, -${filledOrder.size.toFixed(8)} ${quoteName} committed`, 'info');
+                this.logger.log(`Buy filled: +${proceeds.toFixed(8)} ${baseName}, -${filledOrder.size.toFixed(8)} ${quoteName} committed (orderId=${filledOrder.id}, size=${filledOrder.size.toFixed(8)}, price=${filledOrder.price}, isPartial=${filledOrder.isPartial})`, 'info');
             }
 
-            // Convert directly to SPREAD placeholder (one step: ACTIVE -> VIRTUAL/SPREAD)
-            // Create copy for update
-            const updatedOrder = { ...filledOrder, type: ORDER_TYPES.SPREAD, state: ORDER_STATES.VIRTUAL, size: 0, orderId: null };
-            this._updateOrder(updatedOrder);
+            // Only convert to SPREAD if this is a FULLY filled order, not a partial
+            if (!isPartial) {
+                // Convert directly to SPREAD placeholder (one step: ACTIVE -> VIRTUAL/SPREAD)
+                // Create copy for update
+                const updatedOrder = { ...filledOrder, type: ORDER_TYPES.SPREAD, state: ORDER_STATES.VIRTUAL, size: 0, orderId: null };
+                this._updateOrder(updatedOrder);
 
-            this.currentSpreadCount++;
-            this.logger.log(`Converted order ${filledOrder.id} to SPREAD`, 'debug');
+                this.currentSpreadCount++;
+                this.logger.log(`Converted order ${filledOrder.id} to SPREAD`, 'debug');
+            } else {
+                // Partial fill: order already updated to PARTIAL state by syncFromFillHistory
+                // Just log for clarity
+                this.logger.log(`Partial fill processed: order ${filledOrder.id} remains PARTIAL with ${filledOrder.size.toFixed(8)} filled`, 'debug');
+            }
         }
 
         // Accumulate BTS fees based on number of fills: (number_of_fills × total_fee)
@@ -1292,11 +1314,24 @@ class OrderManager {
         bumpTotal('sell', deltaSellTotal);
 
         // Hold proceeds in pendingProceeds so availability reflects them through rotation
-        // Use += to accumulate with any partial fill proceeds already tracked by _adjustFunds
+        // This is the single source of truth for proceeds calculation (not _adjustFunds)
+        const proceedsBefore = { buy: this.funds.pendingProceeds.buy || 0, sell: this.funds.pendingProceeds.sell || 0 };
         this.funds.pendingProceeds.buy = (this.funds.pendingProceeds.buy || 0) + proceedsBuy;
         this.funds.pendingProceeds.sell = (this.funds.pendingProceeds.sell || 0) + proceedsSell;
         this.recalculateFunds();
-        this.logger.log(`Proceeds applied: Buy +${(this.funds.pendingProceeds.buy || 0).toFixed(8)}, Sell +${(this.funds.pendingProceeds.sell || 0).toFixed(8)}`, 'debug');
+        this.logger.log(`Proceeds applied: Before Buy ${proceedsBefore.buy.toFixed(8)} + ${proceedsBuy.toFixed(8)} = After ${(this.funds.pendingProceeds.buy || 0).toFixed(8)} | Before Sell ${proceedsBefore.sell.toFixed(8)} + ${proceedsSell.toFixed(8)} = After ${(this.funds.pendingProceeds.sell || 0).toFixed(8)}`, 'info');
+        
+        // CRITICAL: Persist pending proceeds so they survive bot restart
+        // These funds from partial fills must not be lost when the bot restarts
+        try {
+            if (this.config && this.config.botKey && this.accountOrders) {
+                this.accountOrders.updatePendingProceeds(this.config.botKey, this.funds.pendingProceeds);
+                this.logger.log(`Persisted pendingProceeds: Buy ${(this.funds.pendingProceeds.buy || 0).toFixed(8)}, Sell ${(this.funds.pendingProceeds.sell || 0).toFixed(8)}`, 'debug');
+            }
+        } catch (e) {
+            this.logger.log(`Warning: Failed to persist pendingProceeds: ${e.message}`, 'warn');
+        }
+        
         if (this.logger.level === 'debug') this._logAvailable('after proceeds apply');
         const extraOrderCount = this.outOfSpread ? 1 : 0;
         if (this.outOfSpread) {
@@ -1306,6 +1341,17 @@ class OrderManager {
         // Log available funds before rotation
         this.logger.log(`Available funds before rotation: Buy ${this.funds.available.buy.toFixed(8)} | Sell ${this.funds.available.sell.toFixed(8)}`, 'info');
         this._logAvailable('before rotation');
+        
+        // CRITICAL: Only rebalance if there are ACTUAL fully-filled orders, not just partial fills
+        // Partial fills don't need rotations - the remaining amount stays locked and the order continues
+        const hasFullFills = filledCounts[ORDER_TYPES.BUY] > 0 || filledCounts[ORDER_TYPES.SELL] > 0;
+        const onlyPartialFills = !hasFullFills && (partialFillCount[ORDER_TYPES.BUY] > 0 || partialFillCount[ORDER_TYPES.SELL] > 0);
+        
+        if (onlyPartialFills) {
+            this.logger.log(`Only partial fills detected (no rotations needed). Skipping rebalance.`, 'info');
+            return { ordersToPlace: [], ordersToRotate: [], partialMoves: [] };
+        }
+        
         const newOrders = await this.rebalanceOrders(filledCounts, extraOrderCount, excludeOrderIds);
 
         // Add updateFee to BTS fees if partial orders were moved during rotation
@@ -1321,6 +1367,7 @@ class OrderManager {
 
         // Clear pending proceeds only for sides that had fills processed
         // (preserve pending proceeds from partial fills on the other side)
+        const proceedsBeforeClear = { buy: this.funds.pendingProceeds.buy || 0, sell: this.funds.pendingProceeds.sell || 0 };
         if (filledCounts[ORDER_TYPES.SELL] > 0) {
             // SELL fills produce buy-side proceeds (quote asset received)
             this.funds.pendingProceeds.buy = 0;
@@ -1330,6 +1377,19 @@ class OrderManager {
             this.funds.pendingProceeds.sell = 0;
         }
         this.recalculateFunds();
+        
+        this.logger.log(`Cleared pendingProceeds after rotation: Before Buy ${proceedsBeforeClear.buy.toFixed(8)} -> After ${(this.funds.pendingProceeds.buy || 0).toFixed(8)} | Before Sell ${proceedsBeforeClear.sell.toFixed(8)} -> After ${(this.funds.pendingProceeds.sell || 0).toFixed(8)}`, 'info');
+        
+        // CRITICAL: Persist cleared pendingProceeds so cleared state survives restart
+        try {
+            if (this.config && this.config.botKey && this.accountOrders) {
+                this.accountOrders.updatePendingProceeds(this.config.botKey, this.funds.pendingProceeds);
+                this.logger.log(`Persisted pendingProceeds: Buy ${(this.funds.pendingProceeds.buy || 0).toFixed(8)}, Sell ${(this.funds.pendingProceeds.sell || 0).toFixed(8)}`, 'debug');
+            }
+        } catch (e) {
+            this.logger.log(`Warning: Failed to persist pendingProceeds: ${e.message}`, 'warn');
+        }
+        
         this._logAvailable('after rotation clear');
 
         this.logger && this.logger.logFundsStatus && this.logger.logFundsStatus(this);
