@@ -687,7 +687,9 @@ class Grid {
         );
 
         // DEBUG: Log calculated sizes as requested
-        manager.logger?.log?.(`DEBUG Calculated Sizes (${sideName}): [${newSizes.map(s => s.toFixed(8)).join(', ')}]`, 'debug');
+        try {
+            manager.logger?.log?.(`DEBUG Calculated Sizes (${sideName}): totalInput=${totalInput.toFixed(8)}, sizes=[${newSizes.map(s => s.toFixed(8)).join(', ')}]`, 'debug');
+        } catch (e) { manager.logger?.log?.(`Warning: failed to log calculated sizes: ${e.message}`, 'warn'); }
 
         // Update orders with new sizes
         Grid._updateOrdersForSide(manager, orderType, newSizes, orders);
@@ -729,6 +731,13 @@ class Grid {
 
             const surplusInt = totalInputInt - totalAllocatedInt;
             const surplus = blockchainToFloat(surplusInt, precision);
+
+                try {
+                    manager.logger?.log?.(
+                        `DEBUG Side Surplus (${sideName}): totalInput=${totalInput.toFixed(8)}, allocated=${blockchainToFloat(totalAllocatedInt, precision).toFixed(8)}, surplus=${surplus.toFixed(8)}`,
+                        'debug'
+                    );
+                } catch (e) { manager.logger?.log?.(`Warning: failed to log side surplus: ${e.message}`, 'warn'); }
 
             // Add surplus back to cacheFunds
             if (!manager.funds.cacheFunds) manager.funds.cacheFunds = { buy: 0, sell: 0 };

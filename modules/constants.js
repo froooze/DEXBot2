@@ -82,7 +82,7 @@ const GRID_LIMITS = Object.freeze({
 // - 'info':  Standard production output. State changes (Active/Filled), keys confirmations, and errors.
 // - 'warn':  Warnings (non-critical issues) and errors only.
 // - 'error': Critical errors only.
-const LOG_LEVEL = 'info';
+const LOG_LEVEL = 'debug';
 
 module.exports = { ORDER_TYPES, ORDER_STATES, DEFAULT_CONFIG, TIMING, GRID_LIMITS, LOG_LEVEL };
 
