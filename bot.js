@@ -154,8 +154,6 @@ function normalizeBotEntry(entry, index = 0) {
     return { ...normalized, botIndex: index, botKey: createBotKey(normalized, index) };
 }
 
-const accountOrders = new AccountOrders();
-
 /**
  * DEXBot - Core trading bot class (copied from dexbot.js)
  */
@@ -505,6 +503,10 @@ class DEXBot {
 
     async start(masterPassword = null) {
         await this.initialize(masterPassword);
+        
+        // Create AccountOrders with bot-specific file (one file per bot)
+        const accountOrders = new AccountOrders({ botKey: this.config.botKey });
+        
         if (!this.manager) {
             this.manager = new OrderManager(this.config || {});
             this.manager.account = this.account;
@@ -653,6 +655,14 @@ class DEXBot {
             }
         });
 
+        // Ensure entries exist for ALL active bots (prevents pruning other bots)
+        // Must be done BEFORE loading persisted grid to avoid overwriting saved grids
+        const allBotsConfig = parseJsonWithComments(fs.readFileSync(PROFILES_BOTS_FILE, 'utf8')).bots || [];
+        const allActiveBots = allBotsConfig
+            .filter(b => b.active !== false)
+            .map((b, idx) => normalizeBotEntry(b, idx));
+        accountOrders.ensureBotEntries(allActiveBots);
+
         const persistedGrid = accountOrders.loadBotGrid(this.config.botKey);
         const persistedCacheFunds = accountOrders.loadCacheFunds(this.config.botKey);
         const persistedPendingProceeds = accountOrders.loadPendingProceeds(this.config.botKey);
@@ -777,9 +787,6 @@ class DEXBot {
         
         // Normalize config for current bot with correct index
         const normalizedConfig = normalizeBotEntry(botConfig, botIndex);
-        
-        // Ensure entries exist for ALL active bots (prevents pruning other bots)
-        accountOrders.ensureBotEntries(allActiveBots);
 
         // Authenticate master password
         const masterPassword = await authenticateMasterPassword();

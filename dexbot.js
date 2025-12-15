@@ -138,8 +138,6 @@ function normalizeBotEntries(rawEntries) {
     });
 }
 
-const accountOrders = new AccountOrders();
-
 // Connection handled centrally by modules/bitshares_client; use waitForConnected() when needed
 
 /**
@@ -605,6 +603,10 @@ class DEXBot {
      */
     async start(masterPassword = null) {
         await this.initialize(masterPassword);
+        
+        // Create AccountOrders with bot-specific file (one file per bot)
+        const accountOrders = new AccountOrders({ botKey: this.config.botKey });
+        
         if (!this.manager) {
             this.manager = new OrderManager(this.config || {});
             // Attach account identifiers so OrderManager can fetch on-chain totals when needed

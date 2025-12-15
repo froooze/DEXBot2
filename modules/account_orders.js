@@ -70,16 +70,30 @@ function nowIso() {
  * - Track bot metadata and state
  * - Calculate asset balances from stored grids
  * 
+ * Each bot has its own file: orders-{botkey}.json
+ * This eliminates race conditions when multiple bots write simultaneously.
+ * 
  * @class
  */
 class AccountOrders {
   /**
    * Create an AccountOrders instance.
    * @param {Object} options - Configuration options
-   * @param {string} options.profilesPath - Custom path for orders.json
+   * @param {string} options.botKey - Bot identifier (e.g., 'xrp-bts-0', 'h-bts-1')
+   *                                   If provided, uses orders-{botKey}.json
+   * @param {string} options.profilesPath - Custom path for orders.json (legacy single-file mode)
    */
   constructor(options = {}) {
-    this.profilesPath = options.profilesPath || PROFILES_ORDERS_FILE;
+    this.botKey = options.botKey;
+    
+    // Determine file path: per-bot file if botKey provided, otherwise legacy shared file
+    if (this.botKey) {
+      const ordersDir = path.join(__dirname, '..', 'profiles', 'orders');
+      this.profilesPath = path.join(ordersDir, `orders-${this.botKey}.json`);
+    } else {
+      this.profilesPath = options.profilesPath || PROFILES_ORDERS_FILE;
+    }
+    
     this._needsBootstrapSave = !fs.existsSync(this.profilesPath);
     this.data = this._loadData() || { bots: {}, lastUpdated: nowIso() };
     if (this._needsBootstrapSave) {
@@ -208,6 +222,11 @@ class AccountOrders {
    */
   storeMasterGrid(botKey, orders = [], cacheFunds = null, pendingProceeds = null) {
     if (!botKey) return;
+    
+    // CRITICAL: Reload from disk before writing to prevent race conditions between bot processes
+    // Each bot process has its own in-memory copy of orders.json - reloading ensures we preserve other bots' grids
+    this._loadData();
+    
     const snapshot = Array.isArray(orders) ? orders.map(order => this._serializeOrder(order)) : [];
     if (!this.data.bots[botKey]) {
       const meta = this._buildMeta({ name: null, assetA: null, assetB: null, active: false }, botKey, null);
