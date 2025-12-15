@@ -329,6 +329,45 @@ Fills are tracked with a 5-second deduplication window to prevent duplicate orde
 ### 🔢 Price Tolerance & Integer Rounding
 The bot calculates price tolerances to account for blockchain integer rounding discrepancies. This ensures reliable matching of on-chain orders with grid orders despite minor precision differences.
 
+### 📊 Automatic Grid Recalculation via Threshold Detection
+DEXBot automatically regenerates grid order sizes when market conditions or cached proceeds exceed configurable thresholds. This ensures orders remain optimally sized without manual intervention:
+
+**Two Independent Triggering Mechanisms:**
+
+1. **Cache Funds Threshold** (1% by default)
+   - Monitors accumulated proceeds from filled orders (cached funds)
+   - Triggers when cache ≥ 1% of allocated grid capital on either side
+   - Example: Grid allocated 1000 BTS, cache reaches 15 BTS → ratio is 1.5% → triggers update
+   - Updates buy and sell sides independently based on their respective ratios
+
+2. **Grid Divergence Threshold** (1% by default)
+   - Compares currently calculated grid with persisted grid state
+   - Uses quadratic deviation metric: measures relative size differences squared: `Σ((calculated - persisted) / persisted)² / count`
+   - Triggers when divergence metric × 100 > 1% threshold
+   - Penalizes larger deviations more heavily (10% error contributes 0.01, 50% error contributes 0.25)
+   - Example: If persisted orders are [100, 200, 150] and calculated are [100, 180, 160], metric is ~0.542%
+
+**When Grid Recalculation Occurs:**
+- After order fills and proceeds are collected
+- On startup if cached state diverges from current market conditions
+- Automatically without user action when either threshold is breached
+- Buy and sell sides can update independently
+
+**Benefits:**
+- Keeps order sizing optimal as market volatility or proceeds accumulate
+- Avoids manual recalculation requests for most scenarios
+- Reduces grid staleness while minimizing unnecessary regenerations
+- Maintains capital efficiency by redistributing proceeds back into orders
+
+**Customization:**
+You can adjust thresholds in `modules/constants.js`:
+```javascript
+GRID_REGENERATION_PERCENTAGE: 1,  // Cache funds threshold (%)
+GRID_COMPARISON: {
+    DIVERGENCE_THRESHOLD_Percent: 1  // Grid divergence threshold (%)
+}
+```
+
 ### 💾 Persistent Grid & Price Caching
 DEXBot intelligently caches grid calculations and order prices to avoid unnecessary recalculation:
 - **Grid state persists** in `profiles/orders.json` across bot restarts
