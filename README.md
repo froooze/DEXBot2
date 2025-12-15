@@ -386,13 +386,13 @@ Below is a short summary of the modules in this repository and what they provide
 - `modules/chain_orders.js`: Account-level order operations: select account, create/update/cancel orders, listen for fills with deduplication, read open orders. Uses 'history' mode for fill processing which matches orders from blockchain events.
 - `modules/bitshares_client.js`: Shared BitShares client wrapper and connection utilities (`BitShares`, `createAccountClient`, `waitForConnected`).
 - `modules/btsdex_event_patch.js`: Runtime patch for `btsdex` library to improve history and account event handling.
-- `modules/account_orders.js`: Local persistence for per-bot order-grid snapshots and metadata (`profiles/orders.json`).
+- `modules/account_orders.js`: Local persistence for per-bot order-grid snapshots, metadata, cacheFunds, and pending proceeds (`profiles/orders.json`). Manages bot-specific files with atomic updates and race-condition protection.
 
 ### 📊 Order Subsystem (`modules/order/`)
 
 Core order generation, management, and grid algorithms:
 
-- `modules/constants.js`: Order constants, grid limits, and `DEFAULT_CONFIG`.
+- `modules/constants.js`: Centralized order constants (types: `SELL`, `BUY`, `SPREAD`; states: `VIRTUAL`, `ACTIVE`, `PARTIAL`), timing constants, and `DEFAULT_CONFIG`.
 - `modules/order/index.js`: Public entry point: exports `OrderManager` and `runOrderManagerCalculation()` (dry-run helper).
 - `modules/order/logger.js`: Colored console logger and `logOrderGrid()` helper for formatted output.
 - `modules/order/manager.js`: `OrderManager` class — derives market price, resolves bounds, builds and manages the grid, handles fills and rebalancing.
