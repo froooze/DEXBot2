@@ -706,7 +706,31 @@ class DEXBot {
         }
 
         if (shouldRegenerate) {
-            await this.placeInitialOrders();
+            await this.manager._initializeAssets();
+            console.log('[bot.js] Generating new grid.');
+            await Grid.initializeGrid(this.manager);
+            this.manager.funds.pendingProceeds = { buy: 0, sell: 0 };
+            
+            // If there are existing on-chain orders, reconcile them with the new grid
+            if (Array.isArray(chainOpenOrders) && chainOpenOrders.length > 0) {
+                console.log(`[bot.js] Found ${chainOpenOrders.length} existing chain orders. Syncing them onto the new grid.`);
+                const syncResult = await this.manager.synchronizeWithChain(chainOpenOrders, 'readOpenOrders');
+                const { reconcileStartupOrders } = require('./modules/order/startup_reconcile');
+                await reconcileStartupOrders({
+                    manager: this.manager,
+                    config: this.config,
+                    account: this.account,
+                    privateKey: this.privateKey,
+                    chainOrders,
+                    chainOpenOrders,
+                    syncResult,
+                });
+            } else {
+                // No existing orders: place initial orders on-chain
+                console.log('[bot.js] No existing chain orders found. Placing initial orders.');
+                await this.placeInitialOrders();
+            }
+            accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()), this.manager.funds.cacheFunds, this.manager.funds.pendingProceeds);
         } else {
             console.log('[bot.js] Found active session. Loading and syncing existing grid.');
             await Grid.loadGrid(this.manager, persistedGrid);
@@ -739,9 +763,17 @@ class DEXBot {
         console.log(`[bot.js] Loaded configuration for bot: ${botName}`);
         console.log(`[bot.js] Market: ${botConfig.assetA}-${botConfig.assetB}, Account: ${botConfig.preferredAccount}`);
 
-        // Normalize config
+        // Load all bots from configuration to prevent pruning other active bots
+        const allBotsConfig = parseJsonWithComments(fs.readFileSync(PROFILES_BOTS_FILE, 'utf8')).bots || [];
+        const allActiveBots = allBotsConfig
+            .filter(b => b.active !== false)
+            .map((b, idx) => normalizeBotEntry(b, idx));
+        
+        // Normalize config for current bot
         const normalizedConfig = normalizeBotEntry(botConfig, 0);
-        accountOrders.ensureBotEntries([normalizedConfig]);
+        
+        // Ensure entries exist for ALL active bots (prevents pruning other bots)
+        accountOrders.ensureBotEntries(allActiveBots);
 
         // Authenticate master password
         const masterPassword = await authenticateMasterPassword();
