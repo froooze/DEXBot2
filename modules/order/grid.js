@@ -316,7 +316,7 @@ class Grid {
             manager.applyBotFundsAllocation();
         }
 
-        const diagMsg = `Allocating sizes: sellFunds=${String(manager.funds.available.sell)}, buyFunds=${String(manager.funds.available.buy)}, ` +
+        const diagMsg = `Allocating sizes: sellFunds=${String(manager.calculateAvailableFunds('sell'))}, buyFunds=${String(manager.calculateAvailableFunds('buy'))}, ` +
             `minSellSize=${String(minSellSize)}, minBuySize=${String(minBuySize)}`;
         manager.logger?.log?.(diagMsg, 'debug');
 
@@ -656,9 +656,7 @@ class Grid {
         const gridValue = isBuy
             ? manager.funds?.total?.grid?.buy || 0
             : manager.funds?.total?.grid?.sell || 0;
-        const availableValue = isBuy
-            ? manager.funds?.available?.buy || 0
-            : manager.funds?.available?.sell || 0;
+        const availableValue = manager.calculateAvailableFunds(isBuy ? 'buy' : 'sell');
 
         // Total Input = Cache + Grid + Available
         // We use ALL available funds to resize the grid, attempting to "reset available to 0".

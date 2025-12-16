@@ -1462,7 +1462,7 @@ class OrderManager {
 
             // Step 3: Find furthest active BUY orders and prepare them for rotation (cancel + recreate)
             // Rotation requires available funds - new order consumes available, old order moves to reserved
-            if (this.funds.available.buy > 0) {
+            if (this.calculateAvailableFunds('buy') > 0) {
                 const rotatedBuys = await this.prepareFurthestOrdersForRotation(
                     ORDER_TYPES.BUY,
                     count,
@@ -1510,7 +1510,7 @@ class OrderManager {
 
             // Step 3: Find furthest active SELL orders and prepare them for rotation
             // Rotation requires available funds - new order consumes available, old order moves to reserved
-            if (this.funds.available.sell > 0) {
+            if (this.calculateAvailableFunds('sell') > 0) {
                 const rotatedSells = await this.prepareFurthestOrdersForRotation(
                     ORDER_TYPES.SELL,
                     count,
@@ -2117,7 +2117,7 @@ class OrderManager {
             // - For SELL activation: choose the SPREAD entries with the highest prices first (furthest from market above price)
             // This ensures newly created buy orders use the lowest available spread price and sells use the highest.
             .sort((a, b) => targetType === ORDER_TYPES.BUY ? a.price - b.price : b.price - a.price);
-        const availableFunds = targetType === ORDER_TYPES.BUY ? this.funds.available.buy : this.funds.available.sell;
+        const availableFunds = this.calculateAvailableFunds(targetType === ORDER_TYPES.BUY ? 'buy' : 'sell');
         if (availableFunds <= 0) { this.logger.log(`No available funds to create ${targetType} orders`, 'warn'); return []; }
         let desiredCount = Math.min(count, spreadOrders.length);
         if (desiredCount <= 0) {
