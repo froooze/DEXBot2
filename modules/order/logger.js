@@ -26,11 +26,17 @@ class Logger {
     constructor(level = 'info') {
         this.levels = { debug: 0, info: 1, warn: 2, error: 3 };
         this.level = level;
-        this.colors = {
+        // Only use colors if stdout is a TTY (terminal), not when piped to files
+        const useColors = process.stdout.isTTY;
+        this.colors = useColors ? {
             reset: '\x1b[0m',
             buy: '\x1b[32m', sell: '\x1b[31m', spread: '\x1b[33m',
             debug: '\x1b[36m', info: '\x1b[37m', warn: '\x1b[33m', error: '\x1b[31m',
             virtual: '\x1b[90m', active: '\x1b[32m', partial: '\x1b[34m'
+        } : {
+            reset: '', buy: '', sell: '', spread: '',
+            debug: '', info: '', warn: '', error: '',
+            virtual: '', active: '', partial: ''
         };
     }
 
