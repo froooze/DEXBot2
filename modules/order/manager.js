@@ -247,25 +247,10 @@ class OrderManager {
             }
         }
 
-        // Reduce allocated amounts by BTS fees if applicable
+        // Note: BTS fee deduction happens in Grid.updateGridOrderSizesForSide() during actual sizing
+        // Do not deduct fees here to avoid double-counting
         let finalAllocatedBuy = allocatedBuy;
         let finalAllocatedSell = allocatedSell;
-
-        if (btsFeesForCreation > 0) {
-            if (assetB === 'BTS') {
-                finalAllocatedBuy = Math.max(0, allocatedBuy - btsFeesForCreation);
-                this.logger?.log?.(
-                    `Reduced allocated BTS (buy) by ${btsFeesForCreation.toFixed(8)} for order creation fees: ${allocatedBuy.toFixed(8)} -> ${finalAllocatedBuy.toFixed(8)}`,
-                    'info'
-                );
-            } else if (assetA === 'BTS') {
-                finalAllocatedSell = Math.max(0, allocatedSell - btsFeesForCreation);
-                this.logger?.log?.(
-                    `Reduced allocated BTS (sell) by ${btsFeesForCreation.toFixed(8)} for order creation fees: ${allocatedSell.toFixed(8)} -> ${finalAllocatedSell.toFixed(8)}`,
-                    'info'
-                );
-            }
-        }
 
         // Expose allocation for grid sizing (and diagnostics)
         this.funds.allocated = { buy: finalAllocatedBuy, sell: finalAllocatedSell };
