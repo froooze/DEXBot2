@@ -596,7 +596,7 @@ class Grid {
     static checkAndUpdateGridIfNeeded(manager, cacheFunds = { buy: 0, sell: 0 }) {
         if (!manager) throw new Error('checkAndUpdateGridIfNeeded requires a manager instance');
 
-        const { GRID_LIMITS } = require('./constants');
+        const { GRID_LIMITS } = require('../constants');
         const threshold = GRID_LIMITS.GRID_REGENERATION_PERCENTAGE || 1;
 
         const snap = Grid._getFundSnapshot(manager);

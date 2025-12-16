@@ -1843,19 +1843,29 @@ class OrderManager {
                     this.logger.log(`Persisted cacheFunds.${side} = ${newCacheFundsValue.toFixed(8)}`, 'debug');
                 }
 
-                // Trigger grid comparison to detect divergence after cacheFunds change
+                // Centralized grid comparison trigger after cacheFunds change:
+                // 1. First check: simple percentage-based (GRID_REGENERATION_PERCENTAGE)
+                // 2. If simple check passes, update order sizes and skip expensive quadratic comparison
+                // 3. If simple check fails, run expensive quadratic comparison (DIVERGENCE_THRESHOLD_Percent)
                 if (accountDb) {
                     const Grid = require('./grid');
-                    const persistedGrid = accountDb.loadBotGrid(this.config.botKey) || [];
-                    const calculatedGrid = Array.from(this.orders.values());
 
-                    const comparisonResult = Grid.compareGrids(calculatedGrid, persistedGrid, this, this.funds.cacheFunds);
+                    // Step 1: Simple percentage-based check
+                    const simpleCheckResult = Grid.checkAndUpdateGridIfNeeded(this, this.funds.cacheFunds);
 
-                    if (comparisonResult.buy.metric > 0 || comparisonResult.sell.metric > 0) {
-                        this.logger.log(
-                            `Grid divergence detected after cacheFunds change: buy=${comparisonResult.buy.metric.toFixed(6)}, sell=${comparisonResult.sell.metric.toFixed(6)}`,
-                            'info'
-                        );
+                    // Step 2: If simple check didn't trigger, run expensive quadratic comparison
+                    if (!simpleCheckResult.buyUpdated && !simpleCheckResult.sellUpdated) {
+                        const persistedGrid = accountDb.loadBotGrid(this.config.botKey) || [];
+                        const calculatedGrid = Array.from(this.orders.values());
+
+                        const comparisonResult = Grid.compareGrids(calculatedGrid, persistedGrid, this, this.funds.cacheFunds);
+
+                        if (comparisonResult.buy.metric > 0 || comparisonResult.sell.metric > 0) {
+                            this.logger.log(
+                                `Grid divergence detected after cacheFunds change: buy=${comparisonResult.buy.metric.toFixed(6)}, sell=${comparisonResult.sell.metric.toFixed(6)}`,
+                                'info'
+                            );
+                        }
                     }
                 }
             } catch (err) {
