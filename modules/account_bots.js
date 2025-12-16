@@ -122,7 +122,7 @@ function askNumber(promptText, defaultValue) {
 function askWeightDistribution(promptText, defaultValue) {
     const MIN_WEIGHT = -1;
     const MAX_WEIGHT = 2;
-    console.log('\x1b[33m  -1=SuperValley | 0=Valley | 0.5=Neutral | 1=Mountain | 2=SuperMountain\x1b[0m');
+    console.log('\x1b[33m  -1=SuperValley ←→ 0=Valley ←→ 0.5=Neutral ←→ 1=Mountain ←→ 2=SuperMountain\x1b[0m');
     const suffix = defaultValue !== undefined && defaultValue !== null ? ` [${defaultValue}]` : '';
     const raw = readlineSync.question(`${promptText}${suffix}: `).trim();
     if (raw === '') return defaultValue;
