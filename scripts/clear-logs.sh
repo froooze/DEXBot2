@@ -68,9 +68,9 @@ done
 log_info ""
 
 # Ask for confirmation
-read -p "Delete these log files? (yes/no): " -r CONFIRM
+read -p "Delete these log files? (y/n): " -r CONFIRM
 
-if [ "$CONFIRM" != "yes" ]; then
+if [ "$CONFIRM" != "y" ] && [ "$CONFIRM" != "Y" ]; then
     log_warning "Cancelled"
     exit 0
 fi
