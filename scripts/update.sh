@@ -6,11 +6,20 @@
 #
 # Features:
 # - Checks for updates from main branch
-# - Backs up current profiles/ directory
-# - Performs git pull
+# - Protects profiles/ directory (excluded from git, never modified)
+# - Stashes local changes to modules/constants.js before update
+# - Performs git pull with clean working directory
+# - Reapplies stashed modules/constants.js changes after update
 # - Installs/updates dependencies
 # - Restarts PM2 if running
 # - Logs all operations
+#
+# Protected Files:
+# - profiles/ - Your bot configurations, profiles, and logs (in .gitignore)
+# - modules/constants.js - Local customizations are stashed and reapplied
+#
+# Note: If conflicts occur during stash reapply, the script will warn you and suggest
+# manual resolution using git stash show and git stash drop commands.
 
 set -e
 
