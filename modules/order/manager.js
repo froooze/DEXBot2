@@ -1697,7 +1697,13 @@ class OrderManager {
         const allExcluded = new Set([...correctionOrderIds, ...excludeOrderIds, ...recentlyRotated]);
 
         if (allExcluded.size > 0) {
-            this.logger.log(`Excluding ${allExcluded.size} order(s) from rotation (corrected, pending, or recently rotated)`, 'debug');
+            this.logger.log(
+                `Excluding ${allExcluded.size} order(s) from rotation: ` +
+                `${correctionOrderIds.size} pending correction, ` +
+                `${excludeOrderIds.size} already excluded, ` +
+                `${recentlyRotated.size} recently rotated`,
+                'debug'
+            );
         }
 
         const activeOrders = this.getOrdersByTypeAndState(targetType, ORDER_STATES.ACTIVE)
