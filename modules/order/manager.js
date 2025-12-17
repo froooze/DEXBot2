@@ -324,6 +324,39 @@ class OrderManager {
     }
 
     /**
+     * Persist pending proceeds to disk with retry logic.
+     * Retries up to 3 times with exponential backoff on transient failures.
+     * Fails hard on permanent failure to prevent silent data loss.
+     *
+     * @throws {Error} If persistence fails after all retry attempts
+     */
+    _persistPendingProceeds() {
+        if (!this.config || !this.config.botKey || !this.accountOrders) {
+            return;
+        }
+
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+                this.accountOrders.updatePendingProceeds(this.config.botKey, this.funds.pendingProceeds);
+                this.logger.log(`✓ Persisted pendingProceeds: Buy ${(this.funds.pendingProceeds.buy || 0).toFixed(8)}, Sell ${(this.funds.pendingProceeds.sell || 0).toFixed(8)}`, 'debug');
+                return;  // Success
+            } catch (e) {
+                if (attempt === 3) {
+                    // All retries failed - fail hard
+                    this.logger.log(`CRITICAL: Failed to persist pendingProceeds after ${attempt} attempts: ${e.message}. Proceeds at risk of loss!`, 'error');
+                    throw e;
+                } else {
+                    this.logger.log(`Failed to persist pendingProceeds (attempt ${attempt}/3): ${e.message}. Retrying...`, 'warn');
+                    // Exponential backoff: 100ms, 200ms, 300ms
+                    const waitMs = attempt * 100;
+                    const start = Date.now();
+                    while (Date.now() - start < waitMs) { }  // Busy wait
+                }
+            }
+        }
+    }
+
+    /**
      * Recalculate all fund values based on current order states.
      *
      * This method iterates all orders and computes:
@@ -1404,14 +1437,7 @@ class OrderManager {
 
         // CRITICAL: Persist pending proceeds so they survive bot restart
         // These funds from partial fills must not be lost when the bot restarts
-        try {
-            if (this.config && this.config.botKey && this.accountOrders) {
-                this.accountOrders.updatePendingProceeds(this.config.botKey, this.funds.pendingProceeds);
-                this.logger.log(`Persisted pendingProceeds: Buy ${(this.funds.pendingProceeds.buy || 0).toFixed(8)}, Sell ${(this.funds.pendingProceeds.sell || 0).toFixed(8)}`, 'debug');
-            }
-        } catch (e) {
-            this.logger.log(`Warning: Failed to persist pendingProceeds: ${e.message}`, 'warn');
-        }
+        this._persistPendingProceeds();
         
         if (this.logger.level === 'debug') this._logAvailable('after proceeds apply');
         const extraOrderCount = this.outOfSpread ? 1 : 0;
@@ -1462,14 +1488,7 @@ class OrderManager {
         this.logger.log(`Cleared pendingProceeds after rotation: Before Buy ${proceedsBeforeClear.buy.toFixed(8)} -> After ${(this.funds.pendingProceeds.buy || 0).toFixed(8)} | Before Sell ${proceedsBeforeClear.sell.toFixed(8)} -> After ${(this.funds.pendingProceeds.sell || 0).toFixed(8)}`, 'info');
         
         // CRITICAL: Persist cleared pendingProceeds so cleared state survives restart
-        try {
-            if (this.config && this.config.botKey && this.accountOrders) {
-                this.accountOrders.updatePendingProceeds(this.config.botKey, this.funds.pendingProceeds);
-                this.logger.log(`Persisted pendingProceeds: Buy ${(this.funds.pendingProceeds.buy || 0).toFixed(8)}, Sell ${(this.funds.pendingProceeds.sell || 0).toFixed(8)}`, 'debug');
-            }
-        } catch (e) {
-            this.logger.log(`Warning: Failed to persist pendingProceeds: ${e.message}`, 'warn');
-        }
+        this._persistPendingProceeds();
         
         this._logAvailable('after rotation clear');
 
