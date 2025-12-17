@@ -949,18 +949,21 @@ class DEXBot {
                 }
 
                 // Reconcile existing on-chain orders to the configured target counts.
-                // This logic is shared with the "regenerate" startup path and lives in one place.
-                if (syncResult && (syncResult.unmatchedChainOrders || syncResult.unmatchedGridOrders)) {
-                    await reconcileStartupOrders({
-                        manager: this.manager,
-                        config: this.config,
-                        account: this.account,
-                        privateKey: this.privateKey,
-                        chainOrders,
-                        chainOpenOrders,
-                        syncResult,
-                    });
-                }
+                // IMPORTANT: Call unconditionally, not just when unmatched orders exist!
+                // This ensures activeOrders changes in bots.json are applied on restart:
+                // - If user increased activeOrders (e.g., 10→20), new virtual orders activate
+                // - If user decreased activeOrders (e.g., 20→10), excess orders are cancelled
+                // Without this check, reconciliation is skipped if all current orders match,
+                // leaving the bot with the wrong number of active orders
+                await reconcileStartupOrders({
+                    manager: this.manager,
+                    config: this.config,
+                    account: this.account,
+                    privateKey: this.privateKey,
+                    chainOrders,
+                    chainOpenOrders,
+                    syncResult,
+                });
 
                 // Correct any orders with price mismatches at startup
                 if (syncResult.ordersNeedingCorrection && syncResult.ordersNeedingCorrection.length > 0) {

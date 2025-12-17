@@ -754,7 +754,23 @@ class DEXBot {
         } else {
             console.log('[bot.js] Found active session. Loading and syncing existing grid.');
             await Grid.loadGrid(this.manager, persistedGrid);
-            await this.manager.synchronizeWithChain(chainOpenOrders, 'readOpenOrders');
+            const syncResult = await this.manager.synchronizeWithChain(chainOpenOrders, 'readOpenOrders');
+
+            // Reconcile existing on-chain orders to the configured target counts.
+            // This ensures activeOrders changes in bots.json are applied on restart:
+            // - If user increased activeOrders (e.g., 10→20), new virtual orders activate
+            // - If user decreased activeOrders (e.g., 20→10), excess orders are cancelled
+            const { reconcileStartupOrders } = require('./modules/order/startup_reconcile');
+            await reconcileStartupOrders({
+                manager: this.manager,
+                config: this.config,
+                account: this.account,
+                privateKey: this.privateKey,
+                chainOrders,
+                chainOpenOrders,
+                syncResult,
+            });
+
             this.accountOrders.storeMasterGrid(this.config.botKey, Array.from(this.manager.orders.values()), this.manager.funds.cacheFunds, this.manager.funds.pendingProceeds);
         }
 
