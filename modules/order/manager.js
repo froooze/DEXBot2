@@ -312,6 +312,8 @@ class OrderManager {
         if (!side || (side !== 'buy' && side !== 'sell')) return;
 
         const asset = side === 'buy' ? this.config.assetA : this.config.assetB;
+        // CRITICAL FIX: Only deduct BTS fees from the side that actually has BTS as the asset
+        // If this side's asset is NOT BTS, don't deduct fees from these proceeds
         if (asset !== 'BTS' || this.funds.btsFeesOwed <= 0) return;
 
         const pending = this.funds.pendingProceeds?.[side] || 0;
@@ -1433,12 +1435,12 @@ class OrderManager {
                 this.logger.log(`Sell filled: +${proceeds.toFixed(8)} ${quoteName}, -${filledOrder.size.toFixed(8)} ${baseName} committed (orderId=${filledOrder.id}, size=${filledOrder.size.toFixed(8)}, price=${filledOrder.price}, isPartial=${filledOrder.isPartial})`, 'info');
             } else {
                 const proceeds = filledOrder.size / filledOrder.price;
-                proceedsSell += proceeds;  // Collect, don't add yet
-                // BUY means we receive base asset (sell side tracker) and spend quote asset (buy side)
-                deltaSellFree += proceeds;
-                deltaSellTotal += proceeds;
-                // buyFree was reduced at order creation; only total decreases to reflect the spend
-                deltaBuyTotal -= filledOrder.size;
+                proceedsBuy += proceeds;  // Collect, don't add yet - BUY receives assetA/base which tracks on buy side
+                // BUY means we receive base asset (assetA, buy side) and spend quote asset (assetB, sell side)
+                deltaBuyFree += proceeds;
+                deltaBuyTotal += proceeds;
+                // sellFree was reduced at order creation; only total decreases to reflect the spend
+                deltaSellTotal -= filledOrder.size;
                 const quoteName = this.config.assetB || 'quote';
                 const baseName = this.config.assetA || 'base';
                 this.logger.log(`Buy filled: +${proceeds.toFixed(8)} ${baseName}, -${filledOrder.size.toFixed(8)} ${quoteName} committed (orderId=${filledOrder.id}, size=${filledOrder.size.toFixed(8)}, price=${filledOrder.price}, isPartial=${filledOrder.isPartial})`, 'info');
