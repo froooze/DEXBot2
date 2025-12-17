@@ -1685,23 +1685,32 @@ class OrderManager {
     async prepareFurthestOrdersForRotation(targetType, count, excludeOrderIds = new Set(), filledCount = 0, options = {}) {
         if (count <= 0) return [];
 
-        // Get orderIds that are pending price correction - exclude these from rotation
-        const correctionOrderIds = new Set(
-            (this.ordersNeedingPriceCorrection || []).map(c => c.chainOrderId).filter(Boolean)
+        // Get orderIds with PRICE MISMATCHES (exclude, don't rotate while price-drifted)
+        // Orders with size changes only (sizeChanged=true) are OK to rotate
+        const priceMismatchOrderIds = new Set(
+            (this.ordersNeedingPriceCorrection || [])
+                .filter(c => !c.sizeChanged)  // Only price mismatches, not size changes
+                .map(c => c.chainOrderId)
+                .filter(Boolean)
         );
+
+        // Count grid size changes vs price mismatches for logging
+        const gridSizeCorrections = (this.ordersNeedingPriceCorrection || []).filter(c => c.sizeChanged).length;
+        const priceCorrections = priceMismatchOrderIds.size;
 
         // Also exclude recently rotated orders (prevents double-rotation from rapid fill events)
         const recentlyRotated = this._recentlyRotatedOrderIds || new Set();
 
-        // Combine all exclusion sets
-        const allExcluded = new Set([...correctionOrderIds, ...excludeOrderIds, ...recentlyRotated]);
+        // Combine all exclusion sets (only price-drift orders, not grid-size-change orders)
+        const allExcluded = new Set([...priceMismatchOrderIds, ...excludeOrderIds, ...recentlyRotated]);
 
         if (allExcluded.size > 0) {
             this.logger.log(
                 `Excluding ${allExcluded.size} order(s) from rotation: ` +
-                `${correctionOrderIds.size} pending correction, ` +
+                `${priceCorrections} price mismatch, ` +
                 `${excludeOrderIds.size} already excluded, ` +
-                `${recentlyRotated.size} recently rotated`,
+                `${recentlyRotated.size} recently rotated ` +
+                `(${gridSizeCorrections} orders with grid size changes are OK to rotate)`,
                 'debug'
             );
         }
