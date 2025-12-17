@@ -553,6 +553,36 @@ class Grid {
             manager.logger?.log?.(`Warning: failed to clear persisted cacheFunds during recalc: ${e.message}`, 'warn');
         }
 
+        // CRITICAL: Clear pendingProceeds and btsFeesOwed after grid regeneration
+        // Grid regeneration invalidates all previous proceeds as the grid structure changed.
+        // Stale proceeds from old orders could interfere with new rotation calculations.
+        // Fees from old orders are also no longer relevant with the new grid structure.
+        // Reset to zero and persist to ensure clean state on next restart.
+        if (manager.funds && manager.funds.pendingProceeds) {
+            manager.funds.pendingProceeds = { buy: 0, sell: 0 };
+            try {
+                if (manager.accountOrders && typeof manager.accountOrders.updatePendingProceeds === 'function') {
+                    manager.accountOrders.updatePendingProceeds(manager.config.botKey, manager.funds.pendingProceeds);
+                    manager.logger?.log?.('✓ Cleared pendingProceeds after grid regeneration', 'info');
+                }
+            } catch (e) {
+                manager.logger?.log?.(`Warning: failed to clear persisted pendingProceeds during regeneration: ${e.message}`, 'warn');
+            }
+        }
+
+        // Also clear BTS fees when grid is regenerated
+        if (manager.funds && typeof manager.funds.btsFeesOwed === 'number' && manager.funds.btsFeesOwed > 0) {
+            manager.funds.btsFeesOwed = 0;
+            try {
+                if (manager.accountOrders && typeof manager.accountOrders.updateBtsFeesOwed === 'function') {
+                    manager.accountOrders.updateBtsFeesOwed(manager.config.botKey, 0);
+                    manager.logger?.log?.('✓ Cleared BTS fees owed after grid regeneration', 'info');
+                }
+            } catch (e) {
+                manager.logger?.log?.(`Warning: failed to clear persisted BTS fees during regeneration: ${e.message}`, 'warn');
+            }
+        }
+
         const chainOpenOrders = await readOpenOrdersFn();
         if (!Array.isArray(chainOpenOrders)) {
             manager.logger.log('Could not fetch open orders for resync.', 'error');
