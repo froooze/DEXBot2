@@ -1313,9 +1313,17 @@ async function applyGridDivergenceCorrections(manager, accountOrders, botKey, up
 
     if (manager.ordersNeedingPriceCorrection.length > 0) {
         manager.logger?.log?.(
-            `Marked ${manager.ordersNeedingPriceCorrection.length} orders for size correction after grid divergence detection`,
+            `DEBUG: Marked ${manager.ordersNeedingPriceCorrection.length} orders for size correction after grid divergence detection (sides: ${manager._gridSidesUpdated.join(', ')})`,
             'info'
         );
+
+        // Log specific orders being corrected
+        manager.ordersNeedingPriceCorrection.slice(0, 3).forEach(corr => {
+            manager.logger?.log?.(
+                `  Correcting: ${corr.chainOrderId} | current size: ${corr.size.toFixed(8)} | price: ${corr.expectedPrice.toFixed(4)}`,
+                'debug'
+            );
+        });
 
         // Clear the tracking flag
         manager._gridSidesUpdated = [];
