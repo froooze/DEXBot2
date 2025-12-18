@@ -377,7 +377,7 @@ DEXBot intelligently caches grid calculations and order prices to avoid unnecess
 
 This optimization significantly reduces startup time and blockchain queries, especially for bots running 20+ orders.
 
-### 📱 Offline Filled Order Detection
+### ✈️ Offline Filled Order Detection
 The bot automatically detects orders that were filled while offline:
 - **Compares persisted grid** with current on-chain open orders on startup
 - **Identifies missing orders** (orders from grid that are no longer on-chain)
