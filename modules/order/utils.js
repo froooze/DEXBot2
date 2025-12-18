@@ -127,6 +127,90 @@ function computeChainFundTotals(accountTotals, committedChain) {
     };
 }
 
+/**
+ * Calculates available funds for a specific side (buy/sell).
+ * Accounts for: chain free balance, virtual orders, cache, pending proceeds, and BTS fees.
+ *
+ * @param {string} side - 'buy' or 'sell'
+ * @param {Object} accountTotals - Account totals with buyFree/sellFree
+ * @param {Object} funds - Fund tracking object
+ * @param {string} assetA - Asset A symbol (to determine BTS side)
+ * @param {string} assetB - Asset B symbol (to determine BTS side)
+ * @returns {number} Available funds for the side, always >= 0
+ */
+function calculateAvailableFundsValue(side, accountTotals, funds, assetA, assetB) {
+    if (!side || (side !== 'buy' && side !== 'sell')) return 0;
+
+    const chainFree = side === 'buy' ? (accountTotals?.buyFree || 0) : (accountTotals?.sellFree || 0);
+    const virtuel = side === 'buy' ? (funds.virtuel?.buy || 0) : (funds.virtuel?.sell || 0);
+    const cacheFunds = side === 'buy' ? (funds.cacheFunds?.buy || 0) : (funds.cacheFunds?.sell || 0);
+    const pending = side === 'buy' ? (funds.pendingProceeds?.buy || 0) : (funds.pendingProceeds?.sell || 0);
+
+    // Determine which side actually has BTS as the asset
+    const btsSide = (assetA === 'BTS') ? 'sell' :
+                   (assetB === 'BTS') ? 'buy' : null;
+    let applicableBtsFeesOwed = 0;
+    if (btsSide === side && funds.btsFeesOwed > 0) {
+        // BTS fees would be deducted from pendingProceeds, up to the amount available
+        applicableBtsFeesOwed = Math.min(funds.btsFeesOwed, pending);
+    }
+
+    return Math.max(0, chainFree - virtuel - cacheFunds) + (pending - applicableBtsFeesOwed);
+}
+
+/**
+ * Calculates the current spread percentage between best buy and sell orders.
+ * Checks active orders first, falls back to virtual orders if needed.
+ *
+ * @param {Array} activeBuys - Active buy orders
+ * @param {Array} activeSells - Active sell orders
+ * @param {Array} virtualBuys - Virtual buy orders
+ * @param {Array} virtualSells - Virtual sell orders
+ * @returns {number} Spread percentage (e.g., 2.5 for 2.5%), or 0 if no valid spread
+ */
+function calculateSpreadFromOrders(activeBuys, activeSells, virtualBuys, virtualSells) {
+    const pickBestBuy = () => {
+        if (activeBuys.length) return Math.max(...activeBuys.map(o => o.price));
+        if (virtualBuys.length) return Math.max(...virtualBuys.map(o => o.price));
+        return null;
+    };
+    const pickBestSell = () => {
+        if (activeSells.length) return Math.min(...activeSells.map(o => o.price));
+        if (virtualSells.length) return Math.min(...virtualSells.map(o => o.price));
+        return null;
+    };
+
+    const bestBuy = pickBestBuy();
+    const bestSell = pickBestSell();
+    if (bestBuy === null || bestSell === null || bestBuy === 0) return 0;
+    return ((bestSell / bestBuy) - 1) * 100;
+}
+
+/**
+ * Resolves a config value to a numeric amount.
+ * Supports: direct numbers, percentage strings (e.g., "50%"), or numeric strings.
+ * Returns 0 if value cannot be parsed or if total is needed but not provided.
+ *
+ * @param {*} value - The config value to resolve
+ * @param {number} total - The total amount (required for percentage calculations)
+ * @returns {number} Resolved numeric value
+ */
+function resolveConfigValue(value, total) {
+    if (typeof value === 'number') return value;
+    if (typeof value === 'string') {
+        const p = parsePercentageString(value);
+        if (p !== null) {
+            if (total === null || total === undefined) {
+                return 0; // Cannot resolve without total
+            }
+            return total * p;
+        }
+        const n = parseFloat(value);
+        return Number.isNaN(n) ? 0 : n;
+    }
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 // Blockchain conversions
 // ---------------------------------------------------------------------------
@@ -1276,6 +1360,9 @@ module.exports = {
 
     // Fund calculations
     computeChainFundTotals,
+    calculateAvailableFundsValue,
+    calculateSpreadFromOrders,
+    resolveConfigValue,
 
     // Conversions
     blockchainToFloat,

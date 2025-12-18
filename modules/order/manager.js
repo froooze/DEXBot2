@@ -35,7 +35,7 @@
  * 4. After rotation: pendingProceeds cleared as funds are consumed by new orders
  */
 const { ORDER_TYPES, ORDER_STATES, DEFAULT_CONFIG, TIMING, GRID_LIMITS, LOG_LEVEL } = require('../constants');
-const { parsePercentageString, blockchainToFloat, floatToBlockchainInt, resolveRelativePrice, calculatePriceTolerance, checkPriceWithinTolerance, parseChainOrder, findMatchingGridOrderByOpenOrder, findMatchingGridOrderByHistory, applyChainSizeToGridOrder, correctOrderPriceOnChain, getMinOrderSize, getAssetFees, computeChainFundTotals } = require('./utils');
+const { parsePercentageString, blockchainToFloat, floatToBlockchainInt, resolveRelativePrice, calculatePriceTolerance, checkPriceWithinTolerance, parseChainOrder, findMatchingGridOrderByOpenOrder, findMatchingGridOrderByHistory, applyChainSizeToGridOrder, correctOrderPriceOnChain, getMinOrderSize, getAssetFees, computeChainFundTotals, calculateAvailableFundsValue, calculateSpreadFromOrders, resolveConfigValue } = require('./utils');
 const Logger = require('./logger');
 // Grid functions (initialize/recalculate) are intended to be
 // called directly via require('./grid').initializeGrid(manager) by callers.
@@ -145,26 +145,23 @@ class OrderManager {
     }
 
     // Helper: Resolve config value (percentage, number, or string)
+    // Handles async fetching of account totals if needed
     _resolveConfigValue(value, total) {
-        if (typeof value === 'number') return value;
-        if (typeof value === 'string') {
-            const p = parsePercentageString(value);
-            if (p !== null) {
-                if (total === null || total === undefined) {
-                    this.logger?.log(`Cannot resolve percentage-based botFunds '${value}' because account total is not set. Attempting on-chain lookup (will default to 0 while fetching).`, 'warn');
-                    // Kick off an async fetch of account balances if possible; do not block here.
-                    if (!this._isFetchingTotals) {
-                        this._isFetchingTotals = true;
-                        this._fetchAccountBalancesAndSetTotals().finally(() => { this._isFetchingTotals = false; });
-                    }
-                    return 0;
+        const resolved = resolveConfigValue(value, total);
+
+        // If resolution returned 0 and value was a percentage string, attempt async fetch
+        if (resolved === 0 && typeof value === 'string' && value.trim().endsWith('%')) {
+            if (total === null || total === undefined) {
+                this.logger?.log(`Cannot resolve percentage-based botFunds '${value}' because account total is not set. Attempting on-chain lookup (will default to 0 while fetching).`, 'warn');
+                // Kick off an async fetch of account balances if possible; do not block here.
+                if (!this._isFetchingTotals) {
+                    this._isFetchingTotals = true;
+                    this._fetchAccountBalancesAndSetTotals().finally(() => { this._isFetchingTotals = false; });
                 }
-                return total * p;
             }
-            const n = parseFloat(value);
-            return Number.isNaN(n) ? 0 : n;
         }
-        return 0;
+
+        return resolved;
     }
 
     _computeChainFundTotals() {
@@ -258,24 +255,7 @@ class OrderManager {
      * @returns {number} Available funds for the given side (accounting for fees but not modifying state)
      */
     calculateAvailableFunds(side) {
-        if (!side || (side !== 'buy' && side !== 'sell')) return 0;
-
-        const chainFree = side === 'buy' ? (this.accountTotals?.buyFree || 0) : (this.accountTotals?.sellFree || 0);
-        const virtuel = side === 'buy' ? (this.funds.virtuel?.buy || 0) : (this.funds.virtuel?.sell || 0);
-        const cacheFunds = side === 'buy' ? (this.funds.cacheFunds?.buy || 0) : (this.funds.cacheFunds?.sell || 0);
-        const pending = side === 'buy' ? (this.funds.pendingProceeds?.buy || 0) : (this.funds.pendingProceeds?.sell || 0);
-
-        // Check if BTS fees would apply to this side (pure calculation, no modification)
-        // Determine which side actually has BTS as the asset
-        const btsSide = (this.config.assetA === 'BTS') ? 'sell' :
-                       (this.config.assetB === 'BTS') ? 'buy' : null;
-        let applicableBtsFeesOwed = 0;
-        if (btsSide === side && this.funds.btsFeesOwed > 0) {
-            // BTS fees would be deducted from pendingProceeds, up to the amount available
-            applicableBtsFeesOwed = Math.min(this.funds.btsFeesOwed, pending);
-        }
-
-        return Math.max(0, chainFree - virtuel - cacheFunds) + (pending - applicableBtsFeesOwed);
+        return calculateAvailableFundsValue(side, this.accountTotals, this.funds, this.config.assetA, this.config.assetB);
     }
 
     /**
@@ -2310,9 +2290,7 @@ class OrderManager {
         const activeSells = this.getOrdersByTypeAndState(ORDER_TYPES.SELL, ORDER_STATES.ACTIVE);
         const virtualBuys = this.getOrdersByTypeAndState(ORDER_TYPES.BUY, ORDER_STATES.VIRTUAL);
         const virtualSells = this.getOrdersByTypeAndState(ORDER_TYPES.SELL, ORDER_STATES.VIRTUAL);
-        const pickBestBuy = () => { if (activeBuys.length) return Math.max(...activeBuys.map(o => o.price)); if (virtualBuys.length) return Math.max(...virtualBuys.map(o => o.price)); return null; };
-        const pickBestSell = () => { if (activeSells.length) return Math.min(...activeSells.map(o => o.price)); if (virtualSells.length) return Math.min(...virtualSells.map(o => o.price)); return null; };
-        const bestBuy = pickBestBuy(); const bestSell = pickBestSell(); if (bestBuy === null || bestSell === null || bestBuy === 0) return 0; return ((bestSell / bestBuy) - 1) * 100;
+        return calculateSpreadFromOrders(activeBuys, activeSells, virtualBuys, virtualSells);
     }
 
     /**
