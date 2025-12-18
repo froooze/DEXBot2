@@ -283,6 +283,57 @@ class OrderManager {
     }
 
     /**
+     * Generic persistence wrapper with retry logic and exponential backoff.
+     * Attempts to persist data up to maxAttempts times with exponential backoff.
+     * On final failure, logs critical error but does NOT throw - allows processing to continue.
+     * Flags persistenceWarning so bot can retry persistence later.
+     *
+     * @param {Function} persistFn - Function that performs the persistence (should throw on failure)
+     * @param {string} dataType - Human-readable name of data type (e.g., 'pendingProceeds', 'btsFeesOwed')
+     * @param {*} dataValue - The value being persisted (for logging and warning flag)
+     * @param {number} maxAttempts - Maximum retry attempts (default: 3)
+     * @returns {boolean} true if persistence succeeded, false if failed
+     */
+    _persistWithRetry(persistFn, dataType, dataValue, maxAttempts = 3) {
+        if (!this.config || !this.config.botKey || !this.accountOrders) {
+            return true;  // Can't persist, but that's ok (e.g., dry run)
+        }
+
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                persistFn();  // Execute the persistence function
+                this.logger.log(`✓ Persisted ${dataType}`, 'debug');
+
+                // Clear any previous persistence warning flag
+                if (this._persistenceWarning) {
+                    delete this._persistenceWarning;
+                }
+                return true;  // Success
+            } catch (e) {
+                if (attempt === maxAttempts) {
+                    // All retries failed - don't throw, just flag the issue
+                    this.logger.log(`CRITICAL: Failed to persist ${dataType} after ${attempt} attempts: ${e.message}. Data held in memory. Will retry on next cycle.`, 'error');
+
+                    // Flag this issue so caller can know persistence is degraded
+                    this._persistenceWarning = {
+                        type: dataType,
+                        error: e.message,
+                        timestamp: Date.now(),
+                        data: dataValue
+                    };
+                    return false;  // Signal failure to caller
+                } else {
+                    this.logger.log(`Failed to persist ${dataType} (attempt ${attempt}/${maxAttempts}): ${e.message}. Retrying...`, 'warn');
+                    // Exponential backoff: 100ms, 200ms, 300ms for 3 attempts
+                    const waitMs = attempt * 100;
+                    const start = Date.now();
+                    while (Date.now() - start < waitMs) { }  // Busy wait
+                }
+            }
+        }
+    }
+
+    /**
      * Persist pending proceeds to disk with retry logic.
      * Retries up to 3 times with exponential backoff on transient failures.
      * On final failure, logs critical error but does NOT throw - allows processing to continue
@@ -291,42 +342,11 @@ class OrderManager {
      * @returns {boolean} true if persistence succeeded, false if failed
      */
     _persistPendingProceeds() {
-        if (!this.config || !this.config.botKey || !this.accountOrders) {
-            return true;  // Can't persist, but that's ok (e.g., dry run)
-        }
-
-        for (let attempt = 1; attempt <= 3; attempt++) {
-            try {
-                this.accountOrders.updatePendingProceeds(this.config.botKey, this.funds.pendingProceeds);
-                this.logger.log(`✓ Persisted pendingProceeds: Buy ${(this.funds.pendingProceeds.buy || 0).toFixed(8)}, Sell ${(this.funds.pendingProceeds.sell || 0).toFixed(8)}`, 'debug');
-
-                // Clear any previous persistence warning flag
-                if (this._persistenceWarning) {
-                    delete this._persistenceWarning;
-                }
-                return true;  // Success
-            } catch (e) {
-                if (attempt === 3) {
-                    // All retries failed - don't throw, just flag the issue
-                    this.logger.log(`CRITICAL: Failed to persist pendingProceeds after ${attempt} attempts: ${e.message}. Proceeds held in memory. Will retry on next cycle.`, 'error');
-
-                    // Flag this issue so caller can know persistence is degraded
-                    this._persistenceWarning = {
-                        type: 'pendingProceeds',
-                        error: e.message,
-                        timestamp: Date.now(),
-                        funds: { ...this.funds.pendingProceeds }
-                    };
-                    return false;  // Signal failure to caller
-                } else {
-                    this.logger.log(`Failed to persist pendingProceeds (attempt ${attempt}/3): ${e.message}. Retrying...`, 'warn');
-                    // Exponential backoff: 100ms, 200ms, 300ms
-                    const waitMs = attempt * 100;
-                    const start = Date.now();
-                    while (Date.now() - start < waitMs) { }  // Busy wait
-                }
-            }
-        }
+        return this._persistWithRetry(
+            () => this.accountOrders.updatePendingProceeds(this.config.botKey, this.funds.pendingProceeds),
+            `pendingProceeds: Buy ${(this.funds.pendingProceeds.buy || 0).toFixed(8)}, Sell ${(this.funds.pendingProceeds.sell || 0).toFixed(8)}`,
+            { ...this.funds.pendingProceeds }
+        );
     }
 
     /**
@@ -339,42 +359,11 @@ class OrderManager {
      * @returns {boolean} true if persistence succeeded, false if failed
      */
     _persistBtsFeesOwed() {
-        if (!this.config || !this.config.botKey || !this.accountOrders) {
-            return true;  // Can't persist, but that's ok (e.g., dry run)
-        }
-
-        for (let attempt = 1; attempt <= 3; attempt++) {
-            try {
-                this.accountOrders.updateBtsFeesOwed(this.config.botKey, this.funds.btsFeesOwed);
-                this.logger.log(`✓ Persisted BTS fees owed: ${(this.funds.btsFeesOwed || 0).toFixed(8)} BTS`, 'debug');
-
-                // Clear any previous persistence warning flag
-                if (this._persistenceWarning) {
-                    delete this._persistenceWarning;
-                }
-                return true;  // Success
-            } catch (e) {
-                if (attempt === 3) {
-                    // All retries failed - don't throw, just flag the issue
-                    this.logger.log(`CRITICAL: Failed to persist BTS fees after ${attempt} attempts: ${e.message}. Fees held in memory. Will retry on next cycle.`, 'error');
-
-                    // Flag this issue so caller can know persistence is degraded
-                    this._persistenceWarning = {
-                        type: 'btsFeesOwed',
-                        error: e.message,
-                        timestamp: Date.now(),
-                        funds: this.funds.btsFeesOwed
-                    };
-                    return false;  // Signal failure to caller
-                } else {
-                    this.logger.log(`Failed to persist BTS fees (attempt ${attempt}/3): ${e.message}. Retrying...`, 'warn');
-                    // Exponential backoff: 100ms, 200ms, 300ms
-                    const waitMs = attempt * 100;
-                    const start = Date.now();
-                    while (Date.now() - start < waitMs) { }  // Busy wait
-                }
-            }
-        }
+        return this._persistWithRetry(
+            () => this.accountOrders.updateBtsFeesOwed(this.config.botKey, this.funds.btsFeesOwed),
+            `BTS fees owed: ${(this.funds.btsFeesOwed || 0).toFixed(8)} BTS`,
+            this.funds.btsFeesOwed
+        );
     }
 
 
