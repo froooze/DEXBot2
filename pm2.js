@@ -201,10 +201,10 @@ async function installPM2() {
     });
 
     return new Promise((resolve, reject) => {
-        rl.question('PM2 is not installed. Install now? (y/n): ', (answer) => {
+        rl.question('PM2 is not installed. Install now? (Y/n): ', (answer) => {
             rl.close();
 
-            if (answer.toLowerCase() !== 'y') {
+            if (answer.toLowerCase() === 'n') {
                 console.log('PM2 installation cancelled. Run: npm install -g pm2');
                 process.exit(1);
             }

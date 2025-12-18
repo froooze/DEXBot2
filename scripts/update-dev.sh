@@ -104,7 +104,7 @@ CONSTANTS_STASHED=false
 if [ "$CURRENT_BRANCH" != "$REPO_BRANCH" ]; then
     log_info "Step 3: Switching to $REPO_BRANCH branch..."
     # Stash local changes to modules/constants.js before switching
-    if ! git diff --quiet -- modules/constants.js 2>/dev/null; then
+    if ! git diff --quiet -- modules/constants.js 2>/dev/null || ! git diff --cached --quiet -- modules/constants.js 2>/dev/null; then
         log_info "Stashing local changes to modules/constants.js..."
         if git stash push -m "DEXBot2 update backup: modules/constants.js" -- modules/constants.js; then
             CONSTANTS_STASHED=true
@@ -127,7 +127,7 @@ if [ "$CURRENT_BRANCH" != "$REPO_BRANCH" ]; then
 else
     log_info "Step 3: Cleaning working directory..."
     # Stash local changes to modules/constants.js before cleaning
-    if ! git diff --quiet -- modules/constants.js 2>/dev/null; then
+    if ! git diff --quiet -- modules/constants.js 2>/dev/null || ! git diff --cached --quiet -- modules/constants.js 2>/dev/null; then
         log_info "Stashing local changes to modules/constants.js..."
         if git stash push -m "DEXBot2 update backup: modules/constants.js" -- modules/constants.js; then
             CONSTANTS_STASHED=true
