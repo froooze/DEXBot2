@@ -50,7 +50,7 @@ const TIMING = Object.freeze({
     ACCOUNT_TOTALS_TIMEOUT_MS: 10000,
     // Blockchain fetch interval: how often to refresh blockchain account values (in minutes)
     // Default: 120 minutes (2 hours). Set to 0 or non-number to disable periodic fetches.
-    BLOCKCHAIN_FETCH_INTERVAL_MIN: 120
+    BLOCKCHAIN_FETCH_INTERVAL_MIN: 240
 });
 
 // Grid limits and scaling constants
