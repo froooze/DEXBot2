@@ -1086,11 +1086,11 @@ class OrderManager {
                         }
                     }
                     // Create a new object to avoid mutation bug
-                    // Cancelled surplus orders: preserve original type (BUY/SELL) for grid position reuse
-                    // Only FILLED orders become VIRTUAL SPREAD - cancelled orders keep their type
-                    const updatedOrder = { ...gridOrder, state: ORDER_STATES.VIRTUAL, size: 0, orderId: null };
+                    // Cancelled surplus orders: preserve original type (BUY/SELL) and size for grid history
+                    // Only FILLED orders become VIRTUAL SPREAD with size: 0 - cancelled orders preserve allocation
+                    const updatedOrder = { ...gridOrder, state: ORDER_STATES.VIRTUAL, orderId: null };
                     this._updateOrder(updatedOrder);
-                    this.logger.log(`Order ${updatedOrder.id} (${orderId}) cancelled and reverted to VIRTUAL ${gridOrder.type.toUpperCase()}`, 'info');
+                    this.logger.log(`Order ${updatedOrder.id} (${orderId}) cancelled and reverted to VIRTUAL ${gridOrder.type.toUpperCase()} (size preserved: ${gridOrder.size?.toFixed(8) || 0})`, 'info');
                 }
                 break;
             }
