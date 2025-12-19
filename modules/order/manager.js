@@ -1085,10 +1085,12 @@ class OrderManager {
                             this.logger.log(`[chainFree update] ${gridOrder.type} order moving ACTIVE->VIRTUAL: ${oldFree.toFixed(8)} + ${size.toFixed(8)} = ${this.accountTotals.sellFree.toFixed(8)} ${this.config?.assetA}`, 'debug');
                         }
                     }
-                    // Create a new object to avoid mutation bug - convert to SPREAD placeholder
-                    const updatedOrder = { ...gridOrder, type: ORDER_TYPES.SPREAD, state: ORDER_STATES.VIRTUAL, size: 0, orderId: null };
+                    // Create a new object to avoid mutation bug
+                    // Cancelled surplus orders: preserve original type (BUY/SELL) for grid position reuse
+                    // Only FILLED orders become VIRTUAL SPREAD - cancelled orders keep their type
+                    const updatedOrder = { ...gridOrder, state: ORDER_STATES.VIRTUAL, size: 0, orderId: null };
                     this._updateOrder(updatedOrder);
-                    this.logger.log(`Order ${updatedOrder.id} (${orderId}) cancelled and reverted to VIRTUAL SPREAD`, 'info');
+                    this.logger.log(`Order ${updatedOrder.id} (${orderId}) cancelled and reverted to VIRTUAL ${gridOrder.type.toUpperCase()}`, 'info');
                 }
                 break;
             }
