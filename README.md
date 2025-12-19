@@ -354,20 +354,32 @@ DEXBot automatically regenerates grid order sizes when market conditions or cach
 
 2. **Grid Divergence Threshold** (1 promille by default)
    - Compares currently calculated grid with persisted grid state
-   - Uses quadratic deviation metric: `Σ((calculated - persisted) / persisted)² / count`
-   - Triggers when metric exceeds threshold (in promille, where 1 promille = 0.1%)
-   - Penalizes larger deviations more heavily (10% error contributes 0.01, 50% error contributes 0.25)
-   - Example: If persisted orders are [100, 200, 150] and calculated are [100, 180, 160], metric is ~5.42 promille
+   - **What is Promille?** A relative quadratic error metric that measures how much the calculated grid diverges from the persisted grid. It squares relative errors (penalizing larger deviations exponentially) and is scaled by 1000 for readability. RMS and Promille are interchangeable: higher RMS = higher promille.
+     ```
+     Promille = Σ((calculated - persisted) / persisted)² / count × 1000
+     RMS = √(Promille / 1000)  [converts back to percentage]
+     ```
 
-   **Threshold Reference Table:**
-   | Promille | Avg Error | Description |
-   |----------|-----------|-------------|
-   | 0.1 | ~1.0% | Very strict (almost no drift allowed) |
-   | 0.5 | ~2.2% | Strict |
-   | 1 | ~3.2% | Default (balanced) |
-   | 2 | ~4.5% | Lenient |
-   | 5 | ~7.1% | Very lenient |
-   | 10 | ~10% | Extremely lenient |
+   **Understanding RMS vs Simple Average:**
+   The RMS (quadratic mean) calculation penalizes uneven error distributions:
+   - **Simple Average**: (6.4% + 0%) / 2 = 3.2%
+   - **RMS (Quadratic Mean)**: √((6.4² + 0²) / 2) = 4.53%
+
+   When order errors are unevenly distributed, RMS will be higher than simple average, requiring a higher promille threshold to tolerate the same scenario.
+
+   **Promille Threshold Reference Table:**
+   For the same average error, shows how RMS and Promille values differ between even (100% all same) and uneven (10% outliers, 90% perfect) distributions.
+   | Avg Error | 100% Distribution | Threshold || 10% Distribution | Threshold |
+   |-----------|-------------------|---|---|-------------------|----------|
+   || RMS | Promille || RMS | Promille |
+   | 1.0% | 1.0% | 0.1 | | 3.16% | 1.0 |
+   | 2.2% | 2.2% | 0.5 | | 6.96% | 5.0 |
+   | 3.2% | 3.2% | 1 | | 10.1% | 10 |
+   | 4.5% | 4.5% | 2 | | 14.2% | 20 |
+   | 7.1% | 7.1% | 5 | | 22.5% | 50 |
+   | 10% | 10% | 10 | | 31.6% | 100 |
+
+   **Key Insight:** For uneven distributions, promille scales approximately as `1 + n`. Even if the simple average remains constant at 3.2%, having outlier orders with high errors requires a proportionally higher promille threshold when using RMS-based detection.
 
 **When Grid Recalculation Occurs:**
 - After order fills and proceeds are collected
