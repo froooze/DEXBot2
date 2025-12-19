@@ -419,9 +419,9 @@ async function promptBotData(base = {}) {
     // Prompt sell first, then buy to make the config output match the desired ordering
     const fundsSell = askNumberOrPercentage('botFunds sell amount', base.botFunds && base.botFunds.sell !== undefined ? base.botFunds.sell : DEFAULT_CONFIG.botFunds.sell);
     const fundsBuy = askNumberOrPercentage('botFunds buy amount', base.botFunds && base.botFunds.buy !== undefined ? base.botFunds.buy : DEFAULT_CONFIG.botFunds.buy);
-    // activeOrders must be integers 1-50
-    const ordersSell = askIntegerInRange('activeOrders sell count', base.activeOrders && base.activeOrders.sell !== undefined ? base.activeOrders.sell : DEFAULT_CONFIG.activeOrders.sell, 1, 50);
-    const ordersBuy = askIntegerInRange('activeOrders buy count', base.activeOrders && base.activeOrders.buy !== undefined ? base.activeOrders.buy : DEFAULT_CONFIG.activeOrders.buy, 1, 50);
+    // activeOrders must be integers 1-100
+    const ordersSell = askIntegerInRange('activeOrders sell count', base.activeOrders && base.activeOrders.sell !== undefined ? base.activeOrders.sell : DEFAULT_CONFIG.activeOrders.sell, 1, 100);
+    const ordersBuy = askIntegerInRange('activeOrders buy count', base.activeOrders && base.activeOrders.buy !== undefined ? base.activeOrders.buy : DEFAULT_CONFIG.activeOrders.buy, 1, 100);
 
     // ===== COMPREHENSIVE INPUT VALIDATION =====
 
