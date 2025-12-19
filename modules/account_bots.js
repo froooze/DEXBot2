@@ -409,7 +409,7 @@ async function promptBotData(base = {}) {
     // incrementPercent must be between 0.01 and 10 (prevents grid calculation errors)
     const incrementPercent = askNumberWithBounds('incrementPercent', base.incrementPercent !== undefined ? base.incrementPercent : DEFAULT_CONFIG.incrementPercent, 0.01, 10);
     // targetSpreadPercent must be >= 2x incrementPercent (default is 3x)
-    const defaultSpread = base.targetSpreadPercent !== undefined ? base.targetSpreadPercent : incrementPercent * 3;
+    const defaultSpread = base.targetSpreadPercent !== undefined ? base.targetSpreadPercent : incrementPercent * 4;
     const targetSpreadPercent = askTargetSpreadPercent('targetSpread %', defaultSpread, incrementPercent);
     const weightSell = askWeightDistribution('Weight distribution (sell)', base.weightDistribution && base.weightDistribution.sell !== undefined ? base.weightDistribution.sell : DEFAULT_CONFIG.weightDistribution.sell);
     const weightBuy = askWeightDistributionNoLegend('Weight distribution (buy)', base.weightDistribution && base.weightDistribution.buy !== undefined ? base.weightDistribution.buy : DEFAULT_CONFIG.weightDistribution.buy);
