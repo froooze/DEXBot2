@@ -726,9 +726,12 @@ class Grid {
             precision
         );
 
-        // DEBUG: Log calculated sizes as requested
+        // DEBUG: Log calculated sizes summary
         try {
-            manager.logger?.log?.(`DEBUG Calculated Sizes (${sideName}): totalInput=${totalInput.toFixed(8)}, sizes=[${newSizes.map(s => s.toFixed(8)).join(', ')}]`, 'debug');
+            const minSize = Math.min(...newSizes);
+            const maxSize = Math.max(...newSizes);
+            const avgSize = newSizes.reduce((a, b) => a + b, 0) / newSizes.length;
+            manager.logger?.log?.(`DEBUG Calculated Sizes (${sideName}): count=${newSizes.length}, total=${totalInput.toFixed(8)}, min=${minSize.toFixed(8)}, max=${maxSize.toFixed(8)}, avg=${avgSize.toFixed(8)}`, 'debug');
         } catch (e) { manager.logger?.log?.(`Warning: failed to log calculated sizes: ${e.message}`, 'warn'); }
 
         // Update orders with new sizes
@@ -1195,14 +1198,28 @@ class Grid {
         const totalOrders = matchCount + unmatchedCount;
         const metric = totalOrders > 0 ? sumSquaredDiff / totalOrders : 0;
 
-        // Log large deviations if metric is high
-        if (metric > 0.1) {  // More than 10 promille
-            console.log(`DEBUG [${sideName}] Grid comparison shows high divergence: metric=${metric.toFixed(6)}, maxRelativeDiff=${maxRelativeDiff.toFixed(4)}, largeDeviations=${largeDeviations.length}`);
-            if (largeDeviations.length > 0 && largeDeviations.length <= 5) {
-                largeDeviations.slice(0, 5).forEach(d => {
-                    console.log(`  - ${d.id}: pers=${d.persSize}, calc=${d.calcSize}, diff=${d.percentDiff}%`);
+        // Log divergence calculation breakdown
+        if (metric > 0.01) {  // More than 10 promille (0.01 in normalized form)
+            console.log(`\nDEBUG [${sideName}] Divergence Calculation Breakdown:`);
+            console.log(`  Matched orders: ${matchCount}`);
+            console.log(`  Unmatched orders: ${unmatchedCount}`);
+            console.log(`  Total orders (denominator): ${totalOrders}`);
+            console.log(`  Sum of squared differences: ${sumSquaredDiff.toFixed(8)}`);
+            console.log(`  Metric (normalized): ${metric.toFixed(8)}`);
+            console.log(`  Metric (promille): ${(metric * 1000).toFixed(6)}`);
+            console.log(`  Max relative difference: ${(maxRelativeDiff * 100).toFixed(2)}%`);
+            console.log(`  Large deviations (>10%): ${largeDeviations.length}`);
+
+            if (largeDeviations.length > 0) {
+                console.log(`  Top deviations:`);
+                largeDeviations.slice(0, 10).forEach((d, idx) => {
+                    console.log(`    ${idx + 1}. ${d.id}: pers=${d.persSize}, calc=${d.calcSize}, diff=${d.percentDiff}%`);
                 });
+                if (largeDeviations.length > 10) {
+                    console.log(`    ... and ${largeDeviations.length - 10} more`);
+                }
             }
+            console.log('');
         }
 
         return metric;
