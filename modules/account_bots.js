@@ -241,7 +241,18 @@ async function promptBotData(base = {}) {
     const marketPrice = askMarketPrice('marketPrice (pool, market or A/B)', base.marketPrice || 'pool');
     const minPrice = askNumberOrMultiplier('minPrice', base.minPrice !== undefined ? base.minPrice : DEFAULT_CONFIG.minPrice);
     const maxPrice = askNumberOrMultiplier('maxPrice', base.maxPrice !== undefined ? base.maxPrice : DEFAULT_CONFIG.maxPrice);
-    const incrementPercent = askNumber('incrementPercent', base.incrementPercent !== undefined ? base.incrementPercent : DEFAULT_CONFIG.incrementPercent);
+    let incrementPercent = askNumber('incrementPercent', base.incrementPercent !== undefined ? base.incrementPercent : DEFAULT_CONFIG.incrementPercent);
+    // Validate increment bounds (critical for grid calculation)
+    // Min 0.01: prevents excessive grid density
+    // Max 10: prevents negative or zero stepDown, ensures proper grid structure
+    if (incrementPercent < 0.01) {
+        console.log('\n⚠️  WARNING: incrementPercent too small (< 0.01). Setting to 0.01');
+        incrementPercent = 0.01;
+    }
+    if (incrementPercent > 10) {
+        console.log('\n⚠️  WARNING: incrementPercent too large (> 10). Setting to 10');
+        incrementPercent = 10;
+    }
     const targetSpreadPercent = askNumber('targetSpreadPercent', base.targetSpreadPercent !== undefined ? base.targetSpreadPercent : DEFAULT_CONFIG.targetSpreadPercent);
     const weightSell = askWeightDistribution('Weight distribution (sell)', base.weightDistribution && base.weightDistribution.sell !== undefined ? base.weightDistribution.sell : DEFAULT_CONFIG.weightDistribution.sell);
     const weightBuy = askWeightDistributionNoLegend('Weight distribution (buy)', base.weightDistribution && base.weightDistribution.buy !== undefined ? base.weightDistribution.buy : DEFAULT_CONFIG.weightDistribution.buy);
