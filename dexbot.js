@@ -1466,10 +1466,10 @@ async function handleCLICommands() {
             return true;
         case 'reset':
             await resetBotByName(target);
-            return true;
+            process.exit(0);
         case 'stop':
             await stopBotByName(target);
-            return true;
+            process.exit(0);
         case 'keys':
             await runAccountManager({ waitForConnection: true, exitAfter: true, disconnectAfter: true });
             return true;
