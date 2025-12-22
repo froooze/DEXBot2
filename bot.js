@@ -485,22 +485,26 @@ class DEXBot {
                     const { rotation } = ctx;
                     const { oldOrder, newPrice, newGridId, newSize } = rotation;
 
-                    if (rotation.usingOverride) {
-                        const slot = this.manager.orders.get(newGridId) || { id: newGridId, type: rotation.type, price: newPrice, size: 0, state: ORDER_STATES.VIRTUAL };
-                        const updatedSlot = {
-                            ...slot,
-                            id: newGridId,
-                            type: rotation.type,
-                            size: rotation.newSize,
-                            price: newPrice,
-                            state: ORDER_STATES.VIRTUAL,
-                            orderId: null
-                        };
-                        this.manager._updateOrder(updatedSlot);
-                    }
+                    // ALWAYS update target grid slot with new rotation size (not just when usingOverride)
+                    // This ensures the grid order size matches what was actually placed on-chain
+                    const slot = this.manager.orders.get(newGridId) || { id: newGridId, type: rotation.type, price: newPrice, size: 0, state: ORDER_STATES.VIRTUAL };
+                    const updatedSlot = {
+                        ...slot,
+                        id: newGridId,
+                        type: rotation.type,
+                        size: rotation.newSize,
+                        price: newPrice,
+                        state: ORDER_STATES.VIRTUAL,
+                        orderId: null
+                    };
+                    this.manager._updateOrder(updatedSlot);
+
+                    // Detect if rotation was placed with partial proceeds (size < grid slot size)
+                    // This order should be marked PARTIAL, not ACTIVE, so it's filtered from divergence calculations
+                    const isPartialPlacement = slot.size > 0 && rotation.newSize < slot.size;
 
                     this.manager.completeOrderRotation(oldOrder);
-                    await this.manager.synchronizeWithChain({ gridOrderId: newGridId, chainOrderId: oldOrder.orderId }, 'createOrder');
+                    await this.manager.synchronizeWithChain({ gridOrderId: newGridId, chainOrderId: oldOrder.orderId, isPartialPlacement }, 'createOrder');
                     this.manager.logger.log(`Order size updated: ${oldOrder.orderId} new price ${newPrice.toFixed(4)}, new size ${newSize.toFixed(8)}`, 'info');
                 }
             }
@@ -854,6 +858,68 @@ class DEXBot {
             });
 
             persistGridSnapshot(this.manager, this.accountOrders, this.config.botKey);
+        }
+
+        /**
+         * Perform a full grid resync: cancel orphan orders and regenerate grid.
+         * Triggered by the presence of a `recalculate.<botKey>.trigger` file.
+         */
+        const performResync = async () => {
+            if (this.isResyncing) {
+                console.log('[bot.js] Resync already in progress, skipping trigger.');
+                return;
+            }
+            this.isResyncing = true;
+            try {
+                console.log('[bot.js] Grid regeneration triggered. Performing full grid resync...');
+                const readFn = () => chainOrders.readOpenOrders(this.accountId);
+                await Grid.recalculateGrid(this.manager, {
+                    readOpenOrdersFn: readFn,
+                    chainOrders,
+                    account: this.account,
+                    privateKey: this.privateKey,
+                    config: this.config,
+                });
+                // CRITICAL: Reset pendingProceeds when grid is regenerated
+                // New grid means old partial fill proceeds are no longer relevant
+                this.manager.funds.pendingProceeds = { buy: 0, sell: 0 };
+                persistGridSnapshot(this.manager, this.accountOrders, this.config.botKey);
+
+                if (fs.existsSync(this.triggerFile)) {
+                    fs.unlinkSync(this.triggerFile);
+                    console.log('[bot.js] Removed trigger file.');
+                }
+            } catch (err) {
+                console.log(`[bot.js] Error during triggered resync: ${err.message}`);
+            } finally {
+                this.isResyncing = false;
+            }
+        };
+
+        if (fs.existsSync(this.triggerFile)) {
+            await performResync();
+        }
+
+        // Debounced watcher to avoid duplicate rapid triggers on some platforms
+        let _triggerDebounce = null;
+        try {
+            fs.watch(PROFILES_DIR, (eventType, filename) => {
+                try {
+                    if (filename === path.basename(this.triggerFile)) {
+                        if ((eventType === 'rename' || eventType === 'change') && fs.existsSync(this.triggerFile)) {
+                            if (_triggerDebounce) clearTimeout(_triggerDebounce);
+                            _triggerDebounce = setTimeout(() => {
+                                _triggerDebounce = null;
+                                performResync();
+                            }, 200);
+                        }
+                    }
+                } catch (err) {
+                    console.warn('[bot.js] fs.watch handler error:', err && err.message ? err.message : err);
+                }
+            });
+        } catch (err) {
+            console.warn(`[bot.js] Failed to setup file watcher: ${err.message}`);
         }
 
         // Main loop

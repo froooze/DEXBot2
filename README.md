@@ -183,7 +183,7 @@ You can run bots directly via `node dexbot.js` or the `dexbot` CLI wrapper (inst
 - `dexbot start [bot_name]` — start a specific bot (or all active bots if omitted). Respects each bot's `dryRun` setting.
 - `dexbot drystart [bot_name]` — same as `start` but forces `dryRun=true` for safe simulation.
 - `dexbot stop [bot_name]` — mark a bot (or all bots) inactive; the config file is used the next time the process launches.
-- `dexbot restart [bot_name]` — restart a bot and reset its order grid. This clears saved order state and regenerates the grid from scratch.
+- `dexbot reset [bot_name]` — trigger a grid reset (auto-reloads if running, or applies on next start).
 - `dexbot keys` — manage master password and keyring via `modules/chain_keys.js`.
 - `dexbot bots` — open the interactive editor in `modules/account_bots.js` to create or edit bot entries.
 - `dexbot --cli-examples` — print curated CLI snippets for common tasks.
@@ -240,10 +240,13 @@ pm2 status
 # View real-time logs from all bots (or specific bot)
 pm2 logs [<bot-name>]
 
+# Reset Grid (Regenerate orders)
+dexbot reset [<bot-name>]
+
 # Stop all bots (or specific bot)
 pm2 stop {all|<bot-name>}
 
-# Restart all bots (or specific bot)
+# Restart process (without reset)
 pm2 restart {all|<bot-name>}
 
 # Delete all bots from PM2 (or specific bot)
@@ -461,7 +464,7 @@ Below is a short summary of the modules in this repository and what they provide
 
 ### 🚀 Entry Points
 
-- `dexbot.js`: Main CLI entry point. Handles single-bot mode (start, stop, restart, drystart) and management commands (keys, bots, --cli-examples). Includes full DEXBot class with grid management, fill processing, and account operations.
+- `dexbot.js`: Main CLI entry point. Handles single-bot mode (start, stop, reset, drystart) and management commands (keys, bots, --cli-examples). Includes full DEXBot class with grid management, fill processing, and account operations.
 - `pm2.js`: Unified PM2 launcher. Orchestrates BitShares connection, PM2 check/install, ecosystem config generation from `profiles/bots.json`, master password authentication, and bot startup with automatic restart policies.
 - `bot.js`: PM2-friendly per-bot entry point. Loads bot config by name from `profiles/bots.json`, authenticates via master password (from environment or interactive prompt), initializes DEXBot instance, and runs the trading loop.
 

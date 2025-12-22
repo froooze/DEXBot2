@@ -11,7 +11,7 @@
  * - Automatic order replacement when fills occur
  * - Master password encryption for private keys
  * - Dry-run mode for testing without broadcasting transactions
- * - CLI commands: start, drystart, restart, stop, keys, bots
+ * - CLI commands: start, drystart, reset, stop, keys, bots
  */
 const { BitShares, waitForConnected, setSuppressConnectionLog } = require('./modules/bitshares_client');
 const fs = require('fs');
@@ -46,7 +46,7 @@ function ensureProfilesDirectory() {
 }
 
 
-const CLI_COMMANDS = ['start', 'restart', 'stop', 'drystart', 'keys', 'bots', 'pm2'];
+const CLI_COMMANDS = ['start', 'reset', 'stop', 'drystart', 'keys', 'bots', 'pm2'];
 const CLI_HELP_FLAGS = ['-h', '--help'];
 const CLI_EXAMPLES_FLAG = '--cli-examples';
 const CLI_EXAMPLES = [
@@ -54,7 +54,8 @@ const CLI_EXAMPLES = [
     { title: 'Dry-run a bot without broadcasting', command: 'dexbot drystart bot-name', notes: 'Forces the run into dry-run mode even if the stored config was live.' },
     { title: 'Manage keys', command: 'dexbot keys', notes: 'Runs modules/chain_keys.js to add or update master passwords.' },
     { title: 'Edit bot definitions', command: 'dexbot bots', notes: 'Launches the interactive modules/account_bots.js helper for the JSON config.' },
-    { title: 'Start bots with PM2', command: 'dexbot pm2', notes: 'Generates ecosystem config, authenticates, and starts PM2.' }
+    { title: 'Start bots with PM2', command: 'dexbot pm2', notes: 'Generates ecosystem config, authenticates, and starts PM2.' },
+    { title: 'Reset a bot grid', command: 'dexbot reset bot-name', notes: 'Triggers a full grid regeneration for the named bot.' }
 ];
 const cliArgs = process.argv.slice(2);
 
@@ -64,7 +65,7 @@ function printCLIUsage() {
     console.log('Commands:');
     console.log('  start <bot>       Start the named bot using the tracked config.');
     console.log('  drystart <bot>    Same as start but forces dry-run execution.');
-    console.log('  restart <bot>     Re-run the named bot, regenerating the grid.');
+    console.log('  reset <bot>       Trigger a grid reset (auto-reloads if running, or applies on next start).');
     console.log('  stop <bot>        Mark the bot inactive in config (stop running instance separately).');
     console.log('  keys              Launch the chain key helper (modules/chain_keys.js).');
     console.log('  bots              Launch the interactive bot configurator (modules/account_bots.js).');
@@ -577,22 +578,26 @@ class DEXBot {
                     const { rotation } = ctx;
                     const { oldOrder, newPrice, newGridId, newSize } = rotation;
 
-                    if (rotation.usingOverride) {
-                        const slot = this.manager.orders.get(newGridId) || { id: newGridId, type: rotation.type, price: newPrice, size: 0, state: ORDER_STATES.VIRTUAL };
-                        const updatedSlot = {
-                            ...slot,
-                            id: newGridId,
-                            type: rotation.type,
-                            size: rotation.newSize,
-                            price: newPrice,
-                            state: ORDER_STATES.VIRTUAL,
-                            orderId: null
-                        };
-                        this.manager._updateOrder(updatedSlot);
-                    }
+                    // ALWAYS update target grid slot with new rotation size (not just when usingOverride)
+                    // This ensures the grid order size matches what was actually placed on-chain
+                    const slot = this.manager.orders.get(newGridId) || { id: newGridId, type: rotation.type, price: newPrice, size: 0, state: ORDER_STATES.VIRTUAL };
+                    const updatedSlot = {
+                        ...slot,
+                        id: newGridId,
+                        type: rotation.type,
+                        size: rotation.newSize,
+                        price: newPrice,
+                        state: ORDER_STATES.VIRTUAL,
+                        orderId: null
+                    };
+                    this.manager._updateOrder(updatedSlot);
+
+                    // Detect if rotation was placed with partial proceeds (size < grid slot size)
+                    // This order should be marked PARTIAL, not ACTIVE, so it's filtered from divergence calculations
+                    const isPartialPlacement = slot.size > 0 && rotation.newSize < slot.size;
 
                     this.manager.completeOrderRotation(oldOrder);
-                    await this.manager.synchronizeWithChain({ gridOrderId: newGridId, chainOrderId: oldOrder.orderId }, 'createOrder');
+                    await this.manager.synchronizeWithChain({ gridOrderId: newGridId, chainOrderId: oldOrder.orderId, isPartialPlacement }, 'createOrder');
                     this.manager.logger.log(`Order size updated: ${oldOrder.orderId} new price ${newPrice.toFixed(4)}, new size ${newSize.toFixed(8)}`, 'info');
                 }
             }
@@ -1357,102 +1362,48 @@ async function stopBotByName(botName) {
 }
 
 /**
- * Restart a bot by regenerating its grid and starting it fresh.
- * This method:
- * 1. Generates a new order grid from current configuration
- * 2. Persists the grid snapshot to profiles/orders/{botKey}.json
- * 3. Starts the bot with the new grid (password authentication happens during startup)
+ * Reset a bot by regenerating its grid and starting it fresh.
+ * This method creates a trigger file that signals the bot instance
+ * (whether running locally or via PM2) to perform a full grid resync.
  *
- * @param {string|null} botName - Name of the bot to restart, or null for all active
+ * 1. Creates profiles/recalculate.<botKey>.trigger
+ * 2. If bot is running, it detects file -> resyncs grid -> deletes file
+ * 3. If bot is stopped, it detects file on startup -> resyncs grid -> deletes file
+ *
+ * @param {string|null} botName - Name of the bot to reset, or null for all active
  */
-async function restartBotByName(botName) {
+async function resetBotByName(botName) {
     const { config } = loadSettingsFile();
     const entries = normalizeBotEntries(resolveRawBotEntries(config));
 
-    // Ensure BitShares connection so we can derive prices/assets when building the grid.
-    try {
-        await waitForConnected(10000);
-    } catch (err) {
-        console.warn('Timed out waiting for BitShares connection before generating grid snapshots. Will attempt generation without connection where possible.');
-    }
-
-    // Generate a fresh grid snapshot for the selected bots and persist to profiles/orders/{botKey}.json
+    // Filter targets
     const targets = botName ? entries.filter(b => b.name === botName) : entries.filter(b => b.active);
     if (botName && targets.length === 0) {
-        console.error(`Could not find any bot named '${botName}' to restart.`);
+        console.error(`Could not find any bot named '${botName}' to reset.`);
         process.exit(1);
     }
 
+    console.log(`Setting regeneration trigger for ${targets.length} bot(s)...`);
+
     for (const bot of targets) {
         try {
-            // Build an OrderManager with the bot config and initialize the order grid
-            const manager = new OrderManager(bot);
-
-            // Set account info on the manager so _fetchAccountBalancesAndSetTotals can work
-            if (bot.preferredAccount) {
-                manager.account = bot.preferredAccount;
-                // Try to look up the account ID from the blockchain
-                try {
-                    const { BitShares } = require('./modules/bitshares_client');
-                    const full = await BitShares.db.get_full_accounts([bot.preferredAccount], false);
-                    if (full && full[0] && full[0][1] && full[0][1].account && full[0][1].account.id) {
-                        manager.accountId = full[0][1].account.id;
-                    } else if (full && full[0] && String(full[0][0]).startsWith('1.2.')) {
-                        manager.accountId = full[0][0];
-                    }
-                } catch (err) {
-                    console.warn(`[dexbot restart] Could not look up account ID for '${bot.preferredAccount}': ${err.message}`);
-                }
-            }
-
-            // If botFunds are percentage-based and account info is available, try to
-            // fetch on-chain balances first so percentages resolve correctly.
-            try {
-                const botFunds = bot && bot.botFunds ? bot.botFunds : {};
-                const needsPercent = (v) => typeof v === 'string' && v.includes('%');
-                if ((needsPercent(botFunds.buy) || needsPercent(botFunds.sell)) && (manager.accountId || manager.account)) {
-                    if (typeof manager._fetchAccountBalancesAndSetTotals === 'function') {
-                        await manager._fetchAccountBalancesAndSetTotals();
-                    }
-                }
-            } catch (errFetch) {
-                console.warn(`[dexbot restart] Could not fetch account totals before initializing grid for '${bot.name}': ${errFetch && errFetch.message ? errFetch.message : errFetch}`);
-            }
-
-            // Populate assets/marketPrice and compute the virtual grid (best-effort)
-            try {
-                await Grid.initializeGrid(manager);
-            } catch (e) {
-                // Initialization may fail if on-chain lookups are unavailable; log and continue with whatever grid was built.
-                console.warn(`Grid initialization for '${bot.name}' failed: ${e && e.message ? e.message : e}`);
-            }
-
-            // Create per-bot AccountOrders instance and ensure metadata exists for this bot
-            const botAccountOrders = new AccountOrders({ botKey: bot.botKey });
-            botAccountOrders.ensureBotEntries([bot]);
-
-            // CRITICAL: Reset pendingProceeds when grid is regenerated (restart command)
-            // New grid means old partial fill proceeds are no longer relevant
-            manager.funds.pendingProceeds = { buy: 0, sell: 0 };
-            persistGridSnapshot(manager, botAccountOrders, bot.botKey);
-            console.log(`Generated and stored grid snapshot for '${bot.name}' to profiles/orders/${bot.botKey}.json`);
+            const triggerFile = path.join(PROFILES_DIR, `recalculate.${bot.botKey}.trigger`);
+            fs.writeFileSync(triggerFile, '');
+            console.log(`✓ Trigger set for '${bot.name}' (${path.basename(triggerFile)})`);
         } catch (err) {
-            console.warn(`Failed to generate grid for '${bot.name}': ${err && err.message ? err.message : err}`);
+            console.warn(`Failed to set trigger for '${bot.name}': ${err.message}`);
         }
     }
 
-    // When invoked directly via `dexbot restart` we rebuild and persist the
-    // grid immediately and do NOT create the `recalculate.*.trigger` files
-    // (those remain available as an external hook that other processes
-    // can create manually to request a resync). Proceed to start the bot.
-    const target = botName ? ` '${botName}'` : ' all active bots';
-    console.log(`Restarting${target}. Ensure any previous run is stopped.`);
-    await startBotByName(botName, { dryRun: false });
+    console.log();
+    console.log('Action complete.');
+    console.log('- If the bot is running (CLI or PM2), it will detect the trigger and reset automatically.');
+    console.log('- If the bot is stopped, the grid will be regenerated the next time you run `dexbot start`.');
 }
 
 /**
  * Parse and execute CLI commands.
- * Supported commands: start, drystart, restart, stop, keys, bots
+ * Supported commands: start, drystart, reset, stop, keys, bots
  * @returns {Promise<boolean>} True if a command was handled, false otherwise
  */
 async function handleCLICommands() {
@@ -1470,8 +1421,8 @@ async function handleCLICommands() {
         case 'drystart':
             await startBotByName(target, { dryRun: true });
             return true;
-        case 'restart':
-            await restartBotByName(target);
+        case 'reset':
+            await resetBotByName(target);
             return true;
         case 'stop':
             await stopBotByName(target);

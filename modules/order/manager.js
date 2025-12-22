@@ -1040,7 +1040,7 @@ class OrderManager {
         this.logger.log(`DEBUG: synchronizeWithChain entering switch, source=${source}, chainData.length=${Array.isArray(chainData) ? chainData.length : 'N/A'}`, 'debug');
         switch (source) {
             case 'createOrder': {
-                const { gridOrderId, chainOrderId } = chainData;
+                const { gridOrderId, chainOrderId, isPartialPlacement } = chainData;
                 const gridOrder = this.orders.get(gridOrderId);
                 if (gridOrder) {
                     // Deduct order size from chainFree when moving from VIRTUAL to ACTIVE
@@ -1059,8 +1059,8 @@ class OrderManager {
                     }
                     // Create a new object with updated state to avoid mutation bugs in _updateOrder
                     // (if we mutate in place, _updateOrder can't find the old state index to remove from)
-                    // Preserve PARTIAL state if the order was already PARTIAL (e.g. during a move)
-                    const newState = (gridOrder.state === ORDER_STATES.PARTIAL) ? ORDER_STATES.PARTIAL : ORDER_STATES.ACTIVE;
+                    // Determine state: PARTIAL if rotation placed with proceeds (size < grid slot), otherwise ACTIVE
+                    const newState = isPartialPlacement ? ORDER_STATES.PARTIAL : (gridOrder.state === ORDER_STATES.PARTIAL ? ORDER_STATES.PARTIAL : ORDER_STATES.ACTIVE);
                     const updatedOrder = { ...gridOrder, state: newState, orderId: chainOrderId };
                     this._updateOrder(updatedOrder);
                     this.logger.log(`Order ${updatedOrder.id} synced with on-chain ID ${updatedOrder.orderId} (state=${newState})`, 'info');

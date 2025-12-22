@@ -87,7 +87,7 @@ const GRID_LIMITS = Object.freeze({
         // │ 22.360%     │ ~7.1%     │ Very lenient                │
         // │ 31.623%     │ ~10%      │ Extremely lenient           │
         // └────────────────────────────────────────────────────────┘
-        RMS_PERCENTAGE: 10
+        RMS_PERCENTAGE: 32
     })
 });
 
