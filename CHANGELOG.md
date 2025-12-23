@@ -2,6 +2,63 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.1] - 2025-12-23 - Order Consolidation, Grid Edge Handling & Partial Order Fixes
+
+### Features
+- **Code Consolidation**: Eliminated ~1,000 lines of duplicate code across entry points
+  - Extracted shared `DEXBot` class to `modules/dexbot_class.js` (822 lines)
+  - bot.js refactored from 1,021 → 186 lines
+  - dexbot.js refactored from 1,568 → 598 lines
+  - Unified class-based approach with logPrefix options for context-specific behavior
+  - Extracted `buildCreateOrderArgs()` utility to `modules/order/utils.js`
+
+- **Conditional Rotation**: Smart order creation at grid boundaries
+  - When active order count drops below target, creates new orders instead of rotating
+  - Handles grid edge cases where fewer orders can be placed near min/max prices
+  - Seamlessly transitions back to normal rotation when target is reached
+  - Prevents perpetual deficit caused by edge boundary constraints
+  - Comprehensive test coverage with edge case validation
+
+- **Repository Statistics Analyzer**: Interactive git history visualization
+  - Analyzes repository commits and generates beautiful HTML charts
+  - Tracks added/deleted lines across codebase with daily granularity
+  - Charts include daily changes and cumulative statistics
+  - Configurable file pattern filtering for focused analysis
+  - Script: `scripts/analyze-repo-stats.js`
+
+### Fixed
+- **Partial Order State Machine Invariant**: Guaranteed PARTIAL orders always have size > 0
+  - Fixed bug in `synchronizeWithChain()` where PARTIAL could be set with size = 0
+  - Proper state transitions: ACTIVE (size > 0) → PARTIAL (size > 0) → SPREAD (size = 0)
+  - PARTIAL and SPREAD orders excluded from divergence calculations
+  - Prevents invalid order states from persisting to storage
+
+### Changed
+- **Entry Point Architecture**: Simplified bot.js and dexbot.js to thin wrappers
+  - Removed duplicate class definitions
+  - All core logic now centralized in `modules/dexbot_class.js`
+  - Reduces maintenance overhead and improves consistency
+  - Options object pattern enables context-specific behavior (e.g., logPrefix)
+
+### Testing
+- Added comprehensive test suite for conditional rotation edge cases
+- Added state machine validation tests for partial orders
+- All tests passing with improved grid coverage scenarios
+
+### Technical Details
+- **Grid Coverage Recovery**: Gradual recovery mechanism for edge-bound grids
+  - Shortage = `targetCount - currentActiveCount`
+  - Creates `min(shortage, fillCount)` new orders per fill cycle
+  - Continues until target is reached, then resumes rotation
+  - Respects available virtual orders (no over-activation)
+
+- **Code Quality**: Significant reduction in complexity and duplication
+  - Common patterns unified in shared class
+  - Easier to maintain and update core logic
+  - Improved testability with centralized implementation
+
+---
+
 ## [0.4.0] - 2025-12-22 - Fund Management Consolidation & Automatic Fund Cycling
 
 ### Features
