@@ -924,6 +924,11 @@ class OrderManager {
         this.logger.log(`syncFromFillHistory: Processing fill for order_id=${orderId}`, 'debug');
         this.logger.log(`  Pays: ${paysAmount} (${paysAssetId}), Receives: ${receivesAmount} (${receivesAssetId})`, 'debug');
 
+        // DEBUG: Log asset precision being used
+        const assetAPrecision = this.assets?.assetA?.precision || 5;
+        const assetBPrecision = this.assets?.assetB?.precision || 5;
+        this.logger.log(`  Asset precisions: assetA=${assetAPrecision}, assetB=${assetBPrecision} (using defaults if missing)`, 'debug');
+
         const filledOrders = [];
         const updatedOrders = [];
         let partialFill = false;
@@ -982,6 +987,14 @@ class OrderManager {
 
         // Convert back to float for the rest of the logic
         const newSize = blockchainToFloat(newSizeInt, precision);
+
+        // DEBUG: Log the integer calculations
+        this.logger.log(
+            `  Integer math: currentSize=${currentSize.toFixed(8)} (${currentSizeInt} units) - ` +
+            `filledAmount=${filledAmount.toFixed(8)} (${filledAmountInt} units) = ` +
+            `newSize=${newSize.toFixed(8)} (${newSizeInt} units), precision=${precision}`,
+            'debug'
+        );
 
         if (newSizeInt <= 0) {
             // Fully filled
