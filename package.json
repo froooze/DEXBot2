@@ -9,6 +9,7 @@
   },
   "scripts": {
     "bootstrap:profiles": "node scripts/bootstrap-profiles.js",
+    "cleanup:temp": "node scripts/cleanup-temp-files.js",
     "pm2:unlock-start": "node pm2.js",
     "pm2:start": "pm2 start profiles/ecosystem.config.js",
     "pm2:stop": "pm2 stop profiles/ecosystem.config.js",
