@@ -9,7 +9,7 @@
  * - Fund status display (logFundsStatus)
  * 
  * Fund display (logFundsStatus) shows:
- * - available: max(0, chainFree - virtuel - cacheFunds - btsFeesOwed)
+ * - available: max(0, chainFree - virtuel - cacheFunds - applicableBtsFeesOwed - btsFeesReservation)
  * - total.chain: chainFree + committed.chain (on-chain balance)
  * - total.grid: committed.grid + virtuel (grid allocation)
  * - virtuel: VIRTUAL order sizes (reserved for future placement)
@@ -171,7 +171,7 @@ class Logger {
         console.log(`cacheFunds: ${buy}Buy ${cacheBuy.toFixed(8)}${reset} ${buyName} | ${sell}Sell ${cacheSell.toFixed(8)}${reset} ${sellName}`);
         console.log(`btsFeesOwed (all): ${btsFeesOwed.toFixed(8)} BTS`);
 
-        console.log(`\n${debug}=== FORMULA: available = max(0, chainFree - virtuel - cacheFunds - btsFeesOwed) ===${reset}`);
+        console.log(`\n${debug}=== FORMULA: available = max(0, chainFree - virtuel - cacheFunds - applicableBtsFeesOwed - btsFeesReservation) ===${reset}`);
     }
 
     // Print a comprehensive status summary using manager state.
