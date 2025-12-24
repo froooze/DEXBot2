@@ -2,16 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.4.2] - 2025-12-24 - Comment & Documentation Fixes
+## [0.4.2] - 2025-12-24 - Grid Recalculation Fixes & Documentation Updates
 
 ### Fixed
+- **Grid Recalculation in Post-Rotation Divergence Flow**: Added missing grid recalculation call
+  - **Problem**: Orders were losing size information during post-rotation divergence correction
+  - **Symptoms**: "Skipping virtual X - no size defined" warnings, "Cannot read properties of undefined (reading 'toFixed')" batch errors
+  - **Solution**: Added `Grid.updateGridFromBlockchainSnapshot()` call to post-rotation flow, matching startup and timer divergence paths
+  - **Impact**: Prevents order size loss during divergence correction cycles
+
+- **PARTIAL Order State Preservation at Startup**: Fixed state inconsistency during synchronization
+  - **Problem**: PARTIAL orders (those with remaining amounts being filled) were unconditionally converted to ACTIVE state at startup
+  - **Symptoms**: False divergence spikes (700%+ divergence), state mismatches between persistedGrid and calculatedGrid, unnecessary grid recalculations
+  - **Solution**: Preserve PARTIAL state across bot restarts if already set; only convert VIRTUAL orders to ACTIVE when matched on-chain
+  - **Impact**: Eliminates false divergence detection and maintains consistent order state across restarts
+
+- **Redundant Grid Recalculation Removal**: Eliminated duplicate processing in divergence correction
+  - **Problem**: Grid was being recalculated twice when divergence was detected (once by divergence check, once by correction function)
+  - **Symptoms**: Double order size updates, unnecessary blockchain fetches, performance inefficiency
+  - **Solution**: Removed redundant recalculation from `applyGridDivergenceCorrections()` since caller already recalculates
+  - **Impact**: Single grid recalculation per divergence event, improved performance
+
 - **BTS Fee Formula Documentation**: Updated outdated comments and logged output to accurately reflect the complete fee calculation formula
   - Fixed `modules/order/grid.js`: Changed comment from "2x multiplier" to "4x multiplier" to match actual implementation
   - Updated formula in 5 files to show complete formula: `available = max(0, chainFree - virtuel - cacheFunds - applicableBtsFeesOwed - btsFeesReservation)`
   - Fixed `modules/order/logger.js`: Console output now displays full formula instead of simplified version
   - Updated `modules/order/manager.js`: Changed variable name references from ambiguous "4xReservation" to proper "btsFeesReservation"
   - Fixed `modules/account_bots.js`: Comment now correctly states default targetSpreadPercent is 4x not 3x
-  - **Note**: All function implementations were already correct; this release only updates documentation to match the actual calculations
 
 ---
 
