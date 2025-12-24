@@ -635,6 +635,17 @@ class DEXBot {
                                 // After rotation, run grid comparisons to detect divergence and update _gridSidesUpdated
                                 await OrderUtils.runGridComparisons(this.manager, this.accountOrders, this.config.botKey);
 
+                                // Update grid with recalculated sizes BEFORE applying corrections
+                                // (matches startup and 4-hour timer flows)
+                                if (this.manager._gridSidesUpdated && this.manager._gridSidesUpdated.length > 0) {
+                                    const orderType = Grid._getOrderTypeFromUpdatedFlags(
+                                        this.manager._gridSidesUpdated.includes('buy'),
+                                        this.manager._gridSidesUpdated.includes('sell')
+                                    );
+                                    await Grid.updateGridFromBlockchainSnapshot(this.manager, orderType, false);
+                                    persistGridSnapshot(this.manager, this.accountOrders, this.config.botKey);
+                                }
+
                                 // Apply order corrections for sides marked by grid comparisons
                                 await OrderUtils.applyGridDivergenceCorrections(
                                     this.manager,
