@@ -353,7 +353,7 @@ class Grid {
         const sizingSnap = Grid._getFundSnapshot(manager);
         Grid._logSizingInput(manager, sizingSnap);
 
-        // Deduct BTS fees for orders: 2x multiplier accounts for both creation and rotation buffer
+        // Deduct BTS fees for orders: 4x multiplier accounts for creation and rotation buffer
         // This keeps grid initialization in sync with calculateAvailableFundsValue fee reservation
         // Only if BTS is in the trading pair
         let btsFeesForCreation = 0;

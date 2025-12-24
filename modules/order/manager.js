@@ -24,7 +24,7 @@
  * - cacheFunds: Unallocated funds waiting for rotation (includes fill proceeds)
  * 
  * Calculated values:
- * - available = max(0, chainFree - virtuel - cacheFunds - btsFeesOwed)
+ * - available = max(0, chainFree - virtuel - cacheFunds - applicableBtsFeesOwed - btsFeesReservation)
  * - total.chain = chainFree + committed.chain
  * - total.grid = committed.grid + virtuel
  * 
@@ -60,7 +60,7 @@ const Logger = require('./logger');
  * Funds structure (this.funds):
  * ┌─────────────────────────────────────────────────────────────────────────┐
  * │ available    = max(0, chainFree - virtuel - cacheFunds                │
- * │                     - btsFeesOwed)                                     │
+ * │                     - applicableBtsFeesOwed - btsFeesReservation)      │
  * │               Free funds that can be used for new orders or rotations  │
  * ├─────────────────────────────────────────────────────────────────────────┤
  * │ total.chain  = chainFree + committed.chain                             │
@@ -242,9 +242,9 @@ class OrderManager {
 
     /**
      * Central calculation for available funds (pure calculation, no side effects).
-     * Formula: available = max(0, chainFree - virtuel - cacheFunds - applicableBtsFeesOwed - 4xReservation)
+     * Formula: available = max(0, chainFree - virtuel - cacheFunds - applicableBtsFeesOwed - btsFeesReservation)
      *
-     * The 4x fee reservation ensures sufficient BTS is reserved for:
+     * The btsFeesReservation uses 4x multiplier and ensures sufficient BTS is reserved for:
      * - 1x: current operation fees
      * - 3x: buffer for multiple rotation cycles
      *
@@ -440,7 +440,7 @@ class OrderManager {
         this.funds.total.grid = { buy: gridBuy + virtuelBuy, sell: gridSell + virtuelSell };
 
         // Set available using centralized calculation function
-        // Formula: available = max(0, chainFree - virtuel - cacheFunds - btsFeesOwed - 4xReservation)
+        // Formula: available = max(0, chainFree - virtuel - cacheFunds - applicableBtsFeesOwed - btsFeesReservation)
         this.funds.available.buy = this.calculateAvailableFunds('buy');
         this.funds.available.sell = this.calculateAvailableFunds('sell');
     }
