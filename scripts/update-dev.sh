@@ -168,6 +168,17 @@ log_info "Updates available, pulling changes..."
 # Step 6: Pull latest code (use --rebase to avoid merge prompts)
 if git pull --rebase origin "$REPO_BRANCH"; then
     log_success "Successfully pulled latest code"
+
+    # Show what files changed in this update
+    log_info "Files changed in this update:"
+    git diff HEAD~1 HEAD --name-status 2>/dev/null | while IFS= read -r line; do
+        log_info "  $line"
+    done
+
+    # Show summary statistics
+    git diff HEAD~1 HEAD --stat 2>/dev/null | tail -1 | while IFS= read -r line; do
+        log_info "  $line"
+    done
 else
     log_error "Failed to pull latest code"
     exit 1
