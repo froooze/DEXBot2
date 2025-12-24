@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.2] - 2025-12-24 - Comment & Documentation Fixes
+
+### Fixed
+- **BTS Fee Formula Documentation**: Updated outdated comments and logged output to accurately reflect the complete fee calculation formula
+  - Fixed `modules/order/grid.js`: Changed comment from "2x multiplier" to "4x multiplier" to match actual implementation
+  - Updated formula in 5 files to show complete formula: `available = max(0, chainFree - virtuel - cacheFunds - applicableBtsFeesOwed - btsFeesReservation)`
+  - Fixed `modules/order/logger.js`: Console output now displays full formula instead of simplified version
+  - Updated `modules/order/manager.js`: Changed variable name references from ambiguous "4xReservation" to proper "btsFeesReservation"
+  - Fixed `modules/account_bots.js`: Comment now correctly states default targetSpreadPercent is 4x not 3x
+  - **Note**: All function implementations were already correct; this release only updates documentation to match the actual calculations
+
+---
+
 ## [0.4.1] - 2025-12-23 - Order Consolidation, Grid Edge Handling & Partial Order Fixes
 
 ### Features
