@@ -35,7 +35,7 @@ For detailed setup, see [Installation](#-installation) or [Updating](#updating-d
 - Secure your keys and secrets. Do not commit private keys or passwords to anyone — use `profiles/` for live configuration and keep it out of source control.
 - The authors and maintainers are not responsible for losses.
 
-## 📦 Installation
+## 📥 Installation
 
 ### Prerequisites
 
@@ -463,7 +463,7 @@ Price            Type            State           Size
 
 Below is a short summary of the modules in this repository and what they provide. You can paste these lines elsewhere if you need a quick reference.
 
-### 🚀 Entry Points
+### 🔌 Entry Points
 
 - `dexbot.js`: Main CLI entry point. Handles single-bot mode (start, stop, reset, drystart) and management commands (keys, bots, --cli-examples). Includes full DEXBot class with grid management, fill processing, and account operations.
 - `pm2.js`: Unified PM2 launcher. Orchestrates BitShares connection, PM2 check/install, ecosystem config generation from `profiles/bots.json`, master password authentication, and bot startup with automatic restart policies.
