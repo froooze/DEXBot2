@@ -1643,17 +1643,25 @@ class OrderManager {
     // Note: Filled orders are now converted directly to SPREAD in processFilledOrders, syncFromOpenOrders, and syncFromFillHistory
 
     /**
-     * Rebalance orders after fills using the "rotate furthest" strategy:
-     * 
+     * Rebalance orders after fills using count-based creation vs rotation strategy:
+     *
      * When a SELL fills:
-     * 1. Activate closest VIRTUAL SELL to spread -> needs on-chain order placement
-     * 2. Find furthest active BUY from spread -> cancel and recreate at new price (uses available funds)
-     * 
+     * 1. Activate closest VIRTUAL SELL to spread (replaces the filled SELL)
+     * 2. Move partial BUY orders out of the way (keeps grid clean)
+     * 3. Check BUY side state:
+     *    - If active BUY count < target: Create new BUY orders (rebuild grid coverage)
+     *    - If active BUY count >= target: Rotate furthest BUY orders (optimize prices)
+     *
      * When a BUY fills:
-     * 1. Activate closest VIRTUAL BUY to spread -> needs on-chain order placement  
-     * 2. Find furthest active SELL from spread -> cancel and recreate at new price (uses available funds)
-     * 
-     * Returns { ordersToPlace, ordersToRotate } for blockchain operations.
+     * 1. Activate closest VIRTUAL BUY to spread (replaces the filled BUY)
+     * 2. Move partial SELL orders out of the way (keeps grid clean)
+     * 3. Check SELL side state:
+     *    - If active SELL count < target: Create new SELL orders (rebuild grid coverage)
+     *    - If active SELL count >= target: Rotate furthest SELL orders (optimize prices)
+     *
+     * Decision logic is symmetric: After filling one side, we rebalance the opposite side.
+     * Returns { ordersToPlace, ordersToRotate, partialMoves } for blockchain operations.
+     *
      * @param {Object} filledCounts - Count of filled orders by type { buy: n, sell: n }
      * @param {number} extraOrderCount - Extra orders to create (for spread widening)
      * @param {Set} excludeOrderIds - Set of chain orderIds to exclude from rotation (e.g., just corrected)
@@ -1664,7 +1672,7 @@ class OrderManager {
         const ordersToRotate = [];   // Orders to cancel and recreate at new price
         const partialMoves = [];     // Partial orders to move away from market (also feed preferred rotation slots)
 
-        // When SELL orders fill: activate virtual sells (need on-chain) and rotate furthest buys
+        // When SELL orders fill: activate virtual sells (need on-chain) and handle BUY side rebalance
         if (filledCounts[ORDER_TYPES.SELL] > 0) {
             const count = filledCounts[ORDER_TYPES.SELL] + extraOrderCount;
             const partialMoveSlots = filledCounts[ORDER_TYPES.SELL]; // move partials strictly by number of fills
@@ -1687,14 +1695,14 @@ class OrderManager {
                 this.logger.log(`WARNING: ${partialBuys.length} partial BUY orders exist - skipping partial move`, 'warn');
             }
 
-            // Step 3: Check if we should create new orders or rotate existing ones
-            // If active BUY count is below target, create new orders to rebuild grid coverage
-            // Otherwise, proceed with normal rotation strategy
+            // Step 3: Check if BUY count is below target
+            // If below target: create new BUY orders to rebuild grid coverage
+            // If at/above target: rotate furthest BUY orders
             const currentActiveBuys = this.getOrdersByTypeAndState(ORDER_TYPES.BUY, ORDER_STATES.ACTIVE).length;
             const targetBuys = this.config.activeOrders.buy;
-            const buyNeedsNewOrders = currentActiveBuys < targetBuys;
+            const buyBelowTarget = currentActiveBuys < targetBuys;
 
-            if (buyNeedsNewOrders) {
+            if (buyBelowTarget) {
                 // Create new BUY orders to rebuild grid coverage (instead of rotating)
                 const buyShortage = targetBuys - currentActiveBuys;
                 const buyOrdersToCreate = Math.min(buyShortage, count);
@@ -1707,44 +1715,38 @@ class OrderManager {
                 this.logger.log(`Prepared ${newBuyOrders.length} new BUY orders to rebuild grid coverage`, 'debug');
             } else {
                 // Current BUY count >= target: proceed with normal rotation
-                // Rotation requires available funds - new order consumes available, old order moves to reserved
-                // Rotation Budget: Use cacheFunds or any truly free available funds
-                if (this.calculateAvailableFunds('buy') > 0 || (this.funds.cacheFunds && this.funds.cacheFunds.buy > 0)) {
-                    const rotatedBuys = await this.prepareFurthestOrdersForRotation(
-                        ORDER_TYPES.BUY,
-                        count,
-                        excludeOrderIds,
-                        filledCounts[ORDER_TYPES.SELL],
-                        {
-                            avoidPrices: partialMoves.map(m => m.newPrice),
-                            preferredSlots: partialMoves
-                                .filter(m => m.partialOrder.type === ORDER_TYPES.BUY)
-                                .map(m => ({ id: m.vacatedGridId, price: m.vacatedPrice })),
-                            partialMoves: partialMoves // Pass partial moves for boundary calculation
-                        }
-                    );
-                    ordersToRotate.push(...rotatedBuys);
-
-                    if (rotatedBuys.length < count) {
-                        this.logger.log(`Only prepared ${rotatedBuys.length}/${count} BUY orders for rotation`, 'warn');
+                const rotatedBuys = await this.prepareFurthestOrdersForRotation(
+                    ORDER_TYPES.BUY,
+                    count,
+                    excludeOrderIds,
+                    filledCounts[ORDER_TYPES.SELL],
+                    {
+                        avoidPrices: partialMoves.map(m => m.newPrice),
+                        preferredSlots: partialMoves
+                            .filter(m => m.partialOrder.type === ORDER_TYPES.BUY)
+                            .map(m => ({ id: m.vacatedGridId, price: m.vacatedPrice })),
+                        partialMoves: partialMoves
                     }
-                } else {
-                    this.logger.log(`No available buy funds to rotate orders`, 'warn');
+                );
+                ordersToRotate.push(...rotatedBuys);
+
+                if (rotatedBuys.length < count) {
+                    this.logger.log(`Only prepared ${rotatedBuys.length}/${count} BUY orders for rotation`, 'warn');
                 }
             }
         }
 
-        // When BUY orders fill: activate virtual buys (need on-chain) and rotate furthest sells
+        // When BUY orders fill: activate virtual buys (need on-chain) and handle SELL side rebalance
         if (filledCounts[ORDER_TYPES.BUY] > 0) {
             const count = filledCounts[ORDER_TYPES.BUY] + extraOrderCount;
             const partialMoveSlots = filledCounts[ORDER_TYPES.BUY]; // move partials strictly by number of fills
 
-            // Step 1: Activate closest virtual BUY orders - these need on-chain placement
+            // Step 1: Activate closest virtual BUY orders - these need on-chain placement (replaces the filled BUY)
             const activatedBuys = await this.activateClosestVirtualOrdersForPlacement(ORDER_TYPES.BUY, count);
             ordersToPlace.push(...activatedBuys);
             this.logger.log(`Prepared ${activatedBuys.length} virtual BUY orders for on-chain placement`, 'debug');
 
-            // Step 2: Move partial SELL (opposite side) before we select spread targets for rotation
+            // Step 2: Move partial SELL orders out of the way before we select spread targets for rotation
             const partialSells = this.getPartialOrdersOnSide(ORDER_TYPES.SELL);
             if (partialSells.length === 1) {
                 const reservedSellGridIds = new Set();
@@ -1757,14 +1759,14 @@ class OrderManager {
                 this.logger.log(`WARNING: ${partialSells.length} partial SELL orders exist - skipping partial move`, 'warn');
             }
 
-            // Step 3: Check if we should create new orders or rotate existing ones
-            // If active SELL count is below target, create new orders to rebuild grid coverage
-            // Otherwise, proceed with normal rotation strategy
+            // Step 3: Check if SELL count is below target (opposite side rebalance, symmetric to SELL fill section)
+            // If below target: create new SELL orders to rebuild grid coverage
+            // If at/above target: rotate furthest SELL orders
             const currentActiveSells = this.getOrdersByTypeAndState(ORDER_TYPES.SELL, ORDER_STATES.ACTIVE).length;
             const targetSells = this.config.activeOrders.sell;
-            const sellNeedsNewOrders = currentActiveSells < targetSells;
+            const sellBelowTarget = currentActiveSells < targetSells;
 
-            if (sellNeedsNewOrders) {
+            if (sellBelowTarget) {
                 // Create new SELL orders to rebuild grid coverage (instead of rotating)
                 const sellShortage = targetSells - currentActiveSells;
                 const sellOrdersToCreate = Math.min(sellShortage, count);
@@ -1777,29 +1779,23 @@ class OrderManager {
                 this.logger.log(`Prepared ${newSellOrders.length} new SELL orders to rebuild grid coverage`, 'debug');
             } else {
                 // Current SELL count >= target: proceed with normal rotation
-                // Rotation requires available funds - new order consumes available, old order moves to reserved
-                // Rotation Budget: Use cacheFunds or any truly free available funds
-                if (this.calculateAvailableFunds('sell') > 0 || (this.funds.cacheFunds && this.funds.cacheFunds.sell > 0)) {
-                    const rotatedSells = await this.prepareFurthestOrdersForRotation(
-                        ORDER_TYPES.SELL,
-                        count,
-                        excludeOrderIds,
-                        filledCounts[ORDER_TYPES.BUY],
-                        {
-                            avoidPrices: partialMoves.map(m => m.newPrice),
-                            preferredSlots: partialMoves
-                                .filter(m => m.partialOrder.type === ORDER_TYPES.SELL)
-                                .map(m => ({ id: m.vacatedGridId, price: m.vacatedPrice })),
-                            partialMoves: partialMoves
-                        }
-                    );
-                    ordersToRotate.push(...rotatedSells);
-
-                    if (rotatedSells.length < count) {
-                        this.logger.log(`Only prepared ${rotatedSells.length}/${count} SELL orders for rotation`, 'warn');
+                const rotatedSells = await this.prepareFurthestOrdersForRotation(
+                    ORDER_TYPES.SELL,
+                    count,
+                    excludeOrderIds,
+                    filledCounts[ORDER_TYPES.BUY],
+                    {
+                        avoidPrices: partialMoves.map(m => m.newPrice),
+                        preferredSlots: partialMoves
+                            .filter(m => m.partialOrder.type === ORDER_TYPES.SELL)
+                            .map(m => ({ id: m.vacatedGridId, price: m.vacatedPrice })),
+                        partialMoves: partialMoves
                     }
-                } else {
-                    this.logger.log(`No available sell funds to rotate orders`, 'warn');
+                );
+                ordersToRotate.push(...rotatedSells);
+
+                if (rotatedSells.length < count) {
+                    this.logger.log(`Only prepared ${rotatedSells.length}/${count} SELL orders for rotation`, 'warn');
                 }
             }
         }
