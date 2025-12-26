@@ -1,6 +1,6 @@
 {
   "name": "dexbot2",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "A sophisticated market making bot for the BitShares Decentralized Exchange (DEX), implementing optimized staggered order strategies for automated trading.",
   "main": "modules/chain_orders.js",
   "bin": {
