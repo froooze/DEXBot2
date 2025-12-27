@@ -1496,6 +1496,27 @@ function mapOrderSizes(orders) {
     return Array.isArray(orders) ? orders.map(o => Number(o.size || 0)) : [];
 }
 
+/**
+ * Count active and partial orders by type (used for target comparison).
+ * Includes both ACTIVE and PARTIAL orders since both take up grid positions.
+ * @param {string} orderType - ORDER_TYPES.BUY or ORDER_TYPES.SELL
+ * @param {Map} ordersMap - The orders map from OrderManager
+ * @returns {number} Count of ACTIVE + PARTIAL orders of the given type
+ */
+function countOrdersByType(orderType, ordersMap) {
+    const { ORDER_STATES } = require('../constants');
+    if (!ordersMap || ordersMap.size === 0) return 0;
+
+    let count = 0;
+    for (const order of ordersMap.values()) {
+        if (order.type === orderType &&
+            (order.state === ORDER_STATES.ACTIVE || order.state === ORDER_STATES.PARTIAL)) {
+            count++;
+        }
+    }
+    return count;
+}
+
 // ---------------------------------------------------------------------------
 // Precision Helpers
 // ---------------------------------------------------------------------------
@@ -2036,6 +2057,7 @@ module.exports = {
     filterOrdersByTypeAndState,
     sumOrderSizes,
     mapOrderSizes,
+    countOrdersByType,
 
     // Precision helpers
     getPrecisionByOrderType,

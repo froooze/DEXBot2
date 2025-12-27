@@ -35,7 +35,7 @@
  * 4. After rotation: cacheFunds updated to reflect leftovers (surplus)
  */
 const { ORDER_TYPES, ORDER_STATES, DEFAULT_CONFIG, TIMING, GRID_LIMITS, LOG_LEVEL } = require('../constants');
-const { parsePercentageString, blockchainToFloat, floatToBlockchainInt, resolveRelativePrice, calculatePriceTolerance, checkPriceWithinTolerance, parseChainOrder, findMatchingGridOrderByOpenOrder, findMatchingGridOrderByHistory, applyChainSizeToGridOrder, correctOrderPriceOnChain, getMinOrderSize, getAssetFees, computeChainFundTotals, calculateAvailableFundsValue, calculateSpreadFromOrders, resolveConfigValue, compareBlockchainSizes, filterOrdersByType, getPrecisionByOrderType, getPrecisionForSide, getPrecisionsForManager, calculateOrderSizes } = require('./utils');
+const { parsePercentageString, blockchainToFloat, floatToBlockchainInt, resolveRelativePrice, calculatePriceTolerance, checkPriceWithinTolerance, parseChainOrder, findMatchingGridOrderByOpenOrder, findMatchingGridOrderByHistory, applyChainSizeToGridOrder, correctOrderPriceOnChain, getMinOrderSize, getAssetFees, computeChainFundTotals, calculateAvailableFundsValue, calculateSpreadFromOrders, resolveConfigValue, compareBlockchainSizes, filterOrdersByType, countOrdersByType, getPrecisionByOrderType, getPrecisionForSide, getPrecisionsForManager, calculateOrderSizes } = require('./utils');
 const Logger = require('./logger');
 // Grid functions (initialize/recalculate) are intended to be
 // called directly via require('./grid').initializeGrid(manager) by callers.
@@ -1392,10 +1392,10 @@ class OrderManager {
         const currentSpread = this.calculateCurrentSpread();
         const targetSpread = this.config.targetSpreadPercent + this.config.incrementPercent;
 
-        // Only trigger spread warning if we have at least one active order on BOTH sides.
-        const activeBuys = this.getOrdersByTypeAndState(ORDER_TYPES.BUY, ORDER_STATES.ACTIVE);
-        const activeSells = this.getOrdersByTypeAndState(ORDER_TYPES.SELL, ORDER_STATES.ACTIVE);
-        const hasBothSides = activeBuys.length > 0 && activeSells.length > 0;
+        // Only trigger spread warning if we have at least one order (ACTIVE or PARTIAL) on BOTH sides.
+        const buyCount = countOrdersByType(ORDER_TYPES.BUY, this.orders);
+        const sellCount = countOrdersByType(ORDER_TYPES.SELL, this.orders);
+        const hasBothSides = buyCount > 0 && sellCount > 0;
 
         if (hasBothSides && currentSpread > targetSpread) {
             this.outOfSpread = true;
@@ -1744,7 +1744,7 @@ class OrderManager {
             // Step 3: Check if BUY count is below target
             // If below target: create new BUY orders to rebuild grid coverage
             // If at/above target: rotate furthest BUY orders
-            const currentActiveBuys = this.getOrdersByTypeAndState(ORDER_TYPES.BUY, ORDER_STATES.ACTIVE).length;
+            const currentActiveBuys = countOrdersByType(ORDER_TYPES.BUY, this.orders);
             const targetBuys = this.config.activeOrders.buy;
             const buyBelowTarget = currentActiveBuys < targetBuys;
 
@@ -1848,7 +1848,7 @@ class OrderManager {
             // Step 3: Check if SELL count is below target (opposite side rebalance, symmetric to SELL fill section)
             // If below target: create new SELL orders to rebuild grid coverage
             // If at/above target: rotate furthest SELL orders
-            const currentActiveSells = this.getOrdersByTypeAndState(ORDER_TYPES.SELL, ORDER_STATES.ACTIVE).length;
+            const currentActiveSells = countOrdersByType(ORDER_TYPES.SELL, this.orders);
             const targetSells = this.config.activeOrders.sell;
             const sellBelowTarget = currentActiveSells < targetSells;
 
@@ -2381,35 +2381,33 @@ class OrderManager {
             return null;
         }
 
-        // Parse grid position from ID (e.g., "sell-67" -> { side: "sell", pos: 67 })
-        const match = partialOrder.id.match(/^(sell|buy)-(\d+)$/);
-        if (!match) {
-            this.logger.log(`Cannot parse grid position from order id: ${partialOrder.id}`, 'warn');
+        // Get all grid slots sorted by price (high to low)
+        // This allows navigation across the entire grid regardless of ID namespace (sell-* / buy-*)
+        const allSlots = Array.from(this.orders.values())
+            .filter(o => o.price != null)
+            .sort((a, b) => b.price - a.price);
+
+        // Find current slot's index in price-sorted list
+        const currentIndex = allSlots.findIndex(o => o.id === partialOrder.id);
+        if (currentIndex === -1) {
+            this.logger.log(`Cannot find partial order ${partialOrder.id} in grid`, 'warn');
             return null;
         }
 
-        const orderSide = match[1];
-        const currentPosition = parseInt(match[2], 10);
-
-        // Walk toward market by the requested number of grid slots.
-        // In the standardized grid (ID indexing 0...N), SELL IDs increase index toward market,
-        // and BUY IDs decrease index toward market.
-        // However, if an order has crossed sides (e.g. is a BUY in a sell-N slot), we must move it 
-        // based on its INTENDED target direction (SELL move = price ↓ = index ↑, BUY move = price ↑ = index ↓).
+        // Move toward market by gridSlotsToMove positions
+        // Grid is sorted high-to-low price, so:
+        // - SELL orders move toward lower prices = higher index (toward center)
+        // - BUY orders move toward higher prices = lower index (toward center)
         const direction = partialOrder.type === ORDER_TYPES.SELL ? 1 : -1;
-        const startPosition = currentPosition + (direction * gridSlotsToMove);
-        if (startPosition < 0) {
-            this.logger.log(`Cannot move ${partialOrder.id} by ${gridSlotsToMove} - would go below index 0`, 'warn');
+        const targetIndex = currentIndex + (direction * gridSlotsToMove);
+
+        if (targetIndex < 0 || targetIndex >= allSlots.length) {
+            this.logger.log(`Cannot move ${partialOrder.id} by ${gridSlotsToMove} - would go outside grid bounds (index ${targetIndex})`, 'warn');
             return null;
         }
 
-        const newGridId = `${orderSide}-${startPosition}`;
-        const targetGridOrder = this.orders.get(newGridId);
-
-        if (!targetGridOrder) {
-            this.logger.log(`Target grid slot ${newGridId} does not exist (edge of grid)`, 'warn');
-            return null;
-        }
+        const targetGridOrder = allSlots[targetIndex];
+        const newGridId = targetGridOrder.id;
 
         if (reservedGridIds.has(newGridId)) {
             this.logger.log(`Target grid slot ${newGridId} is reserved for rotation/placement - skipping partial move`, 'warn');
@@ -2577,9 +2575,16 @@ class OrderManager {
     calculateCurrentSpread() {
         const activeBuys = this.getOrdersByTypeAndState(ORDER_TYPES.BUY, ORDER_STATES.ACTIVE);
         const activeSells = this.getOrdersByTypeAndState(ORDER_TYPES.SELL, ORDER_STATES.ACTIVE);
+        const partialBuys = this.getOrdersByTypeAndState(ORDER_TYPES.BUY, ORDER_STATES.PARTIAL);
+        const partialSells = this.getOrdersByTypeAndState(ORDER_TYPES.SELL, ORDER_STATES.PARTIAL);
+
+        // Combine ACTIVE + PARTIAL (both are on-chain and affect the actual spread)
+        const onChainBuys = [...activeBuys, ...partialBuys];
+        const onChainSells = [...activeSells, ...partialSells];
+
         const virtualBuys = this.getOrdersByTypeAndState(ORDER_TYPES.BUY, ORDER_STATES.VIRTUAL);
         const virtualSells = this.getOrdersByTypeAndState(ORDER_TYPES.SELL, ORDER_STATES.VIRTUAL);
-        return calculateSpreadFromOrders(activeBuys, activeSells, virtualBuys, virtualSells);
+        return calculateSpreadFromOrders(onChainBuys, onChainSells, virtualBuys, virtualSells);
     }
 
     /**

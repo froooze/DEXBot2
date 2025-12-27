@@ -15,9 +15,11 @@ async function testCrossedRotation() {
     const { OrderManager, constants } = require('../modules/order/index.js');
     const { ORDER_TYPES, ORDER_STATES } = constants;
 
+    // Set activeOrders.buy to 2 so we're at target (1 ACTIVE + 1 PARTIAL = 2)
+    // This ensures rotation happens instead of creating new orders
     const mgr = new OrderManager({
         assetA: 'IOB.XRP', assetB: 'BTS', marketPrice: 1800,
-        botFunds: { buy: 1000, sell: 1000 }, activeOrders: { buy: 5, sell: 5 }
+        botFunds: { buy: 1000, sell: 1000 }, activeOrders: { buy: 2, sell: 5 }
     });
 
     mgr.assets = {
