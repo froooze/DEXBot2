@@ -323,14 +323,20 @@ class OrderManager {
     /**
      * Actually deduct BTS fees from cacheFunds (has side effects).
      * Called by processFilledOrders() after all proceeds have been added to cacheFunds.
+     *
+     * @param {string|null} requestedSide - Optional side to deduct from ('buy' or 'sell').
+     *                                       If not provided, deducts from the side that has BTS.
      */
-    deductBtsFees() {
+    deductBtsFees(requestedSide = null) {
         if (!this.funds.btsFeesOwed || this.funds.btsFeesOwed <= 0) return;
 
         const assetA = this.config.assetA;
         const assetB = this.config.assetB;
-        const side = (assetA === 'BTS') ? 'sell' :
+        const btsSide = (assetA === 'BTS') ? 'sell' :
             (assetB === 'BTS') ? 'buy' : null;
+
+        // Only deduct if the requested side (if provided) matches the BTS side
+        const side = requestedSide ? (requestedSide === btsSide ? btsSide : null) : btsSide;
 
         if (side) {
             const cache = this.funds.cacheFunds?.[side] || 0;
@@ -871,6 +877,9 @@ class OrderManager {
                     // Create copy for update
                     const updatedOrder = { ...gridOrder };
 
+                    // Convert new size to blockchain integer for comparison
+                    const newInt = floatToBlockchainInt(newSize, precision);
+
                     if (newInt > 0) {
                         // Partially filled - has remainder, transition to PARTIAL state
                         applyChainSizeToGridOrder(this, updatedOrder, newSize);
@@ -1168,10 +1177,11 @@ class OrderManager {
                 const orderId = chainData;
                 const gridOrder = findMatchingGridOrderByOpenOrder({ orderId }, { orders: this.orders, ordersByState: this._ordersByState, assets: this.assets, calcToleranceFn: (p, s, t) => calculatePriceTolerance(p, s, t, this.assets), logger: this.logger });
                 if (gridOrder) {
-                    // Restore order size to chainFree when moving from ACTIVE to VIRTUAL
+                    // Restore order size to chainFree when moving from ACTIVE/PARTIAL to VIRTUAL
                     // This keeps accountTotals.buyFree/sellFree accurate without re-fetching
-                    if (gridOrder.state === ORDER_STATES.ACTIVE && gridOrder.size > 0) {
-                        this._addToChainFree(gridOrder.type, Number(gridOrder.size) || 0, 'ACTIVE->VIRTUAL');
+                    // PARTIAL orders also have on-chain locked funds that need restoration
+                    if ((gridOrder.state === ORDER_STATES.ACTIVE || gridOrder.state === ORDER_STATES.PARTIAL) && gridOrder.size > 0) {
+                        this._addToChainFree(gridOrder.type, Number(gridOrder.size) || 0, `${gridOrder.state}->VIRTUAL`);
                     }
                     // Create a new object to avoid mutation bug
                     // Cancelled surplus orders: preserve original type (BUY/SELL) and size for grid history
@@ -1193,17 +1203,8 @@ class OrderManager {
                 for (const chainOrder of chainData) {
                     const parsedOrder = parseChainOrder(chainOrder, this.assets);
                     if (!parsedOrder) {
-                        this.logger.log(`DEBUG: Could not parse chain order ${chainOrder.id}; attempting fallback by orderId`, 'warn');
-                        // Fallback: attempt to match by orderId even if parsing failed.
-                        const idFallback = { orderId: chainOrder.id };
-                        const gridOrderById = findMatchingGridOrderByOpenOrder(idFallback, { orders: this.orders, ordersByState: this._ordersByState, assets: this.assets, calcToleranceFn: (p, s, t) => calculatePriceTolerance(p, s, t, this.assets), logger: this.logger });
-                        if (!gridOrderById) {
-                            // Nothing to do for this chain order.
-                            continue;
-                        }
-                        this.logger.log(`DEBUG: Matched chain order ${chainOrder.id} to grid order ${gridOrderById.id} via orderId fallback`, 'info');
-                        // Build a shallow parsedOrder so the rest of the code can proceed.
-                        parsedOrder = { orderId: chainOrder.id, type: gridOrderById.type, price: gridOrderById.price, size: gridOrderById.size };
+                        this.logger.log(`ERROR: Could not parse chain order ${chainOrder.id}. Skipping (will retry on next sync).`, 'error');
+                        continue;
                     }
                     relevantChainOrders.push(chainOrder);
                     seenOnChain.add(parsedOrder.orderId);
@@ -1499,10 +1500,14 @@ class OrderManager {
                 let netProceeds = rawProceeds;
                 let feeInfo = '';
                 if (this.config.assetB !== 'BTS') {
-                    const feeResult = getAssetFees(this.config.assetB, rawProceeds);
-                    netProceeds = typeof feeResult === 'number' ? feeResult : rawProceeds;
-                    if (netProceeds !== rawProceeds) {
-                        feeInfo = ` (net after market fee: ${netProceeds.toFixed(8)})`;
+                    try {
+                        const feeResult = getAssetFees(this.config.assetB, rawProceeds);
+                        netProceeds = typeof feeResult === 'number' ? feeResult : rawProceeds;
+                        if (netProceeds !== rawProceeds) {
+                            feeInfo = ` (net after market fee: ${netProceeds.toFixed(8)})`;
+                        }
+                    } catch (e) {
+                        this.logger.log(`WARNING: Could not get fees for ${this.config.assetB}: ${e.message}. Using raw proceeds.`, 'warn');
                     }
                 }
                 proceedsBuy += netProceeds;  // Collect in cacheFunds only, NOT in chainFree
@@ -1521,10 +1526,14 @@ class OrderManager {
                 let netProceeds = rawProceeds;
                 let feeInfo = '';
                 if (this.config.assetA !== 'BTS') {
-                    const feeResult = getAssetFees(this.config.assetA, rawProceeds);
-                    netProceeds = typeof feeResult === 'number' ? feeResult : rawProceeds;
-                    if (netProceeds !== rawProceeds) {
-                        feeInfo = ` (net after market fee: ${netProceeds.toFixed(8)})`;
+                    try {
+                        const feeResult = getAssetFees(this.config.assetA, rawProceeds);
+                        netProceeds = typeof feeResult === 'number' ? feeResult : rawProceeds;
+                        if (netProceeds !== rawProceeds) {
+                            feeInfo = ` (net after market fee: ${netProceeds.toFixed(8)})`;
+                        }
+                    } catch (e) {
+                        this.logger.log(`WARNING: Could not get fees for ${this.config.assetA}: ${e.message}. Using raw proceeds.`, 'warn');
                     }
                 }
                 proceedsSell += netProceeds;  // Collect in cacheFunds only, NOT in chainFree
@@ -1600,10 +1609,9 @@ class OrderManager {
             `Before Buy ${proceedsBefore.buy.toFixed(8)} + fill ${proceedsBuy.toFixed(8)} + avail ${currentAvailBuy.toFixed(8)} = After ${(this.funds.cacheFunds.buy || 0).toFixed(8)} | ` +
             `Before Sell ${proceedsBefore.sell.toFixed(8)} + fill ${proceedsSell.toFixed(8)} + avail ${currentAvailSell.toFixed(8)} = After ${(this.funds.cacheFunds.sell || 0).toFixed(8)}`, 'info');
 
-        // Note: deductBtsFees() now subtracts from cacheFunds
+        // Note: deductBtsFees() automatically determines which side has BTS and deducts from there
         if (hasBtsPair && this.funds.btsFeesOwed > 0) {
-            this.deductBtsFees('buy');
-            this.deductBtsFees('sell');
+            this.deductBtsFees();
         }
 
         this.recalculateFunds();
@@ -1790,6 +1798,8 @@ class OrderManager {
             if (moveInfo) {
                 partialMoves.push(moveInfo);
                 this.logger.log(`Prepared partial ${oppositeType} move: ${moveInfo.partialOrder.id} -> ${moveInfo.newGridId}`, 'debug');
+            } else {
+                this.logger.log(`WARNING: Could not move partial ${oppositeType} order ${partialOrders[0].id} (stuck at grid boundary). Grid may need recalculation.`, 'warn');
             }
         } else if (partialOrders.length > 1) {
             this.logger.log(`WARNING: ${partialOrders.length} partial ${oppositeType} orders exist - skipping partial move`, 'warn');
@@ -1797,7 +1807,17 @@ class OrderManager {
 
         // Step 3: Check if opposite side is below target
         const currentActiveCount = countOrdersByType(oppositeType, this.orders);
-        const targetCount = this.config.activeOrders[side];
+
+        // Validate activeOrders config to prevent NaN/undefined errors
+        let targetCount = 1; // Safe default
+        if (this.config.activeOrders &&
+            this.config.activeOrders[side] &&
+            Number.isFinite(this.config.activeOrders[side])) {
+            targetCount = Math.max(1, this.config.activeOrders[side]);
+        } else if (this.config.activeOrders && this.config.activeOrders[side] === undefined) {
+            this.logger.log(`WARNING: activeOrders.${side} not configured. Using default of 1 active order.`, 'warn');
+        }
+
         const belowTarget = currentActiveCount < targetCount;
 
         if (belowTarget) {
