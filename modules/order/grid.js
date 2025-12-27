@@ -610,6 +610,12 @@ class Grid {
             return;
         }
 
+        // Validate manager.assets is initialized before using for precision
+        if (!manager.assets || typeof manager.assets !== 'object') {
+            manager.logger?.log(`ERROR: manager.assets not initialized. Cannot recalculate grid sizes.`, 'error');
+            return;
+        }
+
         // Calculate new sizes using blockchain total only
         const precision = getPrecisionByOrderType(manager.assets, isBuy ? ORDER_TYPES.BUY : ORDER_TYPES.SELL);
 
@@ -646,10 +652,14 @@ class Grid {
 
         // DEBUG: Log calculated sizes summary
         try {
-            const minSize = Math.min(...newSizes);
-            const maxSize = Math.max(...newSizes);
-            const avgSize = newSizes.reduce((a, b) => a + b, 0) / newSizes.length;
-            manager.logger?.log?.(`DEBUG Blockchain Recalc Sizes (${sideName}): count=${newSizes.length}, total=${allocatedFunds.toFixed(8)}, min=${minSize.toFixed(8)}, max=${maxSize.toFixed(8)}, avg=${avgSize.toFixed(8)}`, 'debug');
+            if (newSizes.length > 0) {
+                const minSize = Math.min(...newSizes);
+                const maxSize = Math.max(...newSizes);
+                const avgSize = newSizes.reduce((a, b) => a + b, 0) / newSizes.length;
+                manager.logger?.log?.(`DEBUG Blockchain Recalc Sizes (${sideName}): count=${newSizes.length}, total=${allocatedFunds.toFixed(8)}, min=${minSize.toFixed(8)}, max=${maxSize.toFixed(8)}, avg=${avgSize.toFixed(8)}`, 'debug');
+            } else {
+                manager.logger?.log?.(`WARNING: No sizes calculated for ${sideName} (empty array)`, 'warn');
+            }
         } catch (e) { manager.logger?.log?.(`Warning: failed to log calculated sizes: ${e.message}`, 'warn'); }
 
         // Update orders with new sizes
@@ -797,6 +807,12 @@ class Grid {
         const buyOrders = filterOrdersByType(allOrders, ORDER_TYPES.BUY);
         const sellOrders = filterOrdersByType(allOrders, ORDER_TYPES.SELL);
 
+        // Validate manager.assets is initialized before using for precision
+        if (!manager.assets || typeof manager.assets !== 'object') {
+            manager.logger?.log(`ERROR: manager.assets not initialized. Cannot update grid order sizes.`, 'error');
+            return;
+        }
+
         const { A: precA, B: precB } = getPrecisionsForManager(manager.assets);
 
         // Calculate new sizes using same weighting algorithm
@@ -917,6 +933,12 @@ class Grid {
         const getIdealOrders = (orders, type) => {
             if (!manager || orders.length === 0) return orders;
 
+            // Validate manager.assets is initialized before using for precision
+            if (!manager.assets || typeof manager.assets !== 'object') {
+                manager.logger?.log?.(`WARNING: manager.assets not initialized in getIdealOrders. Skipping ideal comparison.`, 'warn');
+                return orders;
+            }
+
             const isBuy = type === ORDER_TYPES.BUY;
             const cache = isBuy ? Number(cacheFunds?.buy || 0) : Number(cacheFunds?.sell || 0);
             const grid = isBuy
@@ -947,6 +969,12 @@ class Grid {
                     0,
                     precision
                 );
+
+                // Validate size array length matches order count
+                if (!Array.isArray(idealSizes) || idealSizes.length !== orders.length) {
+                    manager.logger?.log?.(`WARNING: Ideal sizes length mismatch: expected ${orders.length}, got ${idealSizes?.length || 0}`, 'warn');
+                    return orders; // Fallback to original
+                }
 
                 // Return clones with ideal sizes
                 return orders.map((o, i) => ({ ...o, size: idealSizes[i] }));
@@ -1087,6 +1115,12 @@ class Grid {
         const ords = Array.isArray(orders) ? orders : Array.from(manager.orders.values()).filter(o => o.type === orderType);
         if (ords.length === 0) {
             manager.logger?.log(`No ${sideName} orders found to update`, 'warn');
+            return;
+        }
+
+        // Validate size array length matches order count to prevent silent data corruption
+        if (newSizes.length !== ords.length) {
+            manager.logger?.log(`ERROR: Size array length mismatch for ${sideName}: expected ${ords.length}, got ${newSizes.length}. Aborting update.`, 'error');
             return;
         }
 
