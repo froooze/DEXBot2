@@ -29,32 +29,41 @@ function isPercentageString(v) {
  */
 async function correctAllPriceMismatches(manager, accountName, privateKey, accountOrders) {
     if (!manager) throw new Error('manager required');
-    const results = [];
-    let corrected = 0;
-    let failed = 0;
 
-    // Copy the list because it may be mutated during processing
-    // Deduplicate by chainOrderId to avoid double-correction attempts
-    const allOrders = Array.isArray(manager.ordersNeedingPriceCorrection) ? [...manager.ordersNeedingPriceCorrection] : [];
-    const seen = new Set();
-    const ordersToCorrect = allOrders.filter(c => {
-        if (!c.chainOrderId || seen.has(c.chainOrderId)) return false;
-        seen.add(c.chainOrderId);
-        return true;
-    });
-
-    for (const correctionInfo of ordersToCorrect) {
-        const result = await correctOrderPriceOnChain(manager, correctionInfo, accountName, privateKey, accountOrders);
-        results.push({ ...correctionInfo, result });
-
-        if (result && result.success) corrected++; else failed++;
-
-        // Small delay between corrections to avoid rate limiting
-        await new Promise(resolve => setTimeout(resolve, TIMING.SYNC_DELAY_MS));
+    // Use correction lock to prevent concurrent mutations during snapshot
+    if (!manager._correctionsLock) {
+        manager.logger?.log?.(`Warning: corrections lock not available, skipping corrections`, 'warn');
+        return { corrected: 0, failed: 0, results: [] };
     }
 
-    manager.logger?.log?.(`Price correction complete: ${corrected} corrected, ${failed} failed`, 'info');
-    return { corrected, failed, results };
+    return await manager._correctionsLock.acquire(async () => {
+        const results = [];
+        let corrected = 0;
+        let failed = 0;
+
+        // Snapshot under lock (guaranteed no mutations happening)
+        // Deduplicate by chainOrderId to avoid double-correction attempts
+        const allOrders = Array.isArray(manager.ordersNeedingPriceCorrection) ? [...manager.ordersNeedingPriceCorrection] : [];
+        const seen = new Set();
+        const ordersToCorrect = allOrders.filter(c => {
+            if (!c.chainOrderId || seen.has(c.chainOrderId)) return false;
+            seen.add(c.chainOrderId);
+            return true;
+        });
+
+        for (const correctionInfo of ordersToCorrect) {
+            const result = await correctOrderPriceOnChain(manager, correctionInfo, accountName, privateKey, accountOrders);
+            results.push({ ...correctionInfo, result });
+
+            if (result && result.success) corrected++; else failed++;
+
+            // Small delay between corrections to avoid rate limiting
+            await new Promise(resolve => setTimeout(resolve, TIMING.SYNC_DELAY_MS));
+        }
+
+        manager.logger?.log?.(`Price correction complete: ${corrected} corrected, ${failed} failed`, 'info');
+        return { corrected, failed, results };
+    });
 }
 
 function parsePercentageString(v) {
@@ -1301,7 +1310,8 @@ async function runGridComparisons(manager, accountOrders, botKey) {
  * @param {Function} updateOrdersOnChainBatchFn - Callback function to execute batch updates (from bot/dexbot context)
  */
 async function applyGridDivergenceCorrections(manager, accountOrders, botKey, updateOrdersOnChainBatchFn) {
-    if (!manager?._gridSidesUpdated || manager._gridSidesUpdated.length === 0) {
+    if (!manager._correctionsLock) {
+        manager?.logger?.log?.(`Warning: corrections lock not available`, 'warn');
         return;
     }
 
@@ -1312,68 +1322,79 @@ async function applyGridDivergenceCorrections(manager, accountOrders, botKey, up
     // This function only applies the corrections on-chain, no need to recalculate again
 
     // Build array of orders needing correction from sides marked by grid comparisons
-    for (const orderType of manager._gridSidesUpdated) {
-        const ordersOnSide = Array.from(manager.orders.values())
-            .filter(o => o.type === orderType && o.orderId && o.state === ORDER_STATES.ACTIVE);
-
-        for (const order of ordersOnSide) {
-            // Mark for size correction (sizeChanged=true means we won't price-correct, just size)
-            manager.ordersNeedingPriceCorrection.push({
-                gridOrder: { ...order },
-                chainOrderId: order.orderId,
-                rawChainOrder: null,
-                expectedPrice: order.price,
-                actualPrice: order.price,
-                expectedSize: order.size,
-                size: order.size,
-                type: order.type,
-                sizeChanged: true
-            });
+    // Use correction lock to protect all mutations AND the _gridSidesUpdated check (fixes TOCTOU)
+    await manager._correctionsLock.acquire(async () => {
+        // Early return check INSIDE lock to prevent TOCTOU race
+        if (!manager._gridSidesUpdated || manager._gridSidesUpdated.length === 0) {
+            return;
         }
-    }
 
-    if (manager.ordersNeedingPriceCorrection.length > 0) {
-        manager.logger?.log?.(
-            `DEBUG: Marked ${manager.ordersNeedingPriceCorrection.length} orders for size correction after grid divergence detection (sides: ${manager._gridSidesUpdated.join(', ')})`,
-            'info'
-        );
+        for (const orderType of manager._gridSidesUpdated) {
+            const ordersOnSide = Array.from(manager.orders.values())
+                .filter(o => o.type === orderType && o.orderId && o.state === ORDER_STATES.ACTIVE);
 
-        // Log specific orders being corrected
-        manager.ordersNeedingPriceCorrection.slice(0, 3).forEach(corr => {
+            for (const order of ordersOnSide) {
+                // Mark for size correction (sizeChanged=true means we won't price-correct, just size)
+                manager.ordersNeedingPriceCorrection.push({
+                    gridOrder: { ...order },
+                    chainOrderId: order.orderId,
+                    rawChainOrder: null,
+                    expectedPrice: order.price,
+                    actualPrice: order.price,
+                    expectedSize: order.size,
+                    size: order.size,
+                    type: order.type,
+                    sizeChanged: true
+                });
+            }
+        }
+
+        if (manager.ordersNeedingPriceCorrection.length > 0) {
             manager.logger?.log?.(
-                `  Correcting: ${corr.chainOrderId} | current size: ${corr.size.toFixed(8)} | price: ${corr.expectedPrice.toFixed(4)}`,
-                'debug'
+                `DEBUG: Marked ${manager.ordersNeedingPriceCorrection.length} orders for size correction after grid divergence detection (sides: ${manager._gridSidesUpdated.join(', ')})`,
+                'info'
             );
-        });
 
-        // Clear the tracking flag
-        manager._gridSidesUpdated = [];
-
-        // Build rotation objects for size corrections
-        const ordersToRotate = manager.ordersNeedingPriceCorrection.map(correction => ({
-            oldOrder: { orderId: correction.chainOrderId },
-            newPrice: correction.expectedPrice,
-            newSize: correction.size,
-            type: correction.type
-        }));
-
-        // Execute a batch correction for these marked orders
-        try {
-            await updateOrdersOnChainBatchFn({
-                ordersToPlace: [],
-                ordersToRotate: ordersToRotate,
-                partialMoves: []
+            // Log specific orders being corrected
+            manager.ordersNeedingPriceCorrection.slice(0, 3).forEach(corr => {
+                manager.logger?.log?.(
+                    `  Correcting: ${corr.chainOrderId} | current size: ${corr.size.toFixed(8)} | price: ${corr.expectedPrice.toFixed(4)}`,
+                    'debug'
+                );
             });
 
-            // Clear corrections after applying
-            manager.ordersNeedingPriceCorrection = [];
+            // Clear the tracking flag (atomic with gridSidesUpdated access)
+            manager._gridSidesUpdated = [];
 
-            // Re-persist grid after corrections are applied to keep persisted state in sync
-            persistGridSnapshot(manager, accountOrders, botKey);
-        } catch (err) {
-            manager?.logger?.log?.(`Warning: Could not execute grid divergence corrections: ${err.message}`, 'warn');
+            // Build rotation objects for size corrections
+            const ordersToRotate = manager.ordersNeedingPriceCorrection.map(correction => ({
+                oldOrder: { orderId: correction.chainOrderId },
+                newPrice: correction.expectedPrice,
+                newSize: correction.size,
+                type: correction.type
+            }));
+
+            // Execute a batch correction for these marked orders
+            try {
+                await updateOrdersOnChainBatchFn({
+                    ordersToPlace: [],
+                    ordersToRotate: ordersToRotate,
+                    partialMoves: []
+                });
+
+                // Clear corrections after applying
+                manager.ordersNeedingPriceCorrection = [];
+
+                // Re-persist grid after corrections are applied to keep persisted state in sync
+                persistGridSnapshot(manager, accountOrders, botKey);
+            } catch (err) {
+                // CRITICAL: Clear corrections on error too to prevent list explosion
+                // Without this, failed corrections accumulate and never get retried
+                manager.ordersNeedingPriceCorrection = [];
+                manager?.logger?.log?.(`Warning: Could not execute grid divergence corrections: ${err.message}`, 'warn');
+            }
         }
-    }
+    });
 }
 
 // ---------------------------------------------------------------------------

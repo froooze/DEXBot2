@@ -37,6 +37,7 @@
 const { ORDER_TYPES, ORDER_STATES, DEFAULT_CONFIG, TIMING, GRID_LIMITS, LOG_LEVEL } = require('../constants');
 const { parsePercentageString, blockchainToFloat, floatToBlockchainInt, resolveRelativePrice, calculatePriceTolerance, checkPriceWithinTolerance, parseChainOrder, findMatchingGridOrderByOpenOrder, findMatchingGridOrderByHistory, applyChainSizeToGridOrder, correctOrderPriceOnChain, getMinOrderSize, getAssetFees, computeChainFundTotals, calculateAvailableFundsValue, calculateSpreadFromOrders, resolveConfigValue, compareBlockchainSizes, filterOrdersByType, countOrdersByType, getPrecisionByOrderType, getPrecisionForSide, getPrecisionsForManager, calculateOrderSizes } = require('./utils');
 const Logger = require('./logger');
+const AsyncLock = require('./async_lock');
 // Grid functions (initialize/recalculate) are intended to be
 // called directly via require('./grid').initializeGrid(manager) by callers.
 
@@ -135,6 +136,8 @@ class OrderManager {
         this._accountTotalsResolve = null;
         // Orders that need price correction on blockchain (orderId matched but price outside tolerance)
         this.ordersNeedingPriceCorrection = [];
+        // AsyncLock to prevent concurrent mutations to ordersNeedingPriceCorrection
+        this._correctionsLock = new AsyncLock();
         // Track recently rotated orderIds to prevent double-rotation (cleared after successful rotation)
         this._recentlyRotatedOrderIds = new Set();
         // Track which order sides had their sizes updated by grid triggers
