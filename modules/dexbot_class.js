@@ -17,7 +17,7 @@ const chainKeys = require('./chain_keys');
 const chainOrders = require('./chain_orders');
 const { OrderManager, grid: Grid, utils: OrderUtils } = require('./order');
 const { persistGridSnapshot, retryPersistenceIfNeeded, buildCreateOrderArgs, getOrderTypeFromUpdatedFlags } = OrderUtils;
-const { ORDER_STATES, ORDER_TYPES } = require('./constants');
+const { ORDER_STATES, ORDER_TYPES, TIMING } = require('./constants');
 const { attemptResumePersistedGridByPriceMatch, decideStartupGridAction, reconcileStartupOrders } = require('./order/startup_reconcile');
 const { AccountOrders } = require('./account_orders');
 const AsyncLock = require('./order/async_lock');
@@ -40,15 +40,30 @@ class DEXBot {
         this.accountOrders = null;  // Will be initialized in start()
         this.triggerFile = path.join(PROFILES_DIR, `recalculate.${config.botKey}.trigger`);
         this._recentlyProcessedFills = new Map();
-        this._fillDedupeWindowMs = 5000;
 
-        // AsyncLock instances to prevent TOCTOU races (instead of boolean flags)
+        // Time-based configuration for fill processing (from constants.TIMING)
+        this._fillDedupeWindowMs = TIMING.FILL_DEDUPE_WINDOW_MS;      // Window for deduplicating same fill events
+        this._fillCleanupIntervalMs = TIMING.FILL_CLEANUP_INTERVAL_MS;  // Clean old fill records periodically
+
+        // AsyncLock instances to prevent TOCTOU races
         // These ensure only one fill processing or divergence correction runs at a time
         this._fillProcessingLock = new AsyncLock();
         this._divergenceLock = new AsyncLock();
 
         this._incomingFillQueue = [];
         this.logPrefix = options.logPrefix || '';
+
+        // Metrics for monitoring lock contention and fill processing
+        this._metrics = {
+            fillsProcessed: 0,
+            fillProcessingTimeMs: 0,
+            batchesExecuted: 0,
+            lockContentionEvents: 0,
+            maxQueueDepth: 0
+        };
+
+        // Shutdown state
+        this._shuttingDown = false;
     }
 
     _log(msg) {
@@ -91,15 +106,31 @@ class DEXBot {
      * Consume fills from the incoming queue in a loop.
      * Protected by AsyncLock to ensure single consumer.
      * Interruptible: checks queue between steps to merge new work.
+     *
+     * Uses lock state to atomically prevent multiple consumers from queuing up.
+     * If lock is already acquired or has waiters, this call returns immediately.
      */
     async _consumeFillQueue(chainOrders) {
-        // Prevent stacking of consumer calls if lock is busy
-        if (this._isConsuming) return;
-        this._isConsuming = true;
+        // Prevent stacking of consumer calls by checking lock state atomically
+        // If lock is already processing or has queued waiters, don't queue another consumer
+        if (this._fillProcessingLock.isLocked() || this._fillProcessingLock.getQueueLength() > 0) {
+            this._metrics.lockContentionEvents++;
+            return;
+        }
+
+        // Check shutdown state
+        if (this._shuttingDown) {
+            this._warn('Fill processing skipped: shutdown in progress');
+            return;
+        }
 
         try {
             await this._fillProcessingLock.acquire(async () => {
                 while (this._incomingFillQueue.length > 0) {
+                    const batchStartTime = Date.now();
+
+                    // Track max queue depth
+                    this._metrics.maxQueueDepth = Math.max(this._metrics.maxQueueDepth, this._incomingFillQueue.length);
 
                     // 1. Take snapshot of current work
                     const allFills = [...this._incomingFillQueue];
@@ -144,12 +175,18 @@ class DEXBot {
                         }
                     }
 
-                    // Clean up dedupe cache
-                    const now = Date.now();
+                    // Clean up dedupe cache (periodically remove old entries)
+                    // Entries older than FILL_CLEANUP_INTERVAL_MS are removed to prevent memory leak
+                    const cleanupTimestamp = Date.now();
+                    let cleanedCount = 0;
                     for (const [key, timestamp] of this._recentlyProcessedFills) {
-                        if (now - timestamp > this._fillDedupeWindowMs * 2) {
+                        if (cleanupTimestamp - timestamp > this._fillCleanupIntervalMs) {
                             this._recentlyProcessedFills.delete(key);
+                            cleanedCount++;
                         }
+                    }
+                    if (cleanedCount > 0) {
+                        this.manager?.logger?.log(`Cleaned ${cleanedCount} old fill records. Remaining: ${this._recentlyProcessedFills.size}`, 'debug');
                     }
 
                     if (validFills.length === 0) continue; // Loop back for more
@@ -201,15 +238,24 @@ class DEXBot {
 
                             this.manager.logger.log(`>>> Processing sequential fill for order ${filledOrder.id} (${i}/${allFilledOrders.length})`, 'info');
 
-                            const rebalanceResult = await this.manager.processFilledOrders([filledOrder]);
+                            // Create an exclusion set from ALL other pending fills in the worklist
+                            // to prevent the rebalancer from picking an order that is about to be processed
+                            const fullExcludeSet = new Set();
+                            for (const other of allFilledOrders) {
+                                if (other.orderId) fullExcludeSet.add(other.orderId);
+                                if (other.id) fullExcludeSet.add(other.id);
+                            }
+
+                            const rebalanceResult = await this.manager.processFilledOrders([filledOrder], fullExcludeSet);
                             const batchResult = await this.updateOrdersOnChainBatch(rebalanceResult);
 
                             if (batchResult.hadRotation) anyRotations = true;
                             persistGridSnapshot(this.manager, this.accountOrders, this.config.botKey);
 
                             // INTERRUPT CHECK: Did new fills arrive while we broadcasted?
+                            // This includes consequential fills (e.g., a newly placed buy order being filled instantly)
                             if (this._incomingFillQueue.length > 0) {
-                                this.manager.logger.log(`INTERRUPT: ${this._incomingFillQueue.length} new fills detected during sequential loop! Merging...`, 'info');
+                                this.manager.logger.log(`INTERRUPT: ${this._incomingFillQueue.length} new fills detected during sequential loop! Prioritizing...`, 'info');
 
                                 const newRawFills = [...this._incomingFillQueue];
                                 this._incomingFillQueue = [];
@@ -222,14 +268,17 @@ class DEXBot {
                                     if (this._recentlyProcessedFills.has(nfKey)) continue;
 
                                     this._recentlyProcessedFills.set(nfKey, Date.now());
+                                    processedFillKeys.add(nfKey); // Ensure interrupt fills are persisted too
                                     validNewFills.push(nf);
                                 }
 
                                 if (validNewFills.length > 0) {
                                     const newResolved = await processValidFills(validNewFills);
                                     if (newResolved.length > 0) {
-                                        allFilledOrders.push(...newResolved);
-                                        this.manager.logger.log(`Merged ${newResolved.length} new filled orders into current worklist. Total: ${allFilledOrders.length}`, 'info');
+                                        // Insert new fills IMMEDIATELY after the current index (i) 
+                                        // to prioritize them over the remaining original batch
+                                        allFilledOrders.splice(i, 0, ...newResolved);
+                                        this.manager.logger.log(`Inserted ${newResolved.length} consequential fill(s) into current worklist. Total: ${allFilledOrders.length}`, 'info');
                                     }
                                 }
                             }
@@ -292,12 +341,16 @@ class DEXBot {
                         }
                     }
 
-                    // Periodically clean up old fill records
+                    // Periodically clean up old fill records (10% chance per batch)
                     if (Math.random() < 0.1) {
                         try {
-                            await this.accountOrders.cleanOldProcessedFills(this.config.botKey, 3600000);
+                            await this.accountOrders.cleanOldProcessedFills(this.config.botKey, TIMING.FILL_RECORD_RETENTION_MS);
                         } catch (err) { /* warn */ }
                     }
+
+                    // Update metrics
+                    this._metrics.fillsProcessed += validFills.length;
+                    this._metrics.fillProcessingTimeMs += Date.now() - batchStartTime;
 
                 } // End while(_incomingFillQueue)
 
@@ -311,10 +364,15 @@ class DEXBot {
                 console.error('CRITICAL: Error processing fills (logger unavailable):', err);
             }
         } finally {
-            this._isConsuming = false;
-            // Double check race condition
-            if (this._incomingFillQueue.length > 0) {
-                this._consumeFillQueue(chainOrders);
+            // Check if new fills arrived while processing the batch
+            // If queue is not empty and lock is free, trigger another consumer cycle
+            // Fire-and-forget with error handling to prevent uncaught exceptions in finally
+            if (this._incomingFillQueue.length > 0 &&
+                !this._fillProcessingLock.isLocked() &&
+                this._fillProcessingLock.getQueueLength() === 0) {
+                this._consumeFillQueue(chainOrders).catch(err => {
+                    this._warn(`Error in finally-block consumer restart: ${err.message}`);
+                });
             }
         }
     }
@@ -466,302 +524,324 @@ class DEXBot {
         const operations = [];
         const opContexts = [];
 
-        // Step 1: Build create operations
-        if (ordersToPlace && ordersToPlace.length > 0) {
-            for (const order of ordersToPlace) {
-                try {
-                    const args = buildCreateOrderArgs(order, assetA, assetB);
-                    const op = await chainOrders.buildCreateOrderOp(
-                        this.account, args.amountToSell, args.sellAssetId,
-                        args.minToReceive, args.receiveAssetId, null
-                    );
-                    operations.push(op);
-                    opContexts.push({ kind: 'create', order });
-                } catch (err) {
-                    this.manager.logger.log(`Failed to prepare create op for ${order.type} order ${order.id}: ${err.message}`, 'error');
-                }
-            }
-        }
+        // Collect IDs to lock (shadow) during this transaction
+        const idsToLock = new Set();
+        if (ordersToPlace) ordersToPlace.forEach(o => idsToLock.add(o.id));
+        if (ordersToRotate) ordersToRotate.forEach(r => {
+            if (r.oldOrder?.orderId) idsToLock.add(r.oldOrder.orderId);
+            if (r.newGridId) idsToLock.add(r.newGridId);
+        });
+        if (partialMoves) partialMoves.forEach(m => {
+            if (m.partialOrder?.orderId) idsToLock.add(m.partialOrder.orderId);
+            if (m.newGridId) idsToLock.add(m.newGridId);
+        });
 
-        // Step 2: Build update operations for partial order moves (processed before rotations for atomic swap semantics)
-        if (partialMoves && partialMoves.length > 0) {
-            for (const moveInfo of partialMoves) {
-                try {
-                    const { partialOrder, newPrice } = moveInfo;
-                    if (!partialOrder.orderId) continue;
+        // LOCK ORDERS (Shadowing)
+        this.manager.lockOrders(idsToLock);
 
-                    const op = await chainOrders.buildUpdateOrderOp(
-                        this.account, partialOrder.orderId,
-                        {
-                            newPrice: newPrice,
-                            orderType: partialOrder.type
-                        }
-                    );
-
-                    if (op) {
-                        operations.push(op);
-                        opContexts.push({ kind: 'partial-move', moveInfo });
-                        this.manager.logger.log(
-                            `Prepared partial move op: ${partialOrder.orderId} price ${partialOrder.price.toFixed(4)} -> ${moveInfo.newPrice.toFixed(4)}`,
-                            'debug'
-                        );
-                    } else {
-                        this.manager.logger.log(`No change needed for partial move of ${partialOrder.orderId}`, 'debug');
-                    }
-                } catch (err) {
-                    this.manager.logger.log(`Failed to prepare partial move op: ${err.message}`, 'error');
-                }
-            }
-        }
-
-        // Step 3: Build update operations (rotation)
-        if (ordersToRotate && ordersToRotate.length > 0) {
-            const seenOrderIds = new Set();
-            const uniqueRotations = ordersToRotate.filter(r => {
-                const orderId = r?.oldOrder?.orderId;
-                if (!orderId || seenOrderIds.has(orderId)) {
-                    if (orderId) this.manager.logger.log(`Skipping duplicate rotation for ${orderId}`, 'debug');
-                    return false;
-                }
-                seenOrderIds.add(orderId);
-                return true;
-            });
-
-            for (const rotation of uniqueRotations) {
-                try {
-                    const { oldOrder, newPrice, newSize, type } = rotation;
-                    if (!oldOrder.orderId) continue;
-
-                    let newAmountToSell, newMinToReceive;
-                    if (type === 'sell') {
-                        newAmountToSell = newSize;
-                        newMinToReceive = newSize * newPrice;
-                        // Round both to their respective asset precision
-                        const baseAssetPrecision = this.manager.assets?.assetA?.precision || 8;
-                        const quoteAssetPrecision = this.manager.assets?.assetB?.precision || 8;
-                        const baseScaleFactor = Math.pow(10, baseAssetPrecision);
-                        const quoteScaleFactor = Math.pow(10, quoteAssetPrecision);
-                        const newAmountToSellBeforeRound = newAmountToSell;
-                        const newMinToReceiveBeforeRound = newMinToReceive;
-                        newAmountToSell = Math.round(newAmountToSell * baseScaleFactor) / baseScaleFactor;
-                        newMinToReceive = newAmountToSell * newPrice;
-                        newMinToReceive = Math.round(newMinToReceive * quoteScaleFactor) / quoteScaleFactor;
-                        this.manager.logger.log(
-                            `[Rotation SELL] oldOrder=${oldOrder.orderId}, newPrice=${newPrice.toFixed(4)}, ` +
-                            `newSize=${newSize.toFixed(8)} (amount before rounding=${newAmountToSellBeforeRound.toFixed(8)}, after=${newAmountToSell.toFixed(8)}), ` +
-                            `minReceive before=${newMinToReceiveBeforeRound.toFixed(8)}, after=${newMinToReceive.toFixed(8)} ` +
-                            `(basePrec=${baseAssetPrecision}, quotePrec=${quoteAssetPrecision})`,
-                            'debug'
-                        );
-                    } else {
-                        newAmountToSell = newSize;
-                        newMinToReceive = newSize / newPrice;
-                        // Round both to their respective asset precision
-                        const baseAssetPrecision = this.manager.assets?.assetA?.precision || 8;
-                        const quoteAssetPrecision = this.manager.assets?.assetB?.precision || 8;
-                        const baseScaleFactor = Math.pow(10, baseAssetPrecision);
-                        const quoteScaleFactor = Math.pow(10, quoteAssetPrecision);
-                        const newAmountToSellBeforeRound = newAmountToSell;
-                        const newMinToReceiveBeforeRound = newMinToReceive;
-                        newAmountToSell = Math.round(newAmountToSell * quoteScaleFactor) / quoteScaleFactor;
-                        newMinToReceive = newAmountToSell / newPrice;
-                        newMinToReceive = Math.round(newMinToReceive * baseScaleFactor) / baseScaleFactor;
-                        this.manager.logger.log(
-                            `[Rotation BUY] oldOrder=${oldOrder.orderId}, newPrice=${newPrice.toFixed(4)}, ` +
-                            `newSize=${newSize.toFixed(8)} (amount before rounding=${newAmountToSellBeforeRound.toFixed(8)}, after=${newAmountToSell.toFixed(8)}), ` +
-                            `minReceive before=${newMinToReceiveBeforeRound.toFixed(8)}, after=${newMinToReceive.toFixed(8)} ` +
-                            `(basePrec=${baseAssetPrecision}, quotePrec=${quoteAssetPrecision})`,
-                            'debug'
-                        );
-                    }
-
-                    const op = await chainOrders.buildUpdateOrderOp(
-                        this.account, oldOrder.orderId,
-                        { 
-                            amountToSell: newAmountToSell, 
-                            minToReceive: newMinToReceive,
-                            newPrice: newPrice,
-                            orderType: type
-                        }
-                    );
-
-                    if (op) {
-                        operations.push(op);
-                        opContexts.push({ kind: 'rotation', rotation });
-                    } else {
-                        // CRITICAL: If buildUpdateOrderOp returns null (no change detected due to precision),
-                        // we must NOT add this to operations. The rotation will NOT be marked complete,
-                        // preventing a loop where available funds trigger threshold but never get consumed.
-                        this.manager.logger.log(`Skipping rotation of ${oldOrder.orderId}: no blockchain change needed (precision tolerance)`, 'debug');
-                    }
-                } catch (err) {
-                    this.manager.logger.log(`Failed to prepare update op for rotation: ${err.message}`, 'error');
-                }
-            }
-        }
-
-        if (operations.length === 0) {
-            return { executed: false, hadRotation: false };  // No batch executed
-        }
-
-        // Step 4: Execute Batch
-        let hadRotation = false;
-        let updateOperationCount = 0;  // Track update operations for fee accounting
         try {
-            this.manager.logger.log(`Broadcasting batch with ${operations.length} operations...`, 'info');
-            const result = await chainOrders.executeBatch(this.account, this.privateKey, operations);
-
-            // Step 5: Map results in operation order (supports atomic partial-move + rotation swaps)
-            const results = (result && result[0] && result[0].trx && result[0].trx.operation_results) || [];
-            const { getAssetFees } = require('./order/utils');
-            const btsFeeData = getAssetFees('BTS', 1);
-
-            for (let i = 0; i < opContexts.length; i++) {
-                const ctx = opContexts[i];
-                const res = results[i];
-
-                if (ctx.kind === 'create') {
-                    const { order } = ctx;
-                    const chainOrderId = res && res[1];
-                    if (chainOrderId) {
-                        await this.manager.synchronizeWithChain({
-                            gridOrderId: order.id,
-                            chainOrderId,
-                            fee: btsFeeData.createFee
-                        }, 'createOrder');
-                        this.manager.logger.log(`Placed ${order.type} order ${order.id} -> ${chainOrderId}`, 'info');
-                    } else {
-                        this.manager.logger.log(`Batch result missing ID for created order ${order.id}`, 'warn');
+            // Step 1: Build create operations
+            if (ordersToPlace && ordersToPlace.length > 0) {
+                for (const order of ordersToPlace) {
+                    try {
+                        const args = buildCreateOrderArgs(order, assetA, assetB);
+                        const op = await chainOrders.buildCreateOrderOp(
+                            this.account, args.amountToSell, args.sellAssetId,
+                            args.minToReceive, args.receiveAssetId, null
+                        );
+                        operations.push(op);
+                        opContexts.push({ kind: 'create', order });
+                    } catch (err) {
+                        this.manager.logger.log(`Failed to prepare create op for ${order.type} order ${order.id}: ${err.message}`, 'error');
                     }
-                    continue;
                 }
+            }
 
-                if (ctx.kind === 'partial-move') {
-                    const { moveInfo } = ctx;
-                    this.manager.completePartialOrderMove(moveInfo);
-                    await this.manager.synchronizeWithChain(
-                        {
-                            gridOrderId: moveInfo.newGridId,
-                            chainOrderId: moveInfo.partialOrder.orderId,
-                            fee: btsFeeData.updateFee
-                        },
-                        'createOrder'
-                    );
-                    this.manager.logger.log(
-                        `Partial move complete: ${moveInfo.partialOrder.orderId} moved to ${moveInfo.newPrice.toFixed(4)}`,
-                        'info'
-                    );
-                    updateOperationCount++;  // Count as update operation
-                    continue;
-                }
+            // Step 2: Build update operations for partial order moves (processed before rotations for atomic swap semantics)
+            if (partialMoves && partialMoves.length > 0) {
+                for (const moveInfo of partialMoves) {
+                    try {
+                        const { partialOrder, newPrice } = moveInfo;
+                        if (!partialOrder.orderId) continue;
 
-                if (ctx.kind === 'rotation') {
-                    // Skip rotation if we're running divergence corrections (prevents feedback loops)
-                    // Check if divergence lock is currently processing (locked or queued)
-                    if (this._divergenceLock.isLocked() || this._divergenceLock.getQueueLength() > 0) {
-                        this.manager.logger.log(`Skipping rotation during divergence correction phase: ${ctx.rotation?.oldOrder?.orderId}`, 'debug');
-                        continue;
+                        const op = await chainOrders.buildUpdateOrderOp(
+                            this.account, partialOrder.orderId,
+                            {
+                                newPrice: newPrice,
+                                orderType: partialOrder.type
+                            }
+                        );
+
+                        if (op) {
+                            operations.push(op);
+                            opContexts.push({ kind: 'partial-move', moveInfo });
+                            this.manager.logger.log(
+                                `Prepared partial move op: ${partialOrder.orderId} price ${partialOrder.price.toFixed(4)} -> ${moveInfo.newPrice.toFixed(4)}`,
+                                'debug'
+                            );
+                        } else {
+                            this.manager.logger.log(`No change needed for partial move of ${partialOrder.orderId}`, 'debug');
+                        }
+                    } catch (err) {
+                        this.manager.logger.log(`Failed to prepare partial move op: ${err.message}`, 'error');
                     }
+                }
+            }
 
-                    hadRotation = true;
-                    const { rotation } = ctx;
-                    const { oldOrder, newPrice, newGridId, newSize } = rotation;
+            // Step 3: Build update operations (rotation)
+            if (ordersToRotate && ordersToRotate.length > 0) {
+                const seenOrderIds = new Set();
+                const uniqueRotations = ordersToRotate.filter(r => {
+                    const orderId = r?.oldOrder?.orderId;
+                    if (!orderId || seenOrderIds.has(orderId)) {
+                        if (orderId) this.manager.logger.log(`Skipping duplicate rotation for ${orderId}`, 'debug');
+                        return false;
+                    }
+                    seenOrderIds.add(orderId);
+                    return true;
+                });
 
-                    // SIZE-CORRECTION rotations (divergence/threshold triggered) don't have newGridId
-                    // They just resize existing on-chain orders - grid slots already have correct prices/sizes
-                    // Don't create synthetic slots with undefined id which corrupts the grid
-                    if (!newGridId) {
-                        // Just mark the rotation complete and count the update
-                        this.manager.completeOrderRotation(oldOrder);
-                        const sizeStr = (newSize !== undefined && newSize !== null && Number.isFinite(newSize))
-                            ? newSize.toFixed(8) : 'N/A';
-                        const priceStr = (newPrice !== undefined && newPrice !== null && Number.isFinite(newPrice))
-                            ? newPrice.toFixed(4) : 'N/A';
-                        this.manager.logger.log(`Size correction applied: ${oldOrder.orderId} resized to ${sizeStr} @ ${priceStr}`, 'info');
+                for (const rotation of uniqueRotations) {
+                    try {
+                        const { oldOrder, newPrice, newSize, type } = rotation;
+                        if (!oldOrder.orderId) continue;
 
-                        // Optimistically deduct the update fee if BTS is the pair asset
-                        if (this.manager.config.assetA === 'BTS' || this.manager.config.assetB === 'BTS') {
-                            const btsSide = (this.manager.config.assetA === 'BTS') ? 'sell' : 'buy';
-                            const orderType = (btsSide === 'buy') ? ORDER_TYPES.BUY : ORDER_TYPES.SELL;
-                            this.manager._deductFromChainFree(orderType, btsFeeData.updateFee, 'resize-fee');
+                        let newAmountToSell, newMinToReceive;
+                        if (type === 'sell') {
+                            newAmountToSell = newSize;
+                            newMinToReceive = newSize * newPrice;
+                            // Round both to their respective asset precision
+                            const baseAssetPrecision = this.manager.assets?.assetA?.precision || 8;
+                            const quoteAssetPrecision = this.manager.assets?.assetB?.precision || 8;
+                            const baseScaleFactor = Math.pow(10, baseAssetPrecision);
+                            const quoteScaleFactor = Math.pow(10, quoteAssetPrecision);
+                            const newAmountToSellBeforeRound = newAmountToSell;
+                            const newMinToReceiveBeforeRound = newMinToReceive;
+                            newAmountToSell = Math.round(newAmountToSell * baseScaleFactor) / baseScaleFactor;
+                            newMinToReceive = newAmountToSell * newPrice;
+                            newMinToReceive = Math.round(newMinToReceive * quoteScaleFactor) / quoteScaleFactor;
+                            this.manager.logger.log(
+                                `[Rotation SELL] oldOrder=${oldOrder.orderId}, newPrice=${newPrice.toFixed(4)}, ` +
+                                `newSize=${newSize.toFixed(8)} (amount before rounding=${newAmountToSellBeforeRound.toFixed(8)}, after=${newAmountToSell.toFixed(8)}), ` +
+                                `minReceive before=${newMinToReceiveBeforeRound.toFixed(8)}, after=${newMinToReceive.toFixed(8)} ` +
+                                `(basePrec=${baseAssetPrecision}, quotePrec=${quoteAssetPrecision})`,
+                                'debug'
+                            );
+                        } else {
+                            newAmountToSell = newSize;
+                            newMinToReceive = newSize / newPrice;
+                            // Round both to their respective asset precision
+                            const baseAssetPrecision = this.manager.assets?.assetA?.precision || 8;
+                            const quoteAssetPrecision = this.manager.assets?.assetB?.precision || 8;
+                            const baseScaleFactor = Math.pow(10, baseAssetPrecision);
+                            const quoteScaleFactor = Math.pow(10, quoteAssetPrecision);
+                            const newAmountToSellBeforeRound = newAmountToSell;
+                            const newMinToReceiveBeforeRound = newMinToReceive;
+                            newAmountToSell = Math.round(newAmountToSell * quoteScaleFactor) / quoteScaleFactor;
+                            newMinToReceive = newAmountToSell / newPrice;
+                            newMinToReceive = Math.round(newMinToReceive * baseScaleFactor) / baseScaleFactor;
+                            this.manager.logger.log(
+                                `[Rotation BUY] oldOrder=${oldOrder.orderId}, newPrice=${newPrice.toFixed(4)}, ` +
+                                `newSize=${newSize.toFixed(8)} (amount before rounding=${newAmountToSellBeforeRound.toFixed(8)}, after=${newAmountToSell.toFixed(8)}), ` +
+                                `minReceive before=${newMinToReceiveBeforeRound.toFixed(8)}, after=${newMinToReceive.toFixed(8)} ` +
+                                `(basePrec=${baseAssetPrecision}, quotePrec=${quoteAssetPrecision})`,
+                                'debug'
+                            );
                         }
 
-                        updateOperationCount++;
+                        const op = await chainOrders.buildUpdateOrderOp(
+                            this.account, oldOrder.orderId,
+                            { 
+                                amountToSell: newAmountToSell, 
+                                minToReceive: newMinToReceive,
+                                newPrice: newPrice,
+                                orderType: type
+                            }
+                        );
+
+                        if (op) {
+                            operations.push(op);
+                            opContexts.push({ kind: 'rotation', rotation });
+                        } else {
+                            // CRITICAL: If buildUpdateOrderOp returns null (no change detected due to precision),
+                            // we must NOT add this to operations. The rotation will NOT be marked complete,
+                            // preventing a loop where available funds trigger threshold but never get consumed.
+                            this.manager.logger.log(`Skipping rotation of ${oldOrder.orderId}: no blockchain change needed (precision tolerance)`, 'debug');
+                        }
+                    } catch (err) {
+                        this.manager.logger.log(`Failed to prepare update op for rotation: ${err.message}`, 'error');
+                    }
+                }
+            }
+
+            if (operations.length === 0) {
+                return { executed: false, hadRotation: false };  // No batch executed
+            }
+
+            // Step 4: Execute Batch
+            let hadRotation = false;
+            let updateOperationCount = 0;  // Track update operations for fee accounting
+            try {
+                this.manager.logger.log(`Broadcasting batch with ${operations.length} operations...`, 'info');
+                const result = await chainOrders.executeBatch(this.account, this.privateKey, operations);
+
+                // Step 5: Map results in operation order (supports atomic partial-move + rotation swaps)
+                const results = (result && result[0] && result[0].trx && result[0].trx.operation_results) || [];
+                const { getAssetFees } = require('./order/utils');
+                const btsFeeData = getAssetFees('BTS', 1);
+
+                for (let i = 0; i < opContexts.length; i++) {
+                    const ctx = opContexts[i];
+                    const res = results[i];
+
+                    if (ctx.kind === 'create') {
+                        const { order } = ctx;
+                        const chainOrderId = res && res[1];
+                        if (chainOrderId) {
+                            await this.manager.synchronizeWithChain({
+                                gridOrderId: order.id,
+                                chainOrderId,
+                                fee: btsFeeData.createFee
+                            }, 'createOrder');
+                            this.manager.logger.log(`Placed ${order.type} order ${order.id} -> ${chainOrderId}`, 'info');
+                        } else {
+                            this.manager.logger.log(`Batch result missing ID for created order ${order.id}`, 'warn');
+                        }
                         continue;
                     }
 
-                    // FILL-TRIGGERED rotations have newGridId - update target grid slot
-                    const actualSize = newSize;  // Use the rounded newAmountToSell/newMinToReceive
-                    const slot = this.manager.orders.get(newGridId) || { id: newGridId, type: rotation.type, price: newPrice, size: 0, state: ORDER_STATES.VIRTUAL };
-
-                    // Detect if rotation was placed with partial proceeds (size < grid slot size)
-                    const isPartialPlacement = slot.size > 0 && actualSize < slot.size;
-
-                    // CRITICAL: Complete old rotation BEFORE updating new slot state
-                    // This ensures if synchronization fails, old order is properly marked complete
-                    this.manager.completeOrderRotation(oldOrder);
-
-                    // Update the target grid slot with actual size and price from rotation
-                    // NOTE: state=VIRTUAL, orderId=null initially - synchronizeWithChain will update to ACTIVE+orderId
-                    const updatedSlot = {
-                        ...slot,
-                        id: newGridId,
-                        type: rotation.type,
-                        size: actualSize,
-                        price: newPrice,
-                        state: ORDER_STATES.VIRTUAL,
-                        orderId: null
-                    };
-                    this.manager._updateOrder(updatedSlot);
-
-                    // Synchronize new grid slot with blockchain (MUST succeed or grid is inconsistent)
-                    try {
-                        await this.manager.synchronizeWithChain({
-                            gridOrderId: newGridId,
-                            chainOrderId: oldOrder.orderId,
-                            isPartialPlacement,
-                            fee: btsFeeData.updateFee
-                        }, 'createOrder');
-                        this.manager.logger.log(`Order size updated: ${oldOrder.orderId} new price ${newPrice.toFixed(4)}, new size ${actualSize.toFixed(8)}`, 'info');
-                        updateOperationCount++;  // Count as update operation
-                    } catch (err) {
-                        this.manager.logger.log(
-                            `ERROR: Synchronization failed for rotation ${oldOrder.orderId} -> ${newGridId}: ${err.message}. ` +
-                            `Grid slot stuck in VIRTUAL state. Manual recovery may be needed.`,
-                            'error'
+                    if (ctx.kind === 'partial-move') {
+                        const { moveInfo } = ctx;
+                        this.manager.completePartialOrderMove(moveInfo);
+                        await this.manager.synchronizeWithChain(
+                            {
+                                gridOrderId: moveInfo.newGridId,
+                                chainOrderId: moveInfo.partialOrder.orderId,
+                                fee: btsFeeData.updateFee
+                            },
+                            'createOrder'
                         );
-                        // NOTE: Grid is now inconsistent - slot has size but no orderId and state=VIRTUAL
-                        // This should trigger grid reconciliation on next sync to recover
+                        this.manager.logger.log(
+                            `Partial move complete: ${moveInfo.partialOrder.orderId} moved to ${moveInfo.newPrice.toFixed(4)}`,
+                            'info'
+                        );
+                        updateOperationCount++;  // Count as update operation
+                        continue;
+                    }
+
+                    if (ctx.kind === 'rotation') {
+                        // Skip rotation if we're running divergence corrections (prevents feedback loops)
+                        // Check if divergence lock is currently processing (locked or queued)
+                        if (this._divergenceLock?.isLocked() || this._divergenceLock?.getQueueLength() > 0) {
+                            this.manager.logger.log(`Skipping rotation during divergence correction phase: ${ctx.rotation?.oldOrder?.orderId}`, 'debug');
+                            continue;
+                        }
+
+                        hadRotation = true;
+                        const { rotation } = ctx;
+                        const { oldOrder, newPrice, newGridId, newSize } = rotation;
+
+                        // SIZE-CORRECTION rotations (divergence/threshold triggered) don't have newGridId
+                        // They just resize existing on-chain orders - grid slots already have correct prices/sizes
+                        // Don't create synthetic slots with undefined id which corrupts the grid
+                        if (!newGridId) {
+                            // Just mark the rotation complete and count the update
+                            this.manager.completeOrderRotation(oldOrder);
+                            const sizeStr = (newSize !== undefined && newSize !== null && Number.isFinite(newSize))
+                                ? newSize.toFixed(8) : 'N/A';
+                            const priceStr = (newPrice !== undefined && newPrice !== null && Number.isFinite(newPrice))
+                                ? newPrice.toFixed(4) : 'N/A';
+                            this.manager.logger.log(`Size correction applied: ${oldOrder.orderId} resized to ${sizeStr} @ ${priceStr}`, 'info');
+
+                            // Optimistically deduct the update fee if BTS is the pair asset
+                            if (this.manager.config.assetA === 'BTS' || this.manager.config.assetB === 'BTS') {
+                                const btsSide = (this.manager.config.assetA === 'BTS') ? 'sell' : 'buy';
+                                const orderType = (btsSide === 'buy') ? ORDER_TYPES.BUY : ORDER_TYPES.SELL;
+                                this.manager._deductFromChainFree(orderType, btsFeeData.updateFee, 'resize-fee');
+                            }
+
+                            updateOperationCount++;
+                            continue;
+                        }
+
+                        // FILL-TRIGGERED rotations have newGridId - update target grid slot
+                        const actualSize = newSize;  // Use the rounded newAmountToSell/newMinToReceive
+                        const slot = this.manager.orders.get(newGridId) || { id: newGridId, type: rotation.type, price: newPrice, size: 0, state: ORDER_STATES.VIRTUAL };
+
+                        // Detect if rotation was placed with partial proceeds (size < grid slot size)
+                        const isPartialPlacement = slot.size > 0 && actualSize < slot.size;
+
+                        // CRITICAL: Complete old rotation BEFORE updating new slot state
+                        // This ensures if synchronization fails, old order is properly marked complete
+                        this.manager.completeOrderRotation(oldOrder);
+
+                        // Update the target grid slot with actual size and price from rotation
+                        // NOTE: state=VIRTUAL, orderId=null initially - synchronizeWithChain will update to ACTIVE+orderId
+                        const updatedSlot = {
+                            ...slot,
+                            id: newGridId,
+                            type: rotation.type,
+                            size: actualSize,
+                            price: newPrice,
+                            state: ORDER_STATES.VIRTUAL,
+                            orderId: null
+                        };
+                        this.manager._updateOrder(updatedSlot);
+
+                        // Synchronize new grid slot with blockchain (MUST succeed or grid is inconsistent)
+                        try {
+                            await this.manager.synchronizeWithChain({
+                                gridOrderId: newGridId,
+                                chainOrderId: oldOrder.orderId,
+                                isPartialPlacement,
+                                fee: btsFeeData.updateFee
+                            }, 'createOrder');
+                            this.manager.logger.log(`Order size updated: ${oldOrder.orderId} new price ${newPrice.toFixed(4)}, new size ${actualSize.toFixed(8)}`, 'info');
+                            updateOperationCount++;  // Count as update operation
+                        } catch (err) {
+                            this.manager.logger.log(
+                                `ERROR: Synchronization failed for rotation ${oldOrder.orderId} -> ${newGridId}: ${err.message}. ` +
+                                `Grid slot stuck in VIRTUAL state. Manual recovery may be needed.`,
+                                'error'
+                            );
+                            // NOTE: Grid is now inconsistent - slot has size but no orderId and state=VIRTUAL
+                            // This should trigger grid reconciliation on next sync to recover
+                        }
                     }
                 }
-            }
 
-            // Account for BTS update fees paid during batch operations
-            // Only if BTS is in the trading pair
-            if (updateOperationCount > 0 && (this.manager.config.assetA === 'BTS' || this.manager.config.assetB === 'BTS')) {
-                try {
-                    const { getAssetFees } = require('./order/utils');
-                    const btsFeeData = getAssetFees('BTS', 1);
-                    const totalUpdateFees = btsFeeData.updateFee * updateOperationCount;
+                // Account for BTS update fees paid during batch operations
+                // Only if BTS is in the trading pair (reuses btsFeeData from line 664)
+                if (updateOperationCount > 0 && (this.manager.config.assetA === 'BTS' || this.manager.config.assetB === 'BTS')) {
+                    try {
+                        const totalUpdateFees = btsFeeData.updateFee * updateOperationCount;
 
-                    this.manager.funds.btsFeesOwed += totalUpdateFees;
-                    this.manager.logger.log(
-                        `BTS update fees for batch: ${updateOperationCount} update operations × ${btsFeeData.updateFee.toFixed(8)} = +${totalUpdateFees.toFixed(8)} BTS (total owed: ${this.manager.funds.btsFeesOwed.toFixed(8)} BTS)`,
-                        'info'
-                    );
+                        this.manager.funds.btsFeesOwed += totalUpdateFees;
+                        this.manager.logger.log(
+                            `BTS update fees for batch: ${updateOperationCount} update operations × ${btsFeeData.updateFee.toFixed(8)} = +${totalUpdateFees.toFixed(8)} BTS (total owed: ${this.manager.funds.btsFeesOwed.toFixed(8)} BTS)`,
+                            'info'
+                        );
 
-                    // Persist the updated fees owed
-                    await this.manager._persistBtsFeesOwed();
-                } catch (err) {
-                    this.manager.logger.log(`Warning: Could not account for BTS update fees: ${err.message}`, 'warn');
+                        // Persist the updated fees owed
+                        await this.manager._persistBtsFeesOwed();
+                    } catch (err) {
+                        this.manager.logger.log(`Warning: Could not account for BTS update fees: ${err.message}`, 'warn');
+                    }
                 }
+
+            } catch (err) {
+                this.manager.logger.log(`Batch transaction failed: ${err.message}`, 'error');
+                return { executed: false, hadRotation: false };
             }
 
-        } catch (err) {
-            this.manager.logger.log(`Batch transaction failed: ${err.message}`, 'error');
-            return { executed: false, hadRotation: false };
+            // Track batch metrics
+            this._metrics.batchesExecuted++;
+
+            return { executed: true, hadRotation };  // Return whether batch executed and if rotation happened
+        } finally {
+            // UNLOCK ORDERS (release shadowing)
+            this.manager.unlockOrders(idsToLock);
         }
-        return { executed: true, hadRotation };  // Return whether batch executed and if rotation happened
     }
 
 
@@ -1245,6 +1325,64 @@ class DEXBot {
             this._blockchainFetchInterval = null;
             this._log('Stopped periodic blockchain fetch interval');
         }
+    }
+
+    /**
+     * Get current metrics for monitoring and debugging.
+     * @returns {Object} Metrics snapshot
+     */
+    getMetrics() {
+        return {
+            ...this._metrics,
+            queueDepth: this._incomingFillQueue.length,
+            fillProcessingLockActive: this._fillProcessingLock?.isLocked() || false,
+            divergenceLockActive: this._divergenceLock?.isLocked() || false,
+            shadowLocksActive: this.manager?.shadowOrderIds?.size || 0,
+            recentFillsTracked: this._recentlyProcessedFills.size
+        };
+    }
+
+    /**
+     * Gracefully shutdown the bot.
+     * Waits for current fill processing to complete, persists state, and stops intervals.
+     * @returns {Promise<void>}
+     */
+    async shutdown() {
+        this._log('Initiating graceful shutdown...');
+        this._shuttingDown = true;
+
+        // Stop accepting new work
+        this._stopBlockchainFetchInterval();
+
+        // Wait for current fill processing to complete
+        try {
+            await this._fillProcessingLock.acquire(async () => {
+                this._log('Fill processing lock acquired for shutdown');
+
+                // Log any remaining queued fills
+                if (this._incomingFillQueue.length > 0) {
+                    this._warn(`${this._incomingFillQueue.length} fills queued but not processed at shutdown`);
+                }
+
+                // Persist final state
+                if (this.manager && this.accountOrders && this.config?.botKey) {
+                    try {
+                        persistGridSnapshot(this.manager, this.accountOrders, this.config.botKey);
+                        this._log('Final grid snapshot persisted');
+                    } catch (err) {
+                        this._warn(`Failed to persist final state: ${err.message}`);
+                    }
+                }
+            });
+        } catch (err) {
+            this._warn(`Error during shutdown lock acquisition: ${err.message}`);
+        }
+
+        // Log final metrics
+        const metrics = this.getMetrics();
+        this._log(`Shutdown complete. Final metrics: fills=${metrics.fillsProcessed}, batches=${metrics.batchesExecuted}, ` +
+            `avgProcessingTime=${metrics.fillsProcessed > 0 ? (metrics.fillProcessingTimeMs / metrics.fillsProcessed).toFixed(2) : 0}ms, ` +
+            `lockContentions=${metrics.lockContentionEvents}, maxQueueDepth=${metrics.maxQueueDepth}`);
     }
 }
 

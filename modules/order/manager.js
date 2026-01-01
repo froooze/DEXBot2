@@ -136,6 +136,9 @@ class OrderManager {
         this._accountTotalsResolve = null;
         // Orders that need price correction on blockchain (orderId matched but price outside tolerance)
         this.ordersNeedingPriceCorrection = [];
+        // Shadow map: tracks orderIds -> timestamp that are currently 'in-flight'.
+        // This implements Optimistic Locking with Auto-Expiration.
+        this.shadowOrderIds = new Map();
         // AsyncLock to prevent concurrent mutations to ordersNeedingPriceCorrection
         this._correctionsLock = new AsyncLock();
         // Track recently rotated orderIds to prevent double-rotation (cleared after successful rotation)
@@ -199,6 +202,92 @@ class OrderManager {
                 'debug'
             );
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Order Locking (Shadowing) Methods
+    // -------------------------------------------------------------------------
+
+    /**
+     * Lock a set of orders (by grid ID or chain ID) to prevent concurrent modification.
+     * Locks automatically expire after 30 seconds if not explicitly unlocked.
+     * @param {Set|Array} orderIds - Set or Array of IDs to lock
+     */
+    lockOrders(orderIds) {
+        if (!orderIds) return;
+        let count = 0;
+        const now = Date.now();
+        for (const id of orderIds) {
+            if (id) {
+                this.shadowOrderIds.set(id, now);
+                count++;
+            }
+        }
+        if (count > 0) this.logger.log(`Shadow locked ${count} orders. Total locked: ${this.shadowOrderIds.size}`, 'debug');
+
+        // Opportunistically clean expired locks while setting new ones
+        this._cleanExpiredLocks();
+    }
+
+    /**
+     * Unlock a set of orders.
+     * Also performs opportunistic cleanup of expired locks.
+     * @param {Set|Array} orderIds - Set or Array of IDs to unlock
+     */
+    unlockOrders(orderIds) {
+        if (!orderIds) return;
+        let count = 0;
+        for (const id of orderIds) {
+            if (id && this.shadowOrderIds.has(id)) {
+                this.shadowOrderIds.delete(id);
+                count++;
+            }
+        }
+        // Cleanup expired locks opportunistically
+        this._cleanExpiredLocks();
+
+        if (count > 0) this.logger.log(`Shadow unlocked ${count} orders. Total locked: ${this.shadowOrderIds.size}`, 'debug');
+    }
+
+    /**
+     * Internal helper to clean up expired locks.
+     * Locks expire after TIMING.LOCK_TIMEOUT_MS to handle long-running blockchain transactions.
+     * @private
+     */
+    _cleanExpiredLocks() {
+        const now = Date.now();
+        let cleanedCount = 0;
+
+        for (const [id, timestamp] of this.shadowOrderIds) {
+            if (now - timestamp > TIMING.LOCK_TIMEOUT_MS) {
+                this.shadowOrderIds.delete(id);
+                cleanedCount++;
+            }
+        }
+
+        if (cleanedCount > 0) {
+            // Use warn level if many locks expired (potential issue), otherwise debug
+            const logLevel = cleanedCount > 5 ? 'warn' : 'debug';
+            this.logger.log(`Expired ${cleanedCount} lock(s) after ${TIMING.LOCK_TIMEOUT_MS}ms. Remaining: ${this.shadowOrderIds.size}`, logLevel);
+        }
+    }
+
+    /**
+     * Check if an order is currently locked (shadowed).
+     * Locks expire automatically after TIMING.LOCK_TIMEOUT_MS to handle long-running blockchain transactions.
+     * @param {string} id - Grid ID or Chain Order ID
+     * @returns {boolean} True if locked and valid (not expired)
+     */
+    isOrderLocked(id) {
+        if (!id || !this.shadowOrderIds.has(id)) return false;
+
+        const timestamp = this.shadowOrderIds.get(id);
+        if (Date.now() - timestamp > TIMING.LOCK_TIMEOUT_MS) {
+            // Expired lock - clean it up
+            this.shadowOrderIds.delete(id);
+            return false;
+        }
+        return true;
     }
 
     /**
@@ -1387,7 +1476,9 @@ class OrderManager {
      * @returns {Array} Array of partial order objects
      */
     getPartialOrdersOnSide(type) {
-        return this.getOrdersByTypeAndState(type, ORDER_STATES.PARTIAL);
+        // Filter out any orders that are currently shadowed (locked in pending transactions)
+        return this.getOrdersByTypeAndState(type, ORDER_STATES.PARTIAL)
+            .filter(o => !this.isOrderLocked(o.id) && !this.isOrderLocked(o.orderId));
     }
 
     // Periodically poll for fills and recalculate orders on demand.
@@ -1649,6 +1740,14 @@ class OrderManager {
         // NOTE: Spread correction is now PROACTIVE - handled immediately by checkSpreadCondition()
         // when spread is detected as too wide (at startup, after rotations, at 4h fetch)
         // No reactive extraOrderCount logic needed here
+
+        // Ensure all currently filled orders are excluded from being moved or rotated by other fills in this batch
+        if (!excludeOrderIds) excludeOrderIds = new Set();
+        for (const f of filledOrders) {
+            if (f.orderId) excludeOrderIds.add(f.orderId);
+            if (f.id) excludeOrderIds.add(f.id);
+        }
+
         const newOrders = await this.rebalanceOrders(filledCounts, 0, excludeOrderIds);
 
         // Add updateFee to BTS fees if partial orders were moved during rotation
@@ -1786,20 +1885,28 @@ class OrderManager {
         const side = oppositeType === ORDER_TYPES.BUY ? 'buy' : 'sell';
 
         // Step 1: Activate virtual orders of the filled type (replacement orders on-chain)
-        const activatedOrders = await this.activateClosestVirtualOrdersForPlacement(filledType, count);
+        const activatedOrders = await this.activateClosestVirtualOrdersForPlacement(filledType, count, excludeOrderIds);
         ordersToPlace.push(...activatedOrders);
         this.logger.log(`Prepared ${activatedOrders.length} virtual ${filledType} orders for on-chain placement`, 'debug');
 
         // Step 2: Move partial orders of opposite type out of the way
-        const partialOrders = this.getPartialOrdersOnSide(oppositeType);
+        let partialOrders = this.getPartialOrdersOnSide(oppositeType);
+        
+        // CRITICAL: Exclude orders that are currently being processed as fills in this batch
+        if (excludeOrderIds && excludeOrderIds.size > 0) {
+            const originalCount = partialOrders.length;
+            partialOrders = partialOrders.filter(o => !excludeOrderIds.has(o.orderId) && !excludeOrderIds.has(o.id));
+            if (partialOrders.length < originalCount) {
+                this.logger.log(`Excluded ${originalCount - partialOrders.length} partial ${oppositeType} order(s) from move because they are being filled in this batch`, 'debug');
+            }
+        }
+
         if (partialOrders.length === 1) {
             const reservedGridIds = new Set();
             const moveInfo = this.preparePartialOrderMove(partialOrders[0], partialMoveSlots, reservedGridIds);
             if (moveInfo) {
                 partialMoves.push(moveInfo);
                 this.logger.log(`Prepared partial ${oppositeType} move: ${moveInfo.partialOrder.id} -> ${moveInfo.newGridId}`, 'debug');
-            } else {
-                this.logger.log(`WARNING: Could not move partial ${oppositeType} order ${partialOrders[0].id} (stuck at grid boundary). Grid may need recalculation.`, 'warn');
             }
         } else if (partialOrders.length > 1) {
             this.logger.log(`WARNING: ${partialOrders.length} partial ${oppositeType} orders exist - skipping partial move`, 'warn');
@@ -1855,12 +1962,7 @@ class OrderManager {
                 const { floatToBlockchainInt, blockchainToFloat } = require('./utils');
                 const quantizedSize = blockchainToFloat(floatToBlockchainInt(sizePerOrder, precision), precision);
 
-                const newOrder = {
-                    ...gridOrder,
-                    type: oppositeType,
-                    size: quantizedSize,
-                    price: slot.price
-                };
+                const newOrder = { ...gridOrder, type: oppositeType, size: quantizedSize, price: slot.price };
                 ordersToPlace.push(newOrder);
                 ordersCreated++;
                 this.logger.log(`Using vacated partial slot ${slot.id} for new ${oppositeType} at price ${slot.price.toFixed(4)}, size ${quantizedSize.toFixed(8)}`, 'info');
@@ -1869,7 +1971,7 @@ class OrderManager {
             // Fall back to activating virtuals for remaining orders
             if (ordersCreated < ordersToCreate) {
                 const remaining = ordersToCreate - ordersCreated;
-                const newOrders = await this.activateClosestVirtualOrdersForPlacement(oppositeType, remaining);
+                const newOrders = await this.activateClosestVirtualOrdersForPlacement(oppositeType, remaining, excludeOrderIds);
                 ordersToPlace.push(...newOrders);
             }
 
@@ -1909,13 +2011,28 @@ class OrderManager {
      * 
      * @param {string} targetType - ORDER_TYPES.BUY or SELL
      * @param {number} count - Number of orders to activate
+     * @param {Set} excludeOrderIds - Optional set of grid IDs to exclude
      * @returns {Array} Array of order objects ready for on-chain placement
      */
-    async activateClosestVirtualOrdersForPlacement(targetType, count) {
+    async activateClosestVirtualOrdersForPlacement(targetType, count, excludeOrderIds = new Set()) {
         if (count <= 0) return [];
 
         // Only get orders that are truly VIRTUAL (not yet on-chain)
-        const virtualOrders = this.getOrdersByTypeAndState(targetType, ORDER_STATES.VIRTUAL);
+        let virtualOrders = this.getOrdersByTypeAndState(targetType, ORDER_STATES.VIRTUAL);
+
+        // Exclude orders that are currently in the fill queue or otherwise reserved
+        // AND exclude orders that are shadowed (locked in pending transactions)
+        if (excludeOrderIds && excludeOrderIds.size > 0) {
+            virtualOrders = virtualOrders.filter(o => 
+                !excludeOrderIds.has(o.id) && 
+                !excludeOrderIds.has(o.orderId) &&
+                !this.isOrderLocked(o.id) && 
+                !this.isOrderLocked(o.orderId)
+            );
+        } else {
+            // Even if no manual exclusion set, we must respect shadow locks
+            virtualOrders = virtualOrders.filter(o => !this.isOrderLocked(o.id) && !this.isOrderLocked(o.orderId));
+        }
 
         // Debug: log what we found
         this.logger.log(`Found ${virtualOrders.length} VIRTUAL ${targetType} orders for activation`, 'debug');
@@ -2010,7 +2127,11 @@ class OrderManager {
         }
 
         const activeOrders = this.getOrdersByTypeAndState(targetType, ORDER_STATES.ACTIVE)
-            .filter(o => !allExcluded.has(o.orderId)); // Exclude orders that were corrected, pending, or recently rotated
+            .filter(o => 
+                !allExcluded.has(o.orderId) && 
+                !this.isOrderLocked(o.orderId) &&
+                !this.isOrderLocked(o.id)
+            ); // Exclude orders that were corrected, pending, recently rotated, or shadowed
 
         // Sort by distance from market price (furthest first)
         // For BUY: lowest price is furthest from market

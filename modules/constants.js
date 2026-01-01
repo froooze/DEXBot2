@@ -52,7 +52,15 @@ let TIMING = {
     ACCOUNT_TOTALS_TIMEOUT_MS: 10000,
     // Blockchain fetch interval: how often to refresh blockchain account values (in minutes)
     // Default: 240 minutes (4 hours). Set to 0 or non-number to disable periodic fetches.
-    BLOCKCHAIN_FETCH_INTERVAL_MIN: 240
+    BLOCKCHAIN_FETCH_INTERVAL_MIN: 240,
+
+    // Fill processing timing
+    FILL_DEDUPE_WINDOW_MS: 5000,    // 5 seconds - window for deduplicating same fill events
+    FILL_CLEANUP_INTERVAL_MS: 10000, // 10 seconds - clean old fill records (2x dedup window)
+    FILL_RECORD_RETENTION_MS: 3600000, // 1 hour - how long to keep persisted fill records
+
+    // Order locking timing
+    LOCK_TIMEOUT_MS: 30000  // 30 seconds - allows for blockchain transaction latency
 };
 
 // Grid limits and scaling constants
