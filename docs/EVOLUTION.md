@@ -2,14 +2,14 @@
 
 ## Executive Summary
 
-DEXBot2 is a sophisticated decentralized exchange trading bot for the BitShares blockchain. This report documents the complete evolution of the project from its inception in December 2025 through the current 1.4.12 stable release.
+DEXBot2 is a sophisticated decentralized exchange trading bot for the BitShares blockchain. This report documents the complete evolution of the project from its inception in December 2025 through the current 1.4.13 stable release.
 
 ### Key Milestones
 - **Project Inception**: December 2, 2025
 - **Growth Phase**: 1,950 commits over ~8 active months
 - **Code Maturity**: Evolution from basic utilities to a ~70,000+ LoC intelligent TypeScript system
-- **Stability**: Progression from manual testing to a suite of 243 automated test files
-- **Releases**: 93 release entries (v0.1.0 to v1.4.12)
+- **Stability**: Progression from manual testing to a suite of 247 automated test files
+- **Releases**: 94 release entries (v0.1.0 to v1.4.13)
 
 ---
 
@@ -63,11 +63,15 @@ v1.4.8 closed the duplicate-order and ambiguity classes found in an order-engine
 
 v1.4.12 completed the module transition to native ES modules (root + claw flip to `"type": "module"`, Node >= 22 native WebSocket, dist-first ESM entry shims), removed the remaining one-time upgrade shims and backward-compat paths, and pruned dead constants/helpers. Post-release hardening smoothed the migration's rough edges: a Node 22.14 require-cycle boot deadlock, a fill-runtime require-binding stall, phantom residuals from un-batched same-order fills, stranded chain dust after sub-dust fills, and duplicate-orphan self-healing that double-cancelled or stranded funds.
 
+### Phase 10: Broadcast Serialization, Start Canonicalization & Onboarding (August 2026)
+
+v1.4.13 added a single-flight guard that serializes overlapping COW broadcasts (preventing orphan fills), closed fill-lock bypasses, hardened the no-ALS AsyncLock fallback, fixed ESM packaging gaps (engines `>=22.12.0`, `exports` map, browser classification), promoted `dexbot start` to the canonical launch command, stripped residual TUI-dashboard references, and added a BitShares onboarding tutorial for new users.
+
 ---
 
 ## Development Statistics
 
-The project has accumulated 243 automated test files across 93 release entries. See the **Version History** below for a per-release commit breakdown.
+The project has accumulated 247 automated test files across 94 release entries. See the **Version History** below for a per-release commit breakdown.
 
 ---
 
@@ -183,11 +187,12 @@ Compact view; per-commit detail lives in [CHANGELOG.md](../CHANGELOG.md).
 | v1.4.9 → v1.4.10 | 10 | Empty-slot normalization and spread boundary promotion, LP pool-share supply pricing fix, spread check independent of divergence, boundary-slot reconcile re-derivation, validation/broadcast dedup refactor, credit-unlock background daemon, test-suite runtime cut |
 | v1.4.10 → v1.4.11 | 8 | Minimum-slots guard for grid range scaling, monolithic restart restarts credential daemon, dexbot start→unlock alias + runtime-layout-aware unlock spawn fix, dead COW/diagnostic code prune, GRID_RECONCILE.md exposure, Telegram docs, CLI test retargeting to `dexbot test`, `dexbot status` reporting a surviving credential daemon after `stop` |
 | v1.4.11 → v1.4.12 | 21 | Full ESM migration (root + claw `"type": "module"`, dist-first entry shims, Node >= 22 native WebSocket, `ws` dep removal), legacy-compat removal (fs_utils shim, migrate_bot_keys, legacy daemon protocol, pre-1.1.0 wrapper migration, price-source/debtPolicy aliases), dead-code prune + re-entrancy guard restore, claw build aligned with root, 80 test typecheck errors fixed, ESM-cycle boot fix for Node 22.14, fill-runtime require-binding restore, same-order fill batching restore, residual-dust cancel, duplicate-orphan self-heal dedup + ORDER_GONE fund release, ESM direct-run guards + editor tsconfig coverage |
+| v1.4.12 → v1.4.13 | 4 | COW broadcast serialization, fill-lock bypass guards, no-ALS AsyncLock hardening, ESM packaging gaps, `dexbot start` canonicalization, TUI-dashboard reference removal, BitShares onboarding tutorial, npm claw coverage |
 
 ---
 
 **Report Originally Generated**: February 19, 2026
-**Last Updated**: August 10, 2026 (v1.4.12)
-**Total Commits**: 1,994
-**Date Range**: December 2, 2025 – August 10, 2026
+**Last Updated**: August 12, 2026 (v1.4.13)
+**Total Commits**: 1,999
+**Date Range**: December 2, 2025 – August 12, 2026
 **Repository**: DEXBot2 (BitShares DEX Trading Bot)

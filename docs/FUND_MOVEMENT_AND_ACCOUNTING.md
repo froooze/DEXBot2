@@ -845,4 +845,4 @@ Two additional accounting hardening measures added in v1.2.1:
 **TOCTOU in `processFillAccounting`.** `_buildBtsDeferredRefundAdjustment` reads `btsFeeState` from `mgr.orders`, but the order lock was acquired after accounting ran. Fixed by acquiring the lock first, then running `processFillAccounting` under the lock. This fix was also ported to POST-RESET and BOOTSTRAP tracked-fill accounting paths.
 
 ---
-*Technical Reference for DEXBot2 v1.4.12 release*
+*Technical Reference for DEXBot2 v1.4.13 release*

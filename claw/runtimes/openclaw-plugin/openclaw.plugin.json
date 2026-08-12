@@ -2,7 +2,7 @@
   "id": "bitshares-claw",
   "name": "BitShares Claw",
   "description": "Native BitShares and DEXBot2 tools from the DEXBot2 claw integration",
-  "version": "1.4.12",
+  "version": "1.4.13",
   "skills": [
     "skills"
   ],

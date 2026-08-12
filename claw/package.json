@@ -1,6 +1,6 @@
 {
   "name": "dexbot2-claw",
-  "version": "1.4.12",
+  "version": "1.4.13",
   "private": true,
   "description": "Claw bridge and runtime integration layer for BitShares and DEXBot2.",
   "type": "module",

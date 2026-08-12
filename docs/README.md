@@ -2,11 +2,18 @@
 
 This directory contains the comprehensive technical documentation for the DEXBot2 trading bot. It is designed to guide developers from high-level architecture down to the nuances of fund accounting and state management.
 
-**Version context:** v1.4.12 is the current release.
+**Version context:** v1.4.13 is the current release.
 
 ---
 
 ## User-Facing Workflows
+
+### 🎓 [BitShares Onboarding](BITSHARES_ONBOARDING.md)
+*Beginner tutorial for new BitShares users getting started with DEXBot2.*
+- **Account Setup**: Register and fund a BitShares account
+- **Keys Explained**: Owner vs active vs memo vs login key — and which one the bot needs
+- **First Bot**: Import keys, create a bot config, and run a dry run
+- **Troubleshooting**: The most common first-run mistakes and how to fix them
 
 ### 📡 [Market Adapter](../market_adapter/README.md)
 *Live AMA pricing, dynamic weights, and recalc trigger orchestration.*
@@ -129,7 +136,7 @@ This directory contains the comprehensive technical documentation for the DEXBot
 
 ### 🧭 [Evolution Report](EVOLUTION.md)
 *Project timeline and major architecture phases.*
-- **Coverage**: Historical milestones from the initial December 2025 bootstrap through the v1.4.12 stable release (grid persistence safety, dust pipeline fix, net inventory lots); credit/debt runtime and maintenance hardening are covered under Phase 5 (Mar–Jun 2026)
+- **Coverage**: Historical milestones from the initial December 2025 bootstrap through the v1.4.13 stable release (grid persistence safety, dust pipeline fix, net inventory lots); credit/debt runtime and maintenance hardening are covered under Phase 5 (Mar–Jun 2026)
 - **Focus**: Architecture evolution, release history, test growth, and documentation changes
 
 ### 🗒️ [Changelog](../CHANGELOG.md)

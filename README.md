@@ -49,6 +49,10 @@ git clone https://github.com/froooze/DEXBot2.git && cd DEXBot2 && npm install
 
 Detailed setup: [Installation](#installation).
 
+### First Run
+
+New to BitShares? Work through the [BitShares Onboarding Tutorial](docs/BITSHARES_ONBOARDING.md) first — it covers creating and funding an account, choosing the right key, and running your first bot.
+
 ### Disclaimer — Use At Your Own Risk
 
 - This software is provided "as-is" without warranty.
@@ -213,7 +217,7 @@ dexbot restart             # Restart the monolithic runtime
 dexbot delete              # Shut down and clean up
 ```
 
-For independent per-bot process control, start isolated mode with `dexbot start --isolated` or use PM2 instead of the default monolithic runtime.
+First-run details and common mistakes are covered in the [BitShares Onboarding Tutorial](docs/BITSHARES_ONBOARDING.md).
 
 ## 🛠️ Bot Management
 
@@ -251,12 +255,13 @@ Always use `dexbot pm2 restart` instead of raw `pm2 restart all` — the wrapper
 
 > Repo-root users can use `./pm2` instead of `dexbot pm2`.
 
-Logs are written to `profiles/logs/<bot-name>.log` (errors to `<bot-name>-error.log`) in all modes.
+Logs are written to `profiles/logs/` in all modes: the monolithic runtime uses `dexbot.log` / `dexbot-error.log`, and per-bot output uses `<bot-name>.log` / `<bot-name>-error.log`.
 
 ## 📚 Documentation
 
 ### User-Facing Workflows
 
+- **[BitShares Onboarding](docs/BITSHARES_ONBOARDING.md)** - Beginner tutorial: create and fund an account, choose the right key, and run your first bot
 - **[Market Adapter](market_adapter/README.md)** - AMA pricing, grid triggers, dynamic weights, and collateral advisory signals
 - **[MPA and Credit Usage](docs/MPA_CREDIT_USAGE.md)** - Bot-scoped debt policy, MPA borrowing, and credit offer workflows
 - **[Analysis](analysis/README.md)** - Research runners, chart generators, and tuning helpers for AMA fitting, trend detection, bot fitting, and TradingView exports
