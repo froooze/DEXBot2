@@ -543,10 +543,15 @@ async function _rebalanceAfterRecovery(bot: any, context: any) {
     try {
         const rebalanceResult = await bot.manager.performSafeRebalance([], new Set());
         if (!rebalanceResult || rebalanceResult.aborted) {
+            // A deferred abort means owed work is still outstanding (broadcast
+            // held the plan, or the identical-held-plan suppression is waiting
+            // for a fresh fill). That wait can be indefinite on a stale grid
+            // with no fills, so surface it — the spread-correction path and
+            // the out-of-spread watchdog are the heal paths, not this scheduler.
             bot.manager.logger?.log?.(
                 `[RECOVERY] Target-grid rebalance skipped after ${context} ` +
                 `(${rebalanceResult?.reason || 'aborted'})`,
-                'debug'
+                rebalanceResult?.deferred ? 'warn' : 'debug'
             );
             return;
         }
@@ -601,9 +606,22 @@ function _schedulePostRecoveryRebalance(bot: any, context: any) {
         bot._postRecoveryRebalanceTimer = null;
         if (bot._shuttingDown) return;
         if (bot._batchInFlight > 0 || bot._recoverySyncInFlight > 0) {
+            // Throttled visibility: a pipeline that never clears would
+            // otherwise re-defer silently forever (the hang class of the
+            // 2026-09-12 incident). First wait at debug, then a warn every
+            // ~30s (120 x LOCK_REFRESH_MIN_MS) while still blocked.
+            bot._postRecoveryRebalanceDefers = (bot._postRecoveryRebalanceDefers || 0) + 1;
+            if (bot._postRecoveryRebalanceDefers === 1 || bot._postRecoveryRebalanceDefers % 120 === 0) {
+                bot.manager?.logger?.log?.(
+                    `[RECOVERY] Post-recovery rebalance (${context}) waiting for pipeline to clear ` +
+                    `(batchInFlight=${bot._batchInFlight || 0}, recoverySyncInFlight=${bot._recoverySyncInFlight || 0}, waits=${bot._postRecoveryRebalanceDefers})`,
+                    bot._postRecoveryRebalanceDefers === 1 ? 'debug' : 'warn'
+                );
+            }
             bot._postRecoveryRebalanceTimer = setTimeout(run, TIMING.LOCK_REFRESH_MIN_MS);
             return;
         }
+        bot._postRecoveryRebalanceDefers = 0;
         _rebalanceAfterRecovery(bot, context);
     };
     bot._postRecoveryRebalanceTimer = setTimeout(run, 0);

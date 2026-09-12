@@ -290,6 +290,30 @@ let TIMING = {
     // proceeds — a leaked flag can delay fills, never starve them.
     FILL_BROADCAST_DEFER_MAX_MS: 60 * 1000,  // 60 seconds
 
+    // FILL_TOTALS_RETRY_BASE_MS / MAX_MS: Backoff for re-processing fills
+    // parked when the accountTotals refresh failed (stale snapshot). The
+    // deferred fills are held OUTSIDE the live queue and re-queued on a
+    // timer — never dropped, never hot-spun. Delay doubles per consecutive
+    // parked cycle (10s, 20s, 40s) capped at 60s; the attempt counter resets
+    // on the first cycle with no deferrals.
+    FILL_TOTALS_RETRY_BASE_MS: 10 * 1000,  // 10 seconds
+    FILL_TOTALS_RETRY_MAX_MS: 60 * 1000,  // 60 seconds
+
+    // SPREAD_STALE_WARN_MS / ESCALATE_MS: Out-of-spread persistence watchdog.
+    // The spread check retries every pipeline-empty tick (level-triggered),
+    // but a correction can keep producing zero candidates (no funds side, no
+    // correctable slots) while the grid sits stale. Past the warn threshold
+    // each tick is surfaced; past the escalate threshold maintenance requests
+    // a structural resync that re-centers the grid (existing resync guards
+    // dedupe concurrent requests; re-center clears any held-plan signature
+    // by moving the boundary). Time-based so it holds for any tick cadence.
+    SPREAD_STALE_WARN_MS: 10 * 60 * 1000,  // 10 minutes
+    SPREAD_STALE_ESCALATE_MS: 30 * 60 * 1000,  // 30 minutes
+    // Dedicated escalation cooldown for the spread-stale watchdog. Deliberately
+    // separate from BOUNDARY_HOLD_RESYNC_COOLDOWN_MS so tuning boundary-hold
+    // behavior never silently changes the spread watchdog cadence.
+    SPREAD_STALE_RESYNC_COOLDOWN_MS: 5 * 60 * 1000,  // 5 minutes
+
     // BOUNDARY_HOLD_RESYNC_THRESHOLD / COOLDOWN: consecutive boundary-hold
     // batches (each carrying fresh fills) after which the COW executor asks
     // for a guard-aware structural re-center. A hold is correct maker

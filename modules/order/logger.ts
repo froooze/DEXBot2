@@ -605,7 +605,7 @@ class Logger {
 
         if (typeof manager.calculateCurrentSpread === 'function') {
             const spread = manager.calculateCurrentSpread();
-            lines.push(`Current Spread: ${Format.formatPercent2(spread)}%`);
+            lines.push(`Current Spread: ${Number.isFinite(spread) ? `${Format.formatPercent2(spread)}%` : 'one-sided (n/a)'}`);
         }
 
         lines.push(`Spread Condition: ${manager.outOfSpread > 0 ? 'TOO WIDE (' + manager.outOfSpread + ')' : 'Normal'}`);

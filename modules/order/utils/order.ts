@@ -1566,7 +1566,10 @@ function assignGridRoles(allSlots: any, boundaryIdx: any, gapSlots: any, ORDER_T
  * @returns {number} Excess steps (0 if in-spread, >0 if out-of-spread)
  */
 function shouldFlagOutOfSpread(currentSpread: any, nominalSpread: any, toleranceSteps: any, buyCount: any, sellCount: any, incrementPercent: any = 0.5) {
-    if (buyCount === 0 || sellCount === 0) {
+    // Non-finite spread (one-sided book, zero best-buy) with placed orders on
+    // both sides is pathological — treat like the empty side: flag the nominal
+    // gap count, never propagate Infinity as an "extra slots" count.
+    if (buyCount === 0 || sellCount === 0 || !Number.isFinite(Number(currentSpread))) {
         const step = 1 + (incrementPercent / 100);
         const gap = Math.ceil(Math.log(1 + (nominalSpread / 100)) / Math.log(step));
         return Math.max(1, gap);

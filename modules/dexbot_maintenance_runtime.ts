@@ -2330,10 +2330,14 @@ async function executeMaintenanceLogic(bot: any, context: any) {
             } else {
                 const spreadResult = await bot.manager.checkSpreadCondition(BitShares, bot.updateOrdersOnChainPlan.bind(bot));
                 if (await bot._abortFlowIfIllegalState(`${context} spread check`)) return;
-                if (spreadResult && spreadResult.ordersPlaced > 0) {
+                const spreadPlaced = Number(spreadResult?.ordersPlaced) || 0;
+                if (spreadPlaced > 0) {
                     bot._log(`✓ Spread correction during ${context}: ${spreadResult.ordersPlaced} order(s) placed`);
                     await bot._persistAndRecoverIfNeeded();
                 }
+                // Persistence watchdog: a correction that keeps placing nothing
+                // while the spread stays wide is a stale grid, not patience.
+                trackOutOfSpreadStaleness(bot, true, spreadPlaced);
             }
         } catch (err: any) {
             bot._warn(`Error running divergence check during ${context}: ${getErrorMessage(err)}`);
@@ -2345,6 +2349,93 @@ async function executeMaintenanceLogic(bot: any, context: any) {
             bot._lastDeferredDustCount = totalDust;
         }
     }
+}
+
+/**
+ * Out-of-spread persistence watchdog: the never-run-stale backstop.
+ *
+ * The spread check retries every pipeline-empty tick (level-triggered), but a
+ * correction can keep producing zero candidates indefinitely (no funded side,
+ * no correctable slots) while the grid sits stale — and the identical-held-
+ * plan suppression blocks fill-less replans until a fresh fill that a stale
+ * grid cannot produce. Time-based (not tick-counted) so it holds for any
+ * maintenance cadence: warn once past SPREAD_STALE_WARN_MS, then request a
+ * structural re-center past SPREAD_STALE_ESCALATE_MS (existing resync guards
+ * dedupe concurrent requests; the re-center moves the boundary, which clears
+ * any held-plan signature). Resets whenever the spread heals or a correction
+ * places orders.
+ * @param {any} bot
+ * @param {boolean} spreadChecked - Whether the spread check ran this tick
+ * @param {number} ordersPlaced - Correction orders placed this tick
+ * @returns {{staleMs: number, escalated: boolean}}
+ */
+export function trackOutOfSpreadStaleness(bot: any, spreadChecked: boolean, ordersPlaced: number) {
+    const outOfSpread = Number(bot?.manager?.outOfSpread) || 0;
+    if (ordersPlaced > 0 || outOfSpread === 0) {
+        bot._outOfSpreadSince = 0;
+        bot._outOfSpreadStaleWarned = false;
+        return { staleMs: 0, escalated: false };
+    }
+    if (!spreadChecked) {
+        const since = Number(bot._outOfSpreadSince) || 0;
+        return { staleMs: since > 0 ? Date.now() - since : 0, escalated: false };
+    }
+    const now = Date.now();
+    if (!Number(bot._outOfSpreadSince)) bot._outOfSpreadSince = now;
+    const staleMs = now - Number(bot._outOfSpreadSince);
+    const staleMin = Math.round(staleMs / 60000);
+    const warnMs = Number((TIMING as any)?.SPREAD_STALE_WARN_MS) > 0
+        ? Number((TIMING as any).SPREAD_STALE_WARN_MS)
+        : 10 * 60 * 1000;
+    const escalateMs = Number((TIMING as any)?.SPREAD_STALE_ESCALATE_MS) > 0
+        ? Number((TIMING as any).SPREAD_STALE_ESCALATE_MS)
+        : 30 * 60 * 1000;
+    if (staleMs >= warnMs && !bot._outOfSpreadStaleWarned) {
+        bot._outOfSpreadStaleWarned = true;
+        bot._log(
+            `[SPREAD-STALE] Spread out of tolerance for ${staleMin}min with no correction placed ` +
+            `(outOfSpread=${outOfSpread}); structural re-center follows if unhealed`,
+            'warn'
+        );
+    }
+    if (staleMs >= escalateMs && typeof bot.manager?.requestStructuralGridResync === 'function') {
+        // Dedicated spread-stale cooldown (NOT BOUNDARY_HOLD_RESYNC_COOLDOWN_MS:
+        // the two watchdogs must tune independently). Falls back to the legacy
+        // boundary-hold key only for operators who overrode it before the split,
+        // then to the 5min default.
+        const cooldownMs = Number((TIMING as any)?.SPREAD_STALE_RESYNC_COOLDOWN_MS) > 0
+            ? Number((TIMING as any).SPREAD_STALE_RESYNC_COOLDOWN_MS)
+            : Number((TIMING as any)?.BOUNDARY_HOLD_RESYNC_COOLDOWN_MS) > 0
+                ? Number((TIMING as any).BOUNDARY_HOLD_RESYNC_COOLDOWN_MS)
+                : 5 * 60 * 1000;
+        const lastAt = Number(bot._lastSpreadStaleResyncAt) || 0;
+        if (now - lastAt >= cooldownMs) {
+            bot._lastSpreadStaleResyncAt = now;
+            bot._log(
+                `[SPREAD-STALE] Spread out of tolerance for ${staleMin}min despite corrections; ` +
+                `requesting structural re-center`,
+                'warn'
+            );
+            try {
+                const res = bot.manager.requestStructuralGridResync('spread-stale-persistent', {
+                    reason: `Spread out of tolerance for ${staleMin}min with no effective correction (outOfSpread=${outOfSpread})`
+                });
+                (res as any)?.catch?.((err: any) => {
+                    bot.manager?.logger?.log?.(
+                        `[SPREAD-STALE] Structural re-center request failed: ${getErrorMessage(err)}`,
+                        'error'
+                    );
+                });
+            } catch (err: any) {
+                bot.manager?.logger?.log?.(
+                    `[SPREAD-STALE] Structural re-center request failed: ${getErrorMessage(err)}`,
+                    'error'
+                );
+            }
+            return { staleMs, escalated: true };
+        }
+    }
+    return { staleMs, escalated: false };
 }
 
 /**
@@ -3074,6 +3165,7 @@ export default {
     cancelDustOrders,
     isOrderDoesNotExistError,
     runGridMaintenance,
+    trackOutOfSpreadStaleness,
     stopMarketAdapterPm2,
     releaseMarketAdapterRuntime,
     syncMarketAdapterOnPeriodicConfigCheck,

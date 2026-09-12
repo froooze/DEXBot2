@@ -710,6 +710,141 @@ async function processFillsWithBootstrapMode(bot: any, chainOrders: any) {
 }
 
 /**
+ * Release replay-safety dedupe keys consumed by _isNewFillKey for fills that
+ * are NOT being processed after all (stale-totals deferral). Without this, a
+ * re-queued fill is skipped as a duplicate within _fillDedupeWindowMs — the
+ * deferral would credit nothing AND poison the retry. Mirrors the
+ * orphan-adoption release in processSweepOrphanFill.
+ * @param {any} bot
+ * @param {Set<any>} processedFillKeys - Per-cycle key set to release from
+ * @param {any[]} fills - Raw fill events whose keys were consumed
+ */
+function releaseFillDedupeKeys(bot: any, processedFillKeys: Set<any>, fills: any[]) {
+    if (!bot || !processedFillKeys || !Array.isArray(fills)) return;
+    for (const fill of fills) {
+        try {
+            const key = buildFillKey(fill);
+            if (!key) continue;
+            processedFillKeys.delete(key);
+            bot._recentlyQueuedFills?.delete?.(key);
+        } catch { /* best-effort */ }
+    }
+}
+
+/**
+ * Park fills deferred on a stale accountTotals refresh for a bounded retry.
+ *
+ * Background: syncFromFillHistory(Batch) returns { deferred: true } when the
+ * accountTotals refresh fails — accounting is NOT applied. The old code
+ * dropped those fills (already spliced from the queue) while their dedupe
+ * keys stayed marked processed: silent fund loss with a "retrying next
+ * cycle" comment, but the next cycle only exists with backlog.
+ *
+ * Parked fills are held OUTSIDE the live queue (so the maintenance idle gate
+ * keeps working) and re-queued on a backoff timer (FILL_TOTALS_RETRY_BASE_MS,
+ * doubling, capped at FILL_TOTALS_RETRY_MAX_MS). The retry re-runs the same
+ * idempotent sync — safe because nothing was applied and the keys were
+ * released. Retries never stop (attempt counter resets on the first cycle
+ * with no deferrals); the parked array is capped at MAX_INCOMING_FILL_QUEUE
+ * with a critical log as a catastrophic backstop.
+ * @param {any} bot
+ * @param {Object} chainOrders - Chain orders module for blockchain operations
+ * @param {any[]} fills - Raw fill events to park
+ * @param {Object} [options]
+ * @param {number} [options.retryDelayMs] - Override the computed backoff (tests)
+ */
+export function parkFillsForTotalsRetry(bot: any, chainOrders: any, fills: any[], options: { retryDelayMs?: number } = {}) {
+    if (!bot || !Array.isArray(fills) || fills.length === 0) return;
+    if (!Array.isArray((bot as any)._fillTotalsParkedFills)) (bot as any)._fillTotalsParkedFills = [];
+    const parked = (bot as any)._fillTotalsParkedFills;
+    const maxParked = Number((NATIVE_CLIENT as any)?.SUBSCRIPTIONS?.MAX_INCOMING_FILL_QUEUE) > 0
+        ? Number((NATIVE_CLIENT as any).SUBSCRIPTIONS.MAX_INCOMING_FILL_QUEUE)
+        : 1000;
+    if (parked.length + fills.length > maxParked) {
+        // Cap overflow: drop OLDEST first (parked front, then incoming front)
+        // so the surviving set reflects the most current chain state. Either
+        // direction is fund-loss without the fund-drift backstop; newest-wins
+        // is the safer choice because stale fills are the most likely to have
+        // been superseded on-chain.
+        const overflow = parked.length + fills.length - maxParked;
+        const dropped: any[] = [];
+        let remaining = overflow;
+        if (parked.length > 0 && remaining > 0) {
+            const take = Math.min(parked.length, remaining);
+            dropped.push(...parked.splice(0, take));
+            remaining -= take;
+        }
+        if (remaining > 0) {
+            dropped.push(...fills.splice(0, remaining));
+        }
+        bot.manager?.logger?.log?.(
+            `[FILL] Totals-refresh retry park overflow (cap ${maxParked}): dropping ${dropped.length} oldest fill(s) ` +
+            `(${(dropped as any[]).map((f: any) => f?.op?.[1]?.order_id ?? '?').join(',')}); fund-drift detection is the backstop`,
+            'error'
+        );
+        if (fills.length === 0) return;
+    }
+    parked.push(...fills);
+    // A retry is already scheduled — it picks these up; one timer at a time.
+    if ((bot as any)._fillTotalsRetryTimer) return;
+    const attempt = Number((bot as any)._fillTotalsRetryAttempt) || 0;
+    const baseMs = Number((TIMING as any)?.FILL_TOTALS_RETRY_BASE_MS) > 0
+        ? Number((TIMING as any).FILL_TOTALS_RETRY_BASE_MS)
+        : 10000;
+    const maxMs = Number((TIMING as any)?.FILL_TOTALS_RETRY_MAX_MS) > 0
+        ? Number((TIMING as any).FILL_TOTALS_RETRY_MAX_MS)
+        : 60000;
+    const delayMs = (options as any)?.retryDelayMs
+        ?? Math.min(baseMs * Math.pow(2, Math.min(attempt, 3)), maxMs);
+    bot.manager?.logger?.log?.(
+        `[FILL] Parked ${fills.length} fill(s) on totals-refresh failure ` +
+        `(parked=${parked.length}, attempt=${attempt + 1}, retry in ${Math.round(delayMs / 1000)}s); accounting not yet applied`,
+        'warn'
+    );
+    (bot as any)._fillTotalsRetryTimer = setTimeout(() => {
+        (bot as any)._fillTotalsRetryTimer = null;
+        if (bot._shuttingDown) {
+            bot.manager?.logger?.log?.(
+                `[FILL] Shutdown with ${((bot as any)._fillTotalsParkedFills as any[])?.length || 0} totals-parked fill(s) unprocessed; grid persistence snapshot is the backstop`,
+                'error'
+            );
+            return;
+        }
+        // Re-read the attempt counter fresh at fire time (do NOT reuse the
+        // `attempt` captured at park time): a clean cycle may have reset
+        // _fillTotalsRetryAttempt to 0 while this timer was pending, and
+        // writing back the stale captured value would spuriously inflate the
+        // backoff chain. Fresh-read self-corrects; the next park recomputes
+        // the delay from the current counter.
+        const freshAttempt = Number((bot as any)._fillTotalsRetryAttempt) || 0;
+        (bot as any)._fillTotalsRetryAttempt = freshAttempt + 1;
+        const due = Array.isArray((bot as any)._fillTotalsParkedFills)
+            ? (bot as any)._fillTotalsParkedFills.splice(0)
+            : [];
+        if (due.length === 0) return;
+        // NOTE: this unshift runs BEFORE _consumeFillQueue acquires
+        // _fillProcessingLock. Interleaving with an in-flight cycle is benign
+        // by design: the in-flight run already snapshotted its batch, so the
+        // re-queued fills are simply picked up one cycle later (worst case),
+        // and _deferredFillsPending widens the invariant tolerance for that
+        // drain. Do not move the unshift inside the lock without re-checking
+        // the single-flight / bootstrap branches in consumeFillQueue.
+        bot._incomingFillQueue.unshift(...due);
+        (bot as any)._deferredFillsPending = true;
+        bot.manager?.logger?.log?.(
+            `[FILL] Retrying ${due.length} totals-parked fill(s) (attempt ${freshAttempt + 1})`,
+            'warn'
+        );
+        const consume = typeof bot._consumeFillQueue === 'function'
+            ? () => bot._consumeFillQueue(chainOrders)
+            : () => consumeFillQueue(bot, chainOrders);
+        consume().catch((err: any) => {
+            bot._warn?.(`Totals-parked fill retry failed: ${getErrorMessage(err)}`);
+        });
+    }, delayMs);
+}
+
+/**
  * Consume queued fills from incomingFillQueue and rebalance.
  * Deduplicates fills against already-processed set (replay-safe), syncs filled
  * orders from history or open orders mode, handles price mismatches, processes
@@ -778,6 +913,9 @@ async function consumeFillQueue(bot: any, chainOrders: any) {
     }
 
     let pendingFillKeysForCurrentCycle = new Set();
+    // Set when this run parked totals-deferred fills: the retry-attempt
+    // backoff counter only resets on runs with no deferrals.
+    let parkedTotalsRetryThisRun = false;
     try {
         if (bot.manager.isBootstrapping()) {
             let bootstrapSkipped = false;
@@ -925,6 +1063,10 @@ async function consumeFillQueue(bot: any, chainOrders: any) {
                 let allFilledOrders: any[] = [];
                 let ordersNeedingCorrection: any[] = [];
                 const residualCancels: any[] = [];
+                // Fills deferred on a stale accountTotals refresh: accounting
+                // NOT applied. Collected here, keys released, parked for a
+                // bounded retry after the block loop (never dropped).
+                const deferredRefills: any[] = [];
 
                 const processValidFills = async (fillsToSync: any) => {
                     let resolvedOrders: any[] = [];
@@ -936,11 +1078,16 @@ async function consumeFillQueue(bot: any, chainOrders: any) {
                                 persistenceMode: PROCESSED_FILL_PERSISTENCE_MODES.BATCHED
                             });
                             if (batchResult.deferred) {
-                                // Deferred: stale accountTotals refresh failed.
-                                // Do NOT mark the fills processed — they will be
-                                // re-read and re-processed on the next cycle.
+                                // Deferred: stale accountTotals refresh failed —
+                                // accounting NOT applied. Release the consumed
+                                // dedupe keys and park for a bounded retry.
+                                // (The old code returned here: the fills were
+                                // already spliced from the queue and their keys
+                                // stayed marked processed — silent fund loss.)
+                                releaseFillDedupeKeys(bot, processedFillKeys, fillsToSync);
+                                deferredRefills.push(...fillsToSync);
                                 bot.manager.logger.log(
-                                    `[FILL] Deferred ${fillsToSync.length} fill(s) (stale accountTotals, refresh failed); retrying next cycle.`,
+                                    `[FILL] Deferred ${fillsToSync.length} fill(s) (stale accountTotals, refresh failed); parking for retry.`,
                                     'warn'
                                 );
                                 return resolvedOrders;
@@ -967,8 +1114,12 @@ async function consumeFillQueue(bot: any, chainOrders: any) {
                                     historyId: fill?.id
                                 });
                                 if (resultHistory.deferred) {
+                                    // Same totals-refresh deferral as the batch
+                                    // path: release keys, park for retry.
+                                    releaseFillDedupeKeys(bot, processedFillKeys, [fill]);
+                                    deferredRefills.push(fill);
                                     bot.manager.logger.log(
-                                        `[FILL] Deferred fill (stale accountTotals, refresh failed); retrying next cycle.`,
+                                        `[FILL] Deferred fill (stale accountTotals, refresh failed); parking for retry.`,
                                         'warn'
                                     );
                                     continue;
@@ -1052,6 +1203,11 @@ async function consumeFillQueue(bot: any, chainOrders: any) {
                     }
                     allFilledOrders = accumulatedOrders;
 
+                    if (deferredRefills.length > 0) {
+                        parkedTotalsRetryThisRun = true;
+                        parkFillsForTotalsRetry(bot, chainOrders, deferredRefills);
+                    }
+
                     if (ordersNeedingCorrection.length > 0) {
                         const correctionResult = await correctAllPriceMismatches(
                             bot.manager, bot.account, bot.privateKey, chainOrders
@@ -1075,8 +1231,11 @@ async function consumeFillQueue(bot: any, chainOrders: any) {
                         // Accounting + crawls are applied; only the broadcast was
                         // deferred to avoid sleeping in-lock on the broadcast
                         // flag. Post-fill maintenance would immediately attempt
-                        // the same blocked broadcasts, so skip it here and let
-                        // the region-end hook run one no-fill rebalance.
+                        // the same blocked broadcasts, so skip it here:
+                        // _processFillsWithBatching already scheduled the
+                        // no-fill rebalance that applies the owed boundary
+                        // shift once the pipeline is clear (same idempotent
+                        // scheduler the region-end hook uses).
                         bot.manager?.logger?.log?.(
                             '[FILL-QUEUE] Fill rebalance deferred (broadcast active); post-fill maintenance deferred to region end',
                             'debug'
@@ -1192,6 +1351,8 @@ async function consumeFillQueue(bot: any, chainOrders: any) {
             }
 
             bot._markGridActivity('fill processing end');
+            // A run with no totals-deferrals breaks the retry backoff chain.
+            if (!parkedTotalsRetryThisRun) bot._fillTotalsRetryAttempt = 0;
             bot._consecutiveConsumeFailures = 0;
             bot._consumeFailureFirstAt = 0;
         });

@@ -1184,10 +1184,16 @@ class DEXBot {
                 );
                 // Deferred (broadcast region active): accounting is already
                 // applied and crawls recorded. Do NOT broadcast; continue the
-                // remaining chunks so every fill is credited, then let the
-                // region-end hook run a single no-fill rebalance to apply the
-                // owed boundary shift. This replaces the old in-lock 30s wait
-                // that cascaded into "Lock acquisition timeout".
+                // remaining chunks so every fill is credited. The owed
+                // boundary shift is repaid by the no-fill rebalance scheduled
+                // below (level-triggered) and, when a future region actually
+                // ends, by the region-end hook (edge-triggered) — the
+                // scheduler is idempotent, so the first trigger wins. Relying
+                // on the hook alone loses the retry whenever the region
+                // already ended before these fills were processed (live
+                // incident 2026-09-12: 6 fills deferred after the commit, no
+                // future region end, grid frozen). This replaces the old
+                // in-lock 30s wait that cascaded into "Lock acquisition timeout".
                 if ((rebalanceResult as any)?.deferred) {
                     anyDeferred = true;
                     managerLog(
@@ -1222,6 +1228,29 @@ class DEXBot {
             // 0.3293 instead of 0.0001 across restarts).
             if (typeof this.manager?.flushGridDirty === 'function') {
                 await this.manager.flushGridDirty('end-of-tick fill processing');
+            }
+        }
+
+        if (anyDeferred) {
+            // Level-triggered repayment of the owed boundary shift: schedule
+            // the no-fill rebalance directly instead of depending solely on a
+            // future broadcast-region end (which may never come when the
+            // region ended before these fills were processed). The scheduler
+            // re-defers until the pipeline is clear and ignores duplicate
+            // requests, so this is safe alongside the region-end hook.
+            try {
+                DexbotStateRecovery.schedulePostRecoveryRebalance(
+                    this,
+                    'fill rebalance deferred by an active broadcast region'
+                );
+            } catch (err: any) {
+                // Never swallow the owed boundary-shift retry silently: a
+                // scheduling failure here re-creates the frozen-grid hang
+                // this level-triggered retry was added to fix.
+                managerLog(
+                    `[COW] Failed to schedule post-deferral rebalance; owed boundary shift still pending: ${getErrorMessage(err)}`,
+                    'warn'
+                );
             }
         }
 
@@ -1787,11 +1816,14 @@ class DEXBot {
      * long region (e.g. the structural resync's Phase-2 placement) would
      * starve indefinitely — which also keeps the maintenance idle gate shut
      * forever (the queue-length check returns the full settle delay).
+     * Registered via addBroadcastRegionEndListener (fan-out) rather than the
+     * legacy single slot, so a second wirer can never silently displace the
+     * drain. Re-entry safe: the marker keeps repeated wiring idempotent.
      */
     _wireBroadcastRegionEndDrain() {
         const manager: any = this.manager;
-        if (!manager || manager._onBroadcastRegionEnd) return;
-        manager._onBroadcastRegionEnd = () => {
+        if (!manager || typeof manager.addBroadcastRegionEndListener !== 'function') return;
+        const regionEndHandler = () => {
             if (this._shuttingDown) return;
             // A fill-driven rebalance deferred because this region was active:
             // schedule a single no-fill rebalance to apply the boundary crawls
@@ -1817,6 +1849,13 @@ class DEXBot {
             this._deferredFillsPending = true;
             this._scheduleFillConsumerRestart(chainOrders);
         };
+        (regionEndHandler as any)._isRegionEndDrain = true;
+        const existing = Array.isArray(manager._onBroadcastRegionEndListeners)
+            ? manager._onBroadcastRegionEndListeners
+            : [];
+        if (!existing.some((fn: any) => fn && (fn as any)._isRegionEndDrain)) {
+            manager.addBroadcastRegionEndListener(regionEndHandler);
+        }
     }
 
     /**

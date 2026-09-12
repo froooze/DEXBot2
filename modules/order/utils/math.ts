@@ -570,11 +570,15 @@ function getGridBestPrices(activeBuys: any, activeSells: any) {
  *
  * @param {Array<Object>} activeBuys - Active buy orders with price property
  * @param {Array<Object>} activeSells - Active sell orders with price property
- * @returns {number} Spread percentage or 0 if insufficient data
+ * @returns {number} Spread percentage, or Infinity when one side is empty
+ * (the spread is undefined with no opposing quote — never 0, which would
+ * read as a perfectly tight book). Callers that flag on counts
+ * (shouldFlagOutOfSpread) take the empty-side branch before touching this
+ * value; display callers must handle non-finite (see logger status line).
  */
 function calculateSpreadFromOrders(activeBuys: any, activeSells: any) {
     const { bestBuy, bestSell } = getGridBestPrices(activeBuys, activeSells);
-    if (bestBuy === null || bestSell === null || bestBuy === 0) return 0;
+    if (bestBuy === null || bestSell === null || bestBuy === 0) return Infinity;
     return ((bestSell / bestBuy) - 1) * 100;
 }
 

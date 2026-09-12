@@ -2314,7 +2314,12 @@ export async function checkSpreadCondition(manager: any, _BitShares: any, update
 
             // Limit spread = nominal + half increment tolerance (0.5 steps).
             const limitSpread = nominalSpread + (manager.config.incrementPercent * toleranceSteps);
-            manager.logger?.log?.(`Spread too wide (${Format.formatPercent(currentSpread)} > ${Format.formatPercent(limitSpread)}), correcting with ${manager.outOfSpread} extra slot(s)...`, 'warn');
+            // One-sided book: currentSpread is Infinity (no opposing quote), so
+            // log the empty side instead of a bogus "0% > limit" comparison.
+            const spreadDesc = oneSideEmpty
+                ? `one-sided (${onChainBuys.length === 0 ? 'no buys' : 'no sells'})`
+                : `${Format.formatPercent(currentSpread)} > ${Format.formatPercent(limitSpread)}`;
+            manager.logger?.log?.(`Spread too wide (${spreadDesc}), correcting with ${manager.outOfSpread} extra slot(s)...`, 'warn');
 
             // Refresh funds before the side decision below: the top-of-tick recalc may
             // predate fills processed since, and determineOrderSideByFunds reads
@@ -2874,11 +2879,16 @@ export function determineOrderSideByFunds(manager: any, currentMarketPrice: any)
             ? Math.floor(configuredMissingSlots)
             : 1;
 
-        // STRATEGY: Edge-Based Correction (Safe Bridging)
+        // STRATEGY: Window-Contiguous Correction (Safe Bridging)
         // Instead of calculating a "mid-price" (which can be dangerous in wide gaps),
-        // we strictly target the orders closest to the spread gap.
+        // we extend the live window contiguously so a fund-constrained correction
+        // never leaves an interior hole.
         // 1. Priority: Update existing PARTIAL orders at the edge (Highest Buy / Lowest Sell).
-        // 2. Fallback: Activate SPREAD slots at the edge (Lowest Spread for Buy / Highest Spread for Sell).
+        // 2. Fallback: Activate empty slots window-contiguous-first (Lowest Buy-rail /
+        //    Highest Sell-rail, adjacent to the live window top).  A rail with no
+        //    live orders has no window to extend, so it falls back to
+        //    spread-edge-first (Highest Buy / Lowest Sell) to close the spread
+        //    near market first.
 
         const allOrders = Array.from(manager.orders.values()) as Order[];
 
@@ -2935,13 +2945,34 @@ export function determineOrderSideByFunds(manager: any, currentMarketPrice: any)
         // boundary-correct type so a SPREAD slot that, after a boundary shift, now sits
         // in the BUY or SELL zone is excluded — it would otherwise be placed on the
         // correction side at a price the grid already considers the opposite side.
+        // Candidate ordering: window-contiguous-first when the rail has live
+        // orders to extend (BUY lowest first, SELL highest first, both adjacent
+        // to the live window top).  A fully-empty rail has no window anchor —
+        // "lowest buy" would be the rail bottom, placing deep orders while the
+        // near-market gap stays open — so it falls back to spread-edge-first
+        // (BUY highest, SELL lowest) to close the spread near market first.
+        // The gap-band promotion path below stays edge-first by necessity
+        // (boundary derivation requires contiguity), so under fund shortage
+        // in-rail holes heal before band slots.
+        const railHasLiveOrders = allOrders.some((o: any) =>
+            getSlotCorrectType(o) === railType && isOrderPlaced(o)
+        );
+        const sortCandidates = (a: any, b: any): number => {
+            const edgeFirst = railType === ORDER_TYPES.BUY
+                ? b.price - a.price
+                : a.price - b.price;
+            const windowFirst = railType === ORDER_TYPES.BUY
+                ? a.price - b.price
+                : b.price - a.price;
+            return railHasLiveOrders ? windowFirst : edgeFirst;
+        };
         const typedSpreadCandidates = allOrders
             .filter((o: any) =>
                 o.type === ORDER_TYPES.SPREAD
                 && isSlotAvailable(o)
                 && getSlotCorrectType(o) === railType
             )
-            .sort((a: any, b: any) => railType === ORDER_TYPES.BUY ? a.price - b.price : b.price - a.price)
+            .sort(sortCandidates)
             .slice(0, missingSlots);
 
         // Secondary candidates: orphaned virtual slots that have lost their
@@ -2976,7 +3007,7 @@ export function determineOrderSideByFunds(manager: any, currentMarketPrice: any)
                 && !o.orderId
                 && getSlotCorrectType(o) === railType
             )
-            .sort((a: any, b: any) => railType === ORDER_TYPES.BUY ? b.price - a.price : a.price - b.price)
+            .sort(sortCandidates)
             .slice(0, missingSlots);
 
         // If the funded rail is full, the spread itself may be stale: the
