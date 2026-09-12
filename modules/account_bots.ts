@@ -1507,8 +1507,8 @@ async function main() {
                             config.bots[idx] = entry;
                             saveBotsConfig(config, filePath);
                             console.log(`saved settings '${entry.name}' in ${path.basename(filePath)}.\n`);
-                            console.log(`Live pickup (~1min, no restart): ${(BOT_LIVE_CONFIG_KEYS as readonly string[]).join(' / ')}.`);
-                            console.log(`Grid geometry needs 'dexbot reset ${entry.name}'; market/account changes need a restart.\n`);
+                            console.log(`Live pickup (~1min, no reload needed): ${(BOT_LIVE_CONFIG_KEYS as readonly string[]).join(' / ')}.`);
+                            console.log(`Grid geometry needs 'dexbot reset ${entry.name}' (or 'dexbot reload' for everything at once); market/account changes need 'dexbot reload'.\n`);
                         }
                     } catch (err: any) {
                         console.log(`\n❌ Invalid input: ${getErrorMessage(err)}\n`);
