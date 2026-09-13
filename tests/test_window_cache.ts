@@ -10,6 +10,7 @@ const {
     readCacheChunk,
     loadBucketCache,
     priorQueriedInWindow,
+    cleanupOrphanCacheChunks,
 } = require('../market_adapter/inputs/window_cache');
 
 const H = 3600 * 1000;
@@ -157,6 +158,43 @@ function interiorGapCache(queried: { gte: number; lte: number }[]) {
     });
     assert.ok(plan.missing.length > 0, `planner must re-query the uncovered range, got ${JSON.stringify(plan.missing)}`);
     assert.strictEqual(plan.missing[0].gte, WGTE);
+}
+
+{
+    // Narrow runs must not wipe older history: orphan chunks fully outside
+    // the run's active coverage are kept; overlapping shifted ones are still
+    // pruned. (Real incident: a --month 3 feed run deleted 12 older chunk
+    // files covering 2025-09 → 2026-06, forcing a full refetch on wider runs
+    // — out-of-window buckets are never carried forward, so the delete
+    // destroyed history that only Kibana still had.)
+    const os = require('os');
+    const path = require('path');
+    const fs = require('fs');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wc-cleanup-test-'));
+    try {
+        const out = path.join(dir, 'feed_x_1h.json');
+        const oldFile = path.join(dir, 'feed_x_1h.chunk_01_2025-09-12_2025-10-12.json');
+        persistCacheChunk(oldFile,
+            { feed: 'x', timeRange: { gte: '2025-09-12T00:00:00.000Z', lte: '2025-10-12T00:00:00.000Z' } },
+            [[Date.parse('2025-09-15T00:00:00.000Z'), 1, 1, 1, 1, 3]]);
+        const shiftedFile = path.join(dir, 'feed_x_1h.chunk_02_2026-06-12_2026-07-12.json');
+        persistCacheChunk(shiftedFile,
+            { feed: 'x', timeRange: { gte: '2026-06-12T00:00:00.000Z', lte: '2026-07-12T00:00:00.000Z' } },
+            [[Date.parse('2026-06-20T00:00:00.000Z'), 1, 1, 1, 1, 5]]);
+        const isMatch = () => true;
+        const activeFile = path.join(dir, 'feed_x_1h.chunk_01_2026-06-14_2026-07-14.json');
+        const removed = cleanupOrphanCacheChunks(out, {}, isMatch, new Set([path.resolve(activeFile)]),
+            { gte: Date.parse('2026-06-14T00:00:00.000Z'), lte: Date.parse('2026-09-13T00:00:00.000Z') });
+        assert.ok(fs.existsSync(oldFile), 'disjoint older chunk must be kept');
+        assert.ok(!fs.existsSync(shiftedFile), 'overlapping shifted chunk is still pruned');
+        assert.strictEqual(removed.length, 1, `exactly the overlapping file is removed, got ${JSON.stringify(removed)}`);
+        // Without an active range the legacy behavior is unchanged.
+        const removedLegacy = cleanupOrphanCacheChunks(out, {}, isMatch, new Set([path.resolve(activeFile)]));
+        assert.ok(!fs.existsSync(oldFile), 'omitted range keeps legacy delete-all behavior');
+        assert.strictEqual(removedLegacy.length, 1, 'legacy call removes the remaining orphan');
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
 }
 
 console.log('window_cache pruning tests passed');

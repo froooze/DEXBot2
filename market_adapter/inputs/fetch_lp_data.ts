@@ -284,8 +284,8 @@ function loadLocalChunkCache(outPath: any, requestKey: any) {
     return loadBucketCache(outPath, requestKey, isLpChunkMatch);
 }
 
-function cleanupOrphanChunkFiles(outPath: any, requestKey: any, activeFiles: Set<string>) {
-    return cleanupOrphanCacheChunks(outPath, requestKey, isLpChunkMatch, activeFiles);
+function cleanupOrphanChunkFiles(outPath: any, requestKey: any, activeFiles: Set<string>, activeRange?: { gte: number; lte: number } | null) {
+    return cleanupOrphanCacheChunks(outPath, requestKey, isLpChunkMatch, activeFiles, activeRange);
 }
 
 

@@ -243,12 +243,20 @@ function persistCacheChunk(chunkFile: any, meta: any, candles: any) {
 // names (an hour shift crossing midnight orphans the old name). Only files
 // whose embedded meta matches this request are eligible, and only once the
 // caller has completed all windows — a failed run never deletes.
-function cleanupOrphanCacheChunks(outPath: any, requestKey: any, isMatch: (meta: any, requestKey: any) => boolean, activeFiles: Set<string>) {
+// Files whose recorded range does not overlap the run's active coverage are
+// KEPT: a narrow run (e.g. --month 3) must not wipe older history cached by
+// a wider run — out-of-window buckets are never carried forward, so deleting
+// those files would destroy history that can only be refetched from Kibana.
+function cleanupOrphanCacheChunks(outPath: any, requestKey: any, isMatch: (meta: any, requestKey: any) => boolean, activeFiles: Set<string>, activeRange?: { gte: number; lte: number } | null) {
     const removed: string[] = [];
     try {
         for (const file of siblingChunkFiles(outPath)) {
             if (activeFiles.has(path.resolve(file))) continue;
-            if (!readCacheChunk(file, requestKey, isMatch)) continue;
+            const chunk = readCacheChunk(file, requestKey, isMatch);
+            if (!chunk) continue;
+            if (activeRange && Number.isFinite(chunk.rangeGte) && Number.isFinite(chunk.rangeLte)
+                && Number.isFinite(activeRange.gte) && Number.isFinite(activeRange.lte)
+                && ((chunk.rangeLte as number) <= activeRange.gte || (chunk.rangeGte as number) >= activeRange.lte)) continue;
             try {
                 storage.unlink(file);
                 removed.push(file);
@@ -537,7 +545,12 @@ async function runCachedWindows(opts: {
             : mergeCandles(merged, candles, { onCollision: higherVolumeWins });
     }
 
-    const removed = cleanupOrphanCacheChunks(outPath, requestKey, isMatch, new Set(windows.map((w: any) => path.resolve(w.file))));
+    const windowGtes = windows.map((w: any) => Date.parse(String(w.gte))).filter(Number.isFinite);
+    const windowLtes = windows.map((w: any) => Date.parse(String(w.lte))).filter(Number.isFinite);
+    const activeRange = windowGtes.length > 0 && windowLtes.length > 0
+        ? { gte: Math.min(...windowGtes), lte: Math.max(...windowLtes) }
+        : null;
+    const removed = cleanupOrphanCacheChunks(outPath, requestKey, isMatch, new Set(windows.map((w: any) => path.resolve(w.file))), activeRange);
     if (removed.length > 0) {
         console.log(`  Cleaned ${removed.length} orphan chunk file(s): ${removed.map((f: string) => path.basename(f)).join(', ')}`);
     }

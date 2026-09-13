@@ -721,17 +721,20 @@ function generateHTML(data: any, title: any = 'TradingView Style Research') {
                 if (e.ctrlKey || e.metaKey || e.altKey) return;
                 e.preventDefault();
                 const rect = chart.root.getBoundingClientRect();
+                const pxRatio = chart.pxRatio || 1;
+                const bboxLeft = chart.bbox ? chart.bbox.left / pxRatio : 0;
+                const bboxTop = chart.bbox ? chart.bbox.top / pxRatio : 0;
                 // Shift+wheel scales price (cursor-anchored) anywhere over the
                 // price pane — same as wheeling over the price axis. Volume has
                 // no manual Y lock, so it keeps the timeframe zoom.
                 if (chart === priceChart && (e.shiftKey || inYAxisZone(chart, e.clientX))) {
-                    const centerY = chart.posToVal(e.clientY - rect.top, 'y');
+                    const centerY = chart.posToVal(e.clientY - rect.top - bboxTop, 'y');
                     const delta = e.deltaY !== 0 ? e.deltaY : e.deltaX;
                     zoomYAt(chart, centerY, delta < 0 ? 0.91 : 1.10);
                     return;
                 }
                 e.stopPropagation();
-                const left = e.clientX - rect.left - (chart.bbox.left / (chart.pxRatio || 1));
+                const left = e.clientX - rect.left - bboxLeft;
                 const center = chart.posToVal(left, 'x');
                 const s = chart.scales.x || {};
                 const currMin = Number.isFinite(s.min) ? s.min : xMin;
@@ -788,6 +791,8 @@ function generateHTML(data: any, title: any = 'TradingView Style Research') {
             let startMin = 0;
             let startMax = 0;
             let startYRange = null;
+            let startBboxLeft = 0;
+            let startBboxTop = 0;
             let panRaf = 0;
             let pendingPan = null;
             const applyPendingPan = () => {
@@ -799,8 +804,12 @@ function generateHTML(data: any, title: any = 'TradingView Style Research') {
                 // move sets a manual Y range; double-click the price axis to
                 // return to autofit. Axis gutters never pan — they scale.
                 if (chart === priceChart && startYRange && Number.isFinite(p.clientY)) {
-                    const vStart = chart.posToVal(p.startY - p.rectTop, 'y');
-                    const vCur = chart.posToVal(p.clientY - p.rectTop, 'y');
+                    // Plot-relative coords: subtract the axis gutter offset
+                    // (bbox) like bindWheelZoom. On linear scales the offset
+                    // cancels in subtraction, but on log scale the ratio
+                    // corrupts and vertical drag dies without it.
+                    const vStart = chart.posToVal(p.startY - p.rectTop - p.bboxTop, 'y');
+                    const vCur = chart.posToVal(p.clientY - p.rectTop - p.bboxTop, 'y');
                     if (Number.isFinite(vStart) && Number.isFinite(vCur) && vCur !== vStart) {
                         // Rigid move only: the span is locked by construction so a
                         // plot drag can never rescale — Y scaling happens solely
@@ -822,7 +831,7 @@ function generateHTML(data: any, title: any = 'TradingView Style Research') {
                         }
                     }
                 }
-                const delta = chart.posToVal(p.clientX - p.rectLeft, 'x') - chart.posToVal(p.startX - p.rectLeft, 'x');
+                const delta = chart.posToVal(p.clientX - p.rectLeft - p.bboxLeft, 'x') - chart.posToVal(p.startX - p.rectLeft - p.bboxLeft, 'x');
                 syncXRange(startMin - delta, startMax - delta);
             };
             const onMove = (e) => {
@@ -833,6 +842,7 @@ function generateHTML(data: any, title: any = 'TradingView Style Research') {
                     clientX: e.clientX, clientY: e.clientY,
                     startX: startClientX, startY: startClientY,
                     rectLeft: rect.left, rectTop: rect.top,
+                    bboxLeft: startBboxLeft, bboxTop: startBboxTop,
                 };
                 if (!panRaf) panRaf = requestAnimationFrame(applyPendingPan);
             };
@@ -857,6 +867,9 @@ function generateHTML(data: any, title: any = 'TradingView Style Research') {
                 dragging = true;
                 startClientX = e.clientX;
                 startClientY = e.clientY;
+                const startPxRatio = chart.pxRatio || 1;
+                startBboxLeft = chart.bbox ? chart.bbox.left / startPxRatio : 0;
+                startBboxTop = chart.bbox ? chart.bbox.top / startPxRatio : 0;
                 const s = chart.scales.x || {};
                 startMin = Number.isFinite(s.min) ? s.min : currentCandles[0].time;
                 startMax = Number.isFinite(s.max) ? s.max : currentCandles[currentCandles.length - 1].time;
@@ -2473,6 +2486,7 @@ function generateHTML(data: any, title: any = 'TradingView Style Research') {
             if (!wrap) {
                 try { if (getComputedStyle(u.root).position === 'static') u.root.style.position = 'relative'; } catch (e) {}
                 wrap = document.createElement('div');
+                wrap.className = 'um-wrap';
                 wrap.style.cssText = 'position:absolute;z-index:24;pointer-events:none;';
                 wrap.innerHTML =
                     '<div class="um-line" style="position:absolute;top:0;height:100%;width:0;border-left:2px dashed #22d3ee;opacity:0.75;"></div>' +
