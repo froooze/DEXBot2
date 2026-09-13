@@ -1,7 +1,7 @@
 # DEXBot vs DEXBot2 — Detailed Comparison Report
 
 > **Date:** 2026-09-02 *(metrics refreshed against local source trees)*
-> **Scope:** Full architectural, functional, and operational comparison between the original [DEXBot](https://github.com/Codaone/DEXBot) (Python, v1.0.0) and DEXBot2 (TypeScript, v1.6.0).
+> **Scope:** Full architectural, functional, and operational comparison between the original [DEXBot](https://github.com/Codaone/DEXBot) (Python, v1.0.0) and DEXBot2 (TypeScript, v1.6.1).
 > **Audience:** Developers, contributors, and operators evaluating or migrating between the two projects.
 
 ---
@@ -36,7 +36,7 @@
 
 | Attribute | DEXBot (original) | DEXBot2 |
 |---|---|---|
-| **Release Track** | 1.0.0 | v1.6.0 |
+| **Release Track** | 1.0.0 | v1.6.1 |
 | **Language** | Python 3.6+ | TypeScript 5.x |
 | **Status** | Released 1.0.0, unmaintained | Active development |
 | **Last Repo Activity** | May 23, 2020 | 2026-09-02 |
@@ -780,7 +780,7 @@ Where:
 
 | Metric | DEXBot | DEXBot2 |
 |---|---|---|
-| **Release Track** | 1.0.0 | v1.6.0 |
+| **Release Track** | 1.0.0 | v1.6.1 |
 | **Active Since** | ~2018 | December 2025 |
 | **Last Commit** | May 23, 2020 | 2026-09-02 |
 | **Total Commits** | 2281 | 2,125 (v1.4.25) |

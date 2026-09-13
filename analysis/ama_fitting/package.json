@@ -1,6 +1,6 @@
 {
   "name": "ama_fitting",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "description": "Tools for fitting AMA parameters to market data",
   "main": "../../dist/analysis/ama_fitting/optimizer_high_resolution.js",
   "scripts": {

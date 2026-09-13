@@ -806,4 +806,4 @@ To prevent "Time-of-Check to Time-of-Use" errors:
 **TOCTOU protection in `processFillAccounting`.** `_buildBtsDeferredRefundAdjustment` reads `btsFeeState` from `mgr.orders` while the order lock is held — the lock is acquired before accounting runs, and the POST-RESET and BOOTSTRAP tracked-fill accounting paths follow the same locking pattern.
 
 ---
-*Technical Reference for DEXBot2 v1.6.0 release*
+*Technical Reference for DEXBot2 v1.6.1 release*
