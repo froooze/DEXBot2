@@ -258,7 +258,7 @@ function printCLIUsage() {
     console.log('  reload            Reload the monolithic runtime (leaves credential daemon untouched).');
     console.log('  restart           Restart the monolithic runtime (re-unlocks credential daemon).');
     console.log('  delete            Stop/delete all runtime processes.');
-    console.log('  whitelist, white  Generate market adapter whitelist from AMA bot configs. Flags (--dynamic-weight, --no-asymmetric-bounds, --prune, --bot <key>) are forwarded. --bot implies overwrite for that key.');
+    console.log('  whitelist, white  Generate market adapter whitelist from AMA bot configs. Flags (--dynamic-weight, --asymmetric-bounds, --prune, --bot <key>) are forwarded. --bot implies overwrite for that key.');
     console.log('  clear             Remove all log files from <profiles>/logs/ (runs scripts/clear-logs.sh).');
     console.log('  clear-orders      Remove all persisted order files from <profiles>/orders/.');
     console.log('  clear-market-adapter  Remove market adapter data, state, and logs.');

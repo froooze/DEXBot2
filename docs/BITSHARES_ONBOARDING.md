@@ -317,8 +317,9 @@ dexbot white
 ```
 
 This writes `profiles/market_adapter_whitelist.json` for your AMA bot so it
-writes live grid files and recalc triggers. DEXBot2 starts/stops the adapter
-automatically when active AMA bots exist.
+writes live grid files and recalc triggers. New entries enable AMA pricing only;
+range scaling stays disabled unless you opt in with `dexbot white --asymmetric-bounds`.
+DEXBot2 starts/stops the adapter automatically when active AMA bots exist.
 
 ---
 

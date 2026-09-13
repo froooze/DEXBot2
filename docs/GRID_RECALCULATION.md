@@ -259,26 +259,27 @@ need a reset to move to the new asymmetric range and offset placement price.
 
 ### Configuration
 
-Range scaling is enabled by whitelist:
+Range scaling is enabled by the whitelist's `asymmetricBounds: true` flag.
+Generate or update the AMA whitelist with:
 
 ```bash
 dexbot white
 ```
 
 This writes `profiles/market_adapter_whitelist.json`. The default generation
-enables AMA live writes and range scaling for new AMA bots, while leaving
-dynamic weights disabled.
+enables AMA live writes for new AMA bots, while leaving dynamic weights and
+range scaling disabled.
 
-To leave range scaling disabled while allowing AMA pricing:
+To opt new AMA entries into range scaling:
 
 ```bash
-dexbot white --no-asymmetric-bounds
+dexbot white --asymmetric-bounds
 ```
 
-To overwrite an existing bot's flags (otherwise preserved):
+To overwrite one existing bot (otherwise preserved):
 
 ```bash
-dexbot white --dynamic-weight --bot <botKey>
+dexbot white --asymmetric-bounds --bot <botKey>
 ```
 
 The snapshot fields involved are:

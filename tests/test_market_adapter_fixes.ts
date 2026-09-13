@@ -104,7 +104,7 @@ async function testWhitelistGenerationPreservesExistingEntries() {
 
     const result = buildWhitelist(bots, existing, {
         dynamicWeight: false,
-        asymmetricBounds: true,
+        asymmetricBounds: false,
     });
 
     assert.deepStrictEqual(
@@ -114,7 +114,7 @@ async function testWhitelistGenerationPreservesExistingEntries() {
     );
     assert.deepStrictEqual(
         result.whitelist['new-ama-1'],
-        { ama: true, dynamicWeight: false, asymmetricBounds: true },
+        { ama: true, dynamicWeight: false, asymmetricBounds: false },
         'new AMA entry should be added with current command defaults'
     );
     assert.deepStrictEqual(
@@ -133,37 +133,47 @@ async function testWhitelistGenerationOptionDefaults() {
     console.log(' - Testing whitelist generation option defaults...');
     assert.deepStrictEqual(
         parseOptions([]),
-        { dynamicWeight: false, asymmetricBounds: true, prune: false, botKeys: [] },
-        'dynamicWeight should default off for newly generated whitelist entries'
+        { dynamicWeight: false, asymmetricBounds: false, prune: false, botKeys: [] },
+        'dynamicWeight and range scaling should default off for newly generated whitelist entries'
     );
     assert.deepStrictEqual(
         parseOptions(['--dynamic-weight']),
-        { dynamicWeight: true, asymmetricBounds: true, prune: false, botKeys: [] },
+        { dynamicWeight: true, asymmetricBounds: false, prune: false, botKeys: [] },
         'dynamicWeight should be explicitly opt-in'
     );
     assert.deepStrictEqual(
-        parseOptions(['--dynamic-weight=true', '--no-asymmetric-bounds']),
-        { dynamicWeight: true, asymmetricBounds: false, prune: false, botKeys: [] },
-        'explicit dynamicWeight opt-in should combine with asymmetric-bounds opt-out'
+        parseOptions(['--asymmetric-bounds']),
+        { dynamicWeight: false, asymmetricBounds: true, prune: false, botKeys: [] },
+        'range scaling should be explicitly opt-in'
+    );
+    assert.deepStrictEqual(
+        parseOptions(['--dynamic-weight=true', '--asymmetric-bounds']),
+        { dynamicWeight: true, asymmetricBounds: true, prune: false, botKeys: [] },
+        'explicit dynamicWeight and range-scaling opt-ins should combine'
     );
     assert.deepStrictEqual(
         parseOptions(['--dynamic-weight=true', '--no-dynamic-weight']),
-        { dynamicWeight: false, asymmetricBounds: true, prune: false, botKeys: [] },
+        { dynamicWeight: false, asymmetricBounds: false, prune: false, botKeys: [] },
         'explicit disable should win if conflicting dynamicWeight flags are provided'
     );
     assert.deepStrictEqual(
+        parseOptions(['--asymmetric-bounds', '--no-asymmetric-bounds']),
+        { dynamicWeight: false, asymmetricBounds: false, prune: false, botKeys: [] },
+        'explicit disable should win if conflicting asymmetric-bounds flags are provided'
+    );
+    assert.deepStrictEqual(
         parseOptions(['--prune']),
-        { dynamicWeight: false, asymmetricBounds: true, prune: true, botKeys: [] },
+        { dynamicWeight: false, asymmetricBounds: false, prune: true, botKeys: [] },
         '--prune should enable prune mode'
     );
     assert.deepStrictEqual(
         parseOptions(['--bot', 'my-bot']),
-        { dynamicWeight: false, asymmetricBounds: true, prune: false, botKeys: ['my-bot'] },
+        { dynamicWeight: false, asymmetricBounds: false, prune: false, botKeys: ['my-bot'] },
         '--bot should collect targeted botKeys'
     );
     assert.deepStrictEqual(
         parseOptions(['--bot', 'a', '--bot=b']),
-        { dynamicWeight: false, asymmetricBounds: true, prune: false, botKeys: ['a', 'b'] },
+        { dynamicWeight: false, asymmetricBounds: false, prune: false, botKeys: ['a', 'b'] },
         '--bot should support repeated and = forms'
     );
     for (const argv of [
@@ -274,7 +284,7 @@ async function testWhitelistPruneRemovesStaleEntries() {
         'pool-bot-bbb': { ama: false, dynamicWeight: false, asymmetricBounds: false },
     };
 
-    const result = buildWhitelist(bots, existing, { dynamicWeight: false, asymmetricBounds: true, prune: true });
+    const result = buildWhitelist(bots, existing, { dynamicWeight: false, asymmetricBounds: false, prune: true });
 
     assert.ok(
         result.whitelist['active-bot-aaa'] !== undefined,
@@ -302,13 +312,13 @@ async function testWhitelistPrunePreservesNonAmaManualEntries() {
         'pool-bot-bbb': { ama: true, dynamicWeight: false, asymmetricBounds: false, derivativeSignals: 'ema12' },
     };
 
-    const resultNoPrune = buildWhitelist(bots, existing, { dynamicWeight: false, asymmetricBounds: true, prune: false });
+    const resultNoPrune = buildWhitelist(bots, existing, { dynamicWeight: false, asymmetricBounds: false, prune: false });
     assert.ok(
         resultNoPrune.whitelist['pool-bot-bbb'] !== undefined,
         'without --prune, manual non-AMA entries must be preserved'
     );
 
-    const resultPrune = buildWhitelist(bots, existing, { dynamicWeight: false, asymmetricBounds: true, prune: true });
+    const resultPrune = buildWhitelist(bots, existing, { dynamicWeight: false, asymmetricBounds: false, prune: true });
     assert.ok(
         resultPrune.whitelist['pool-bot-bbb'] !== undefined,
         'with --prune, manual non-AMA entries for bots still in bots.json must be preserved'
@@ -324,7 +334,7 @@ async function testWhitelistPrunePreservesUnknownFields() {
         'ama-bot-aaa': { ama: true, dynamicWeight: true, asymmetricBounds: true, derivativeSignals: 'ema12' },
     };
 
-    const result = buildWhitelist(bots, existing, { dynamicWeight: false, asymmetricBounds: true, prune: true });
+    const result = buildWhitelist(bots, existing, { dynamicWeight: false, asymmetricBounds: false, prune: true });
 
     assert.deepStrictEqual(
         result.whitelist['ama-bot-aaa'],

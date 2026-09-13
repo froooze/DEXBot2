@@ -27,6 +27,7 @@ function isAmaGridPrice(value: any) {
 function parseOptions(argv: string[]) {
     const dynamicWeightEnabled = argv.includes('--dynamic-weight=true') || argv.includes('--dynamic-weight') || argv.includes('--with-dynamic-weight');
     const dynamicWeightDisabled = argv.includes('--dynamic-weight=false') || argv.includes('--no-dynamic-weight');
+    const asymmetricBoundsEnabled = argv.includes('--asymmetric-bounds=true') || argv.includes('--asymmetric-bounds') || argv.includes('--with-asymmetric-bounds');
     const asymmetricBoundsDisabled = argv.includes('--asymmetric-bounds=false') || argv.includes('--no-asymmetric-bounds');
     const pruneEnabled = argv.includes('--prune');
 
@@ -70,7 +71,7 @@ function parseOptions(argv: string[]) {
 
     return {
         dynamicWeight: dynamicWeightEnabled && !dynamicWeightDisabled,
-        asymmetricBounds: !asymmetricBoundsDisabled,
+        asymmetricBounds: asymmetricBoundsEnabled && !asymmetricBoundsDisabled,
         prune: pruneEnabled,
         botKeys,
     };
@@ -91,7 +92,7 @@ function loadExistingWhitelist() {
 
     if (Array.isArray(raw)) {
         for (const botKey of raw) {
-            if (botKey) entries[String(botKey)] = { ama: true, dynamicWeight: true, asymmetricBounds: true };
+            if (botKey) entries[String(botKey)] = { ama: true, dynamicWeight: false, asymmetricBounds: false };
         }
     } else if (raw && typeof raw === 'object') {
         for (const [botKey, entry] of Object.entries(raw)) {

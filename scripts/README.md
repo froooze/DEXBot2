@@ -98,18 +98,18 @@ node dist/scripts/validate_bots.js
 **Purpose:** Generate `profiles/market_adapter_whitelist.json` from bots whose `gridPrice` uses AMA mode.
 ```bash
 # Add missing AMA bots from profiles/bots.json to profiles/market_adapter_whitelist.json.
-# Existing entries are preserved; new entries enable AMA/range scaling and leave dynamicWeight disabled.
+# Existing entries are preserved; new entries enable AMA only and leave dynamicWeight and range scaling disabled.
 dexbot white
 
 # Add missing AMA bots with dynamicWeight enabled for newly generated entries
 dexbot white --dynamic-weight
 
-# Add missing AMA bots with asymmetricBounds disabled for newly generated entries
-dexbot white --no-asymmetric-bounds
+# Add missing AMA bots with range scaling (asymmetricBounds) enabled for newly generated entries
+dexbot white --asymmetric-bounds
 
 # Overwrite existing entry for a specific bot (implies overwrite for that key only; other bots unchanged)
 dexbot white --dynamic-weight --bot <botKey>
-dexbot white --no-asymmetric-bounds --bot <botKey>
+dexbot white --asymmetric-bounds --bot <botKey>
 
 # Remove whitelist entries for bots no longer in profiles/bots.json
 dexbot white --prune

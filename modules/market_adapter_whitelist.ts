@@ -55,7 +55,7 @@ function loadMarketAdapterWhitelist(): Map<string, WhitelistFlags> | false {
 
         if (Array.isArray(raw)) {
             for (const botKey of raw) {
-                map.set(String(botKey), { ama: true, dynamicWeight: true, asymmetricBounds: true });
+                map.set(String(botKey), { ama: true, dynamicWeight: false, asymmetricBounds: false });
             }
         } else if (raw && typeof raw === 'object') {
             for (const [botKey, entry] of Object.entries(raw)) {

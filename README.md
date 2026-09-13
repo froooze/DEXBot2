@@ -176,9 +176,10 @@ Keep the default settings first, and tune these:
    ```
 
    This writes `market_adapter_whitelist.json` in the profiles directory. New AMA bots get AMA
-   live writes and range scaling. Use `dexbot white --dynamic-weight` for
-   newly generated dynamic-weight entries; existing entries are preserved.
-   To overwrite an existing bot: `dexbot white --dynamic-weight --bot <botKey>`.
+   live writes only; dynamic weights and range scaling are disabled by default. Use
+   `dexbot white --dynamic-weight` or `dexbot white --asymmetric-bounds` to opt
+   newly generated entries into those features; existing entries are preserved.
+   To overwrite an existing bot, include `--bot <botKey>` with the desired flags.
 
 6. **Start DEXBot2** with `dexbot start`.
 
@@ -253,7 +254,7 @@ First-run details and common mistakes are covered in the [BitShares Onboarding T
 ```bash
 dexbot key                 # Master password/keyring
 dexbot bot                 # Interactive bot configurator
-dexbot white               # Market adapter whitelist, dynamic weights off by default
+dexbot white               # AMA whitelist; dynamic weights and range scaling off by default
 
 dexbot reset {all|<bot>}   # Regenerate grid
 dexbot disable {all|<bot>} # Disable bot in config
