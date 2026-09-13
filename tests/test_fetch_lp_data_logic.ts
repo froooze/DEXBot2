@@ -113,8 +113,8 @@ async function testLpSequentialCachesAndReuses() {
     assert.ok(first.length > 0, 'first LP fetch must return candles');
     const callsAfterFirst = searchCalls;
     assert.ok(callsAfterFirst > 0, 'first LP fetch must query Kibana');
-    const chunks = fs.readdirSync(dir).filter((n) => n.includes('.chunk_'));
-    assert.ok(chunks.length > 0, 'LP fetch must persist chunk files for reuse');
+    const shards = fs.readdirSync(dir).filter((n) => n.includes('.shard_'));
+    assert.ok(shards.length > 0, 'LP fetch must persist month-shard files for reuse');
 
     const second = await fetchCandlesSequentially('1.19.133', LP_ASSET_A, LP_ASSET_B, config, outPath);
     assert.deepStrictEqual(second, first, 'cached LP rerun must return identical candles');

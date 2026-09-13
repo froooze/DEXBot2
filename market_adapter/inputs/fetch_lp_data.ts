@@ -38,12 +38,10 @@ import { writeJsonAtomic } from '../utils/atomic_write.js';
 import {
     TAIL_REFRESH_HOURS,
     IMMUTABLE_WINDOW_AGE_MS,
-    chunkPathFor,
     cachedCandlesInRange,
     findMissingBucketRanges,
     pruneImmutableGaps,
     loadBucketCache,
-    cleanupOrphanCacheChunks,
     buildFetchWindowsFromRange,
     formatWindowLine,
     runCachedWindows,
@@ -269,8 +267,10 @@ function loadCachedFetchContext(bot: any, intervalSeconds: any) {
 // ─── Local-first incremental reuse ────────────────────────────────────────────
 // Bucket-level reuse lives in ./window_cache.js and is shared by all three
 // candle fetchers (pool, book, feed) through the single runCachedWindows
-// entry point. Below are only the LP-specific identity predicate and thin
-// wrappers preserving the historical helper names/exports.
+// entry point. Storage is fixed calendar-month shards, so there is no
+// orphan cleanup and no per-run rewrite: below is only the LP-specific
+// identity predicate plus thin wrappers preserving the historical helper
+// names/exports.
 
 function isLpChunkMatch(meta: any, requestKey: any) {
     if (meta.pool !== requestKey.pool) return false;
@@ -280,21 +280,17 @@ function isLpChunkMatch(meta: any, requestKey: any) {
     return true;
 }
 
-function loadLocalChunkCache(outPath: any, requestKey: any) {
-    return loadBucketCache(outPath, requestKey, isLpChunkMatch);
-}
-
-function cleanupOrphanChunkFiles(outPath: any, requestKey: any, activeFiles: Set<string>, activeRange?: { gte: number; lte: number } | null) {
-    return cleanupOrphanCacheChunks(outPath, requestKey, isLpChunkMatch, activeFiles, activeRange);
+function loadLocalChunkCache(outPath: any, requestKey: any, range?: { gte: number; lte: number } | null) {
+    return loadBucketCache(outPath, requestKey, isLpChunkMatch, range);
 }
 
 
 async function fetchCandlesSequentially(fullPoolId: any, assetA: any, assetB: any, config: any, outPath: any) {
     // Pool, book and feed fetches share ONE cache function: runCachedWindows
-    // in window_cache.js. Completed chunk files double as the resume ledger
-    // (an interrupted run exact-matches finished windows on retry), so the
-    // old sidecar *.fetch_manifest.json is no longer written — legacy files
-    // are still read by loadCachedFetchContext but never created.
+    // in window_cache.js. Shard files double as the resume ledger (an
+    // interrupted run reuses finished months on retry), so the old sidecar
+    // *.fetch_manifest.json is no longer written — legacy files are still
+    // read by loadCachedFetchContext but never created.
     const chunkMonths = resolveChunkMonths(config);
     const bucketMs = Number(config.intervalSeconds) * 1000;
     const effectiveTimeRange = config.timeRange
@@ -303,11 +299,12 @@ async function fetchCandlesSequentially(fullPoolId: any, assetA: any, assetB: an
     const requestKey = buildRequestKey(config, fullPoolId, assetA, assetB, effectiveTimeRange, outPath);
 
     const plainWindows = buildFetchWindowsFromRange(effectiveTimeRange, chunkMonths);
+    // Windows are fetch-planning splits only (query batching + progress);
+    // storage layout is fixed calendar-month shards, so no per-window file.
     const windows = plainWindows.map((window: any, idx: any) => ({
         index: idx + 1,
         gte: window.gte,
         lte: window.lte,
-        file: chunkPathFor(outPath, idx + 1, window),
     }));
     const total = windows.length;
 
@@ -371,7 +368,7 @@ async function fetchCandlesSequentially(fullPoolId: any, assetA: any, assetB: an
             console.warn(`  Chunk fetch retry ${info.attempt}/${info.attempts} for ${String(info.gte).slice(0, 10)} → ${String(info.lte).slice(0, 10)} in ${info.backoffMs}ms after failure: ${getErrorMessage(info.error)}`);
         },
     });
-    console.log(`  Merged ${merged.length} candles from ${windows.length} chunk files`);
+    console.log(`  Merged ${merged.length} candles across ${windows.length} window(s) (month-shard cache)`);
     return merged;
 }
 
@@ -656,5 +653,5 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     });
 }
 
-export { applyPrecisionOverrides, parseBotsConfig, selectBot, fetchCandlesSequentially, outputPath, buildFetchWindowsFromRange, findMissingBucketRanges, loadLocalChunkCache, cachedCandlesInRange, pruneImmutableGaps, cleanupOrphanChunkFiles, TAIL_REFRESH_HOURS, IMMUTABLE_WINDOW_AGE_MS }
+export { applyPrecisionOverrides, parseBotsConfig, selectBot, fetchCandlesSequentially, outputPath, buildFetchWindowsFromRange, findMissingBucketRanges, loadLocalChunkCache, cachedCandlesInRange, pruneImmutableGaps, TAIL_REFRESH_HOURS, IMMUTABLE_WINDOW_AGE_MS }
 

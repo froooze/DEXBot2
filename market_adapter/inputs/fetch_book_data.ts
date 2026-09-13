@@ -25,7 +25,7 @@ import { getMarketCandles } from '../core/kibana_market_candles.js';
 import { path } from '../../modules/path_api.js';
 import { PATHS } from '../../modules/paths.js';
 import { toIntervalLabel, slugPart } from '../interval_utils.js';
-import { chunkPathFor, buildFetchWindowsFromRange, runCachedWindows } from './window_cache.js';
+import { buildFetchWindowsFromRange, runCachedWindows } from './window_cache.js';
 
 function bookCacheKey(assetA: any, assetB: any) {
     // Orientation matters: candles are B-per-A, so A/B and B/A are different series.
@@ -73,11 +73,11 @@ async function fetchMarketCandlesSequentially(assetA: any, assetB: any, opts: an
     };
 
     const plainWindows = buildFetchWindowsFromRange(timeRange, chunkMonths);
+    // Windows are fetch-planning splits only; storage is fixed month shards.
     const windows = plainWindows.map((w: any, idx: any) => ({
         index: idx + 1,
         gte: w.gte,
         lte: w.lte,
-        file: chunkPathFor(outPath, idx + 1, w),
     }));
 
     // Passthrough for auth/transport overrides; the window range itself is

@@ -1,20 +1,33 @@
 'use strict';
 /**
- * WINDOW CACHE — generic persistent bucket cache for windowed Kibana candle fetches.
+ * WINDOW CACHE — persistent bucket cache for windowed Kibana candle fetches.
  *
- * Problem: callers anchor their range at floored-"now", so every run shifts all
- * windows and an exact time-range match would invalidate the whole cache.
- * This module makes reuse range-aware instead: sibling chunk files are loaded
- * once, buckets inside the new window are kept, and only missing buckets are
- * queried (plus a tail refresh for late-indexed trades).
+ * Storage is decoupled from querying: candles live in fixed calendar-month
+ * shards (`<base>.shard_YYYY-MM.json`, UTC), one file per month with a stable
+ * name that never shifts. A run maps its requested range onto the overlapping
+ * shards, loads ONLY those files, fetches only genuinely missing buckets, and
+ * writes back ONLY shards that gained buckets or query coverage. Pure-reuse
+ * runs perform zero writes and zero deletes.
  *
- * Chunk files live next to `outPath`:
- *   `<base>.chunk_<ii>_<YYYY-MM-DD>_<YYYY-MM-DD><ext>`
- * each holding `{ meta, candles }`. Callers supply:
- *   - `requestKey` — opaque identity object stored in each chunk's meta,
+ * Each shard holds `{ meta, candles }` where `meta.queriedRanges` records the
+ * spans actually queried to produce the data (monotonically unioned on every
+ * write). Missing buckets are pruned only against recorded query coverage —
+ * the absence of local buckets alone never certifies history as empty.
+ *
+ * Legacy `*.chunk_<ii>_<start>_<end>.json` files (run-relative naming) are
+ * still read: their buckets and query coverage are absorbed into the
+ * overlapping shards, and a legacy file is deleted once every one of its
+ * buckets provably lives in a shard. Disjoint legacy files are simply never
+ * loaded and never touched — narrow runs cannot wipe older history by
+ * construction (no orphan-deletion pass exists anymore).
+ *
+ * Callers supply:
+ *   - `requestKey` — opaque identity object stored in each shard's meta,
  *   - `isMatch(meta, requestKey)` — same-pool/feed/interval/assets check,
  *   - `fetchRange(gteIso, lteIso)` — query one (sub-)range, gap-filled grid,
- *   - `metaForWindow(window)` — meta to persist with a (re)fetched chunk.
+ *   - `metaForWindow(window)` — identity meta fields (source/feed/pool/...);
+ *     the runner overrides timeRange with the shard bounds and drops
+ *     chunkIndex, which is meaningless for stable shards.
  *
  * Node-only (disk I/O via storage). Browser-safe code must not import this.
  */
@@ -39,22 +52,65 @@ const TAIL_REFRESH_HOURS = 48;
 // pure waste. Only the recent past is re-checked (see TAIL_REFRESH_HOURS).
 const IMMUTABLE_WINDOW_AGE_MS = 7 * 24 * 3600 * 1000;
 
-function siblingChunkFiles(outPath: any) {
+// ─── Month-shard naming ───────────────────────────────────────────────────────
+// Shard key is the UTC calendar month; bounds are half-open [start, end) so
+// every bucket timestamp maps to exactly one shard (a bucket exactly at a
+// month boundary belongs to the new month).
+
+function shardKeyForTimestamp(tsMs: any) {
+    const d = new Date(Number(tsMs));
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+
+function shardBoundsForKey(key: any) {
+    const parts = String(key).split('-').map(Number);
+    const start = Date.UTC(parts[0], parts[1] - 1, 1);
+    const end = parts[1] === 12 ? Date.UTC(parts[0] + 1, 0, 1) : Date.UTC(parts[0], parts[1], 1);
+    return { start, end };
+}
+
+function shardKeysForRange(gteMs: any, lteMs: any) {
+    const keys: string[] = [];
+    let cursor = new Date(Date.UTC(
+        new Date(Number(gteMs)).getUTCFullYear(),
+        new Date(Number(gteMs)).getUTCMonth(), 1));
+    const last = new Date(Number(lteMs));
+    while (cursor <= last) {
+        keys.push(shardKeyForTimestamp(cursor.getTime()));
+        cursor = new Date(Date.UTC(cursor.getUTCFullYear(), cursor.getUTCMonth() + 1, 1));
+    }
+    return keys;
+}
+
+function shardRangeOverlaps(shardKey: any, gteMs: any, lteMs: any) {
+    const { start, end } = shardBoundsForKey(shardKey);
+    return start <= lteMs && end > gteMs;
+}
+
+function shardPathFor(outPath: any, shardKey: any) {
+    const parsed = path.parse(outPath);
+    return path.join(parsed.dir, `${parsed.name}.shard_${shardKey}${parsed.ext}`);
+}
+
+function siblingCacheFiles(outPath: any) {
     const resolved = path.resolve(outPath);
     const parsed = path.parse(resolved);
     if (!storage.exists(parsed.dir)) return [];
-    const prefix = `${parsed.name}.chunk_`;
-    return storage.readdir(parsed.dir)
-        .filter((name: any) => name.startsWith(prefix) && name.endsWith(parsed.ext))
-        .map((name: any) => path.join(parsed.dir, name))
-        .sort();
-}
-
-function chunkPathFor(outPath: any, index: any, window: any) {
-    const parsed = path.parse(outPath);
-    const start = String(window.gte).slice(0, 10);
-    const end = String(window.lte).slice(0, 10);
-    return path.join(parsed.dir, `${parsed.name}.chunk_${String(index).padStart(2, '0')}_${start}_${end}${parsed.ext}`);
+    const shardPrefix = `${parsed.name}.shard_`;
+    const legacyPrefix = `${parsed.name}.chunk_`;
+    const out: { file: string; kind: 'shard' | 'legacy'; shardKey: string | null }[] = [];
+    for (const name of storage.readdir(parsed.dir)) {
+        if (!name.endsWith(parsed.ext)) continue;
+        if (name.startsWith(shardPrefix)) {
+            const key = name.slice(shardPrefix.length, name.length - parsed.ext.length);
+            if (!/^\d{4}-\d{2}$/.test(key)) continue;
+            out.push({ file: path.join(parsed.dir, name), kind: 'shard', shardKey: key });
+        } else if (name.startsWith(legacyPrefix)) {
+            out.push({ file: path.join(parsed.dir, name), kind: 'legacy', shardKey: null });
+        }
+    }
+    out.sort((a: any, b: any) => (a.file < b.file ? -1 : 1));
+    return out;
 }
 
 function readCacheChunk(chunkFile: any, requestKey: any, isMatch: (meta: any, requestKey: any) => boolean) {
@@ -90,27 +146,28 @@ function readCacheChunk(chunkFile: any, requestKey: any, isMatch: (meta: any, re
     }
 }
 
-// Previously-proven coverage surviving a same-filename overwrite, clipped
-// to the window being persisted. Sound: any in-window range the old file
-// vouched for was really queried, and had it held trades those candles
-// would be in that same file (hence carried forward as reusable, never
-// missing). Out-of-window parts are dropped by the clip, so nothing is
-// vouched for beyond what the rewritten file can testify to.
-function priorQueriedInWindow(chunkFile: any, requestKey: any, isMatch: (meta: any, requestKey: any) => boolean, gteMs: number, lteMs: number) {
-    const chunk = readCacheChunk(chunkFile, requestKey, isMatch);
-    if (!chunk) return [];
-    return chunk.queried
-        .filter((q: any) => q.lte > gteMs && q.gte < lteMs)
-        .map((q: any) => ({ gte: Math.max(q.gte, gteMs), lte: Math.min(q.lte, lteMs) }));
+function rangesOverlap(aGte: any, aLte: any, bGte: any, bLte: any) {
+    return aGte <= bLte && aLte >= bGte;
 }
 
-function loadBucketCache(outPath: any, requestKey: any, isMatch: (meta: any, requestKey: any) => boolean) {
+function loadBucketCache(outPath: any, requestKey: any, isMatch: (meta: any, requestKey: any) => boolean, range?: { gte: number; lte: number } | null) {
     const byTs = new Map();
     const fileCover: { gte: number | null; lte: number | null; count: number; queried: { gte: number; lte: number }[] }[] = [];
+    const legacy: { file: string; candles: any[]; queried: { gte: number; lte: number }[] }[] = [];
+    const shards: { file: string; shardKey: string; candles: any[]; queried: { gte: number; lte: number }[] }[] = [];
     let files = 0;
-    for (const file of siblingChunkFiles(outPath)) {
-        const chunk = readCacheChunk(file, requestKey, isMatch);
+    const scoped = range && Number.isFinite(range.gte) && Number.isFinite(range.lte);
+    for (const entry of siblingCacheFiles(outPath)) {
+        if (entry.kind === 'shard' && entry.shardKey) {
+            // Shards outside the requested range are never even opened —
+            // a narrow run reads only the months it needs.
+            if (scoped && !shardRangeOverlaps(entry.shardKey, (range as any).gte, (range as any).lte)) continue;
+        }
+        const chunk = readCacheChunk(entry.file, requestKey, isMatch);
         if (!chunk) continue;
+        if (entry.kind === 'legacy' && scoped
+            && chunk.rangeGte !== null && chunk.rangeLte !== null
+            && !rangesOverlap(chunk.rangeGte, chunk.rangeLte, (range as any).gte, (range as any).lte)) continue;
         files += 1;
         fileCover.push({ gte: chunk.rangeGte, lte: chunk.rangeLte, count: chunk.candles.length, queried: chunk.queried });
         for (const c of chunk.candles) {
@@ -120,8 +177,13 @@ function loadBucketCache(outPath: any, requestKey: any, isMatch: (meta: any, req
             const prev = byTs.get(ts);
             if (!prev || Number(c[5] || 0) > Number(prev[5] || 0)) byTs.set(ts, c);
         }
+        if (entry.kind === 'legacy') {
+            legacy.push({ file: entry.file, candles: chunk.candles.filter((c: any) => Array.isArray(c)), queried: chunk.queried });
+        } else if (entry.shardKey) {
+            shards.push({ file: entry.file, shardKey: entry.shardKey, candles: chunk.candles.filter((c: any) => Array.isArray(c)), queried: chunk.queried });
+        }
     }
-    return { byTs, files, fileCover };
+    return { byTs, files, fileCover, legacy, shards };
 }
 
 function cachedCandlesInRange(localCache: any, gteMs: number, lteMs: number) {
@@ -131,6 +193,45 @@ function cachedCandlesInRange(localCache: any, gteMs: number, lteMs: number) {
     }
     out.sort((a: any, b: any) => a[0] - b[0]);
     return out;
+}
+
+// ─── Queried-range set ops ────────────────────────────────────────────────────
+// Coverage provenance: normalize recorded spans (sort, merge overlapping or
+// bucket-adjacent) so growth checks and absorption decisions are exact.
+
+function unionQueriedRanges(ranges: { gte: number; lte: number }[], bucketMs: number) {
+    const clean = (ranges || [])
+        .filter((q: any) => q && Number.isFinite(Number(q.gte)) && Number.isFinite(Number(q.lte)) && Number(q.lte) >= Number(q.gte))
+        .map((q: any) => ({ gte: Number(q.gte), lte: Number(q.lte) }))
+        .sort((a: any, b: any) => a.gte - b.gte || a.lte - b.lte);
+    const merged: { gte: number; lte: number }[] = [];
+    const gap = Number.isFinite(Number(bucketMs)) && Number(bucketMs) > 0 ? Number(bucketMs) : 0;
+    for (const q of clean) {
+        const top = merged[merged.length - 1];
+        if (top && q.gte <= top.lte + gap) {
+            if (q.lte > top.lte) top.lte = q.lte;
+        } else {
+            merged.push({ gte: q.gte, lte: q.lte });
+        }
+    }
+    return merged;
+}
+
+function rangesCoveredBy(have: { gte: number; lte: number }[], want: { gte: number; lte: number }[]) {
+    for (const w of want || []) {
+        let covered = false;
+        for (const h of have || []) {
+            if (h.gte <= w.gte && h.lte >= w.lte) { covered = true; break; }
+        }
+        if (!covered) return false;
+    }
+    return true;
+}
+
+function clipRangeTo(q: { gte: number; lte: number }, gteMs: number, lteMs: number) {
+    const gte = Math.max(q.gte, gteMs);
+    const lte = Math.min(q.lte, lteMs);
+    return lte >= gte ? { gte, lte } : null;
 }
 
 function addUtcMonths(date: any, months: any) {
@@ -239,36 +340,17 @@ function persistCacheChunk(chunkFile: any, meta: any, candles: any) {
     writeJsonAtomic(chunkFile, payload);
 }
 
-// Stale chunk files accumulate when shifted windows change date-based file
-// names (an hour shift crossing midnight orphans the old name). Only files
-// whose embedded meta matches this request are eligible, and only once the
-// caller has completed all windows — a failed run never deletes.
-// Files whose recorded range does not overlap the run's active coverage are
-// KEPT: a narrow run (e.g. --month 3) must not wipe older history cached by
-// a wider run — out-of-window buckets are never carried forward, so deleting
-// those files would destroy history that can only be refetched from Kibana.
-function cleanupOrphanCacheChunks(outPath: any, requestKey: any, isMatch: (meta: any, requestKey: any) => boolean, activeFiles: Set<string>, activeRange?: { gte: number; lte: number } | null) {
-    const removed: string[] = [];
-    try {
-        for (const file of siblingChunkFiles(outPath)) {
-            if (activeFiles.has(path.resolve(file))) continue;
-            const chunk = readCacheChunk(file, requestKey, isMatch);
-            if (!chunk) continue;
-            if (activeRange && Number.isFinite(chunk.rangeGte) && Number.isFinite(chunk.rangeLte)
-                && Number.isFinite(activeRange.gte) && Number.isFinite(activeRange.lte)
-                && ((chunk.rangeLte as number) <= activeRange.gte || (chunk.rangeGte as number) >= activeRange.lte)) continue;
-            try {
-                storage.unlink(file);
-                removed.push(file);
-            } catch (err: any) {
-                console.warn(`  Could not remove orphan chunk ${path.relative(process.cwd(), file)}: ${getErrorMessage(err)}`);
-            }
+function candlesEqual(a: any[], b: any[]) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+        const x = a[i];
+        const y = b[i];
+        if (!Array.isArray(x) || !Array.isArray(y) || x.length !== y.length) return false;
+        for (let j = 0; j < x.length; j++) {
+            if (Number(x[j]) !== Number(y[j])) return false;
         }
-    } catch (err: any) {
-        console.warn(`  Orphan chunk cleanup skipped: ${getErrorMessage(err)}`);
-        return [];
     }
-    return removed;
+    return true;
 }
 
 /**
@@ -411,9 +493,15 @@ function higherVolumeWins(existing: any, incoming: any) {
     return incoming[5] > existing[5] ? incoming : existing;
 }
 
+function sortedCandles(byTs: Map<number, any>) {
+    return [...byTs.values()].sort((a: any, b: any) => Number(a[0]) - Number(b[0]));
+}
+
 /**
- * Run windows with bucket-level reuse. `windows` entries are
- * `{ index, gte, lte, file }` (1-based index). Returns merged candles.
+ * Run windows with bucket-level reuse against month-shard storage. `windows`
+ * entries are `{ index, gte, lte }` (1-based index, fetch-planning splits —
+ * `chunkMonths` controls query batching only, never file layout). Returns
+ * merged candles clipped to the requested windows.
  *
  * Fetch policy per window: exact reuse when nothing is missing, sub-range
  * queries merged over local when gaps are small (and `allowSubFetch`), else
@@ -422,6 +510,13 @@ function higherVolumeWins(existing: any, incoming: any) {
  * fetch reports partial (`{ candles, complete: false }`) is merged into
  * this run's output but NOT persisted, so the missing side is re-queried
  * on the next run instead of being baked in as gap-filled zeros.
+ *
+ * Persistence is per shard and write-on-change only: a shard file is
+ * rewritten solely when it gains buckets or query coverage. Reuse-only runs
+ * touch nothing on disk. Legacy `*.chunk_*` files overlapping the run are
+ * absorbed (buckets + coverage folded into the shards) and deleted once
+ * every one of their buckets provably lives in a shard; disjoint legacy
+ * files are never loaded and never deleted.
  */
 async function runCachedWindows(opts: {
     windows: any[];
@@ -454,26 +549,97 @@ async function runCachedWindows(opts: {
         onRetry: opts.onFetchRetry,
     };
 
-    const localCache = loadBucketCache(outPath, requestKey, isMatch);
+    const bounds = windows.map((w: any) => ({
+        gte: Date.parse(String(w.gte)),
+        lte: Date.parse(String(w.lte)),
+    }));
+    const finiteBounds = bounds.every((b: any) => Number.isFinite(b.gte) && Number.isFinite(b.lte));
+    const overall = finiteBounds && bounds.length > 0
+        ? { gte: Math.min(...bounds.map((b: any) => b.gte)), lte: Math.max(...bounds.map((b: any) => b.lte)) }
+        : null;
+
+    // Scoped load: only shards/legacy files overlapping the run are opened.
+    const localCache = loadBucketCache(outPath, requestKey, isMatch, overall);
     if (localCache.files > 0) {
-        console.log(`  Local cache: ${localCache.files} chunk files, ${localCache.byTs.size} buckets — fetching only what is missing`);
+        console.log(`  Local cache: ${localCache.files} file(s), ${localCache.byTs.size} buckets — fetching only what is missing`);
     }
+
+    // In-memory shard states for every month the run touches, seeded from
+    // whatever shard files already exist.
+    const shardStates = new Map<string, {
+        key: string; file: string;
+        candles: Map<number, any>;
+        queried: { gte: number; lte: number }[];
+        pendingQueried: { gte: number; lte: number }[];
+    }>();
+    if (overall) {
+        for (const key of shardKeysForRange(overall.gte, overall.lte)) {
+            const file = shardPathFor(outPath, key);
+            const existing = localCache.shards.find((s: any) => s.shardKey === key);
+            const candles = new Map<number, any>();
+            if (existing) {
+                for (const c of existing.candles) {
+                    const ts = Number(c[0]);
+                    if (Number.isFinite(ts)) candles.set(ts, c);
+                }
+            }
+            shardStates.set(key, {
+                key, file, candles,
+                queried: unionQueriedRanges(existing?.queried ?? [], bucketMs),
+                pendingQueried: [],
+            });
+        }
+        // Fold legacy query coverage into the overlapping shards so the
+        // provenance survives absorption (a span the legacy file really
+        // queried stays proven-queried after the file is gone).
+        for (const leg of localCache.legacy) {
+            for (const q of leg.queried) {
+                for (const state of shardStates.values()) {
+                    const { start, end } = shardBoundsForKey(state.key);
+                    const clipped = clipRangeTo(q, start, end);
+                    if (clipped) state.pendingQueried.push(clipped);
+                }
+            }
+        }
+    }
+
+    const noteCompletedWindow = (gteMs: number, lteMs: number, candles: any[], queried: { gte: number; lte: number }[]) => {
+        // Later windows plan against what earlier windows proved: fresh
+        // buckets join the pool and fresh coverage joins the cover, so a
+        // re-query inside one run never fetches the same span twice.
+        // Only complete windows feed this — partial data stays in this
+        // run's output and is re-queried next run.
+        for (const c of candles) {
+            if (!Array.isArray(c)) continue;
+            const ts = Number(c[0]);
+            if (!Number.isFinite(ts)) continue;
+            const prev = localCache.byTs.get(ts);
+            if (!prev || Number(c[5] || 0) > Number(prev[5] || 0)) localCache.byTs.set(ts, c);
+        }
+        if (queried.length > 0) {
+            localCache.fileCover.push({ gte: gteMs, lte: lteMs, count: candles.length, queried });
+        }
+        // Fan window results out to the shards they fall in.
+        for (const state of shardStates.values()) {
+            const { start, end } = shardBoundsForKey(state.key);
+            for (const c of candles) {
+                const ts = Number(c[0]);
+                if (!Number.isFinite(ts) || ts < start || ts >= end) continue;
+                const prev = state.candles.get(ts);
+                if (!prev || Number(c[5] || 0) > Number(prev[5] || 0)) state.candles.set(ts, c);
+            }
+            for (const q of queried) {
+                const clipped = clipRangeTo(q, start, end);
+                if (clipped) state.pendingQueried.push(clipped);
+            }
+        }
+    };
 
     let merged: any[] = [];
     for (const windowEntry of windows) {
         const tag = formatWindowLine('Chunk', windowEntry.index, total, windowEntry.gte, windowEntry.lte);
         const gteMs = Date.parse(String(windowEntry.gte));
         const lteMs = Date.parse(String(windowEntry.lte));
-
-        // Exact-match fast path: chunk file already holds this exact range.
-        const exact = readCacheChunk(windowEntry.file, requestKey, isMatch);
-        if (exact && exact.rangeGte === gteMs && exact.rangeLte === lteMs) {
-            console.log(`${tag} (cached ${exact.candles.length} candles)`);
-            merged = merged.length === 0
-                ? exact.candles
-                : mergeCandles(merged, exact.candles, { onCollision: higherVolumeWins });
-            continue;
-        }
 
         const plan = planWindowReuse(localCache, {
             gteMs, lteMs, bucketMs,
@@ -484,7 +650,8 @@ async function runCachedWindows(opts: {
         const reusableNote = reusable.length > 0 ? `, ${reusable.length} buckets local` : '';
         if (inputsValid && missing.length === 0 && (reusable.length > 0 || localCache.files > 0)) {
             console.log(`${tag} (reused ${reusable.length} local buckets, nothing missing)`);
-            persistCacheChunk(windowEntry.file, { ...metaForWindow(windowEntry), fetchedAt: new Date().toISOString(), queriedRanges: priorQueriedInWindow(windowEntry.file, requestKey, isMatch, gteMs, lteMs) }, reusable);
+            // Reuse is read-only: shard files already hold these buckets, so
+            // nothing is rewritten.
             merged = merged.length === 0
                 ? reusable
                 : mergeCandles(merged, reusable, { onCollision: higherVolumeWins });
@@ -517,10 +684,8 @@ async function runCachedWindows(opts: {
             // Clamp to the window (drops the one-bucket over-fetch above).
             candles = mergedLocal.filter((c: any) => Number(c[0]) >= gteMs && Number(c[0]) <= lteMs);
             // Claimed coverage is the canonical missing ranges (a conservative
-            // subset of what was actually queried with the +1-bucket overlap),
-            // plus previously-proven in-window coverage surviving the rewrite.
-            queriedRanges = missing.map((m: any) => ({ gte: m.gte, lte: m.lte }))
-                .concat(priorQueriedInWindow(windowEntry.file, requestKey, isMatch, gteMs, lteMs));
+            // subset of what was actually queried with the +1-bucket overlap).
+            queriedRanges = missing.map((m: any) => ({ gte: m.gte, lte: m.lte }));
         } else {
             if (reusable.length > 0) {
                 console.log(`${tag} (local cover${reusableNote}; gap too large — full window fetch)`);
@@ -536,7 +701,7 @@ async function runCachedWindows(opts: {
             queriedRanges = [{ gte: gteMs, lte: lteMs }];
         }
         if (windowComplete) {
-            persistCacheChunk(windowEntry.file, { ...metaForWindow(windowEntry), fetchedAt: new Date().toISOString(), queriedRanges }, candles);
+            noteCompletedWindow(gteMs, lteMs, candles, queriedRanges);
         } else {
             console.log(`${tag} (partial — kept for this run, not cached; will re-query next run)`);
         }
@@ -545,14 +710,69 @@ async function runCachedWindows(opts: {
             : mergeCandles(merged, candles, { onCollision: higherVolumeWins });
     }
 
-    const windowGtes = windows.map((w: any) => Date.parse(String(w.gte))).filter(Number.isFinite);
-    const windowLtes = windows.map((w: any) => Date.parse(String(w.lte))).filter(Number.isFinite);
-    const activeRange = windowGtes.length > 0 && windowLtes.length > 0
-        ? { gte: Math.min(...windowGtes), lte: Math.max(...windowLtes) }
-        : null;
-    const removed = cleanupOrphanCacheChunks(outPath, requestKey, isMatch, new Set(windows.map((w: any) => path.resolve(w.file))), activeRange);
-    if (removed.length > 0) {
-        console.log(`  Cleaned ${removed.length} orphan chunk file(s): ${removed.map((f: string) => path.basename(f)).join(', ')}`);
+    // Flush: rewrite only shards that gained buckets or coverage. Everything
+    // else on disk is already current.
+    if (overall) {
+        const fetchedAt = new Date().toISOString();
+        for (const state of shardStates.values()) {
+            const { start, end } = shardBoundsForKey(state.key);
+            // Absorb every loaded bucket in this shard's span (legacy files
+            // included): presence on disk already makes a bucket reusable,
+            // so folding it into its home shard preserves trust semantics
+            // exactly while letting the legacy file retire below.
+            for (const [ts, c] of localCache.byTs) {
+                if (ts < start || ts >= end) continue;
+                const prev = state.candles.get(ts);
+                if (!prev || Number(c[5] || 0) > Number(prev[5] || 0)) state.candles.set(ts, c);
+            }
+            const before = sortedCandles(new Map(
+                (localCache.shards.find((s: any) => s.shardKey === state.key)?.candles || [])
+                    .filter((c: any) => Array.isArray(c) && Number.isFinite(Number(c[0])))
+                    .map((c: any) => [Number(c[0]), c] as [number, any]),
+            ));
+            const after = sortedCandles(state.candles);
+            const union = unionQueriedRanges(state.queried.concat(state.pendingQueried), bucketMs);
+            if (candlesEqual(before, after) && rangesCoveredBy(state.queried, union)) continue;
+            const synthWindow = {
+                index: 0,
+                gte: new Date(start).toISOString(),
+                lte: new Date(end).toISOString(),
+            };
+            const meta = { ...metaForWindow(synthWindow), fetchedAt, queriedRanges: union };
+            meta.timeRange = { gte: synthWindow.gte, lte: synthWindow.lte };
+            meta.shard = state.key;
+            delete meta.chunkIndex;
+            persistCacheChunk(state.file, meta, after);
+            state.queried = union;
+            state.pendingQueried = [];
+        }
+
+        // Retire legacy files whose every bucket now provably lives in a
+        // shard. Buckets outside this run's range block retirement (their
+        // home shards were not loaded), so nothing absorbable is ever lost —
+        // a later wider run retires them. Disjoint legacy files were never
+        // loaded and are never touched.
+        const absorbed: string[] = [];
+        for (const leg of localCache.legacy) {
+            let complete = true;
+            for (const c of leg.candles) {
+                const ts = Number(c?.[0]);
+                if (!Number.isFinite(ts)) continue;
+                if (overall && (ts < overall.gte || ts > overall.lte)) { complete = false; break; }
+                const state = shardStates.get(shardKeyForTimestamp(ts));
+                if (!state || !state.candles.has(ts)) { complete = false; break; }
+            }
+            if (!complete) continue;
+            try {
+                storage.unlink(leg.file);
+                absorbed.push(leg.file);
+            } catch (err: any) {
+                console.warn(`  Could not absorb legacy chunk ${path.relative(process.cwd(), leg.file)}: ${getErrorMessage(err)}`);
+            }
+        }
+        if (absorbed.length > 0) {
+            console.log(`  Absorbed ${absorbed.length} legacy chunk file(s): ${absorbed.map((f: string) => path.basename(f)).join(', ')}`);
+        }
     }
     return merged;
 }
@@ -560,19 +780,21 @@ async function runCachedWindows(opts: {
 export {
     TAIL_REFRESH_HOURS,
     IMMUTABLE_WINDOW_AGE_MS,
-    siblingChunkFiles,
-    chunkPathFor,
+    shardKeyForTimestamp,
+    shardBoundsForKey,
+    shardKeysForRange,
+    shardPathFor,
     readCacheChunk,
-    priorQueriedInWindow,
     loadBucketCache,
     cachedCandlesInRange,
+    unionQueriedRanges,
+    rangesCoveredBy,
     addUtcMonths,
     normalizeDateInput,
     buildFetchWindowsFromRange,
     findMissingBucketRanges,
     pruneImmutableGaps,
     persistCacheChunk,
-    cleanupOrphanCacheChunks,
     planWindowReuse,
     formatWindowLine,
     fetchRangeLogged,

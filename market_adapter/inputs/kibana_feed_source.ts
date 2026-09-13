@@ -36,7 +36,7 @@ import { kibanaSearch, DEFAULT_CONFIG as BASE_CONFIG } from '../core/kibana_clie
 import { path } from '../../modules/path_api.js';
 import { PATHS } from '../../modules/paths.js';
 import { toIntervalLabel, slugPart } from '../interval_utils.js';
-import { chunkPathFor, buildFetchWindowsFromRange, runCachedWindows } from './window_cache.js';
+import { buildFetchWindowsFromRange, runCachedWindows } from './window_cache.js';
 import { isTransientNetworkError, sleepMs } from '../../modules/utils/errors.js';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -559,11 +559,11 @@ async function fetchFeedCandlesSequentially(feedCtx: any, assetA: any, assetB: a
     const isCross = feedCtx?.kind === 'cross';
 
     const plainWindows = buildFetchWindowsFromRange(timeRange, chunkMonths);
+    // Windows are fetch-planning splits only; storage is fixed month shards.
     const windows = plainWindows.map((w: any, idx: any) => ({
         index: idx + 1,
         gte: w.gte,
         lte: w.lte,
-        file: chunkPathFor(outPath, idx + 1, w),
     }));
 
     const fetchRange = isCross

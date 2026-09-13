@@ -205,9 +205,9 @@ async function testPartialWindowIsNotCached() {
 
     const partial = await fetchMarketCandlesSequentially(ASSET_A, ASSET_B, opts);
     assert.ok(partial.length > 0, 'partial fetch must still return the surviving side');
-    const chunksAfterPartial = fs.readdirSync(dir).filter((n) => n.includes('.chunk_'));
+    const shardsAfterPartial = fs.readdirSync(dir).filter((n) => n.includes('.shard_'));
     assert.strictEqual(
-        chunksAfterPartial.length,
+        shardsAfterPartial.length,
         0,
         'a partial window must not be persisted to disk'
     );
@@ -216,8 +216,8 @@ async function testPartialWindowIsNotCached() {
     failBDirection = false;
     const healed = await fetchMarketCandlesSequentially(ASSET_A, ASSET_B, opts);
     assert.ok(healed.length > 0, 'healed fetch must return candles');
-    const chunksAfterHeal = fs.readdirSync(dir).filter((n) => n.includes('.chunk_'));
-    assert.ok(chunksAfterHeal.length > 0, 'healed fetch must persist chunk files');
+    const shardsAfterHeal = fs.readdirSync(dir).filter((n) => n.includes('.shard_'));
+    assert.ok(shardsAfterHeal.length > 0, 'healed fetch must persist month-shard files');
 
     fs.rmSync(dir, { recursive: true, force: true });
 }
