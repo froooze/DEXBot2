@@ -1729,6 +1729,7 @@ class OrderManager {
         // don't consume activation budget (mirrors _pickVirtualSlotsToActivate).
         const sellsClosestFirst = this.getOrdersByTypeAndState(ORDER_TYPES.SELL, ORDER_STATES.VIRTUAL)
             .filter((o: any) => inRailFor(ORDER_TYPES.SELL, o))
+            .filter((o: any) => parseSlotIndex(o?.id) !== null)
             .sort((a: any, b: any) => a.price - b.price);
         const validSells: any[] = [];
         for (const o of sellsClosestFirst) {
@@ -1744,6 +1745,7 @@ class OrderManager {
         // selecting up to buyCount orders that pass the minimum-size filter.
         const buysClosestFirst = this.getOrdersByTypeAndState(ORDER_TYPES.BUY, ORDER_STATES.VIRTUAL)
             .filter((o: any) => inRailFor(ORDER_TYPES.BUY, o))
+            .filter((o: any) => parseSlotIndex(o?.id) !== null)
             .sort((a: any, b: any) => b.price - a.price);
         const validBuys: any[] = [];
         for (const o of buysClosestFirst) {

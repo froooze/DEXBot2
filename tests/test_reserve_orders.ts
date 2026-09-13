@@ -26,7 +26,7 @@ const {
 
 const { _setFeeCache } = require('../modules/order/utils/math');
 const { reconcileGrid, optimizeRebalanceActions } = require('../modules/order/utils/validate');
-const { _reconcileStartupSide } = require('../modules/order/grid_reconcile_internal');
+const { _reconcileStartupSide, _countActiveOnGrid, _pickVirtualSlotsToActivate } = require('../modules/order/grid_reconcile_internal');
 const { countLiveReserveOrders, getTargetedSyncReason } = require('../modules/dexbot_maintenance_runtime');
 _setFeeCache({
     BTS: {
@@ -1009,11 +1009,13 @@ async function runTests() {
         const railChain = Array.from({ length: 12 }, (_, i) => ({ id: `1.7.${900 + i}` }));
         const shelfChain = shelfIds.map((s) => ({ id: s.orderId }));
         const fullChain = [...railChain, ...shelfChain];
-        // chain 15 (12 rail + 3 shelf) vs target 8 => cancelCount 7, all from rail.
+        // Shelf sits outside window accounting: chain 12 grid (shelf excluded)
+        // vs target 8 => cancelCount 4, all from rail. The shelf surplus must
+        // not fabricate extra cancels (issue #27 follow-up).
         const shelfPlan = await runShelfStartup(shelfMgr, fullChain, []);
         assert.deepStrictEqual(
             shelfPlan.plannedCancels.map((c: any) => c.chainOrderId),
-            ['1.7.902', '1.7.903', '1.7.904', '1.7.905', '1.7.906', '1.7.907', '1.7.908'],
+            ['1.7.902', '1.7.903', '1.7.904', '1.7.905'],
             'cheapest non-reserve rail cancels first, floor reserves (900/901) last, shelf never a candidate'
         );
         const cancelled = new Set(shelfPlan.plannedCancels.map((c: any) => c.chainOrderId));
@@ -1057,14 +1059,108 @@ async function runTests() {
             'execute selects the identical shelf-safe cancel set'
         );
         const liveBuys = execMgr.getOrdersByTypeAndState(ORDER_TYPES.BUY, ORDER_STATES.ACTIVE).filter((o: any) => o && o.orderId);
-        assert.strictEqual(liveBuys.length, 8, 'post-state converges to target count (5 rail + 3 shelf)');
+        // Grid count converges to target (8 rail); the shelf survives alongside
+        // outside window accounting, so the raw live total reads 8 + 3.
+        const gridBuys = liveBuys.filter((o: any) => /^slot-\d+$/.test(String(o.id)));
+        assert.strictEqual(gridBuys.length, 8, 'grid count converges to target (8 rail, shelf excluded)');
+        assert.strictEqual(liveBuys.length, 11, 'raw live total reads 8 rail + 3 shelf');
         const liveIds = new Set(liveBuys.map((o: any) => o.id));
         for (const s of shelfIds) {
             assert(liveIds.has(s.id), `shelf ${s.id} survives execution`);
         }
-        for (const rid of ['slot-0', 'slot-1', 'slot-9', 'slot-10', 'slot-11']) {
+        for (const rid of ['slot-0', 'slot-1', 'slot-6', 'slot-7', 'slot-8', 'slot-9', 'slot-10', 'slot-11']) {
             assert(liveIds.has(rid), `rail survivor ${rid} stays live (floor reserves + closest window)`);
         }
+    }
+
+    console.log(' - shelf orders never inflate grid counts or mask shortfalls (issue #27 follow-up)...');
+    {
+        // Local maker (the shelf block above scopes its own): 14-slot grid,
+        // first N buys live, no reserves in the base config.
+        const makeCountMgr = async (liveCount: number) => {
+            const mgr = new OrderManager({
+                market: 'TEST/BTS', assetA: 'TEST', assetB: 'BTS',
+                startPrice: 100, incrementPercent: 1, targetSpreadPercent: 0,
+                activeOrders: { buy: 6, sell: 3 },
+                reserveOrders: { buy: 2, sell: 0 },
+            });
+            mgr.logger.level = 'silent';
+            mgr.assets = { assetA: { id: '1.3.0', precision: 8, symbol: 'TEST' }, assetB: { id: '1.3.1', precision: 5, symbol: 'BTS' } };
+            await mgr.setAccountTotals({ buy: 100000, sell: 100, buyFree: 100000, sellFree: 100 });
+            await mgr.resetFunds();
+            mgr._gapSlots = 0;
+            mgr.boundaryIdx = 12;
+            mgr.pauseFundRecalc();
+            for (let i = 0; i < 14; i++) {
+                const live = i < liveCount;
+                await mgr._updateOrder({
+                    id: `slot-${i}`, type: i < 12 ? ORDER_TYPES.BUY : ORDER_TYPES.SELL,
+                    price: 80 + i, size: 100,
+                    state: live ? ORDER_STATES.ACTIVE : ORDER_STATES.VIRTUAL,
+                    orderId: live ? `1.7.${900 + i}` : null,
+                });
+            }
+            await mgr.resumeFundRecalc();
+            return mgr;
+        };
+        // _countActiveOnGrid gates to slot-N: a live shelf must not inflate
+        // matchedOnGrid, or neededSlots/creates get suppressed.
+        const mgr = await makeCountMgr(5);
+        mgr.pauseFundRecalc();
+        for (const s of [
+            { id: 'deep-0', price: 70, orderId: '1.7.800' },
+            { id: 'deep-1', price: 71, orderId: '1.7.801' },
+        ]) {
+            await mgr._updateOrder({
+                id: s.id, type: ORDER_TYPES.BUY,
+                price: s.price, size: 500,
+                state: ORDER_STATES.ACTIVE,
+                orderId: s.orderId,
+            });
+        }
+        await mgr.resumeFundRecalc();
+        assert.strictEqual(
+            _countActiveOnGrid(mgr, ORDER_TYPES.BUY), 5,
+            'matchedOnGrid counts 5 rail actives, shelf excluded'
+        );
+        // Startup creates: 5 rail live vs target 8 => 3 creates planned, not
+        // suppressed to 0 by the 2 shelf orders.
+        const plannedCancels: any[] = [];
+        const plannedCreates: any[] = [];
+        await _reconcileStartupSide({
+            orderType: ORDER_TYPES.BUY, targetCount: 8,
+            chainSideOrders: Array.from({ length: 5 }, (_, i) => ({ id: `1.7.${900 + i}` }))
+                .concat([{ id: '1.7.800' }, { id: '1.7.801' }]),
+            unmatchedSideOrders: [],
+            manager: mgr, chainOrders: {}, account: 'acct', privateKey: 'pk',
+            dryRun: true, plannedCreates, plannedUpdates: [], plannedCancels, planOnly: true,
+        });
+        assert.strictEqual(plannedCancels.length, 0, 'no surplus: shelf excluded from chainCount');
+        assert(plannedCreates.length >= 3, `window shortfall creates 3 (got ${plannedCreates.length})`);
+        // Targeted sync: 5 rail live + 2 shelf vs target 6+2=8 => the window
+        // shortfall (5 < 8) must fire; shelf must not mask it to 7-8.
+        (mgr as any).config = { ...(mgr as any).config, activeOrders: { buy: 6, sell: 0 }, reserveOrders: { buy: 2, sell: 0 } };
+        (mgr as any).checkFundDriftAfterFills = () => null;
+        const reason: any = getTargetedSyncReason({ manager: mgr, config: (mgr as any).config });
+        assert(reason && typeof reason.reason === 'string', 'window shortfall returns a reason despite shelf');
+        assert(
+            reason.reason.includes('buy 5/8'),
+            `shortfall names the grid count without shelf (got: ${reason.reason})`
+        );
+        // _pickVirtualSlotsToActivate never spends window budget on a VIRTUAL shelf.
+        const shelfVirtualMgr = await makeCountMgr(5);
+        shelfVirtualMgr.pauseFundRecalc();
+        await shelfVirtualMgr._updateOrder({
+            id: 'deep-9', type: ORDER_TYPES.BUY,
+            price: 69, size: 500,
+            state: ORDER_STATES.VIRTUAL,
+        });
+        await shelfVirtualMgr.resumeFundRecalc();
+        const picks = _pickVirtualSlotsToActivate(shelfVirtualMgr, ORDER_TYPES.BUY, 8);
+        assert(
+            picks.every((p: any) => /^slot-\d+$/.test(String(p.id))),
+            'window activation picks only slot-N ids'
+        );
     }
 
     console.log('✓ Reserve orders tests passed!');

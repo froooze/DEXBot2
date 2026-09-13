@@ -20,8 +20,8 @@ async function testDuplicateRacePrevention() {
         },
         synchronizeWithChain: async () => { },
         syncFromOpenOrders: async (chainOrders) => {
-            console.log("[MOCK] syncFromOpenOrders matching sell-2 to 1.7.2");
-            const s2 = orders.get('sell-2');
+            console.log("[MOCK] syncFromOpenOrders matching slot-6 to 1.7.2");
+            const s2 = orders.get('slot-6');
             if (s2) {
                 s2.orderId = '1.7.2';
                 s2.state = ORDER_STATES.ACTIVE;
@@ -42,11 +42,13 @@ async function testDuplicateRacePrevention() {
         startPrice: 0.5
     };
 
-    // SETUP: 
-    // sell-1 and sell-2 are both VIRTUAL
+    // SETUP:
+    // slot-5 and slot-6 are both VIRTUAL (slot-N ids required: production
+    // invariant — grids only mint slot-N; non-slot-N shelf/manual ids are
+    // excluded from window activation by design, issue #27 follow-up).
     // One chain order exists (1.7.1) which is unmatched on grid
-    orders.set('sell-1', { id: 'sell-1', type: ORDER_TYPES.SELL, state: ORDER_STATES.VIRTUAL, price: 0.55, size: 100 });
-    orders.set('sell-2', { id: 'sell-2', type: ORDER_TYPES.SELL, state: ORDER_STATES.VIRTUAL, price: 0.6, size: 100 });
+    orders.set('slot-5', { id: 'slot-5', type: ORDER_TYPES.SELL, state: ORDER_STATES.VIRTUAL, price: 0.55, size: 100 });
+    orders.set('slot-6', { id: 'slot-6', type: ORDER_TYPES.SELL, state: ORDER_STATES.VIRTUAL, price: 0.6, size: 100 });
 
     const chainOpenOrders = [
         {
@@ -89,9 +91,9 @@ async function testDuplicateRacePrevention() {
 
     // targetSell = 2. 
     // unmatchedSell = 1. 
-    // updates = 1 (sell-1 will be targeted for update by 1.7.1).
-    // creations = 1 (sell-2 will be targeted for creation).
-    console.log("RUNNING RECONCILE: Expecting Phase 2 update for sell-1 to fail, trigger sync, and match sell-2");
+    // updates = 1 (slot-5 will be targeted for update by 1.7.1).
+    // creations = 1 (slot-6 will be targeted for creation).
+    console.log("RUNNING RECONCILE: Expecting Phase 2 update for slot-5 to fail, trigger sync, and match slot-6");
     await reconcileGridOrders({
         manager,
         config: { activeOrders: { sell: 2 } },
@@ -101,7 +103,7 @@ async function testDuplicateRacePrevention() {
         chainOpenOrders: chainOpenOrders
     });
 
-    assert.strictEqual(createCalled, false, "Should NOT call createOrder for sell-2 because it was matched during recovery sync");
+    assert.strictEqual(createCalled, false, "Should NOT call createOrder for slot-6 because it was matched during recovery sync");
     assert.strictEqual(batchAttempts, 3, 'Should attempt startup update batch 3 times (initial + 2 retries)');
     assert.ok(sequentialAttempts > 0, 'Should fall back to sequential update attempts after batch retries are exhausted');
     console.log("✅ Race prevention test passed");

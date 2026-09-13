@@ -2168,15 +2168,22 @@ export async function monitorDivergence(manager: any, calculatedGrid: any, persi
      * @returns {{onChainBuys: Array<import('./types').Order>, onChainSells: Array<import('./types').Order>}}
      */
 function _getOnChainOrders(manager: any): any {
+        // Slot-N gated: fork-kept shelf/manual orders (non-slot-N ids, e.g.
+        // deep-*) sit outside window accounting — same gate as reserve
+        // classification and startup cancel candidates (issue #27 follow-up).
+        // Without this, a live shelf masks an empty window side (oneSideEmpty
+        // stays false) and skews the spread inputs. No-op on grids that only
+        // mint slot-N ids.
+        const isGridSlot = (o: any) => o?.orderId && Number(o?.size || 0) > 0 && parseSlotIndex(o?.id) !== null;
         const onChainBuys = [
             ...manager.getOrdersByTypeAndState(ORDER_TYPES.BUY, ORDER_STATES.ACTIVE),
             ...manager.getOrdersByTypeAndState(ORDER_TYPES.BUY, ORDER_STATES.PARTIAL)
-        ].filter((o: any) => o?.orderId && Number(o?.size || 0) > 0);
+        ].filter(isGridSlot);
 
         const onChainSells = [
             ...manager.getOrdersByTypeAndState(ORDER_TYPES.SELL, ORDER_STATES.ACTIVE),
             ...manager.getOrdersByTypeAndState(ORDER_TYPES.SELL, ORDER_STATES.PARTIAL)
-        ].filter((o: any) => o?.orderId && Number(o?.size || 0) > 0);
+        ].filter(isGridSlot);
 
         return { onChainBuys, onChainSells };
     }
@@ -2259,11 +2266,11 @@ export async function checkSpreadCondition(manager: any, _BitShares: any, update
 
             const buyCount = manager.getOrdersByTypeAndState(ORDER_TYPES.BUY, ORDER_STATES.ACTIVE)
                 .concat(manager.getOrdersByTypeAndState(ORDER_TYPES.BUY, ORDER_STATES.PARTIAL))
-                .filter((o: any) => o?.orderId && Number(o?.size || 0) > 0)
+                .filter((o: any) => o?.orderId && Number(o?.size || 0) > 0 && parseSlotIndex(o?.id) !== null)
                 .length;
             const sellCount = manager.getOrdersByTypeAndState(ORDER_TYPES.SELL, ORDER_STATES.ACTIVE)
                 .concat(manager.getOrdersByTypeAndState(ORDER_TYPES.SELL, ORDER_STATES.PARTIAL))
-                .filter((o: any) => o?.orderId && Number(o?.size || 0) > 0)
+                .filter((o: any) => o?.orderId && Number(o?.size || 0) > 0 && parseSlotIndex(o?.id) !== null)
                 .length;
 
             manager.outOfSpread = shouldFlagOutOfSpread(currentSpread, nominalSpread, toleranceSteps, buyCount, sellCount, manager.config.incrementPercent);

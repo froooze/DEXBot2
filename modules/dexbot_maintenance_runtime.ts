@@ -71,6 +71,7 @@ function getActiveOrdersTotal(config: any) { return require('./order/utils/order
 function correctAllPriceMismatches(...args: any) { return require('./order/utils/order').correctAllPriceMismatches(...args); }
 function isOrderOnChain(...args: any) { return require('./order/utils/order').isOrderOnChain(...args); }
 function parseChainOrder(...args: any) { return require('./order/utils/order').parseChainOrder(...args); }
+function parseSlotIndex(...args: any) { return require('./order/utils/order').parseSlotIndex(...args); }
 
 const CODE_ROOT = path.join(__dirname, '..');
 const PROFILES_DIR = PATHS.PROFILES_DIR;
@@ -542,7 +543,13 @@ function countLiveGridOrders(manager: any, type: any) {
     if (!manager) return 0;
     const active = manager.getOrdersByTypeAndState?.(type, ORDER_STATES.ACTIVE) || [];
     const partial = manager.getOrdersByTypeAndState?.(type, ORDER_STATES.PARTIAL) || [];
-    return active.concat(partial).filter((o: any) => o?.orderId).length;
+    // Slot-N gated: fork-kept shelf/manual orders (non-slot-N ids, e.g.
+    // deep-*) sit outside window accounting — same gate as reserve
+    // classification and startup cancel candidates (issue #27 follow-up).
+    // Without this, a live shelf inflates the live window+reserves count and
+    // masks a real window/reserve shortfall, so targeted sync never fires.
+    // No-op on grids that only mint slot-N ids.
+    return active.concat(partial).filter((o: any) => o?.orderId && parseSlotIndex(o?.id) !== null).length;
 }
 
 function getTargetActiveOrders(config: any, side: any) {

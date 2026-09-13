@@ -89,11 +89,14 @@ const { _setFeeCache } = require('../modules/order/utils/math');
             }
         });
 
+        // NOTE: grid slots must use slot-N ids (production invariant — grids
+        // only mint slot-N). Shelf/manual fork-kept ids (non-slot-N) are
+        // excluded from window activation by design (issue #27 follow-up).
         const orders = new Map([
-            ['s-near', { id: 's-near', type: ORDER_TYPES.SELL, state: ORDER_STATES.VIRTUAL, orderId: null, price: 101, size: 1.01 }],
-            ['s-out', { id: 's-out', type: ORDER_TYPES.SELL, state: ORDER_STATES.VIRTUAL, orderId: null, price: 103, size: 1.03 }],
-            ['b-near', { id: 'b-near', type: ORDER_TYPES.BUY, state: ORDER_STATES.VIRTUAL, orderId: null, price: 99, size: 0.99 }],
-            ['b-out', { id: 'b-out', type: ORDER_TYPES.BUY, state: ORDER_STATES.VIRTUAL, orderId: null, price: 97, size: 0.97 }],
+            ['slot-11', { id: 'slot-11', type: ORDER_TYPES.SELL, state: ORDER_STATES.VIRTUAL, orderId: null, price: 101, size: 1.01 }],
+            ['slot-13', { id: 'slot-13', type: ORDER_TYPES.SELL, state: ORDER_STATES.VIRTUAL, orderId: null, price: 103, size: 1.03 }],
+            ['slot-9', { id: 'slot-9', type: ORDER_TYPES.BUY, state: ORDER_STATES.VIRTUAL, orderId: null, price: 99, size: 0.99 }],
+            ['slot-7', { id: 'slot-7', type: ORDER_TYPES.BUY, state: ORDER_STATES.VIRTUAL, orderId: null, price: 97, size: 0.97 }],
         ]);
 
         const manager = {
@@ -165,15 +168,15 @@ const { _setFeeCache } = require('../modules/order/utils/math');
 
         assert.deepStrictEqual(
             createSequence,
-            ['s-out', 'b-out', 's-near', 'b-near'],
+            ['slot-13', 'slot-7', 'slot-11', 'slot-9'],
             'startup creates should pair outside->center across sell and buy sides'
         );
 
         const expectedChainIdsByOrderId = {
-            's-out': '1.7.1',
-            'b-out': '1.7.2',
-            's-near': '1.7.3',
-            'b-near': '1.7.4',
+            'slot-13': '1.7.1',
+            'slot-7': '1.7.2',
+            'slot-11': '1.7.3',
+            'slot-9': '1.7.4',
         };
 
         for (const [orderId, expectedChainId] of Object.entries(expectedChainIdsByOrderId)) {

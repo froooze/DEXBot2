@@ -42,9 +42,12 @@ async function testDeltaBalanceCheck() {
         startPrice: 0.5
     };
 
-    // Add a virtual grid order that we want to activate/update to
-    manager.orders.set('sell-1', {
-        id: 'sell-1',
+    // Add a virtual grid order that we want to activate/update to.
+    // NOTE: slot-N id required (production invariant — grids only mint
+    // slot-N; non-slot-N shelf/manual ids are excluded from window
+    // activation by design, issue #27 follow-up).
+    manager.orders.set('slot-5', {
+        id: 'slot-5',
         type: ORDER_TYPES.SELL,
         state: ORDER_STATES.VIRTUAL,
         price: 0.6,
@@ -119,7 +122,7 @@ async function testDeltaBalanceCheck() {
     console.log("\nSUB-TEST 3: Reduction (80 < 90) with low balance (2) -> Should SUCCEED");
     updateCalled = false;
     manager.accountTotals.sellFree = 2; // Very low balance
-    manager.orders.get('sell-1').size = 80; // Grid size reduced to 80 (Reduction from 90)
+    manager.orders.get('slot-5').size = 80; // Grid size reduced to 80 (Reduction from 90)
     await reconcileGridOrders({
         manager,
         account: 'test-account',

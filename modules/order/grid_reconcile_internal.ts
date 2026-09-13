@@ -66,8 +66,15 @@ function computePlacementCrossing(manager: any, gridOrder: any, excludeChainOrde
  * @private
  */
 function _countActiveOnGrid(manager: any, type: any): number {
-    const active = manager.getOrdersByTypeAndState(type, ORDER_STATES.ACTIVE).filter((o: any) => o && o.orderId);
-    const partial = manager.getOrdersByTypeAndState(type, ORDER_STATES.PARTIAL).filter((o: any) => o && o.orderId);
+    // Slot-N gated: fork-kept shelf/manual orders (non-slot-N ids, e.g.
+    // deep-*) sit outside window accounting — same gate as reserve
+    // classification and matched-excess candidates (issue #27 follow-up).
+    // Without this, a live shelf inflates matchedOnGrid, suppresses
+    // neededSlots/creates, and its chain-count surplus cancels real window
+    // orders. No-op on grids that only mint slot-N ids.
+    const isGridSlot = (o: any) => o && o.orderId && parseSlotIndex(o?.id) !== null;
+    const active = manager.getOrdersByTypeAndState(type, ORDER_STATES.ACTIVE).filter(isGridSlot);
+    const partial = manager.getOrdersByTypeAndState(type, ORDER_STATES.PARTIAL).filter(isGridSlot);
     return active.length + partial.length;
 }
 
@@ -191,6 +198,13 @@ function _pickVirtualSlotsToActivate(manager: any, type: any, count: any): any[]
     const slotsOfType = (Array.from(manager.orders.values()) as any[])
         .filter(typeFilter)
         .filter(inRail)
+        // Slot-N gated: fork-kept shelf/manual slots (non-slot-N ids, e.g.
+        // deep-*) must never activate as window orders — same gate as reserve
+        // classification and startup cancel candidates (issue #27 follow-up).
+        // A VIRTUAL shelf passes the type + fail-open geometry filters above;
+        // without this it would consume window activation budget at an
+        // off-market manual price. No-op on grids that only mint slot-N ids.
+        .filter((slot: any) => parseSlotIndex(slot?.id) !== null)
         .sort((a: any, b: any) => type === ORDER_TYPES.BUY ? b.price - a.price : a.price - b.price);
 
     let effectiveMin = 0;
@@ -1880,7 +1894,22 @@ async function _reconcileStartupSide({
     }
 
     const processedUnmatched = sortedUnmatched.slice(updateCount);
-    const chainCount = chainSideOrders.length;
+    // Slot-N gated chain count: fork-kept shelf/manual orders (non-slot-N
+    // grid ids, e.g. deep-*) sit outside window accounting — same gate as
+    // _countActiveOnGrid and matched-excess candidates (issue #27 follow-up).
+    // Without this, a live shelf inflates chainCount, suppresses creates
+    // (target - chain) and fabricates a surplus (chain - target) that cancels
+    // real window orders. No-op on grids that only mint slot-N ids.
+    let chainCount = chainSideOrders.length;
+    try {
+        const shelfOrderIds = new Set<string>();
+        for (const s of (manager?.orders?.values?.() ?? []) as any) {
+            if (s?.orderId && parseSlotIndex(s?.id) === null) shelfOrderIds.add(String(s.orderId));
+        }
+        if (shelfOrderIds.size > 0 && Array.isArray(chainSideOrders)) {
+            chainCount = chainSideOrders.filter((co: any) => co && !shelfOrderIds.has(String(co?.id))).length;
+        }
+    } catch { /* fail-open: keep unfiltered count */ }
     const createCount = Math.max(0, targetCount - chainCount);
     const remainingSlots = desiredSlots.slice(updateCount);
 
