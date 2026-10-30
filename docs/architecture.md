@@ -607,6 +607,54 @@ the whole snapshot in `calculateTargetGrid`), otherwise a later derivation could
 apply those older deltas on top of the re-anchored boundary. Records recorded
 after plan-build are not in the snapshot and stay owed for the next cycle.
 
+The anchor slot is the current fill batch's **extremum** for that side (max slot
+for SELL, min slot for BUY), resolved from each fill's real execution price with
+the slot id only as a legacy fallback. The guard pivot is the *last-processed*
+fill, which a chunked sweep overwrites per chunk (live: 1366 → 1349 → 1361);
+anchoring on it leaves the furthest fill's counter order inside the implied
+band. `calculateTargetGrid` passes the batch into
+`reanchorBoundaryFromLastFill`.
+
+### Rail-Derived Commit Boundary (counter orders are the fact)
+
+A plan built at a re-anchored boundary places **counter orders** on the promoted
+rail (`SELL fill at s => counter BUY at s - gapSlots`). If the refill hold then
+keeps the old committed boundary because the opposite-side refills were
+guard-skipped, those counters are reclassified as in-band and the next plan
+places sells on top of them (live 2026‑10‑30: counters at 1329.7–1345.7 were
+held behind boundary 133, then sells were rotated onto 1345.728664 — the exact
+price of the buy that had just filled; visible spread 1.5% → 0.3%).
+
+`deriveRailBoundary` (`dexbot_cow_runtime.ts`, pre-broadcast) therefore clamps
+the boundary to the batch's resulting rails — live master orders plus kept op
+destinations (creates / rotations, cancels removed):
+
+```text
+maxBuyIdx <= boundary <= minSellIdx - gapSlots - 1
+```
+
+Counter orders win over empty refill holes. When the batch placed nothing above
+the committed boundary, the clamp is a no-op and the refill hold is unchanged.
+A crossed or over-ceiling rail fails closed (`rail-crossed` /
+`rail-exceeds-grid`): keep the previous boundary, never legalize the overlap;
+GAP-EVAC / the next plan owns the offending order.
+
+### Live-Price Provenance (fill, gap, crossing)
+
+A refused-commit adoption can leave a master slot keyed at an old generation
+price while its chain order rests elsewhere (slot-118 @1267 vs a trade at
+1345.73). The grid slot keeps that identity price (`GRID-PRICE-INVARIANT`); the
+**transient decisions** use the live chain price:
+
+- fill records pin the execution price from paid/received amounts (or the chain
+  order price), so the last-fill pivot and the re-anchor judge the real market;
+- gap-evacuation geometry maps the live price onto the ladder
+  (`resolveLiveOrderLadderPosition`) before falling back to the slot index, and
+  a price mismatch whose live price is in-band queues a cancel-only evacuation
+  ahead of any plain re-price;
+- the crossing-guard candidate set uses the live price, so an emission cannot
+  print onto a live opposite-side order that was adopted at a stale slot price.
+
 ### Candidate Selection: Spread Edge, Grid Slot, Last-Fill Consistent
 
 The planner only ever emits the tightening edge on a real grid slot:

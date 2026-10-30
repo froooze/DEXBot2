@@ -152,6 +152,7 @@ import {
 } from './utils/math.js';
 import {
     parseChainOrder,
+    geometryTypeForSlotIndex,
     applyChainSizeToGridOrder,
     convertToSpreadPlaceholder,
     virtualizeOrder,
@@ -171,6 +172,7 @@ import {
 import { hasGenesisLadder } from './genesis_policy.js';
 import { getErrorMessage } from '../utils/errors.js';
 import type { OrderManagerLike, SyncResult, ManagedOrder, UnmatchedChainOrder, ParsedChainOrder, PendingPriceCorrection, ChainOrder, OrderType, AssetInfo, AssetPair } from '../types.js';
+import type { GridGenesis } from './utils/math.js';
 
 interface SyncFillEvent {
     op?: [unknown, FillOpInput?];
@@ -209,6 +211,8 @@ interface FillEntryContext {
     filledAmountInt: number;
     currentSizeIntFromGrid: number;
     rawForSaleInt: number;
+    /** Execution price from the fill amounts (quote per base), null when unknown. */
+    fillPrice: number | null;
 }
 
 interface FillTransitionParams {
@@ -225,6 +229,16 @@ interface FillTransitionParams {
     blockNum?: number;
     historyId?: string;
     isMaker: boolean;
+    /**
+     * Execution price (quote per base) from the chain fill / chain order, when
+     * known. The fill record must carry the REAL trade price: `matchedGridOrder`
+     * is keyed by slot, and a refused-commit adoption can leave that slot at a
+     * stale generation price (e.g. slot-118 @1267 while the chain order traded
+     * at 1345.7). The last-fill pivot / re-anchor read this field, never the
+     * slot price. The slot's own identity price is intentionally NOT rewritten
+     * (GRID-PRICE-INVARIANT).
+     */
+    fillPrice?: number | null;
 }
 
 interface SyncChainData {
@@ -566,7 +580,15 @@ async function adoptChainOrderIntoSlot(mgr: OrderManagerLike, slot: ManagedOrder
                 matchedGridOrderIds.delete(bestMatch.id);
                 return false;
             }
-            filledOrders.push({ ...bestMatch });
+            filledOrders.push({
+                ...bestMatch,
+                // Pass-2 adoption of an already-gone order: the parsed chain
+                // price is the only trade fact available (bestMatch.price is
+                // the slot identity and may be stale).
+                ...(Number.isFinite(Number(chainOrder.price)) && Number(chainOrder.price) > 0
+                    ? { price: Number(chainOrder.price) }
+                    : {})
+            });
             updatedOrders.push(spreadOrder);
             chainOrderIdsOnGrid.add(chainOrderId);
             try { _filterUnmatchedChainOrders(mgr, chainOrderId); } catch { /* counting hygiene only */ }
@@ -1157,14 +1179,61 @@ class SyncEngine {
                     const precision = gridOrder.type === ORDER_TYPES.SELL ? assetAPrecision : assetBPrecision;
                     const isPriceEqual = chainPriceOnSameLevel(chainOrder.price, gridOrder.price, mgr._genesis, precision, mgr.assets, toFiniteNumber(chainOrder.size), gridOrder.size, gridOrder.type, mgr.config?.incrementPercent);
                     if (!isPriceEqual) {
-                        queueCorrection({
-                            gridOrder: { ...gridOrder },
-                            chainOrderId: gridOrder.orderId,
-                            expectedPrice: gridOrder.price,
-                            actualPrice: chainOrder.price,
-                            size: chainOrder.size,
-                            type: gridOrder.type
-                        });
+                        // GAP-EVACUATION PRECEDENCE: classify the order's REAL
+                        // chain price against the live band before queueing a
+                        // plain price correction. An order whose live price maps
+                        // inside the gap band must be cancelled, not "corrected"
+                        // back to a stale slot price (the correction would leave
+                        // it resting inside the spread). A refused-commit
+                        // adoption can leave the local slot id in-rail while the
+                        // order actually trades in-band.
+                        let inBand = false;
+                        try {
+                            if (Array.isArray(mgr._genesis?.priceLevels) && mgr._genesis.priceLevels.length > 0) {
+                            const liveIdx = Number(slotIndexForPrice(chainOrder.price, mgr._genesis as GridGenesis));
+                            inBand = Number.isFinite(liveIdx) && liveIdx >= 0
+                                && geometryTypeForSlotIndex(liveIdx, mgr.boundaryIdx, mgr._gapSlots) === ORDER_TYPES.SPREAD;
+                            }
+                        } catch { inBand = false; }
+                        if (inBand) {
+                            // Drop an opposite-kind queued entry for the same
+                            // chain order so the cancel and a price update cannot
+                            // both drain.
+                            if (Array.isArray(mgr.ordersNeedingPriceCorrection)) {
+                                for (let i = mgr.ordersNeedingPriceCorrection.length - 1; i >= 0; i--) {
+                                    const queued = mgr.ordersNeedingPriceCorrection[i];
+                                    if (queued?.chainOrderId === gridOrder.orderId && queued.isSurplus !== true) {
+                                        mgr.ordersNeedingPriceCorrection.splice(i, 1);
+                                    }
+                                }
+                            }
+                            queueCorrection({
+                                gridOrder: { ...gridOrder },
+                                chainOrderId: gridOrder.orderId,
+                                expectedPrice: gridOrder.price,
+                                actualPrice: chainOrder.price,
+                                size: chainOrder.size,
+                                type: chainOrder.type,
+                                isSurplus: true,
+                                gapEvacuation: true,
+                                boundaryIdx: mgr.boundaryIdx
+                            });
+                            mgr.logger?.log?.(
+                                `[SYNC] Gap-evacuation queued for ${gridOrder.orderId} (slot ${gridOrder.id}): ` +
+                                `live price ${Format.formatPrice6(Number(chainOrder.price))} maps inside the gap band ` +
+                                `(boundary ${mgr.boundaryIdx}, gap ${mgr._gapSlots}) — cancelling instead of re-pricing`,
+                                'warn'
+                            );
+                        } else {
+                            queueCorrection({
+                                gridOrder: { ...gridOrder },
+                                chainOrderId: gridOrder.orderId,
+                                expectedPrice: gridOrder.price,
+                                actualPrice: chainOrder.price,
+                                size: chainOrder.size,
+                                type: gridOrder.type
+                            });
+                        }
                     }
                 }
 
@@ -1292,7 +1361,7 @@ class SyncEngine {
                         // processing (deriveTargetBoundary) derives boundary
                         // movement from fill.type, and a SPREAD type would
                         // silently drop the shift for this completed order.
-                        filledOrders.push({ ...gridOrder, type: chainOrder.type });
+                        filledOrders.push({ ...gridOrder, type: chainOrder.type, price: toFiniteNumber(chainOrder.price, gridOrder.price) });
                         updatedOrders.push(spreadOrder);
                     }
                 }
@@ -1364,7 +1433,21 @@ class SyncEngine {
                     if (resolvedType === ORDER_TYPES.SPREAD) {
                         resolvedType = resolveSpreadOrderSide(currentGridOrder.price, mgr.config.startPrice);
                     }
-                    filledOrders.push({ ...currentGridOrder, type: resolvedType });
+                    const liveChainPrice = (() => {
+                        const raw = currentGridOrder?.rawOnChain;
+                        if (!raw) return null;
+                        try {
+                            const parsed = parseChainOrder(raw as unknown as ChainOrder, mgr.assets);
+                            if (!parsed) return null;
+                            if (currentGridOrder.orderId && parsed.orderId !== currentGridOrder.orderId) return null;
+                            return Number.isFinite(Number(parsed.price)) && Number(parsed.price) > 0 ? Number(parsed.price) : null;
+                        } catch { return null; }
+                    })();
+                    filledOrders.push({
+                        ...currentGridOrder,
+                        type: resolvedType,
+                        ...(liveChainPrice != null ? { price: liveChainPrice } : {})
+                    });
                 }
             }
         }
@@ -1505,7 +1588,7 @@ class SyncEngine {
         return null;
     }
 
-    _computeFillContext(mgr: OrderManagerLike, matchedGridOrder: ManagedOrder, paysAssetId: string | null | undefined, paysAmountRaw: number) {
+    _computeFillContext(mgr: OrderManagerLike, matchedGridOrder: ManagedOrder, paysAssetId: string | null | undefined, paysAmountRaw: number, receivesAssetId: string | null | undefined = null, receivesAmountRaw: number | null = null) {
         const assets = mgr.assets;
         if (!assets?.assetA || !assets?.assetB) throw new Error('assets required for fill context');
         // A SPREAD slot can carry an on-chain order (e.g. spread-correction
@@ -1536,11 +1619,44 @@ class SyncEngine {
         const rawForSaleInt = rawForSale !== undefined && rawForSale !== null ? toFiniteNumber(rawForSale) : NaN;
         const driftSignal = Number.isFinite(rawForSaleInt) && Math.round(rawForSaleInt) < currentSizeIntFromGrid;
 
-        return { orderType, currentSize, precision, filledAmount, currentSizeIntFromGrid, rawForSaleInt, driftSignal };
+        // Execution price from the actual paid/received amounts (quote per
+        // base). This is the fill FACT the last-fill pivot and the re-anchor
+        // need; the slot price is only a grid identity and may be stale after
+        // a refused-commit chain adoption.
+        let fillPrice: number | null = null;
+        if (Number.isFinite(Number(receivesAmountRaw)) && Number(receivesAmountRaw) > 0
+            && Number.isFinite(Number(paysAmountRaw)) && Number(paysAmountRaw) > 0) {
+            const A = assets.assetA;
+            const B = assets.assetB;
+            let baseRaw: number | null = null;
+            let quoteRaw: number | null = null;
+            if (paysAssetId === A.id && receivesAssetId === B.id) {
+                baseRaw = Number(paysAmountRaw);
+                quoteRaw = Number(receivesAmountRaw);
+            } else if (paysAssetId === B.id && receivesAssetId === A.id) {
+                baseRaw = Number(receivesAmountRaw);
+                quoteRaw = Number(paysAmountRaw);
+            }
+            if (baseRaw !== null && quoteRaw !== null) {
+                const base = blockchainToFloat(baseRaw, A.precision);
+                const quote = blockchainToFloat(quoteRaw, B.precision);
+                if (base > 0 && quote > 0) {
+                    const price = quote / base;
+                    if (Number.isFinite(price) && price > 0) fillPrice = price;
+                }
+            }
+        }
+
+        return { orderType, currentSize, precision, filledAmount, currentSizeIntFromGrid, rawForSaleInt, driftSignal, fillPrice };
     }
 
     async _computeFillTransitionResult(mgr: OrderManagerLike, params: FillTransitionParams) {
-        const { matchedGridOrder, orderType, precision, filledAmount, filledAmountInt, currentSizeIntFromGrid, chainRefetched, chainConfirmsEmpty, effectiveRawForSale, blockNum, historyId, isMaker } = params;
+        const { matchedGridOrder, orderType, precision, filledAmount, filledAmountInt, currentSizeIntFromGrid, chainRefetched, chainConfirmsEmpty, effectiveRawForSale, blockNum, historyId, isMaker, fillPrice } = params;
+        // Fill price provenance: prefer the real execution price, fall back to
+        // the slot level only when no chain price/amounts are available.
+        const resolvedFillPrice = Number.isFinite(Number(fillPrice)) && Number(fillPrice) > 0
+            ? Number(fillPrice)
+            : matchedGridOrder.price;
 
         let resolvedChainConfirmsEmpty = chainConfirmsEmpty;
         if (chainRefetched && Number.isFinite(effectiveRawForSale) && Math.round(effectiveRawForSale) <= 0) {
@@ -1651,6 +1767,7 @@ class SyncEngine {
             filledOrderResult = {
                 ...matchedGridOrder,
                 type: orderType,
+                price: resolvedFillPrice,
                 blockNum,
                 historyId,
                 isMaker
@@ -1659,6 +1776,7 @@ class SyncEngine {
             filledOrderResult = {
                 ...matchedGridOrder,
                 type: orderType,
+                price: resolvedFillPrice,
                 size: filledAmount,
                 isPartial: true,
                 blockNum,
@@ -1778,7 +1896,7 @@ class SyncEngine {
                         return { filledOrders: [], updatedOrders: [], partialFill: false };
                     }
 
-                    const ctx = this._computeFillContext(mgr, matchedGridOrder, paysAssetId, paysAmountRaw);
+                    const ctx = this._computeFillContext(mgr, matchedGridOrder, paysAssetId, paysAmountRaw, receivesAssetId, receivesAmountRaw);
                     mgr.logger.log(`[SYNC] Order ${orderId} (${ctx.orderType}) currentSize=${ctx.currentSize}, filledAmount=${ctx.filledAmount}`, 'debug');
 
                     let effectiveRawForSale = ctx.rawForSaleInt;
@@ -1821,7 +1939,8 @@ class SyncEngine {
                         effectiveRawForSale,
                         blockNum,
                         historyId,
-                        isMaker
+                        isMaker,
+                        fillPrice: ctx.fillPrice
                     });
 
                     const filledOrders: ManagedOrder[] = [];
@@ -2002,7 +2121,7 @@ class SyncEngine {
                             continue;
                         }
 
-                        const ctx = this._computeFillContext(mgr, matchedGridOrder, paysAssetId, paysAmountRaw);
+                        const ctx = this._computeFillContext(mgr, matchedGridOrder, paysAssetId, paysAmountRaw, entry.receivesAssetId, entry.receivesAmountRaw);
                         mgr.logger.log(`[SYNC] Order ${orderId} (${ctx.orderType}) currentSize=${ctx.currentSize}, filledAmount=${ctx.filledAmount}`, 'debug');
 
                         if (ctx.driftSignal && orderId) {
@@ -2016,7 +2135,8 @@ class SyncEngine {
                             filledAmount: ctx.filledAmount,
                             filledAmountInt: floatToBlockchainInt(ctx.filledAmount, ctx.precision),
                             currentSizeIntFromGrid: ctx.currentSizeIntFromGrid,
-                            rawForSaleInt: ctx.rawForSaleInt
+                            rawForSaleInt: ctx.rawForSaleInt,
+                            fillPrice: ctx.fillPrice
                         });
                     }
 
@@ -2125,7 +2245,8 @@ class SyncEngine {
                             effectiveRawForSale,
                             blockNum: lastCtx.entry.blockNum,
                             historyId: lastCtx.entry.historyId,
-                            isMaker: lastCtx.entry.isMaker
+                            isMaker: lastCtx.entry.isMaker,
+                            fillPrice: lastCtx.fillPrice
                         });
 
                         if (result.isFull) {

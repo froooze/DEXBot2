@@ -2258,18 +2258,13 @@ function refreshLastFillPivotFromQueue(bot: BotLike): boolean {
             const orderId = fillOp?.order_id || fill?.orderId;
             let type: unknown = null;
             let price: number | null = null;
-            // Prefer the grid slot: a limit fill executes at (or better than)
-            // its slot price, which is exactly the guard's price convention.
-            const slot = findSlotByOrderId(orderId);
-            if (slot && (slot.type === ORDER_TYPES.BUY || slot.type === ORDER_TYPES.SELL)) {
-                type = slot.type;
-                const slotPrice = Number(slot.price);
-                if (Number.isFinite(slotPrice) && slotPrice > 0) price = slotPrice;
-            }
-            // Fall back to fill economics (B/A convention, mirroring
-            // _computeFillContext's pays-asset side resolution, including
-            // SPREAD slots carrying on-chain orders).
-            if ((type == null || price == null) && fillOp?.pays && fillOp?.receives && assets?.assetA && assets?.assetB) {
+            // FILL ECONOMICS FIRST: the pays/receives amounts are the trade
+            // fact. The grid slot is only an identity hint — after a
+            // refused-commit adoption it can still be keyed at an old
+            // generation price (live incident: slot-118 @1267 for an order
+            // that traded at 1345.73), and preferring the slot price made the
+            // last-fill pivot / re-anchor judge a market that never traded.
+            if (fillOp?.pays && fillOp?.receives && assets?.assetA && assets?.assetB) {
                 try {
                     const pays = fillOp.pays as { asset_id?: unknown; amount?: unknown };
                     const receives = fillOp.receives as { amount?: unknown };
@@ -2287,6 +2282,16 @@ function refreshLastFillPivotFromQueue(bot: BotLike): boolean {
                         }
                     }
                 } catch { /* best-effort */ }
+            }
+            // Fall back to the grid slot only when the fill amounts are absent
+            // (a limit fill normally executes at its slot price).
+            if ((type == null || price == null)) {
+                const slot = findSlotByOrderId(orderId);
+                if (slot && (slot.type === ORDER_TYPES.BUY || slot.type === ORDER_TYPES.SELL)) {
+                    type = slot.type;
+                    const slotPrice = Number(slot.price);
+                    if (Number.isFinite(slotPrice) && slotPrice > 0) price = slotPrice;
+                }
             }
             if ((type === ORDER_TYPES.BUY || type === ORDER_TYPES.SELL)
                 && Number.isFinite(price as number) && (price as number) > 0) {
@@ -2866,6 +2871,174 @@ function resolveRefillBoundaryHold(
     return {
         effectiveBoundary: heldRefillSlotIds.length > 0 ? committedBoundary : workingBoundary,
         heldRefillSlotIds
+    };
+}
+
+/**
+ * Derive the boundary the actual rails imply.
+ *
+ * `boundary` is a claim about where the BUY rail ends and the gap band begins;
+ * live orders are the fact. A fill-driven plan built at a re-anchored boundary
+ * places COUNTER orders above the committed boundary (SELL fill at slot s =>
+ * counter BUY at s - gapSlots). If the refill hold then keeps the old boundary,
+ * those counters sit inside the implied band; the next plan sees the old
+ * geometry and places a SELL on top of them, collapsing the spread (live
+ * incident: a sweep's counters at 1329.7-1345.7 were reclassified as in-band by
+ * a hold to 133, then sells were rotated to 1345.728664 — the exact price of
+ * the buy that had just filled).
+ *
+ * Rails are clamped by construction:
+ *
+ *     maxBuyIdx <= boundary <= minSellIdx - gapSlots - 1
+ *
+ * Counter orders therefore win over empty refill holes: a held boundary may
+ * never strand a placed counter. When the plan did not place an order on the
+ * promoted rail (the normal refill-hold case) `maxBuyIdx` stays at/below the
+ * committed boundary and the hold is preserved unchanged.
+ *
+ * @param manager - OrderManager (master grid rails)
+ * @param opContexts - Kept op contexts of the batch (post guard/final gate)
+ * @param desiredBoundary - Plan boundary (falls back to the committed one)
+ * @param gapSlots - Gap band width
+ * @returns Boundary implied by the rails, or null when no rail geometry is
+ *   usable / the rails already cross (caller keeps the current value).
+ */
+export function deriveRailBoundary(
+    manager: OrderManagerLike,
+    opContexts: Iterable<unknown> | null | undefined,
+    desiredBoundary: unknown,
+    gapSlots: unknown
+): { boundary: number | null; maxBuyIdx: number | null; minSellIdx: number | null; clamped: boolean; reason?: string } {
+    let rawGap = Format.toKnownNumber(gapSlots);
+    if (!Number.isFinite(rawGap)) {
+        // Fall back to the genesis gap width before giving up: a restored
+        // manager can briefly hold a null _gapSlots while the genesis is set.
+        rawGap = Format.toKnownNumber((manager as { _genesis?: { gapSlots?: unknown } })?._genesis?.gapSlots);
+    }
+    if (!Number.isFinite(rawGap) || rawGap < 0) {
+        return { boundary: null, maxBuyIdx: null, minSellIdx: null, clamped: false, reason: 'no-gap' };
+    }
+    const gap = Math.floor(rawGap);
+    const isSide = (t: unknown): t is string => t === ORDER_TYPES.BUY || t === ORDER_TYPES.SELL;
+
+    // Start from the live master rails, then apply the kept ops as a delta.
+    // This is the post-batch rail set: cancels remove, creates add, rotations
+    // move (source -> destination), size updates stay.
+    const rails = new Map<string, string>();
+    const master = (manager as { orders?: unknown })?.orders;
+    let maxSlotIdx: number | null = null;
+    if (master instanceof Map) {
+        for (const raw of master.values()) {
+            const o = raw as ManagedOrder | null | undefined;
+            if (!o || !o.id) continue;
+            const parsed = parseSlotIndex(o.id);
+            if (parsed !== null && parsed !== undefined && Number.isFinite(Number(parsed))) {
+                maxSlotIdx = maxSlotIdx === null ? Number(parsed) : Math.max(maxSlotIdx, Number(parsed));
+            }
+            if (!o.orderId || (o.state !== ORDER_STATES.ACTIVE && o.state !== ORDER_STATES.PARTIAL)) continue;
+            if (isSide(o.type)) rails.set(String(o.id), o.type);
+        }
+    }
+
+    if (opContexts && typeof (opContexts as Iterable<unknown>)[Symbol.iterator] === 'function') {
+        for (const raw of opContexts) {
+            const ctx = raw as JsonObj | null | undefined;
+            if (!ctx) continue;
+            if (ctx.kind === 'cancel') {
+                const id = (ctx.order as JsonObj | undefined)?.id;
+                if (id != null) rails.delete(String(id));
+            } else if (ctx.kind === 'create') {
+                const id = ctx.id;
+                const side = (ctx.order as JsonObj | undefined)?.type;
+                if (id != null) {
+                    const parsedId = parseSlotIndex(String(id));
+                    if (parsedId !== null && parsedId !== undefined && Number.isFinite(Number(parsedId))) {
+                        maxSlotIdx = maxSlotIdx === null ? Number(parsedId) : Math.max(maxSlotIdx, Number(parsedId));
+                    }
+                }
+                if (id != null && isSide(side)) rails.set(String(id), side);
+            } else if (ctx.kind === 'rotation') {
+                const rotation = ctx.rotation as JsonObj | undefined;
+                const oldId = (rotation?.oldOrder as JsonObj | undefined)?.id;
+                const newId = rotation?.newGridId;
+                const side = rotation?.type;
+                if (oldId != null) rails.delete(String(oldId));
+                if (newId != null) {
+                    const parsedId = parseSlotIndex(String(newId));
+                    if (parsedId !== null && parsedId !== undefined && Number.isFinite(Number(parsedId))) {
+                        maxSlotIdx = maxSlotIdx === null ? Number(parsedId) : Math.max(maxSlotIdx, Number(parsedId));
+                    }
+                }
+                if (newId != null && isSide(side)) rails.set(String(newId), side);
+            } else if (ctx.kind === 'size-update') {
+                const o = (ctx.updateInfo as JsonObj | undefined)?.partialOrder as JsonObj | undefined;
+                if (o?.id != null && isSide(o.type)) rails.set(String(o.id), o.type);
+            }
+        }
+    }
+
+    let maxBuyIdx: number | null = null;
+    let minSellIdx: number | null = null;
+    for (const [id, side] of rails) {
+        const parsed = parseSlotIndex(id);
+        if (parsed === null || parsed === undefined || !Number.isFinite(Number(parsed))) continue;
+        const idx = Number(parsed);
+        if (side === ORDER_TYPES.BUY) maxBuyIdx = maxBuyIdx === null ? idx : Math.max(maxBuyIdx, idx);
+        else minSellIdx = minSellIdx === null ? idx : Math.min(minSellIdx, idx);
+    }
+    if (maxBuyIdx === null && minSellIdx === null) {
+        return { boundary: null, maxBuyIdx: null, minSellIdx: null, clamped: false, reason: 'no-rails' };
+    }
+
+    // A live BUY at b needs boundary >= b; a live SELL at s needs
+    // boundary <= s - gap - 1. An empty interval means the rails already
+    // overlap (pre-existing crossed book): do not legalize it here.
+    const upper = minSellIdx === null ? Infinity : minSellIdx - gap - 1;
+    if (maxBuyIdx !== null && maxBuyIdx > upper) {
+        return {
+            boundary: null,
+            maxBuyIdx,
+            minSellIdx,
+            clamped: false,
+            reason: `rail-crossed maxBuy=${maxBuyIdx} > minSell-gap-1=${upper}`
+        };
+    }
+
+    const desired = Format.toKnownNumber(desiredBoundary);
+    const committed = Format.toKnownNumber((manager as { boundaryIdx?: unknown })?.boundaryIdx);
+    let base = Number.isFinite(desired) ? Number(desired) : (Number.isFinite(committed) ? Number(committed) : null);
+    if (base === null) {
+        base = maxBuyIdx !== null ? maxBuyIdx : (Number.isFinite(upper) ? upper : 0);
+    }
+
+    // Grid ceiling: the SELL rail must fit (sellStart <= last slot). A
+    // destination slot in this batch can extend the observed maximum.
+    const gridCeiling = maxSlotIdx !== null && maxSlotIdx - gap - 1 >= 0
+        ? maxSlotIdx - gap - 1
+        : null;
+    const allowedUpper = Number.isFinite(upper)
+        ? (gridCeiling === null ? (upper as number) : Math.min(upper as number, gridCeiling))
+        : gridCeiling;
+    if (maxBuyIdx !== null && allowedUpper !== null && maxBuyIdx > allowedUpper) {
+        return {
+            boundary: null,
+            maxBuyIdx,
+            minSellIdx,
+            clamped: false,
+            reason: `rail-exceeds-grid maxBuy=${maxBuyIdx} > ceiling=${allowedUpper}`
+        };
+    }
+    let next = base as number;
+    if (allowedUpper !== null) next = Math.min(next, allowedUpper);
+    if (maxBuyIdx !== null) next = Math.max(next, maxBuyIdx);
+    next = Math.max(0, next);
+
+    return {
+        boundary: next,
+        maxBuyIdx,
+        minSellIdx,
+        clamped: next !== base,
+        ...(next !== base ? { reason: `rail-clamped maxBuy=${maxBuyIdx ?? 'none'} minSell=${minSellIdx ?? 'none'}` } : {})
     };
 }
 /**
@@ -4741,12 +4914,47 @@ async function updateOrdersOnChainBatchCOWBody(
                 'warn'
             );
         }
+        // RAIL-DERIVED BOUNDARY: the committed boundary must match the rails the
+        // batch actually places. A fill-driven plan built at a re-anchored
+        // boundary puts counter orders on the promoted rail (SELL fill at s ->
+        // counter BUY at s-gap); holding the old boundary would reclassify those
+        // counters as in-band and the next plan would place sells on top of them
+        // (spread collapse). Counter orders win over empty refill holes: clamp
+        // to [maxBuy, minSell-gap-1]. In the pure-refill-hold case no order was
+        // placed above the committed boundary, so this is a no-op.
+        const railBoundary = deriveRailBoundary(
+            bot.manager,
+            opContexts,
+            effectiveBoundary,
+            (bot.manager as { _gapSlots?: unknown })?._gapSlots
+        );
+        if (railBoundary.boundary !== null && Number.isFinite(Number(railBoundary.boundary))) {
+            const railEffective = Number(railBoundary.boundary);
+            if (railEffective !== effectiveBoundary) {
+                bot.manager.logger.log(
+                    `[COW] Boundary rail-derived: planned ${workingBoundary}, held ${effectiveBoundary} -> ${railEffective} ` +
+                    `(maxBuy=${railBoundary.maxBuyIdx ?? 'none'}, minSell=${railBoundary.minSellIdx ?? 'none'}) ` +
+                    `— keeping placed counter orders on their rails`,
+                    'warn'
+                );
+                effectiveBoundary = railEffective;
+            }
+        } else if (railBoundary.reason) {
+            bot.manager.logger.log(
+                `[COW] Boundary rail-derived: unusable (${railBoundary.reason}); keeping ${effectiveBoundary}`,
+                'warn'
+            );
+        }
+        // Commit bookkeeping follows the boundary actually committed: a plan
+        // whose target equals the effective value applied its crawls even when
+        // the refill hold triggered (the counters carried the shift).
+        boundaryHeld = effectiveBoundary !== workingBoundary;
         // Consecutive-hold tracking (INV-COW-007 visibility): escalate a
         // growing run — the grid is trailing the market and only fresh
         // fills unstick it. Cleared automatically on the first clean batch.
         const consecutiveHolds = trackBoundaryHold(
             bot.manager,
-            refillHold.heldRefillSlotIds.length > 0,
+            boundaryHeld,
             bot.manager.boundaryIdx,
             workingBoundary,
             refillHold.heldRefillSlotIds

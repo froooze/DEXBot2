@@ -420,8 +420,10 @@ function _validatePriceCorrectionEntry(manager: OrderManagerLike, entry: Pending
         if (!slot) {
             return { valid: false, reason: `gap-evacuation target ${slotId || '?'} no longer owns ${entry.chainOrderId}` };
         }
-        const idx = parseSlotIndex(slot.id);
-        const geometry = geometryTypeForSlotIndex(idx, manager?.boundaryIdx, manager?._gapSlots);
+        // Live chain price first: a refused-commit adoption can leave the local
+        // slot id in-rail while the order actually rests inside the band.
+        const live = resolveLiveOrderLadderPosition(slot, manager?.assets, manager?._genesis);
+        const geometry = geometryTypeForSlotIndex(live.idx, manager?.boundaryIdx, manager?._gapSlots);
         if (geometry !== ORDER_TYPES.SPREAD) {
             return { valid: false, reason: `gap-evacuation target ${slotId} is no longer in the current gap band` };
         }
@@ -1427,18 +1429,72 @@ function geometryTypeForSlotIndex(idx: number | string | null | undefined, bound
 }
 
 /**
+ * Resolve a slot's LIVE ladder position from its on-chain price.
+ *
+ * `slot.id` is the local generation index; after a refused-commit adoption it
+ * can be stale (an order still keyed at slot-117 can be resting at the
+ * slot-138 price on chain). Evacuation geometry must therefore prefer the
+ * chain order's real price, mapped onto the genesis ladder, and only fall back
+ * to the stored slot index. The slot's identity price is NOT rewritten — this
+ * is a read-only geometry probe (GRID-PRICE-INVARIANT stays intact).
+ *
+ * @param slot - Grid slot (needs id/orderId/rawOnChain)
+ * @param assets - Asset pair (precision + ids) for parseChainOrder
+ * @param genesis - Genesis ladder for price -> slot index
+ * @returns {idx, price}: ladder index (null when unknown) and live price
+ */
+function resolveLiveOrderLadderPosition(
+    slot: ManagedOrder | null | undefined,
+    assets: AssetPair | null | undefined,
+    genesis: unknown
+): { idx: number | null; price: number | null } {
+    const fallbackIdx = parseSlotIndex(slot?.id);
+    const fallbackPrice = Number(slot?.price);
+    const raw = slot?.rawOnChain as unknown as ChainOrder | null | undefined;
+    if (!raw || !assets || !genesis) {
+        return { idx: fallbackIdx, price: Number.isFinite(fallbackPrice) && fallbackPrice > 0 ? fallbackPrice : null };
+    }
+    try {
+        const parsed = parseChainOrder(raw, assets);
+        if (!parsed) return { idx: fallbackIdx, price: Number.isFinite(fallbackPrice) && fallbackPrice > 0 ? fallbackPrice : null };
+        if (slot?.orderId && parsed.orderId !== slot.orderId) {
+            // The raw snapshot belongs to a different chain order: not evidence
+            // for this slot.
+            return { idx: fallbackIdx, price: Number.isFinite(fallbackPrice) && fallbackPrice > 0 ? fallbackPrice : null };
+        }
+        const livePrice = Number(parsed.price);
+        if (!Number.isFinite(livePrice) || livePrice <= 0) {
+            return { idx: fallbackIdx, price: Number.isFinite(fallbackPrice) && fallbackPrice > 0 ? fallbackPrice : null };
+        }
+        let idx: number | null = fallbackIdx;
+        try {
+            const resolved = Number(MathUtils.slotIndexForPrice(livePrice, genesis as GridGenesis));
+            if (Number.isFinite(resolved) && resolved >= 0) idx = resolved;
+        } catch { /* keep the stored index */ }
+        return { idx, price: livePrice };
+    } catch {
+        return { idx: fallbackIdx, price: Number.isFinite(fallbackPrice) && fallbackPrice > 0 ? fallbackPrice : null };
+    }
+}
+
+/**
  * Detect gap-evacuation candidates by GEOMETRY ONLY: live on-chain orders
  * whose parsed slot index sits strictly inside the gap band
  * (boundary < idx < sellStartIdx). Never consults the stored slot type —
  * Phase 2 retypes in-band actives to rail types, so type-based detection
  * would go blind exactly when evacuation matters.
  *
+ * The ladder index prefers the order's LIVE chain price (see
+ * resolveLiveOrderLadderPosition): a refused-commit adoption can leave the
+ * local slot id in-rail while the order actually rests inside the band.
+ *
  * @param {Map} masterGrid - Master grid (slotId -> order)
  * @param {number} boundaryIdx - Last BUY slot index (frozen at plan-build)
  * @param {number} gapSlots - Spread gap slot count (frozen at plan-build)
+ * @param {Object} [options] - assets/genesis for the live-price probe
  * @returns {Array} Candidates [{id, idx, type, price, size, orderId}]
  */
-function detectGapEvacuationCandidates(masterGrid: Map<string, ManagedOrder>, boundaryIdx: number | string | null, gapSlots: number | string | null): Array<{ id: string; idx: number; type: OrderType; price: number; size: number; orderId: string }> {
+function detectGapEvacuationCandidates(masterGrid: Map<string, ManagedOrder>, boundaryIdx: number | string | null, gapSlots: number | string | null, options: { assets?: AssetPair | null; genesis?: unknown } = {}): Array<{ id: string; idx: number; type: OrderType; price: number; size: number; orderId: string }> {
     const out: Array<{ id: string; idx: number; type: OrderType; price: number; size: number; orderId: string }> = [];
     if (!masterGrid || typeof masterGrid.values !== 'function') return out;
     // Explicit null/undefined/'' guard BEFORE Number(): Number(null) === 0 and
@@ -1454,10 +1510,18 @@ function detectGapEvacuationCandidates(masterGrid: Map<string, ManagedOrder>, bo
     if (!Number.isFinite(sellStartIdx)) return out;
     for (const slot of masterGrid.values()) {
         if (!slot || !isOrderOnChain(slot) || !slot.orderId) continue;
-        const idx = parseSlotIndex(slot.id);
+        const live = resolveLiveOrderLadderPosition(slot, options.assets, options.genesis);
+        const idx = live.idx;
         if (idx === null || idx === undefined) continue;
         if (Number(idx) > b && Number(idx) < sellStartIdx) {
-            out.push({ id: slot.id, idx: Number(idx), type: slot.type, price: slot.price, size: slot.size, orderId: slot.orderId });
+            out.push({
+                id: slot.id,
+                idx: Number(idx),
+                type: slot.type,
+                price: live.price != null ? live.price : slot.price,
+                size: slot.size,
+                orderId: slot.orderId
+            });
         }
     }
     return out;
@@ -1665,13 +1729,29 @@ function isCrossingCheckCandidate(o: CrossingCandidate | null | undefined, exclu
  */
 function buildCrossingCheckCandidates(manager: OrderManagerLike): CrossingCandidate[] {
     if (!manager) return [];
-    const candidates: CrossingCandidate[] = manager.orders instanceof Map ? [...manager.orders.values()] : [];
+    // LIVE PRICE: a refused-commit adoption can leave a master slot keyed at an
+    // old generation level while its chain order actually rests at another
+    // price (live incident: the grid still said slot-117 @1263 while the buy
+    // was live at 1345.7). Using the stored price let a sell be emitted at the
+    // same 1345.728664, self-crossing the live buy. Parse the chain snapshot
+    // for the crossing probe only — the slot's identity price is unchanged.
+    const withLivePrice = (o: CrossingCandidate): CrossingCandidate => {
+        const candidate = o as unknown as ManagedOrder;
+        if (!candidate || typeof candidate !== 'object') return o;
+        const live = resolveLiveOrderLadderPosition(candidate, manager.assets, manager._genesis);
+        if (live.price == null || !Number.isFinite(Number(live.price)) || Number(live.price) <= 0) return o;
+        return { ...o, price: Number(live.price) } as CrossingCandidate;
+    };
+    const candidates: CrossingCandidate[] = manager.orders instanceof Map
+        ? [...manager.orders.values()].map(withLivePrice)
+        : [];
     if (manager._pendingBroadcasts instanceof Map) {
         for (const entry of manager._pendingBroadcasts.values()) {
-            if (entry && entry.slotId && entry.order) candidates.push(entry);
+            if (entry && entry.slotId && entry.order) candidates.push(withLivePrice(entry as unknown as CrossingCandidate));
         }
     }
     if (Array.isArray(manager._lastUnmatchedChainOrders)) {
+        // Unmatched chain orders already carry the chain price; keep as-is.
         for (const o of manager._lastUnmatchedChainOrders) {
             if (o && o.type != null && o.price != null) candidates.push(o);
         }
@@ -3546,7 +3626,7 @@ function collectKnownOnChainOrderIds(mgr: OrderManagerLike, placedResults: unkno
     return { masterIds: [...masterIds], createIds: [...createIds], all: [...all] };
 }
 
-export { parseChainOrder, applyChainSizeToGridOrder,  buildFillKey, correctOrderPriceOnChain, correctAllPriceMismatches, _validatePriceCorrectionEntry, _stampCorrectionProvenance, findLiveOrderOwnerByChainId, buildCreateOrderArgs, getOrderTypeFromUpdatedFlags, resolveConfiguredPriceBound, virtualizeOrder, convertToSpreadPlaceholder, toRailHolePlaceholder, geometryTypeForSlotIndex, detectGapEvacuationCandidates, updateGapEvacuationStreaks, resolveSpreadOrderSide, chainOrderMatchesSlot, chainOrderMatchesSlotWithTolerance, crossingCandidateChainId, isCrossingCheckCandidate, buildCrossingCheckCandidates, parseSlotIndex, filterOrdersByType, buildOutsideInPairGroups, extractBatchOperationResults, formatUnmatchedChainOrder, isNonBlockingUnmatchedOrder, isStrandedHoldOrder, isOrderOnChain, isOrderVirtual, hasOnChainId, isOrderPlaced, isPhantomOrder, isSlotAvailable, isEmptyGridSlot, isOrderHealthy, checkSizeThreshold, checkSizesBeforeMinimum, calculateIdealBoundary, assignGridRoles, resolveOnChainRetypeType, shouldFlagOutOfSpread, buildIndexes, validateIndexes, ordersEqual, buildDelta, deriveTargetBoundary, isShiftEligibleFill, resolveEdgeCount, resolveEdgeOrders, selectEdgeSlots, getCoreOrdersTotal, getSideBudget, calculateBudgetedSizes, buildCreateOpFingerprint, isOrderGoneErrorMessage, recordDuplicateOrphanDetection, clearDuplicateOrphanDetection, duplicateOrphanLogInfo, chainOrderUnchangedFromCache, detectCrossedBookPlan, collectKnownOnChainOrderIds, edgeOrderIdSet, liveWindowIdSet, checkGridPriceInvariant, reportGridPriceInvariant };
+export { parseChainOrder, resolveLiveOrderLadderPosition, applyChainSizeToGridOrder,  buildFillKey, correctOrderPriceOnChain, correctAllPriceMismatches, _validatePriceCorrectionEntry, _stampCorrectionProvenance, findLiveOrderOwnerByChainId, buildCreateOrderArgs, getOrderTypeFromUpdatedFlags, resolveConfiguredPriceBound, virtualizeOrder, convertToSpreadPlaceholder, toRailHolePlaceholder, geometryTypeForSlotIndex, detectGapEvacuationCandidates, updateGapEvacuationStreaks, resolveSpreadOrderSide, chainOrderMatchesSlot, chainOrderMatchesSlotWithTolerance, crossingCandidateChainId, isCrossingCheckCandidate, buildCrossingCheckCandidates, parseSlotIndex, filterOrdersByType, buildOutsideInPairGroups, extractBatchOperationResults, formatUnmatchedChainOrder, isNonBlockingUnmatchedOrder, isStrandedHoldOrder, isOrderOnChain, isOrderVirtual, hasOnChainId, isOrderPlaced, isPhantomOrder, isSlotAvailable, isEmptyGridSlot, isOrderHealthy, checkSizeThreshold, checkSizesBeforeMinimum, calculateIdealBoundary, assignGridRoles, resolveOnChainRetypeType, shouldFlagOutOfSpread, buildIndexes, validateIndexes, ordersEqual, buildDelta, deriveTargetBoundary, isShiftEligibleFill, resolveEdgeCount, resolveEdgeOrders, selectEdgeSlots, getCoreOrdersTotal, getSideBudget, calculateBudgetedSizes, buildCreateOpFingerprint, isOrderGoneErrorMessage, recordDuplicateOrphanDetection, clearDuplicateOrphanDetection, duplicateOrphanLogInfo, chainOrderUnchangedFromCache, detectCrossedBookPlan, collectKnownOnChainOrderIds, edgeOrderIdSet, liveWindowIdSet, checkGridPriceInvariant, reportGridPriceInvariant };
 export type { CrawlEntry }
 export { resolveEdgeAnchorPrice, resolveLiveEdgeAnchorPrice, compareEdge, collectRefillSlotIds, recordOrderPlacement, isFreshlyPlacedOrder, _filterUnmatchedChainOrders };
 

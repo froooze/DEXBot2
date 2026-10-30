@@ -1512,7 +1512,7 @@ export function resolveSpreadMarketReference(manager: OrderManagerLike): number 
  * @param {number} gapSlots - Gap band width
  * @returns {{boundaryIdx: number|null, reanchored: boolean, from?: number|null, to?: number, side?: string, fillSlot?: number, reason?: string}}
  */
-export function reanchorBoundaryFromLastFill(manager: OrderManagerLike, boundaryIdx: number | null | undefined, slots: ManagedOrder[] | null | undefined, gapSlots: number): { boundaryIdx: number | null; reanchored: boolean; from?: number | null; to?: number; side?: string; fillSlot?: number; reason?: string } {
+export function reanchorBoundaryFromLastFill(manager: OrderManagerLike, boundaryIdx: number | null | undefined, slots: ManagedOrder[] | null | undefined, gapSlots: number, fills: Array<{ id?: string; type?: string; price?: unknown }> | null | undefined = null): { boundaryIdx: number | null; reanchored: boolean; from?: number | null; to?: number; side?: string; fillSlot?: number; reason?: string } {
     // NB: Number(null) === 0 and Number('') === 0 — a boundary-less manager must
     // not be re-anchored onto slot 0 (same absent-value trap as
     // consumePendingFillCrawls).
@@ -1553,11 +1553,59 @@ export function reanchorBoundaryFromLastFill(manager: OrderManagerLike, boundary
     if (!Number.isFinite(levelPrice) || levelPrice <= 0 || Math.abs(levelPrice - price) / price > maxDrift) {
         return { boundaryIdx: boundary, reanchored: false, reason: 'off-ladder-fill' };
     }
+    // BATCH EXTREMUM: the pivot is the LAST-processed fill, but a sweep is
+    // processed in chunks and the pivot is overwritten per chunk (live
+    // incident: one sweep's pivot bounced 1366 -> 1349 -> 1361). Anchoring on
+    // the last chunk under-advances the window and leaves the furthest fill's
+    // counter-order in-band. The rail must clear the FURTHEST fill of the side:
+    // max slot for SELL fills, min slot for BUY fills. Prices are the real
+    // execution prices (sync_engine stamps them from the chain), with the slot
+    // id as a fallback for legacy fill records.
+    let anchorIdx = idx;
+    let anchorPrice = price;
+    if (Array.isArray(fills) && fills.length > 0) {
+        let best: { idx: number; price: number } | null = null;
+        for (const f of fills) {
+            if (!f || f.type !== side) continue;
+            let fIdx: number | null = null;
+            let fPrice: number | null = null;
+            const rawPrice = Number(f.price);
+            if (Number.isFinite(rawPrice) && rawPrice > 0) {
+                try {
+                    const candidateIdx = Number(MathUtils.slotIndexForPrice(rawPrice, genesis));
+                    const candidateLevel = Number(MathUtils.priceForSlot(candidateIdx, genesis));
+                    if (Number.isFinite(candidateIdx) && candidateIdx >= 0
+                        && Number.isFinite(candidateLevel) && candidateLevel > 0
+                        && Math.abs(candidateLevel - rawPrice) / rawPrice <= maxDrift) {
+                        fIdx = candidateIdx;
+                        fPrice = rawPrice;
+                    }
+                } catch { /* fall back to the slot id */ }
+            }
+            if (fIdx === null) {
+                const idIdx = OrderUtils.parseSlotIndex(f.id);
+                if (idIdx !== null && idIdx !== undefined && Number.isFinite(Number(idIdx)) && Number(idIdx) >= 0) {
+                    fIdx = Number(idIdx);
+                    try { fPrice = Number(MathUtils.priceForSlot(fIdx, genesis)); } catch { fPrice = null; }
+                }
+            }
+            if (fIdx === null) continue;
+            if (best === null
+                || (side === ORDER_TYPES.SELL && fIdx > best.idx)
+                || (side === ORDER_TYPES.BUY && fIdx < best.idx)) {
+                best = { idx: fIdx, price: Number.isFinite(Number(fPrice)) && Number(fPrice) > 0 ? Number(fPrice) : anchorPrice };
+            }
+        }
+        if (best !== null) {
+            anchorIdx = best.idx;
+            anchorPrice = best.price;
+        }
+    }
     const gap = Number.isFinite(Number(gapSlots)) && Number(gapSlots) >= 0 ? Math.floor(Number(gapSlots)) : 0;
     const slotCount = Array.isArray(slots) ? slots.length : 0;
     if (slotCount === 0) return { boundaryIdx: boundary, reanchored: false, reason: 'no-slots' };
     const ceiling = (slotCount - gap - 1) >= 0 ? (slotCount - gap - 1) : (slotCount - 1);
-    const required = side === ORDER_TYPES.SELL ? idx - gap : idx - 1;
+    const required = side === ORDER_TYPES.SELL ? anchorIdx - gap : anchorIdx - 1;
     if (side === ORDER_TYPES.SELL ? boundary >= required : boundary <= required) {
         return { boundaryIdx: boundary, reanchored: false, reason: 'already-outside' };
     }
@@ -1577,7 +1625,7 @@ export function reanchorBoundaryFromLastFill(manager: OrderManagerLike, boundary
     // band. Allow exactly that residual (PARTIAL, same side, same ladder
     // level); every other in-band order still refuses the re-anchor.
     const allowedInBandSlotIds: string[] = [];
-    const fillSlotOrder = Array.isArray(slots) ? slots[idx] : null;
+    const fillSlotOrder = Array.isArray(slots) ? slots[anchorIdx] : null;
     if (fillSlotOrder && fillSlotOrder.orderId
         && fillSlotOrder.state === ORDER_STATES.PARTIAL
         && fillSlotOrder.type === side) {
@@ -1605,13 +1653,13 @@ export function reanchorBoundaryFromLastFill(manager: OrderManagerLike, boundary
     }
     try {
         manager.logger?.log?.(
-            `[BOUNDARY] Re-anchored from the last fill: ${side} filled at slot ${idx} ` +
-            `(${price.toFixed(6)}); boundary ${boundary} -> ${candidate} so the fill sits outside ` +
+            `[BOUNDARY] Re-anchored from the last fill: ${side} filled at slot ${anchorIdx} ` +
+            `(${anchorPrice.toFixed(6)}); boundary ${boundary} -> ${candidate} so the fill sits outside ` +
             `its own window (crawl alone cannot recover a window behind the fill)`,
             'warn'
         );
     } catch { /* logging is best-effort */ }
-    return { boundaryIdx: candidate, reanchored: true, from: boundary, to: candidate, side, fillSlot: idx };
+    return { boundaryIdx: candidate, reanchored: true, from: boundary, to: candidate, side, fillSlot: anchorIdx };
 }
 
 /**

@@ -78,6 +78,7 @@ interface ReconcileGridOptions {
     dustThresholdPercent?: number;
     gapSlots?: number;
     assets?: AssetPair | null;
+    genesis?: unknown;
     evacStreaks?: Map<string, number>;
     [key: string]: unknown;
 }
@@ -689,7 +690,10 @@ function reconcileGrid(masterGrid: Map<string, ManagedOrder>, targetGrid: Map<st
     let evacReady: Array<{ id: string }> = [];
     try {
         if (options?.evacStreaks instanceof Map && hasPlanGeometry) {
-            const candidates = detectGapEvacuationCandidates(masterGrid, validatedBoundary, planGapSlots);
+            const candidates = detectGapEvacuationCandidates(masterGrid, validatedBoundary, planGapSlots, {
+                assets: evacAssets,
+                genesis: options?.genesis ?? null
+            });
             const tick = updateGapEvacuationStreaks(options.evacStreaks, candidates);
             evacReady = tick.ready;
             if (evacReady.length > 0 && logger) {

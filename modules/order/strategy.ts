@@ -325,7 +325,7 @@ class StrategyEngine {
         // inventory. The fill is the anchor: place it outside its own window.
         // Validated like a boundary commit (strands no live in-band order), and
         // only for an on-ladder fill price.
-        const reanchor = reanchorBoundaryFromLastFill(this.manager, newBoundaryIdx, allSlots, gapSlots);
+        const reanchor = reanchorBoundaryFromLastFill(this.manager, newBoundaryIdx, allSlots, gapSlots, fills);
         if (reanchor.reanchored) {
             newBoundaryIdx = reanchor.boundaryIdx;
             // An absolute fill anchor already reflects every older owed crawl.

@@ -66,7 +66,7 @@ import {
     buildSuccessResult,
     evaluateCommit
 } from './utils/validate.js';
-import { resolveSpreadOrderSide, parseSlotIndex, parseChainOrder, geometryTypeForSlotIndex, isOrderOnChain, resolveEdgeCount, resolveLiveEdgeAnchorPrice, compareEdge, collectRefillSlotIds, recordOrderPlacement, isFreshlyPlacedOrder } from './utils/order.js';
+import { resolveSpreadOrderSide, resolveLiveOrderLadderPosition, parseSlotIndex, parseChainOrder, geometryTypeForSlotIndex, isOrderOnChain, resolveEdgeCount, resolveLiveEdgeAnchorPrice, compareEdge, collectRefillSlotIds, recordOrderPlacement, isFreshlyPlacedOrder } from './utils/order.js';
 import { getErrorMessage, getErrorCode } from '../utils/errors.js';
 import type { GridGenesis } from './utils/math.js';
 import type {
@@ -301,7 +301,8 @@ class COWRebalanceEngine {
                 dustThresholdPercent,
                 gapSlots: gapSlots ?? undefined,
                 evacStreaks: evacStreaks ?? undefined,
-                assets: this.assets
+                assets: this.assets,
+                genesis: manager?._genesis ?? null
             }
         );
 
@@ -2438,7 +2439,8 @@ class OrderManager implements OrderManagerLike {
             dustThresholdPercent: this.config?.gridLimits?.PARTIAL_DUST_THRESHOLD_PERCENTAGE,
             gapSlots: this._gapSlots,
             evacStreaks: this._gapEvacStreaks,
-            assets: this.assets
+            assets: this.assets,
+            genesis: this._genesis ?? null
         });
     }
 
@@ -2491,9 +2493,16 @@ class OrderManager implements OrderManagerLike {
             const chainOrderId = candidate?.orderId;
             if (!slotId || !chainOrderId) continue;
 
-            // 1. Re-verify geometry against the CURRENT committed boundary.
-            const idx = parseSlotIndex(slotId);
-            if (idx === null || geometryTypeForSlotIndex(idx, boundary, gapSlots) !== ORDER_TYPES.SPREAD) continue;
+            // 1. Live slot check + geometry re-verification against the CURRENT
+            // committed boundary. Prefer the order's LIVE chain price: a
+            // refused-commit adoption can leave the local slot id in-rail while
+            // the order actually rests inside the band.
+            const slot = this.orders.get(slotId);
+            if (!slot || !isOrderOnChain(slot) || slot.orderId !== chainOrderId) continue;
+            const live = resolveLiveOrderLadderPosition(slot, this.assets, this._genesis);
+            // Unknown ladder position is not evidence of an in-band order.
+            if (live.idx === null || !Number.isFinite(Number(live.idx))
+                || geometryTypeForSlotIndex(live.idx, boundary, gapSlots) !== ORDER_TYPES.SPREAD) continue;
 
             // 2. Act threshold (stricter than the warn threshold).
             if (Number(this._gapEvacStreaks.get(slotId) || 0) < cancelThreshold) continue;
@@ -2501,10 +2510,6 @@ class OrderManager implements OrderManagerLike {
             // 3./4. Queued-once + no duplicate chain-order entry.
             if (this._gapEvacCancelQueued.has(slotId)) continue;
             if (this.ordersNeedingPriceCorrection.some((entry) => entry?.chainOrderId === chainOrderId)) continue;
-
-            // 5. Live slot check.
-            const slot = this.orders.get(slotId);
-            if (!slot || !isOrderOnChain(slot) || slot.orderId !== chainOrderId) continue;
 
             this.ordersNeedingPriceCorrection.push({
                 gridOrder: { ...slot },

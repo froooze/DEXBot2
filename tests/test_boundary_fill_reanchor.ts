@@ -186,5 +186,39 @@ run('REANCHOR-11 a ceiling-clamped target fails closed', () => {
     assert.strictEqual(r.reason, 'ceiling-clamped');
 });
 
+run('REANCHOR-15 batch extremum: a SELL sweep anchors on its FURTHEST fill, not the last-processed pivot', () => {
+    // Pivot is the first chunk's fill (105) but the batch also filled 108.
+    // Anchoring on the pivot would leave slot 8 behind the new window.
+    const mgr = makeManager(105, ORDER_TYPES.SELL);
+    const r = reanchorBoundaryFromLastFill(mgr, 2, makeSlots(), 1, [
+        { type: ORDER_TYPES.SELL, price: 105 },
+        { type: ORDER_TYPES.SELL, price: 108 }
+    ]);
+    assert.strictEqual(r.reanchored, true, `expected a re-anchor, got ${JSON.stringify(r)}`);
+    assert.strictEqual(r.fillSlot, 8, 'the furthest SELL fill must anchor the geometry');
+    assert.strictEqual(r.boundaryIdx, 7, 'gap 1 => boundary 7 so sellStart is 9');
+});
+
+run('REANCHOR-16 batch extremum (mirror): a BUY sweep anchors on its LOWEST fill', () => {
+    const mgr = makeManager(107, ORDER_TYPES.BUY);
+    const r = reanchorBoundaryFromLastFill(mgr, 4, makeSlots(), 1, [
+        { type: ORDER_TYPES.BUY, price: 105 },
+        { type: ORDER_TYPES.BUY, price: 102 }
+    ]);
+    assert.strictEqual(r.reanchored, true, `expected a re-anchor, got ${JSON.stringify(r)}`);
+    assert.strictEqual(r.fillSlot, 2, 'the lowest BUY fill must anchor the geometry');
+    assert.strictEqual(r.boundaryIdx, 1, 'BUY fill at 2 => boundary <= 1');
+});
+
+run('REANCHOR-17 opposite-side fills in the batch are ignored by the extremum', () => {
+    const mgr = makeManager(105, ORDER_TYPES.SELL);
+    const r = reanchorBoundaryFromLastFill(mgr, 2, makeSlots(), 1, [
+        { type: ORDER_TYPES.SELL, price: 105 },
+        { type: ORDER_TYPES.BUY, price: 110 }
+    ]);
+    assert.strictEqual(r.fillSlot, 5, 'a BUY fill must not move a SELL anchor');
+    assert.strictEqual(r.boundaryIdx, 4);
+});
+
 console.log(`\nREANCHOR summary: ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);
