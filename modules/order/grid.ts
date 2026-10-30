@@ -122,12 +122,29 @@ const GRID_CONSTANTS = {
 
 type FundStateSnapshot = { buyFree: number; buyLocked: number; sellFree: number; sellLocked: number };
 
+interface SpreadCorrectionRotation {
+    id: string;
+    orderId: string;
+    oldOrder: ManagedOrder;
+    newGridId: string;
+    newPrice: number;
+    newSize: number;
+    type: OrderType;
+}
+
 interface SpreadCorrection {
     ordersToPlace: ManagedOrder[];
     // Create-only since the spread repair stopped top-uping partials (a PARTIAL
     // cannot be grown in place — clampPostFillUpdateSize). Kept as an explicit
     // empty array because updateOrdersOnChainBatch expects the field.
     ordersToUpdate: Array<{ partialOrder: ManagedOrder; newSize: number }>;
+    // Fund-constrained promotion: when free funds cannot fund a tightening
+    // create, move a resting same-side order into the promoted slot instead
+    // (same booked size or smaller, never a new commitment). This is the only
+    // repair path for a fully allocated rail; a plain CREATE would read 0 free
+    // forever. Produced by prepareSpreadCorrectionOrders, consumed by
+    // buildActionsFromPlan as an UPDATE rotation.
+    ordersToRotate?: SpreadCorrectionRotation[];
     // Number of spread-tightening create targets found before the funding loop
     // ran. Lets the caller distinguish "no actionable candidate exists" from
     // "candidates existed but free funds could not fund any" (see
@@ -326,18 +343,65 @@ export function getOccupiedCorrectionSlots(manager: OrderManagerLike, correction
             const liveState = cur.state === ORDER_STATES.ACTIVE || cur.state === ORDER_STATES.PARTIAL;
             if (liveState && cur.orderId) occupied.push(o.id);
         }
+        // Rotation destinations are empty slots when planned; if one was
+        // taken between plan and broadcast the UPDATE would overwrite/duplicate
+        // it, so treat it exactly like an occupied CREATE destination.
+        for (const r of correction.ordersToRotate || []) {
+            const dest = r?.newGridId;
+            if (!dest) continue;
+            const cur = orders.get(dest);
+            if (!cur) continue;
+            const liveState = cur.state === ORDER_STATES.ACTIVE || cur.state === ORDER_STATES.PARTIAL;
+            if (liveState && cur.orderId) occupied.push(dest);
+        }
     } catch { /* best-effort detection */ }
     return occupied;
 }
 
 /**
+ * Executable-action count for a spread correction: CREATEs plus fund-constrained
+ * ROTATIONs. A rotation tightens the spread exactly like a create; callers that
+ * test only ordersToPlace would misclassify a rotation-only plan as "nothing
+ * to do" and skip the broadcast.
+ * @param {Object|null|undefined} correction - Prepared spread correction
+ * @returns {number} Number of actions the COW plan will execute
+ */
+export function getSpreadCorrectionActionCount(correction: SpreadCorrection | null | undefined): number {
+    return (correction?.ordersToPlace?.length || 0) + (correction?.ordersToRotate?.length || 0);
+}
+
+/**
+ * Rotation-only fallback when normal side selection has no fundable side.
+ *
+ * `determineOrderSideByFunds` is still pure-fund-driven, so a rail with
+ * exactly zero free on both sides returns null. Rotations, however, need no
+ * new commitment: a fully allocated rail can still be repaired by moving a
+ * resting order into a promoted gap slot. Try both sides and accept the first
+ * executable plan (create or rotation). Callers must only use this when the
+ * side decision failed for INSUFFICIENT FREE FUNDS, not for an unavailable
+ * market price where cross-asset side comparison is unsafe.
+ * @param {Object} manager - Order manager
+ * @returns {Promise<{correction: SpreadCorrection, side: OrderType}|null>}
+ */
+async function prepareZeroFreeRotationFallback(manager: OrderManagerLike): Promise<{ correction: SpreadCorrection; side: OrderType } | null> {
+    for (const side of [ORDER_TYPES.BUY, ORDER_TYPES.SELL] as OrderType[]) {
+        const correction = await prepareSpreadCorrectionOrders(manager, side, manager.outOfSpread);
+        if (correction && getSpreadCorrectionActionCount(correction) > 0) {
+            return { correction, side };
+        }
+    }
+    return null;
+}
+
+/**
  * P1/P3 shared re-plan: derive a spread correction from the CURRENT master
  * state (side chosen from fresh on-chain book, opposite-side starvation
- * fallback). Used both for the plan-time collision dedupe and the bounded
- * refusal retry. Read-only against the grid; no _gridLock needed (matches the
- * existing TOCTOU fund re-plan contract).
+ * fallback). A zero-free decision still tries the rotation-only fallback.
+ * Used both for the plan-time collision dedupe and the bounded refusal retry.
+ * Read-only against the grid; no _gridLock needed (matches the existing TOCTOU
+ * fund re-plan contract).
  * @param {Object} manager - OrderManager instance
- * @returns {Promise<Object|null>} A correction with at least one create, or null
+ * @returns {Promise<Object|null>} A correction with at least one executable action, or null
  */
 export async function replanSpreadCorrectionFromFreshMaster(manager: OrderManagerLike): Promise<SpreadCorrection | null> {
     const freshOnChain = _getOnChainOrders(manager);
@@ -346,12 +410,16 @@ export async function replanSpreadCorrectionFromFreshMaster(manager: OrderManage
         ? (freshBest.bestBuy + freshBest.bestSell) / 2
         : Number(manager.config.startPrice) || 0;
     const decision = determineOrderSideByFunds(manager, freshPrice);
-    if (!decision.side) return null;
+    if (!decision.side) {
+        if (decision.code !== 'no-free-funds') return null;
+        const fallback = await prepareZeroFreeRotationFallback(manager);
+        return fallback?.correction ?? null;
+    }
     let c = await prepareSpreadCorrectionOrders(manager, decision.side, manager.outOfSpread);
-    if ((c?.ordersToPlace?.length || 0) === 0) {
+    if (getSpreadCorrectionActionCount(c) === 0) {
         const opposite = decision.side === ORDER_TYPES.BUY ? ORDER_TYPES.SELL : ORDER_TYPES.BUY;
         const oc = await prepareSpreadCorrectionOrders(manager, opposite, manager.outOfSpread);
-        if ((oc?.ordersToPlace?.length || 0) > 0) c = oc;
+        if (getSpreadCorrectionActionCount(oc) > 0) c = oc;
     }
     return c;
 }
@@ -385,7 +453,7 @@ export async function resolveOccupiedCorrection(manager: OrderManagerLike, corre
     const occupied = getOccupiedCorrectionSlots(manager, correction);
     if (!(occupied.length > 0 && attempt < maxAttempts)) return { action: 'broadcast' };
     const replanned = await replanSpreadCorrectionFromFreshMaster(manager);
-    if (replanned && (replanned.ordersToPlace?.length || 0) > 0) {
+    if (replanned && getSpreadCorrectionActionCount(replanned) > 0) {
         return { action: 'replanned', correction: replanned, occupied };
     }
     return { action: 'blocked', occupied };
@@ -2960,12 +3028,31 @@ export async function checkSpreadCondition(manager: OrderManagerLike, _BitShares
             // point are covered by the TOCTOU re-plan before broadcast.
             try { await manager.recalculateFunds(); } catch { /* best-effort */ }
             const decision = determineOrderSideByFunds(manager, lastPrice);
-            if (!decision.side) { stall = 'no-free-funds'; return false; }
+            let chosenSide = decision.side;
+            if (!chosenSide) {
+                // Exact-zero free funds still allow a no-new-commitment repair:
+                // rotate a resting order into the promoted gap slot.
+                if (decision.code === 'no-free-funds') {
+                    const fallback = await prepareZeroFreeRotationFallback(manager);
+                    if (fallback) {
+                        correction = fallback.correction;
+                        chosenSide = fallback.side;
+                        manager.logger?.log?.(
+                            `[SPREAD] No fundable side, but a rotation-only repair is available on ${fallback.side}; ` +
+                            `using resting inventory (no new commitment).`,
+                            'info'
+                        );
+                    }
+                }
+                if (!chosenSide) { stall = 'no-free-funds'; return false; }
+            }
 
             // Perform spread correction by placing orders on the chosen side.
-            correction = await prepareSpreadCorrectionOrders(manager, decision.side, manager.outOfSpread);
+            if (!correction) {
+                correction = await prepareSpreadCorrectionOrders(manager, chosenSide, manager.outOfSpread);
+            }
             if (!correction) { stall = 'no-candidates'; return false; }
-            let placeCount = correction.ordersToPlace?.length || 0;
+            let placeCount = getSpreadCorrectionActionCount(correction);
             // Fold each side into the stall cause; merge (never overwrite) across
             // the starvation fallback so an UNFUNDED plan on the chosen side is
             // not masked by an empty plan on the opposite side. The old code
@@ -2987,7 +3074,7 @@ export async function checkSpreadCondition(manager: OrderManagerLike, _BitShares
                 const oppositeCorrection = await prepareSpreadCorrectionOrders(manager, oppositeSide, manager.outOfSpread);
                 if (oppositeCorrection) {
                     correction = oppositeCorrection;
-                    placeCount = oppositeCorrection.ordersToPlace?.length || 0;
+                    placeCount = getSpreadCorrectionActionCount(oppositeCorrection);
                     const oppositeStall = classifySpreadStall(oppositeCorrection);
                     // Precedence merge (never overwrite): 'unfunded' > sync-repairable
                     // > geometry bind > readiness > 'no-candidates'. The old collapse
@@ -3056,22 +3143,22 @@ export async function checkSpreadCondition(manager: OrderManagerLike, _BitShares
                     ? (freshBest.bestBuy + freshBest.bestSell) / 2
                     : Number(manager.config.startPrice) || 0;
                 const rePlanDecision = determineOrderSideByFunds(manager, freshPrice);
-                if (!rePlanDecision.side) {
-                    manager.logger?.log?.(
-                        `[SPREAD] Fund state changed; no side has sufficient funds for re-plan. Skipping cycle.`,
-                        'warn'
-                    );
-                    // Same no-free-funds condition as the initial decision:
-                    // signal the caller to refresh account totals/open orders.
-                    stall = 'no-free-funds';
-                    return { ordersPlaced: 0, partialsMoved: 0, stall };
+                let rePlanCorrection: SpreadCorrection | null = null;
+                if (rePlanDecision.side) {
+                    rePlanCorrection = await prepareSpreadCorrectionOrders(manager, rePlanDecision.side, manager.outOfSpread);
+                } else if (rePlanDecision.code === 'no-free-funds') {
+                    // Fund state changed to zero free between lock release and
+                    // broadcast. Do not discard a rotation-only repair: it
+                    // needs no new funds.
+                    const fallback = await prepareZeroFreeRotationFallback(manager);
+                    rePlanCorrection = fallback?.correction ?? null;
                 }
-                const rePlanCorrection = await prepareSpreadCorrectionOrders(manager, rePlanDecision.side, manager.outOfSpread);
-                if (rePlanCorrection && (rePlanCorrection.ordersToPlace?.length || 0) > 0) {
+                if (rePlanCorrection && getSpreadCorrectionActionCount(rePlanCorrection) > 0) {
                     activeCorrection = rePlanCorrection;
                     manager.logger?.log?.(
                         `[SPREAD] Fund state changed between lock release and broadcast — ` +
-                        `re-planned with updated funds: ${activeCorrection.ordersToPlace?.length || 0} creates`,
+                        `re-planned with updated funds: ${activeCorrection.ordersToPlace?.length || 0} creates, ` +
+                        `${activeCorrection.ordersToRotate?.length || 0} rotation(s)`,
                         'info'
                     );
                 } else {
@@ -3137,7 +3224,7 @@ export async function checkSpreadCondition(manager: OrderManagerLike, _BitShares
                     lastResult = batchResult ?? null;
                     if (batchResult && batchResult.executed === true) {
                         await manager.recalculateFunds();
-                        const placed = activeCorrection.ordersToPlace?.length || 0;
+                        const placed = getSpreadCorrectionActionCount(activeCorrection);
                         return { ordersPlaced: placed, partialsMoved: 0 };
                     }
                     const cause = classifySpreadRefusalCause(batchResult);
@@ -3151,7 +3238,7 @@ export async function checkSpreadCondition(manager: OrderManagerLike, _BitShares
                         'warn'
                     );
                     const replanned = await replanSpreadCorrectionFromFreshMaster(manager);
-                    if (!replanned || (replanned.ordersToPlace?.length || 0) === 0) break;
+                    if (!replanned || getSpreadCorrectionActionCount(replanned) === 0) break;
                     recordSpreadCorrectionRetry(manager);
                     activeCorrection = replanned;
                 }
@@ -3420,9 +3507,9 @@ export async function getDustOrders(manager: OrderManagerLike, partials: Managed
      * @param {import('./types').OrderManager} manager - The manager instance.
      * @param {number} currentMarketPrice - Last traded price in B/A format (e.g. BTS/XRP), used to
      *   normalize sell-side funds into buy-side units for a fair cross-asset comparison.
-     * @returns {{ side: import('./types').OrderType|null, reason: string }} The side to correct on, or null if insufficient funds.
+     * @returns {{ side: import('./types').OrderType|null, reason: string, code?: 'market-price-unavailable'|'no-free-funds' }} The side to correct on, or null with a structured cause.
      */
-export function determineOrderSideByFunds(manager: OrderManagerLike, currentMarketPrice: number): { side: OrderType | null; reason: string } {
+export function determineOrderSideByFunds(manager: OrderManagerLike, currentMarketPrice: number): { side: OrderType | null; reason: string; code?: 'market-price-unavailable' | 'no-free-funds' } {
         const buyAvailable = Math.min(
             Number(manager.funds?.available?.buy || 0),
             Number(manager.accountTotals?.buyFree || 0)
@@ -3475,7 +3562,7 @@ export function determineOrderSideByFunds(manager: OrderManagerLike, currentMark
                 `Spread correction skipped: ${skipReason}; refusing to compare raw cross-asset units`,
                 'warn'
             );
-            return { side: null, reason: skipReason };
+            return { side: null, reason: skipReason, code: 'market-price-unavailable' };
         }
 
         if (!side) {
@@ -3494,7 +3581,11 @@ export function determineOrderSideByFunds(manager: OrderManagerLike, currentMark
             );
         }
 
-        return { side, reason: side ? `Choosing ${side}` : (skipReason || 'Insufficient free funds') };
+        return {
+            side,
+            reason: side ? `Choosing ${side}` : (skipReason || 'Insufficient free funds'),
+            ...(side ? {} : { code: 'no-free-funds' as const })
+        };
     }
 
     /**
@@ -4131,25 +4222,27 @@ export function determineOrderSideByFunds(manager: OrderManagerLike, currentMark
         ].sort((a, b) => a.price - b.price);
 
         const ctx = await _getSizingContext(manager, sideName);
-        if (!ctx || ctx.budget <= 0 || syntheticSideSlots.length === 0) {
-            // A zero sizing budget is a FUND condition (stale/empty free balance),
-            // not a structural one — mark it 'unfunded' so the caller keeps
-            // arming the refresh for it. A missing context or an empty rail is
-            // genuinely structural.
-            const stallHint = (ctx && Number(ctx.budget) <= 0) ? 'unfunded' : 'no-candidates';
-            return { ordersToPlace: [], ordersToUpdate: [], plannedCount: 0, stallHint, origin: COW_ORIGINS.SPREAD_CORRECTION };
+        if (!ctx || syntheticSideSlots.length === 0) {
+            // A missing context or an empty rail is genuinely structural.
+            return { ordersToPlace: [], ordersToUpdate: [], ordersToRotate: [], plannedCount: 0, stallHint: 'no-candidates', origin: COW_ORIGINS.SPREAD_CORRECTION };
         }
         const precisionEpsilon = getPrecisionSlack(ctx.precision, 1);
 
-        const idealSizes = allocateFundsByWeights(
-            ctx.budget,
-            syntheticSideSlots.length,
-            (manager.config.weightDistribution ?? {})[sideName],
-            (manager.config.incrementPercent ?? 0) / 100,
-            railType === ORDER_TYPES.BUY,
-            0,
-            ctx.precision
-        );
+        // Zero free funds must NOT return early: the fund-constrained rotation
+        // below is the only repair a fully allocated rail has. With no budget
+        // every create is skipped below, then a resting order is rotated into
+        // the promoted slot (same booked size, no new commitment).
+        const idealSizes = ctx.budget > 0
+            ? allocateFundsByWeights(
+                ctx.budget,
+                syntheticSideSlots.length,
+                (manager.config.weightDistribution ?? {})[sideName],
+                (manager.config.incrementPercent ?? 0) / 100,
+                railType === ORDER_TYPES.BUY,
+                0,
+                ctx.precision
+            )
+            : [];
 
         const idealById = new Map<string, number>();
         syntheticSideSlots.forEach((slot, idx) => {
@@ -4190,10 +4283,6 @@ export function determineOrderSideByFunds(manager: OrderManagerLike, currentMark
                     ideal
                 });
             }
-        }
-
-        if (prioritizedTargets.length === 0) {
-            return { ordersToPlace: [], ordersToUpdate: [], plannedCount: 0, stallHint: 'no-candidates', origin: COW_ORIGINS.SPREAD_CORRECTION };
         }
 
         // Chain-truth budget (see deriveChainTruthFundBudget): `availableFund`
@@ -4286,10 +4375,109 @@ export function determineOrderSideByFunds(manager: OrderManagerLike, currentMark
             remainingBudget -= createSize;
         }
 
+        // FUND-CONSTRAINED PROMOTION: free funds could not fund every
+        // tightening slot. A fully allocated rail (botFunds 100%, every slot
+        // resting) has ~0 free forever, so create-only repair can never close
+        // the spread (live 2026-10-30: "planned 4, placing 1"). Rotate a
+        // resting same-side order into each unfunded promoted slot instead.
+        // The move commits NO new funds (size is the source's booked size) and
+        // is bounded by the same promotion/geometry guards as a create.
+        const ordersToRotate: SpreadCorrectionRotation[] = [];
+        {
+            const fundedCreateIds = new Set<string>(ordersToPlace.map((o) => String(o.id)));
+            // Use the POST-FILTER candidate list, not raw promotedCandidates:
+            // spreadCandidates has already passed slot dedupe and the
+            // placed-price collision filter (a promoted slot whose price is
+            // already occupied from another slot must not become a rotation
+            // destination). Re-derive the subset instead of bypassing those
+            // guards.
+            const promotedIds = new Set(promotedCandidates.map((c) => String(c.id)));
+            const unfundedPromotions = spreadCandidates
+                .filter((c) => promotedIds.has(String(c.id)))
+                .filter((c) => !fundedCreateIds.has(String(c.id)))
+                .filter((c) => isSlotAvailable(c));
+            if (unfundedPromotions.length > 0) {
+                const windowIds = liveWindowIdSet(manager, railType);
+                const edgeIds = edgeOrderIdSet(
+                    allSlotsByPrice,
+                    manager.config,
+                    railType,
+                    resolveLiveEdgeAnchorPrice(manager, sideName),
+                    windowIds
+                );
+                const sourcePool = allOrders
+                    .filter((o) => o.type === railType
+                        && o.state === ORDER_STATES.ACTIVE
+                        && !!o.orderId
+                        && Number(o.size) > 0
+                        && o.price != null
+                        && Number.isFinite(Number(o.price)))
+                    .filter((o) => {
+                        const idx = slotIndexMap.get(o.id);
+                        if (idx === undefined) return false;
+                        return railType === ORDER_TYPES.BUY ? idx <= buyEndIdx : idx >= sellStartIdx;
+                    })
+                    .filter((o) => !edgeIds || !edgeIds.has(String(o.id)))
+                    .sort((a, b) => railType === ORDER_TYPES.BUY
+                        ? Number(a.price) - Number(b.price)
+                        : Number(b.price) - Number(a.price));
+                const usedSourceIds = new Set<string>();
+                for (const dest of unfundedPromotions) {
+                    const source = sourcePool.find((s) => !usedSourceIds.has(String(s.id)));
+                    if (!source) break;
+                    const sourceSize = Number(source.size);
+                    if (!Number.isFinite(sourceSize) || sourceSize <= 0) continue;
+                    // Same booked size: a rotation is not a re-size and must
+                    // never need new funds. If the source size is unhealthy at
+                    // the destination (it is the same asset/side, so this is
+                    // only a corrupt-size guard), skip rather than shrink.
+                    if (!isOrderHealthy(sourceSize, railType, manager.assets, sourceSize)) continue;
+                    const destPrice = Number(dest.price);
+                    if (!Number.isFinite(destPrice) || destPrice <= 0) continue;
+                    ordersToRotate.push({
+                        id: String(source.id),
+                        orderId: String(source.orderId),
+                        oldOrder: source,
+                        newGridId: String(dest.id),
+                        newPrice: destPrice,
+                        newSize: sourceSize,
+                        type: railType
+                    });
+                    usedSourceIds.add(String(source.id));
+                }
+                if (ordersToRotate.length > 0) {
+                    manager.logger?.log?.(
+                        `[SPREAD-CORRECTION] Fund-constrained promotion on ${sideName}: rotating ` +
+                        `${ordersToRotate.length} resting order(s) into the gap ` +
+                        `(${ordersToRotate.map((r) => `${r.id}->${r.newGridId}`).join(', ')}) — ` +
+                        `no new funds required`,
+                        'warn'
+                    );
+                }
+            }
+        }
+
+        if (ordersToPlace.length === 0 && ordersToRotate.length === 0) {
+            // Candidates existed but neither free funds nor a rotation source
+            // could act: a FUND/rail-structure stall, not a structural absence.
+            return {
+                ordersToPlace: [],
+                ordersToUpdate: [],
+                ordersToRotate: [],
+                plannedCount: spreadCandidates.length,
+                stallHint: 'unfunded',
+                origin: COW_ORIGINS.SPREAD_CORRECTION
+            };
+        }
+
         let boundaryIdx: number | undefined;
-        const placedPromotedIds = new Set(ordersToPlace
-            .filter((order) => promotedCandidates.some((slot) => slot.id === order.id))
-            .map((order) => order.id));
+        const placedPromotedIds = new Set([
+            ...ordersToPlace
+                .filter((order) => promotedCandidates.some((slot) => slot.id === order.id))
+                .map((order) => order.id),
+            ...ordersToRotate
+                .map((rotation) => rotation.newGridId)
+        ]);
         if (placedPromotedIds.size > 0) {
             // Derive boundary from the placed promoted set's extremes (via
             // slotIndexMap), not the contiguous prefix.  Any promoted-but-
@@ -4348,19 +4536,32 @@ export function determineOrderSideByFunds(manager: OrderManagerLike, currentMark
             );
         }
 
-        if (ordersToPlace.length < spreadCandidates.length) {
+        if (ordersToPlace.length + ordersToRotate.length < spreadCandidates.length) {
             manager.logger?.log?.(
-                `[SPREAD-CORRECTION] Fund-constrained placement on ${sideName}: planned ${spreadCandidates.length}, placing ${ordersToPlace.length}`,
+                `[SPREAD-CORRECTION] Fund-constrained placement on ${sideName}: planned ${spreadCandidates.length}, ` +
+                `placing ${ordersToPlace.length} create(s) + ${ordersToRotate.length} rotation(s)`,
                 'info'
             );
         }
 
-        if (ordersToPlace.length > 0) {
+        if (ordersToPlace.length > 0 || ordersToRotate.length > 0) {
             manager.logger?.log?.(
-                `[SPREAD-CORRECTION] Prepared creates=${ordersToPlace.length}, remainingBudget=${Format.formatSizeByOrderType(Math.max(0, remainingBudget), railType, manager.assets)}`,
+                `[SPREAD-CORRECTION] Prepared creates=${ordersToPlace.length}, rotations=${ordersToRotate.length}, ` +
+                `remainingBudget=${Format.formatSizeByOrderType(Math.max(0, remainingBudget), railType, manager.assets)}`,
                 'debug'
             );
         }
 
-        return { ordersToPlace, ordersToUpdate: [], plannedCount: prioritizedTargets.length, ...(boundaryIdx === undefined ? {} : { boundaryIdx }), origin: COW_ORIGINS.SPREAD_CORRECTION };
+        return {
+            ordersToPlace,
+            ordersToUpdate: [],
+            ordersToRotate,
+            // Number of tightening candidates found before funding/rotation.
+            // Include rotation targets: a rotation-only plan has a non-zero
+            // planned count and must not look like an empty plan to callers
+            // that distinguish 'unfunded' from 'no-candidates'.
+            plannedCount: spreadCandidates.length,
+            ...(boundaryIdx === undefined ? {} : { boundaryIdx }),
+            origin: COW_ORIGINS.SPREAD_CORRECTION
+        };
     }

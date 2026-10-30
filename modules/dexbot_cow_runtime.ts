@@ -4207,7 +4207,7 @@ async function updateOrdersOnChainBatchCOWBody(
                                         stampUsable = false;
                                         bot.manager.logger.log(
                                             `[LAST-FILL-GUARD] Stamped evacuation for ${action.id} -> ${action.newGridId} is stale under live ` +
-                                            `boundary ${bot.manager?.boundaryIdx}/gap ${bot.manager?._gapSlots} — re-proving live`,
+                                            `boundary ${bot.manager?.boundaryIdx}/gap ${bot.manager?._gapSlots} — refusing the stale plan`,
                                             'warn'
                                         );
                                     }
@@ -4264,12 +4264,23 @@ async function updateOrdersOnChainBatchCOWBody(
                                     }
                                     let sidePrecision: number | null = null;
                                     try { sidePrecision = getPrecisionByOrderType(bot.manager.assets, orderType); } catch { sidePrecision = null; }
-                                    // Geometry re-proof under the LIVE boundary: if the
-                                    // source is no longer in-band (or dest no longer rail),
-                                    // this is not an evacuation anymore — fall through to
-                                    // the normal guard instead of bypassing via the probe.
-                                    // Non-finite live geometry cannot disprove; probe proceeds.
-                                    if (isEvacuationStampStillValid(bot.manager?.boundaryIdx, bot.manager?._gapSlots, action.id, action.newGridId, orderType)) {
+                                    // Geometry re-proof under the LIVE boundary. A stale
+                                    // evacuation must NOT fall through to the direction-only
+                                    // last-fill guard: that guard only checks the fill price,
+                                    // not whether the move still makes grid sense. Live
+                                    // incident 2026-10-30: a plan built at boundary 124
+                                    // wanted to evacuate buys 125-128; by execution the
+                                    // boundary was 128 and those orders were valid in-rail.
+                                    // The stale probe was rejected, the normal guard then
+                                    // allowed the four lower buys, and the grid lost its
+                                    // bid edge (spread 1.51% -> 2.74%). Fail closed: skip
+                                    // the op and let the next plan/reconcile re-evaluate.
+                                    // Non-finite live geometry keeps plan-build authority
+                                    // (isEvacuationStampStillValid returns true there).
+                                    let staleSkipReason: string | null = null;
+                                    if (!isEvacuationStampStillValid(bot.manager?.boundaryIdx, bot.manager?._gapSlots, action.id, action.newGridId, orderType)) {
+                                        staleSkipReason = `source/dest no longer evacuation geometry under live boundary ${bot.manager?.boundaryIdx}/gap ${bot.manager?._gapSlots}`;
+                                    } else {
                                         const evacCheck = isEvacuationRotationAllowed(oldPrice, oldSize, newPrice, newSize, orderType, sidePrecision);
                                         if (evacCheck.allowed) {
                                             bypassedEvacuation = true;
@@ -4278,15 +4289,23 @@ async function updateOrdersOnChainBatchCOWBody(
                                                 `${evacCheck.reason} (probed live: ${Format.formatPrice6(oldPrice)} -> ${Format.formatPrice6(newPrice)})`,
                                                 'warn'
                                             );
+                                        } else {
+                                            staleSkipReason = evacCheck.reason;
                                         }
-                                    } else {
+                                    }
+                                    if (!bypassedEvacuation) {
+                                        lastFillGuardStats.checked++;
+                                        lastFillGuardStats.skipped++;
+                                        skippedUpdateCount++;
+                                        if (action.id) skippedUpdateSlotIds.add(action.id);
+                                        if (action.newGridId) skippedUpdateSlotIds.add(action.newGridId);
                                         bot.manager.logger.log(
-                                            `[LAST-FILL-GUARD] Unstamped evacuation probe for ${action.id} -> ${action.newGridId} rejected: ` +
-                                            `source/dest no longer evacuation geometry under live boundary ${bot.manager?.boundaryIdx}/gap ${bot.manager?._gapSlots} — normal guard applies`,
+                                            `[LAST-FILL-GUARD] Skipping ${orderType} UPDATE for ${action.id} -> ${action.newGridId}: ` +
+                                            `stale gap-evacuation (${staleSkipReason ?? 'not violation-reducing'}) — next plan re-evaluates`,
                                             'warn'
                                         );
+                                        continue;
                                     }
-                                    // Not allowed: fall through to the normal guard below.
                                 }
                             }
                             if (bypassedEvacuation) {
@@ -5769,10 +5788,24 @@ function runFinalPivotGate(bot: BotLike, operations: unknown[], opContexts: OpPh
                 'debug'
             );
         } catch { /* logging is best-effort */ }
-        if (!pivotChanged) return { ...empty, refreshed };
         // Pivot moved (or armed mid-batch): re-check every built op's FINAL
         // price. Same bypass rules as the build loop; unjudgeable => KEEP.
         const actions = (Array.isArray(opts.actions) ? opts.actions : []) as CowAction[];
+        // A stamped gap-evacuation can also go stale WITHOUT a pivot change:
+        // a boundary commit can land between op-building and this gate. Do not
+        // take the no-op fast path while any such stamp no longer matches the
+        // LIVE geometry. The loop below drops it fail-closed.
+        const hasStaleStampedEvac = actions.some((a) => {
+            if (!a || a.origin !== COW_ORIGINS.GAP_EVACUATION) return false;
+            if (!Number.isFinite(Format.toKnownNumber(a.evacBoundary))
+                || !Number.isFinite(Format.toKnownNumber(a.evacGapSlots))) return false;
+            const evacType = a.order?.type ?? a.type;
+            return !isEvacuationStampStillValid(
+                bot.manager?.boundaryIdx, bot.manager?._gapSlots,
+                a.id, a.newGridId, evacType
+            );
+        });
+        if (!pivotChanged && !hasStaleStampedEvac) return { ...empty, refreshed };
         const batchOrigin = (opts.cowResult as JsonObj | undefined)?.origin as string | undefined;
         const actionBySlot = new Map<string, CowAction>();
         for (const a of actions) {
@@ -5858,7 +5891,38 @@ function runFinalPivotGate(bot: BotLike, operations: unknown[], opContexts: OpPh
                 if (rotOrigin === COW_ORIGINS.GAP_EVACUATION
                     && Number.isFinite(Format.toKnownNumber(action?.evacBoundary))
                     && Number.isFinite(Format.toKnownNumber(action?.evacGapSlots))) {
-                    if (stats) stats.bypassed = (Number(stats.bypassed) || 0) + 1;
+                    // Stale-stamp backstop: the build loop already refuses a
+                    // stamp that no longer matches the LIVE geometry, but the
+                    // final gate must not re-grant the bypass if the boundary
+                    // moved after op-building. Drop when the source/dest
+                    // geometry is no longer valid (the normal guard only
+                    // checks price direction).
+                    const evacSrcId = ((rot.oldOrder as JsonObj | undefined)?.id as string | undefined) || null;
+                    const evacDestId = (rot.newGridId as string | undefined) || null;
+                    const evacStampLive = evacSrcId != null && evacDestId != null
+                        && isEvacuationStampStillValid(
+                            bot.manager?.boundaryIdx, bot.manager?._gapSlots,
+                            evacSrcId, evacDestId, type
+                        );
+                    if (evacStampLive) {
+                        if (stats) stats.bypassed = (Number(stats.bypassed) || 0) + 1;
+                        continue;
+                    }
+                    // Geometry went stale after op-building (e.g. a boundary
+                    // commit landed mid-batch). Dropping is the only fail-closed
+                    // option: the normal guard below only checks the fill price,
+                    // so a non-violating stale move would still ship.
+                    dropIdx.add(i);
+                    if (stats) stats.skipped = (Number(stats.skipped) || 0) + 1;
+                    dropped.push({ index: i, kind: ctx.kind, slotId, price, type });
+                    try {
+                        bot.manager?.logger?.log?.(
+                            `[LAST-FILL-GUARD] Final gate dropping stale gap-evacuation ` +
+                            `${ctx.kind} ${slotId ?? 'unknown'}: source/dest no longer evacuation ` +
+                            `geometry under live boundary ${bot.manager?.boundaryIdx}/gap ${bot.manager?._gapSlots}`,
+                            'warn'
+                        );
+                    } catch { /* logging is best-effort */ }
                     continue;
                 }
             } else {
@@ -6102,6 +6166,8 @@ async function processBatchResults(bot: BotLike, result: JsonObj, opContexts: Op
     const btsFeeData = getAssetFeesSafe('BTS');
     let hadRotation = false;
     let updateOperationCount = 0;
+    let createOperationCount = 0;
+    let rotationOperationCount = 0;
 
     const updatesToApply: JsonObj[] = [];
 
@@ -6135,6 +6201,7 @@ async function processBatchResults(bot: BotLike, result: JsonObj, opContexts: Op
             updateOperationCount++;
         }
         else if (ctx.kind === 'create') {
+            createOperationCount++;
             const chainOrderId = res && (res as unknown[])[1];
             if (chainOrderId) {
                 await bot.manager.synchronizeWithChain({
@@ -6179,6 +6246,7 @@ async function processBatchResults(bot: BotLike, result: JsonObj, opContexts: Op
         }
         else if (ctx.kind === 'rotation') {
             hadRotation = true;
+            rotationOperationCount++;
             const rotation = (ctx.rotation ?? {}) as JsonObj;
             const oldOrder = rotation.oldOrder as JsonObj | undefined;
             const newPrice = rotation.newPrice;
@@ -6265,7 +6333,13 @@ async function processBatchResults(bot: BotLike, result: JsonObj, opContexts: Op
     return {
         executed: true,
         hadRotation,
-        updateOperationCount
+        updateOperationCount,
+        // Actions that reached post-broadcast processing (guards already
+        // removed skipped ops). Callers that report "orders placed" must use
+        // this instead of the plan's pre-guard action count.
+        executedActionCount: opContexts.length,
+        createOperationCount,
+        rotationOperationCount
     };
 }
 export { isSpreadCorrectionBypassAllowed, isLastFillGuardBlocked, resolveOnGridPivot, checkGridPriceInvariant, recordRestampBuyAboveAnchor, collectGapBandPlacementShadowSlots, deriveRotationPrice, refreshLastFillPivotFromQueue, runFinalPivotGate, buildOutsideInPairGroupsForOrders, buildOutsideInPairGroupsForCreateEntries, markMissingCreateResultsAsStructuralBlocker, formatUnmatchedChainOrderForLog, recordPendingBroadcast, clearPendingBroadcasts, popPushedWorkingGrid, findChainOrderForSlot, reconcileAfterUncertainBroadcast, executeWithRetryOnUncertain, executeChunkedWithRetryOnUncertain, formatPartialBroadcastSummary, buildActionsFromPlan, buildCowResultFromPlan, applyRotationTransitionsToWorkingGrid, updateOrdersOnChainBatchCOW, processBatchResults, adoptPlacedBatchFromChain, resolveRefillBoundaryHold, toRefillSlotIdSet, trackBoundaryHold };

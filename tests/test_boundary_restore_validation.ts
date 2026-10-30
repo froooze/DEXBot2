@@ -431,6 +431,40 @@ async function testLoadGridToleratesTransientStranding() {
     console.log('  PASS: tolerate flag keeps transient boundary');
 }
 
+// ── loadGrid: re-anchored PARTIAL residual is transient, not poison ─────
+async function testLoadGridToleratesReanchoredPartialResidual() {
+    console.log('Running test: loadGrid keeps a re-anchored boundary with the fill PARTIAL residual');
+
+    const levels = [100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111];
+    const genesis = buildGenesisFromPriceLevels(105, 1, 1, levels);
+    const grid = levels.map((price, idx) => ({
+        id: `slot-${idx}`,
+        price,
+        type: idx <= 6 ? ORDER_TYPES.BUY : ORDER_TYPES.SELL,
+        state: idx === 7 ? ORDER_STATES.PARTIAL : ORDER_STATES.ACTIVE,
+        size: 10,
+        orderId: `1.7.${400 + idx}`,
+    }));
+    const manager = buildFakeManager({ incrementPercent: 1, targetSpreadPercent: 1, startPrice: 105 });
+    const gap = calculateGapSlots(1, 1);
+
+    const check = validatePersistedBoundary(6, grid, gap);
+    assert.strictEqual(check.reason, BOUNDARY_REJECT_PLACED_IN_BAND,
+        'precondition: the anchor-slot PARTIAL is in-band under the re-anchored boundary');
+    assert.strictEqual(isTransientInBandRejection(check), true,
+        'precondition: the residual shape is classified transient');
+
+    await loadGrid(manager, grid, 6, genesis, { tolerateTransientStranding: true });
+    assert.strictEqual(manager.boundaryIdx, 6,
+        'the persisted re-anchored boundary must survive startup/recovery loading');
+    assert.ok(manager.logs.some(l => l.msg.includes('transient in-band placement') && l.level === 'warn'),
+        'the partial-residual load is warned, not rejected');
+    assert.ok(!manager.logs.some(l => l.msg.includes('Persisted boundary rejected')),
+        'the residual must not trigger a boundary rebuild');
+
+    console.log('  PASS: re-anchored PARTIAL residual loads with the boundary intact');
+}
+
 // ── runner ──────────────────────────────────────────────────────────────
 
 // ── crossed-book takes precedence over co-occurring stranding ──────────
@@ -478,6 +512,7 @@ async function runAll() {
     await testRecoveryRejectsPoisonedSnapshot();
     await testRecoveryToleratesTransientStranding();
     await testLoadGridToleratesTransientStranding();
+    await testLoadGridToleratesReanchoredPartialResidual();
     console.log('All boundary restore validation tests passed');
 }
 

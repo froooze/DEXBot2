@@ -515,6 +515,59 @@ async function testIndexRemapResolvesSameContext() {
     console.log('✓ FG-11 passed');
 }
 
+async function testStaleEvacuationStampNeverBypasses() {
+    console.log('\n[FG-12] stale gap-evacuation stamp must not bypass at the final gate');
+    const slots = [{ id: 'slot-106', orderId: '1.7.1', type: ORDER_TYPES.SELL, price: SELL_PIVOT }];
+    // Live geometry: boundary 200 / gap 4. Source slot-100 is NOT in band
+    // anymore, so the plan-build stamp (boundary 99) is stale.
+    const bot = makeBot({ queue: [sellFillOp('1.7.1', SELL_PIVOT)], slots });
+    bot.manager.boundaryIdx = 200;
+    bot.manager._gapSlots = 4;
+    // Direction-legal price: only the stale geometry can justify a drop.
+    const ops = [{ fake: 'stale-evac' }];
+    const ctxs = [rotCtx('slot-104', '1.7.e1', SELL_THR + 5, 5, ORDER_TYPES.SELL, 'slot-100')];
+    const actions = [rotAction('slot-100', '1.7.e1', 'slot-104', SELL_THR + 5, 5, ORDER_TYPES.SELL, {
+        origin: 'gap-evacuation', evacBoundary: 99, evacGapSlots: 4
+    })];
+    const opts = gateOpts(bot, actions);
+    const res = runFinalPivotGate(bot, ops, ctxs, opts);
+    assert.strictEqual(res.dropped.length, 1, 'stale stamp drops even when the price itself is direction-legal');
+    assert.strictEqual(opts.lastFillGuardStats.bypassed, 0, 'a stale stamp must not count as a bypass');
+
+    // Positive control: with live geometry still matching the stamp, the
+    // bypass remains (source slot-100 in band 99..103, dest slot-104 rail).
+    const bot2 = makeBot({ queue: [sellFillOp('1.7.1', SELL_PIVOT)], slots });
+    bot2.manager.boundaryIdx = 99;
+    bot2.manager._gapSlots = 4;
+    const ops2 = [{ fake: 'live-evac' }];
+    const ctxs2 = [rotCtx('slot-104', '1.7.e2', SELL_THR + 5, 5, ORDER_TYPES.SELL, 'slot-100')];
+    const actions2 = [rotAction('slot-100', '1.7.e2', 'slot-104', SELL_THR + 5, 5, ORDER_TYPES.SELL, {
+        origin: 'gap-evacuation', evacBoundary: 99, evacGapSlots: 4
+    })];
+    const opts2 = gateOpts(bot2, actions2);
+    const res2 = runFinalPivotGate(bot2, ops2, ctxs2, opts2);
+    assert.strictEqual(res2.dropped.length, 0, 'live stamp geometry still bypasses');
+    assert.strictEqual(opts2.lastFillGuardStats.bypassed, 1);
+    console.log('✓ FG-12 passed');
+
+    // FG-13: boundary moved while the pivot stayed unchanged. The gate must
+    // not take the no-op fast path just because pivotChanged is false.
+    const bot3 = makeBot({ queue: [], slots });
+    bot3.manager.boundaryIdx = 200;
+    bot3.manager._gapSlots = 4;
+    const ops3 = [{ fake: 'pivot-neutral-stale-evac' }];
+    const ctxs3 = [rotCtx('slot-104', '1.7.e3', SELL_THR + 5, 5, ORDER_TYPES.SELL, 'slot-100')];
+    const actions3 = [rotAction('slot-100', '1.7.e3', 'slot-104', SELL_THR + 5, 5, ORDER_TYPES.SELL, {
+        origin: 'gap-evacuation', evacBoundary: 99, evacGapSlots: 4
+    })];
+    const opts3 = gateOpts(bot3, actions3);
+    const res3 = runFinalPivotGate(bot3, ops3, ctxs3, opts3);
+    assert.strictEqual(res3.pivotChanged, false, 'precondition: pivot did not change');
+    assert.strictEqual(res3.dropped.length, 1,
+        'pivot-neutral boundary change must still drop a stale gap-evacuation stamp');
+    console.log('✓ FG-13 passed');
+}
+
 async function main() {
     await testNoOpWhenPivotUnchanged();
     await testIncidentReplayDropsBothRotations();
@@ -527,6 +580,7 @@ async function main() {
     await testHelperParityWithGuard();
     await testSameSlotUpdateResolvesSourceAction();
     await testIndexRemapResolvesSameContext();
+    await testStaleEvacuationStampNeverBypasses();
     console.log('\nAll final-pivot-gate regression tests passed.');
 }
 

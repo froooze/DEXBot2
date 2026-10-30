@@ -46,7 +46,8 @@ async function buildProductionGeometry(
     manager: any,
     liveBuy: [number, number],
     liveSell: [number, number],
-    totals: { buy: number; sell: number } = { buy: 0, sell: 500 }
+    totals: { buy: number; sell: number } = { buy: 0, sell: 500 },
+    options: { liveState?: string } = {}
 ) {
     manager.assets = {
         assetA: { id: '1.3.1', symbol: 'BASE', precision: 5 },
@@ -65,7 +66,7 @@ async function buildProductionGeometry(
             id: `slot-${i}`,
             price: price(i),
             type,
-            state: live ? ORDER_STATES.ACTIVE : ORDER_STATES.VIRTUAL,
+            state: live ? (options.liveState || ORDER_STATES.ACTIVE) : ORDER_STATES.VIRTUAL,
             size: live ? 2 : 1.5,
             orderId: live ? `1.7.${500000 + i}` : ''
         });
@@ -389,8 +390,14 @@ async function testMixedCaseStallIsUnfunded() {
     const sellAlloc = 0.001;
 
     const manager = newManager({ buy: dustBuy, sell: sellAlloc });
-    await buildProductionGeometry(manager, [131, 145], [156, 175], { buy: dustBuy, sell: sellAlloc });
+    // PARTIAL live orders keep the sell rail on-chain but are deliberately not
+    // rotation sources (a partial must never be moved by a spread correction),
+    // so this scenario still exercises the mixed fund/structural stall.
+    await buildProductionGeometry(manager, [131, 145], [156, 175],
+        { buy: dustBuy, sell: sellAlloc }, { liveState: ORDER_STATES.PARTIAL });
 
+    assert.strictEqual(manager.orders.get('slot-175').state, ORDER_STATES.PARTIAL,
+        'precondition: live sells are PARTIAL and cannot be rotation sources');
     // Precondition: side selection picks BUY, which plans a hole but funds none;
     // the locked SELL side plans nothing.
     assert.strictEqual(
@@ -403,10 +410,14 @@ async function testMixedCaseStallIsUnfunded() {
         `precondition: BUY must plan (${buyCorrection.plannedCount}) yet place 0`
     );
     const sellCorrection = await Grid.prepareSpreadCorrectionOrders(manager, ORDER_TYPES.SELL, 6);
-    assert.strictEqual(
-        Number(sellCorrection.plannedCount || 0), 0,
-        'precondition: the locked SELL side plans nothing'
-    );
+    // A zero-budget side with tightening candidates now reports plannedCount>0
+    // (an UNFUNDED plan) instead of the old early-return plannedCount=0. What
+    // matters for this regression is that it cannot execute anything: no create
+    // and no rotation source (live sells are PARTIAL).
+    assert.strictEqual(sellCorrection.ordersToPlace.length, 0,
+        'precondition: the locked SELL side places nothing');
+    assert.strictEqual((sellCorrection.ordersToRotate || []).length, 0,
+        'precondition: PARTIAL sells are not rotation sources');
 
     const result = await manager.checkSpreadCondition({}, async () => ({ executed: true }));
     assert.strictEqual(result.ordersPlaced, 0, 'no order can be placed');

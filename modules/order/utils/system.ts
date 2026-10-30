@@ -82,7 +82,7 @@ const require = createRequire(import.meta.url);
 import { path } from '../../path_api.js';
 import { getStorage } from '../../storage/index.js';
 const storage = getStorage();
-import { API_LIMITS, ORDER_TYPES, COW_ACTIONS, FEE_PARAMETERS, BTS_PRECISION, PIPELINE_TIMING, NATIVE_CLIENT, GRID_LIMITS, TIMING } from '../../constants.js';
+import { API_LIMITS, ORDER_TYPES, ORDER_STATES, COW_ACTIONS, FEE_PARAMETERS, BTS_PRECISION, PIPELINE_TIMING, NATIVE_CLIENT, GRID_LIMITS, TIMING } from '../../constants.js';
 import { PATHS } from '../../paths.js';
 import { toFiniteNumber, isValidNumber, toKnownNumber } from '../format.js';
 import * as MathUtils from './math.js';
@@ -1521,7 +1521,13 @@ export function reanchorBoundaryFromLastFill(manager: OrderManagerLike, boundary
     }
     const boundary = Number(boundaryIdx);
     if (!Number.isFinite(boundary)) return { boundaryIdx: boundaryIdx ?? null, reanchored: false, reason: 'no-boundary' };
-    const ref = resolveLastFillGuardReference(manager);
+    // An absolute re-anchor must be a FILL fact, never a book seed. The
+    // generic guard deliberately accepts a one-sided book seed as a pricing
+    // hint, but using that heuristic as the geometry anchor would move the
+    // boundary off our own resting order price. Prefer the live pivot only
+    // when its provenance is 'fill'; otherwise fall back to the bot-scoped
+    // last-market-fill row (a real trade that survives grid regeneration).
+    const ref = resolveFillProvenancedReference(manager);
     const price = Number(ref?.price);
     if (!Number.isFinite(price) || price <= 0) return { boundaryIdx: boundary, reanchored: false, reason: 'cold-pivot' };
     const side = ref.type === ORDER_TYPES.SELL ? ORDER_TYPES.SELL : ref.type === ORDER_TYPES.BUY ? ORDER_TYPES.BUY : null;
@@ -1557,9 +1563,40 @@ export function reanchorBoundaryFromLastFill(manager: OrderManagerLike, boundary
     }
     const candidate = Math.max(0, Math.min(ceiling, required));
     if (candidate === boundary) return { boundaryIdx: boundary, reanchored: false, reason: 'no-op' };
+    // Clamping can defeat the anchor: a fill near the grid ceiling needs
+    // `required > ceiling`, so the clamped candidate still leaves the fill
+    // inside its own window. Fail closed instead of reporting a re-anchor that
+    // did not move the fill outside.
+    const outsideWindow = side === ORDER_TYPES.SELL ? candidate >= required : candidate <= required;
+    if (!outsideWindow) {
+        return { boundaryIdx: boundary, reanchored: false, reason: 'ceiling-clamped' };
+    }
+    // The fill's OWN residual is not a stranding placement: a partial fill
+    // leaves the remainder at the fill slot, and any boundary that puts the
+    // fill outside its window necessarily puts that slot inside the implied
+    // band. Allow exactly that residual (PARTIAL, same side, same ladder
+    // level); every other in-band order still refuses the re-anchor.
+    const allowedInBandSlotIds: string[] = [];
+    const fillSlotOrder = Array.isArray(slots) ? slots[idx] : null;
+    if (fillSlotOrder && fillSlotOrder.orderId
+        && fillSlotOrder.state === ORDER_STATES.PARTIAL
+        && fillSlotOrder.type === side) {
+        let orderIdx: number | null = null;
+        try { orderIdx = Number(MathUtils.slotIndexForPrice(Number(fillSlotOrder.price), genesis)); } catch { orderIdx = null; }
+        const orderPrice = Number(fillSlotOrder.price);
+        if (orderIdx === idx && Number.isFinite(orderPrice) && orderPrice > 0
+            && Math.abs(orderPrice - price) / price <= maxDrift) {
+            allowedInBandSlotIds.push(String(fillSlotOrder.id));
+        }
+    }
     let check: { ok: boolean; reason?: string } = { ok: true };
     try {
-        check = MathUtils.validatePersistedBoundary(candidate, slots ?? [], gap);
+        check = MathUtils.validatePersistedBoundary(
+            candidate,
+            slots ?? [],
+            gap,
+            allowedInBandSlotIds.length > 0 ? { allowInBandSlotIds: allowedInBandSlotIds } : undefined
+        );
     } catch (err) {
         check = { ok: false, reason: getErrorMessage(err) };
     }
@@ -1575,6 +1612,34 @@ export function reanchorBoundaryFromLastFill(manager: OrderManagerLike, boundary
         );
     } catch { /* logging is best-effort */ }
     return { boundaryIdx: candidate, reanchored: true, from: boundary, to: candidate, side, fillSlot: idx };
+}
+
+/**
+ * Resolve a FILL-PROVENANCED reference for absolute geometry repairs.
+ *
+ * `resolveLastFillGuardReference` intentionally accepts a one-sided book seed
+ * as a guard hint. A re-anchor is different: it moves the boundary, so a
+ * heuristic max-bid/min-ask price must never be treated as a trade. Accept the
+ * live pivot only when `lastFillPivotSource === 'fill'`; otherwise fall back to
+ * the bot-scoped last-market-fill row, which is written only by real fills and
+ * survives grid regeneration.
+ * @param {Object} manager - OrderManager instance
+ * @returns {{price: number|null, type: string|null}}
+ */
+function resolveFillProvenancedReference(manager: OrderManagerLike): { price: number | null; type: string | null } {
+    if (manager?.lastFillPivotSource === 'fill') {
+        const livePrice = Number(manager?._lastFilledPrice);
+        const liveType = manager?._lastFilledType;
+        if (Number.isFinite(livePrice) && livePrice > 0 && (liveType === ORDER_TYPES.BUY || liveType === ORDER_TYPES.SELL)) {
+            return { price: livePrice, type: liveType };
+        }
+    }
+    const marketPrice = Number(manager?._lastMarketFillPrice);
+    const marketType = manager?._lastMarketFillType;
+    if (Number.isFinite(marketPrice) && marketPrice > 0 && (marketType === ORDER_TYPES.BUY || marketType === ORDER_TYPES.SELL)) {
+        return { price: marketPrice, type: marketType };
+    }
+    return { price: null, type: null };
 }
 
 export function resolveLastFillGuardReference(manager: OrderManagerLike): { price: number | null; type: string | null } {

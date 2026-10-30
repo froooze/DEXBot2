@@ -484,8 +484,15 @@ The correction path is fund-only and never manufactures budget by shrinking a re
    it cannot move bestBuy/bestSell and cannot narrow the spread.
 4. Contiguous gap-slot promotion may extend the window while preserving
    MIN_SPREAD_ORDERS and the opposite placed rail.
-5. If free funds cannot cover every target, place the affordable prefix, stop
-   without shrinking inventory, and log the fund-constrained remainder.
+5. If free funds cannot cover every target, place the affordable prefix, then
+   **rotate a resting same-side order** into each unfunded promoted gap slot
+   (same booked size, never a new commitment). A fully allocated rail has ~0
+   free forever, so create-only repair can never close the spread; the rotation
+   is the repair path and is bounded by the same promotion, crossing, last-fill,
+   dedupe/duplicate-price and edge-order guards as a create. It never shrinks or
+   grows the moved order. Exactly-zero free on both sides is covered by a
+   rotation-only fallback around side selection (an unavailable market price is
+   still a hard skip: cross-asset comparison is unsafe).
 6. If neither side places an effective order, `checkSpreadCondition` reports a
    `stall` cause (`no-free-funds` / `unfunded` / `no-candidates` / `cold-book` /
    `unmatched-orders` / `readiness-gate` / `last-fill-blocked` /
@@ -521,8 +528,10 @@ const availableFund = Math.max(0, Math.min(
     manager.accountTotals[side === 'buy' ? 'buyFree' : 'sellFree']
 ));
 
-// Each target is created or topped up only while remainingBudget covers it.
-// No resting ACTIVE/PARTIAL order is shrunk to fund the correction.
+// Each target is created only while remainingBudget covers it.
+// If the budget cannot fund a promoted gap slot, a resting same-side ACTIVE
+// order is rotated into that slot at its booked size (no new commitment).
+// No resting ACTIVE/PARTIAL order is shrunk or grown to fund the correction.
 ```
 
 `availableFund` is `chainFree − virtualReservation`, so it reads 0 when the
@@ -576,13 +585,27 @@ SELL fill at slot f  ->  boundary >= f - gapSlots     (sellStart = f + 1)
 BUY  fill at slot f  ->  boundary <= f - 1            (buy window ends below f)
 ```
 
-Preconditions, all fail-closed: a real fill-provenanced pivot (a cold/book-seeded
-pivot or a price without a recorded fill side never anchors), an on-ladder price
-within one increment (`off-ladder-fill`), and the candidate must pass
-`validatePersistedBoundary` — a re-anchor that would strand a live order inside
-the re-typed band is refused (`unsafe: placed_order_in_band`). Every accepted
-re-anchor is logged at warn with the fill slot, the pivot price and the boundary
-move.
+Preconditions, all fail-closed: a real fill-provenanced pivot (`lastFillPivotSource`
+must be `fill`; a book-seeded max-bid/min-ask heuristic never anchors, and the
+bot-scoped last-market-fill row is the fallback), an on-ladder price within one
+increment (`off-ladder-fill`), a target that actually puts the fill outside the
+window after the grid-ceiling clamp (`ceiling-clamped`), and the candidate must
+pass `validatePersistedBoundary`. A live order inside the re-typed band still
+refuses the re-anchor (`unsafe: placed_order_in_band`) with one deliberate
+exception: the fill's **own PARTIAL residual** at the anchor slot (same side,
+same ladder level) is allow-listed, because any boundary that puts the fill
+outside its window necessarily puts that remainder inside the band. A partial
+fill therefore no longer deadlocks the geometry; GAP-EVAC cleans the residual
+afterwards. Because that remainder is persisted in-band, the startup and
+recovery load paths pass `tolerateTransientStranding` and keep the boundary
+(warn + load) instead of rebuilding it away. Every accepted re-anchor is logged
+at warn with the fill slot, the pivot price and the boundary move.
+
+The re-anchor is an **absolute** anchor. Its accepted result subsumes every
+pending crawl snapshot taken at plan time (`consumedCrawlIds` is replaced with
+the whole snapshot in `calculateTargetGrid`), otherwise a later derivation could
+apply those older deltas on top of the re-anchored boundary. Records recorded
+after plan-build are not in the snapshot and stay owed for the next cycle.
 
 ### Candidate Selection: Spread Edge, Grid Slot, Last-Fill Consistent
 

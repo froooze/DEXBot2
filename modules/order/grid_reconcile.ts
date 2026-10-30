@@ -109,7 +109,11 @@ export async function attemptResumePersistedGridByPriceMatch({
         const { loadGrid } = require('./grid');
         // Prefer explicit genesis if caller wired it, else fall back to manager._genesis
         const genesisArg = genesis ?? manager._genesis ?? null;
-        await loadGrid(manager, persistedGrid, boundaryIdx, genesisArg);
+        // This is a resume/adoption path, not a poison-ingestion path. Pure
+        // in-band stranding is the normal SPREAD-GUARD / partial-fill-anchor
+        // state and GAP-EVAC owns cleanup; keep the persisted boundary so a
+        // re-anchor surviving in the snapshot is not rebuilt away here.
+        await loadGrid(manager, persistedGrid, boundaryIdx, genesisArg, { tolerateTransientStranding: true });
         await manager.synchronizeWithChain(chainOpenOrders, 'readOpenOrders');
 
         const matchedOrderIds = new Set(

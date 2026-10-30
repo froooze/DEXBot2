@@ -15,7 +15,7 @@
 
 const assert = require('assert');
 const { deriveTargetBoundary } = require('../modules/order/utils/order');
-const { ORDER_TYPES } = require('../modules/constants');
+const { ORDER_TYPES, ORDER_STATES } = require('../modules/constants');
 
 let passed = 0;
 let failed = 0;
@@ -167,6 +167,64 @@ run('CRAWL-10 the explicit drop path (rebuild/reject) still clears everything', 
     manager._clearPendingFillCrawls('grid rebuild');
     assert.strictEqual(manager._pendingFillCrawls.length, 0,
         'a discarded generation has no geometry for the deltas to apply onto');
+});
+
+run('CRAWL-11 a fill re-anchor consumes the whole owed ledger at plan time', () => {
+    // A capped derivation (crossChunkBudget 0) leaves every owed record
+    // unconsumed, then the absolute fill anchor moves the boundary. If those
+    // records stay owed, the next derivation applies them ON TOP of the
+    // re-anchored boundary. The strategy must snapshot and consume them.
+    const StrategyModule = require('../modules/order/strategy').default;
+    const StrategyEngine = StrategyModule.default || StrategyModule.StrategyEngine || StrategyModule;
+    const localSlots = LEVELS.map((price, idx) => ({
+        id: `slot-${idx}`, price,
+        type: idx <= 6 ? ORDER_TYPES.BUY : ORDER_TYPES.SELL,
+        state: ORDER_STATES.VIRTUAL, size: 10, orderId: null,
+    }));
+    const manager: any = {
+        _genesis: { priceLevels: LEVELS, startPrice: 100, incrementPercent: 1, gapSlots: 1 },
+        _gapSlots: 1,
+        _boundaryShiftBudget: 0,
+        _pendingFillCrawls: [crawl('slot-3', ORDER_TYPES.SELL, 11000)],
+        _lastFilledPrice: 105,
+        _lastFilledType: ORDER_TYPES.SELL,
+        lastFillPivotSource: 'fill',
+        _lastMarketFillPrice: null,
+        _lastMarketFillType: null,
+        orders: new Map(localSlots.map((s) => [s.id, { ...s }])),
+        config: {
+            ...config,
+            assetA: 'TEST', assetB: 'BTS',
+            targetSpreadPercent: 2,
+            weightDistribution: { buy: 1, sell: 1 },
+            gridLimits: { PARTIAL_DUST_THRESHOLD_PERCENTAGE: 5, MIN_ORDER_SIZE_FACTOR: 50 },
+            feeParams: { BTS_RESERVATION_MULTIPLIER: 1.2 },
+            min_BTS_value: 0,
+        },
+        assets: {
+            assetA: { id: '1.3.0', precision: 6, symbol: 'TEST' },
+            assetB: { id: '1.3.1', precision: 6, symbol: 'BTS' },
+        },
+        logger: { log: () => {} },
+        _markGridDirty: () => {},
+    };
+    const strategy = new StrategyEngine(manager);
+    const result = strategy.calculateTargetGrid({
+        frozenMasterGrid: manager.orders,
+        config: manager.config,
+        accountAssets: manager.assets,
+        funds: {
+            allocatedBuy: 5000, allocatedSell: 500,
+            chainFreeBuy: 5000, chainFreeSell: 500,
+            btsBalance: { free: 100 },
+        },
+        fills: [],
+        currentBoundaryIdx: 2,
+    });
+    assert.strictEqual(result.boundaryIdx, 4, `re-anchor must move 2 -> 4, got ${result.boundaryIdx}`);
+    assert.deepStrictEqual(result.consumedCrawlIds,
+        [{ slotId: 'slot-3', side: ORDER_TYPES.SELL, ts: 11000 }],
+        'the absolute re-anchor must subsume the owed record at plan time');
 });
 
 console.log(`\nCRAWL-CONSUME summary: ${passed} passed, ${failed} failed`);

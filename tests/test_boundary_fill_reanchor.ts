@@ -16,7 +16,7 @@
 
 const assert = require('assert');
 const { reanchorBoundaryFromLastFill } = require('../modules/order/utils/system');
-const { ORDER_TYPES } = require('../modules/constants');
+const { ORDER_TYPES, ORDER_STATES } = require('../modules/constants');
 
 let passed = 0;
 let failed = 0;
@@ -36,26 +36,30 @@ function run(name: string, fn: () => void) {
 
 const LEVELS = [100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111];
 
-function makeSlots(placedIdxs: number[] = []) {
+function makeSlots(placedIdxs: number[] = [], partialIdxs: number[] = []) {
     const placed = new Set(placedIdxs);
+    const partial = new Set(partialIdxs);
     return LEVELS.map((price, idx) => ({
         id: `slot-${idx}`,
         type: idx < 6 ? ORDER_TYPES.BUY : ORDER_TYPES.SELL,
         price,
-        orderId: placed.has(idx) ? `1.7.${idx}` : null,
+        orderId: placed.has(idx) || partial.has(idx) ? `1.7.${idx}` : null,
+        state: partial.has(idx) ? ORDER_STATES.PARTIAL : ORDER_STATES.ACTIVE,
         size: 10,
     }));
 }
 
-function makeManager(fillPrice: number | null, fillType: string | null) {
+function makeManager(fillPrice: number | null, fillType: string | null, over: Record<string, any> = {}) {
     return {
         _genesis: { priceLevels: LEVELS },
         config: { incrementPercent: 1 },
         _lastFilledPrice: fillPrice,
         _lastFilledType: fillType,
+        lastFillPivotSource: fillPrice != null && fillType != null ? 'fill' : null,
         _lastMarketFillPrice: null,
         _lastMarketFillType: null,
         logger: { log: () => {} },
+        ...over,
     };
 }
 
@@ -129,6 +133,57 @@ run('REANCHOR-8 a missing boundary is left to the derivation', () => {
     const mgr = makeManager(105, ORDER_TYPES.SELL);
     assert.strictEqual(reanchorBoundaryFromLastFill(mgr, null, makeSlots(), 1).reason, 'no-boundary');
     assert.strictEqual(reanchorBoundaryFromLastFill(mgr, undefined, makeSlots(), 1).reason, 'no-boundary');
+});
+
+run('REANCHOR-9 the fill\'s own PARTIAL residual does not block the re-anchor', () => {
+    // Fill at idx 7 (107), gap 1 => boundary target 6, band (6, 8): the
+    // partial remainder at idx 7 is inside the new band but it IS the fill
+    // anchor, not a stranded foreign order.
+    const mgr = makeManager(107, ORDER_TYPES.SELL);
+    const r = reanchorBoundaryFromLastFill(mgr, 3, makeSlots([], [7]), 1);
+    assert.strictEqual(r.reanchored, true, `expected a re-anchor, got ${JSON.stringify(r)}`);
+    assert.strictEqual(r.boundaryIdx, 6);
+    assert.strictEqual(r.fillSlot, 7);
+});
+
+run('REANCHOR-10 an ACTIVE in-band order at the fill slot is still refused (not the residual)', () => {
+    // Same geometry as REANCHOR-9 but the slot is ACTIVE, not PARTIAL: that
+    // is a genuinely stranded placement and must keep blocking the re-anchor.
+    const mgr = makeManager(107, ORDER_TYPES.SELL);
+    const r = reanchorBoundaryFromLastFill(mgr, 3, makeSlots([7]), 1);
+    assert.strictEqual(r.reanchored, false, 'an ACTIVE in-band order must never be allowed');
+    assert.ok(String(r.reason).startsWith('unsafe:'), `expected unsafe, got ${r.reason}`);
+});
+
+run('REANCHOR-12 a book-seeded pivot never supplies the absolute anchor', () => {
+    // One-sided book seed: price/type are set, but provenance is 'book'.
+    // Without a real market-fill row there is nothing to anchor to.
+    const mgr = makeManager(105, ORDER_TYPES.SELL, { lastFillPivotSource: 'book' });
+    const r = reanchorBoundaryFromLastFill(mgr, 2, makeSlots(), 1);
+    assert.strictEqual(r.reanchored, false, 'a book seed must not move the boundary');
+    assert.strictEqual(r.reason, 'cold-pivot');
+});
+
+run('REANCHOR-13 a real market fill rescues a book-seeded live pivot', () => {
+    const mgr = makeManager(105, ORDER_TYPES.SELL, {
+        lastFillPivotSource: 'book',
+        _lastMarketFillPrice: 108,
+        _lastMarketFillType: ORDER_TYPES.SELL,
+    });
+    const r = reanchorBoundaryFromLastFill(mgr, 2, makeSlots(), 1);
+    assert.strictEqual(r.reanchored, true, `expected the market-fill fallback to anchor, got ${JSON.stringify(r)}`);
+    assert.strictEqual(r.boundaryIdx, 7, 'fill at idx 8 with gap 1 => boundary 7');
+    assert.strictEqual(r.fillSlot, 8);
+});
+
+run('REANCHOR-11 a ceiling-clamped target fails closed', () => {
+    // Genesis has 12 levels but the live slot list is shorter (legacy grid).
+    // Fill at idx 11 needs boundary 10, ceiling is 10-1-1=8 => the clamp can
+    // no longer put the fill outside its window; the re-anchor must refuse.
+    const mgr = makeManager(111, ORDER_TYPES.SELL);
+    const r = reanchorBoundaryFromLastFill(mgr, 4, makeSlots().slice(0, 10), 1);
+    assert.strictEqual(r.reanchored, false, `expected refusal, got ${JSON.stringify(r)}`);
+    assert.strictEqual(r.reason, 'ceiling-clamped');
 });
 
 console.log(`\nREANCHOR summary: ${passed} passed, ${failed} failed`);

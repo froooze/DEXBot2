@@ -677,7 +677,19 @@ async function finishStartupSequence(bot: BotLike, startupState: Awaited<ReturnT
                     await bot._persistAndRecoverIfNeeded();
                 } else {
                     bot._log('Found active session. Loading and syncing existing grid.');
-                    await botGridModule(bot).loadGrid(bot.manager, persistedGrid, persistedBoundaryIdx, persistedGenesis);
+                    // Pure in-band stranding is the transient SPREAD-GUARD /
+                    // partial-fill-anchor state, not snapshot poison: the
+                    // re-anchor deliberately leaves the fill's own PARTIAL
+                    // residual inside the band until GAP-EVAC clears it.
+                    // Keep the persisted boundary (warn + load) exactly like
+                    // the recovery path; a rebuild here would undo the repair.
+                    await botGridModule(bot).loadGrid(
+                        bot.manager,
+                        persistedGrid,
+                        persistedBoundaryIdx,
+                        persistedGenesis,
+                        { tolerateTransientStranding: true }
+                    );
                     // Phase 3 restart resilience: restore persisted gap-evacuation
                     // streaks (pruned to surviving slots) so an order stranded
                     // in-band across frequent restarts still reaches the cancel

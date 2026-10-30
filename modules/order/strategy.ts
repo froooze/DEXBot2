@@ -328,6 +328,25 @@ class StrategyEngine {
         const reanchor = reanchorBoundaryFromLastFill(this.manager, newBoundaryIdx, allSlots, gapSlots);
         if (reanchor.reanchored) {
             newBoundaryIdx = reanchor.boundaryIdx;
+            // An absolute fill anchor already reflects every older owed crawl.
+            // The derivation may have left records owed (cap exhausted, mixed
+            // remainder), so consuming only its subset would let a later
+            // derivation apply those deltas ON TOP of the re-anchored boundary
+            // and overshoot. Snapshot at PLAN time (not commit time): a fill
+            // recorded after this plan must stay owed and crawl next cycle.
+            const pendingAtPlan = Array.isArray(this.manager._pendingFillCrawls)
+                ? this.manager._pendingFillCrawls
+                : [];
+            consumedCrawlIds = pendingAtPlan
+                .filter((e) => e && typeof e.slotId === 'string' && e.slotId.length > 0)
+                .map((e) => {
+                    const ts = Number(e.ts);
+                    return {
+                        slotId: e.slotId,
+                        side: String(e.side ?? ''),
+                        ...(Number.isFinite(ts) ? { ts } : {})
+                    };
+                });
             try { this.manager._markGridDirty?.(); } catch { /* best-effort */ }
         }
         // Unanchorable (null boundary, no numeric center anywhere): refuse to

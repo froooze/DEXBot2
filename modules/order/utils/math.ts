@@ -1714,7 +1714,7 @@ function validateBoundaryCommit(
     proposedBoundary: number | null | undefined,
     orders: Iterable<unknown>,
     gapSlots: number,
-    options: { rejectInBandPlacements?: boolean } = {}
+    options: { rejectInBandPlacements?: boolean; allowInBandSlotIds?: Iterable<string> } = {}
 ): { ok: boolean; reason?: string; detail?: string } {
     // Absent-aware: null/undefined/'' means "no proposal" (ok), NOT boundary 0,
     // otherwise Number('') === 0 would self-legalize a fake boundary 0 commit.
@@ -1773,6 +1773,15 @@ function validateBoundaryCommit(
     let inBandCount = 0;
     let firstInBandIdx: number | null = null;
     let firstInBandPrice: number | null = null;
+    // Explicit allow-list for the fill's OWN residual order (partial fill at
+    // the anchor slot). A re-anchor to `fillSlot - gapSlots` necessarily puts
+    // that residual inside the implied band; refusing it deadlocks the
+    // geometry (the residual cannot be cancelled by the re-anchor itself).
+    // Callers must pass only the last-fill residual id — ACTIVE/foreign
+    // in-band placements stay rejected.
+    const allowedInBand = options.allowInBandSlotIds
+        ? new Set(Array.from(options.allowInBandSlotIds).filter((id): id is string => typeof id === 'string' && id.length > 0))
+        : null;
     for (let idx = 0; idx < sorted.length; idx++) {
         const o = sorted[idx];
         if (!o.orderId) continue;
@@ -1782,6 +1791,8 @@ function validateBoundaryCommit(
         } else if (idx >= sellStart) {
             if (price < minSellPrice) minSellPrice = price;
         } else if (options.rejectInBandPlacements) {
+            const slotId = (o as { id?: unknown }).id;
+            if (allowedInBand && typeof slotId === 'string' && allowedInBand.has(slotId)) continue;
             inBandCount++;
             if (firstInBandIdx === null) {
                 firstInBandIdx = idx;
@@ -1838,9 +1849,13 @@ function validateBoundaryCommit(
 function validatePersistedBoundary(
     proposedBoundary: number | null | undefined,
     orders: Iterable<unknown>,
-    gapSlots: number
+    gapSlots: number,
+    options: { allowInBandSlotIds?: Iterable<string> } = {}
 ): { ok: boolean; reason?: string; detail?: string } {
-    return validateBoundaryCommit(proposedBoundary, orders, gapSlots, { rejectInBandPlacements: true });
+    return validateBoundaryCommit(proposedBoundary, orders, gapSlots, {
+        rejectInBandPlacements: true,
+        ...(options.allowInBandSlotIds ? { allowInBandSlotIds: options.allowInBandSlotIds } : {})
+    });
 }
 
 /**
