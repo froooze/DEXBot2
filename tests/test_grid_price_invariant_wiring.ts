@@ -367,8 +367,8 @@ async function testWIRE003_PivotIsValidatedNotRaw() {
     // the raw one (allowed). That is what makes the wiring observable.
     const { isLastFillGuardBlocked } = require('../modules/dexbot_cow_runtime');
     const price = 111;
-    const viaValidated = isLastFillGuardBlocked(price, 10, ORDER_TYPES.BUY, validated.price, ORDER_TYPES.BUY, 5);
-    const viaRaw = isLastFillGuardBlocked(price, 10, ORDER_TYPES.BUY, 112, ORDER_TYPES.BUY, 5);
+    const viaValidated = isLastFillGuardBlocked(price, ORDER_TYPES.BUY, validated.price, ORDER_TYPES.BUY);
+    const viaRaw = isLastFillGuardBlocked(price, ORDER_TYPES.BUY, 112, ORDER_TYPES.BUY);
 
     assert.strictEqual(viaValidated.blocked, true,
         'a BUY at 111 must be BLOCKED when judged against the validated pivot 110 (BUY must be below it)');

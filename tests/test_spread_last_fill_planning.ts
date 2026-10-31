@@ -23,6 +23,7 @@ const { OrderManager } = require('../modules/order/manager');
 const { grid: Grid } = require('../modules/order').default;
 const { ORDER_TYPES, ORDER_STATES } = require('../modules/constants');
 const { trackOutOfSpreadStaleness } = require('../modules/dexbot_maintenance_runtime');
+const { warnCrossingCreate } = require('../modules/dexbot_cow_runtime');
 
 /**
  * Mid-grid voided rail: BUY slots 0-1 ACTIVE, gap 2-4 empty (SPREAD), SELL 5-6
@@ -283,7 +284,7 @@ function testGeometryBindEscalatesEarly() {
     console.log('  ✓ SLF-10 passed');
 }
 
-function makeBot() {
+function makeBot(pivot: { price: number; type: string } | null = null) {
     const logs: Array<{ msg: string; level?: string }> = [];
     return {
         _outOfSpreadSince: 0,
@@ -291,15 +292,98 @@ function makeBot() {
         _outOfSpreadTransientCount: 0,
         _outOfSpreadToleranceSince: 0,
         _lastSpreadStaleResyncAt: 0,
+        _lastGeometryResyncPivotKey: '',
+        _geometryResyncWarnedPivotKey: '',
         _spreadCorrectionStall: null,
         manager: {
             outOfSpread: 1,
             requestStructuralGridResync: () => { throw new Error('unexpected resync'); },
-            logger: { log: () => {} }
+            logger: { log: () => {} },
+            _lastMarketFillPrice: pivot ? pivot.price : null,
+            _lastMarketFillType: pivot ? pivot.type : null,
+            _lastMarketFillAt: pivot ? Date.now() - (30 * 60 * 1000) : 0
         },
         _log: (msg: string, level?: string) => logs.push({ msg: String(msg), level }),
         logs
     };
+}
+
+function testGeometryBindRecenterIsCappedPerPivot() {
+    console.log('\n[SLF-11] one geometry re-center per fill pivot (churn cap)...');
+    const pivot = { price: 1.07, type: ORDER_TYPES.SELL };
+    const bot: any = makeBot(pivot);
+    let resyncs = 0;
+    bot.manager.requestStructuralGridResync = () => { resyncs += 1; };
+    bot.manager.outOfSpread = 2;
+    bot._spreadCorrectionStall = 'last-fill-blocked';
+    bot._outOfSpreadSince = Date.now() - (12 * 60 * 1000); // past the 10 min geometry window
+
+    // 1st: the re-center can help (it re-derives the center around the pivot).
+    const first = trackOutOfSpreadStaleness(bot, true, 0, false);
+    assert.strictEqual(first.escalated, true, 'the first geometry bind must re-center');
+    assert.strictEqual(resyncs, 1);
+    assert.strictEqual(bot._lastGeometryResyncPivotKey, `${pivot.price}|${pivot.type}`,
+        'the pivot the re-center ran for must be recorded');
+
+    // 2nd with the SAME pivot (cooldown elapsed): refuse and say why once.
+    bot._lastSpreadStaleResyncAt = 0; // pretend the cooldown has elapsed
+    const second = trackOutOfSpreadStaleness(bot, true, 0, false);
+    assert.strictEqual(second.escalated, false,
+        'a re-center cannot move the pivot, so the same fill must not trigger another one');
+    assert.strictEqual(resyncs, 1, 'no second structural re-center');
+    assert.ok(bot.logs.some((l: any) => /cannot clear it/.test(String(l.msg))),
+        `the refusal must be explained (got: ${bot.logs.map((l: any) => l.msg).join(' | ')})`);
+    const warns = bot.logs.filter((l: any) => /cannot clear it/.test(String(l.msg))).length;
+    trackOutOfSpreadStaleness(bot, true, 0, false);
+    assert.strictEqual(bot.logs.filter((l: any) => /cannot clear it/.test(String(l.msg))).length, warns,
+        'the explanation must not repeat every tick');
+
+    // A NEW fill pivot re-arms the escalation budget (that re-center can help).
+    bot.manager._lastMarketFillPrice = 1.065;
+    bot._lastSpreadStaleResyncAt = 0;
+    const third = trackOutOfSpreadStaleness(bot, true, 0, false);
+    assert.strictEqual(third.escalated, true, 'a fresh pivot gets a fresh re-center budget');
+    assert.strictEqual(resyncs, 2);
+
+    // A placement (spread healed) clears the memory.
+    trackOutOfSpreadStaleness(bot, true, 1, false);
+    assert.strictEqual(bot._lastGeometryResyncPivotKey, '', 'a placement clears the churn memory');
+    assert.strictEqual(bot._geometryResyncWarnedPivotKey, '');
+    console.log('  ✓ SLF-11 passed');
+}
+
+function testCrossingCreateIsObserved() {
+    console.log('\n[SLF-12] a generic CREATE on the crossing side is observed, never blocked...');
+    const logs: Array<{ msg: string; level?: string }> = [];
+    const bot: any = {
+        manager: {
+            logger: { log: (msg: string, level?: string) => logs.push({ msg: String(msg), level }) },
+            // No live market read: the floor falls back to the fill reference.
+            _lastFilledPrice: 1.05,
+            _lastFilledType: ORDER_TYPES.SELL,
+            lastFillPivotSource: 'fill',
+            _lastFilledAt: Date.now()
+        }
+    };
+    // A SELL at/below the floor crosses (the planner's `doesNotCrossMarket`).
+    assert.strictEqual(warnCrossingCreate(bot, 1.05, ORDER_TYPES.SELL, 'slot-9'), true,
+        'a SELL at the floor must be observed');
+    assert.strictEqual(warnCrossingCreate(bot, 1.04, ORDER_TYPES.SELL, 'slot-9'), true,
+        'a SELL below the floor must be observed');
+    assert.ok(logs.some((l) => /crossing side of the floor/.test(l.msg)), 'the observation must be logged');
+    const warned = logs.length;
+    // The safe side is silent, and the helper never blocks (returns false).
+    assert.strictEqual(warnCrossingCreate(bot, 1.06, ORDER_TYPES.SELL, 'slot-9'), false,
+        'a SELL above the floor is not a crossing');
+    assert.strictEqual(warnCrossingCreate(bot, 1.0, ORDER_TYPES.BUY, 'slot-2'), false,
+        'a BUY below the floor is not a crossing');
+    assert.strictEqual(logs.length, warned, 'non-crossing placements must not log');
+    // Fail-open when no reference exists (cold) or the price/type is unusable.
+    const cold: any = { manager: { logger: { log: () => {} } } };
+    assert.strictEqual(warnCrossingCreate(cold, 1.05, ORDER_TYPES.SELL, 'slot-9'), false, 'a cold floor is a no-op');
+    assert.strictEqual(warnCrossingCreate(bot, NaN, ORDER_TYPES.SELL, 'slot-9'), false, 'a bad price is a no-op');
+    assert.strictEqual(warnCrossingCreate(bot, 1.05, 'SPREAD', 'slot-9'), false, 'a side-neutral type is a no-op');
+    console.log('  ✓ SLF-12 passed');
 }
 
 async function main() {
@@ -313,6 +397,8 @@ async function main() {
     await testSellMirrorReportsGeometryBind();
     testStallMergePrecedence();
     testGeometryBindEscalatesEarly();
+    testGeometryBindRecenterIsCappedPerPivot();
+    testCrossingCreateIsObserved();
     console.log('\nAll spread last-fill planning tests passed.');
 }
 

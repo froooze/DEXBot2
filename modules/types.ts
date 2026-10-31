@@ -255,6 +255,15 @@ export interface BotLike {
   _lastDeferredHoldResyncAt: number;
   _lastGridPriceInvariantResyncAt: number;
   _lastSpreadStaleResyncAt: number;
+  /**
+   * Fill pivot (`price|type`) the geometry-bind (`last-fill-blocked`) escalation
+   * already re-centered for. A re-center does not move the pivot, so a second
+   * request on the same fill only churns the new generation; cleared whenever
+   * the spread heals.
+   */
+  _lastGeometryResyncPivotKey: string;
+  /** Pivot key the "re-center cannot clear this pivot" warning was logged for. */
+  _geometryResyncWarnedPivotKey: string;
   _gridLockHoldWarnAt: number;
   _outOfSpreadSince: number;
   _outOfSpreadStaleWarned: boolean;

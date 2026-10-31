@@ -9,7 +9,7 @@ import { lazyShim } from './lazy_shim.js';
 
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
-import { nowIso, fireStructuralResync } from './order/utils/system.js';
+import { nowIso, fireStructuralResync, resolveLastFillGuardReference } from './order/utils/system.js';
 import { path } from './path_api.js';
 import * as chainOrders from './chain_orders.js';
 import * as grid from './order/grid.js';
@@ -2765,6 +2765,19 @@ async function executeMaintenanceLogic(bot: BotLike, context: string) {
 }
 
 /**
+ * Clear the geometry-bind re-center memory (one re-center per fill pivot).
+ * Called whenever the spread actually heals — a placement or a sustained
+ * in-tolerance run — so a later geometry bind on a *different* pivot starts
+ * with a fresh budget.
+ * @param {Object} bot - DEXBot instance
+ */
+function clearGeometryResyncMemory(bot: BotLike) {
+    if (!bot) return;
+    bot._lastGeometryResyncPivotKey = '';
+    bot._geometryResyncWarnedPivotKey = '';
+}
+
+/**
  * Out-of-spread persistence watchdog: the never-run-stale backstop.
  *
  * The spread check retries every pipeline-empty tick (level-triggered), but a
@@ -2795,6 +2808,7 @@ export function trackOutOfSpreadStaleness(bot: BotLike, spreadChecked: boolean, 
         bot._outOfSpreadStaleWarned = false;
         bot._outOfSpreadTransientCount = 0;
         bot._outOfSpreadToleranceSince = 0;
+        clearGeometryResyncMemory(bot);
         try { bot.manager._spreadRailOversubscribed = null; } catch { /* best-effort */ }
         return { staleMs: 0, escalated: false };
     }
@@ -2816,6 +2830,7 @@ export function trackOutOfSpreadStaleness(bot: BotLike, spreadChecked: boolean, 
         bot._outOfSpreadStaleWarned = false;
         bot._outOfSpreadTransientCount = 0;
         bot._outOfSpreadToleranceSince = 0;
+        clearGeometryResyncMemory(bot);
         try { bot.manager._spreadRailOversubscribed = null; } catch { /* best-effort */ }
         return { staleMs: 0, escalated: false };
     }
@@ -2865,19 +2880,48 @@ export function trackOutOfSpreadStaleness(bot: BotLike, spreadChecked: boolean, 
         ? Number(TIMING.SPREAD_STALE_FUND_ESCALATE_MS)
         : 5 * 60 * 1000;
     // The geometry bind has its own (longer than funds, shorter than structural)
-    // window: the sell window is behind the last sale, which only a re-center
-    // repairs.
+    // window: the window is behind the last fill, which a re-center repairs by
+    // re-deriving the center AROUND that same fill. Capped at ONE re-center per
+    // pivot value: the re-center does not move the pivot, so a second attempt on
+    // the same fill re-derives the same veto (the pivot can sit outside the new
+    // grid's placeable side when the market has moved far away) and would only
+    // cancel/re-place the new generation every cooldown. Until a fill refreshes
+    // the pivot (or it expires), the honest repair is a fill — so report once
+    // and stop.
     const geometryBlocked = bot._spreadCorrectionStall === 'last-fill-blocked';
+    let geometryPivotKey = '';
+    if (geometryBlocked) {
+        try {
+            const ref = resolveLastFillGuardReference(bot.manager);
+            if (ref?.price != null && Number.isFinite(Number(ref.price))) geometryPivotKey = `${Number(ref.price)}|${String(ref.type ?? '')}`;
+        } catch { geometryPivotKey = ''; }
+    }
+    const geometryAlreadyRecentered = geometryBlocked && !!geometryPivotKey
+        && bot._lastGeometryResyncPivotKey === geometryPivotKey;
     const geometryEscalateMs = Number(TIMING?.SPREAD_STALE_GEOMETRY_ESCALATE_MS) > 0
         ? Number(TIMING.SPREAD_STALE_GEOMETRY_ESCALATE_MS)
         : 10 * 60 * 1000;
     const escalateMs = oversubscribedFresh
         ? fundEscalateMs
-        : geometryBlocked
-            ? geometryEscalateMs
-            : (Number(TIMING?.SPREAD_STALE_ESCALATE_MS) > 0
-                ? Number(TIMING.SPREAD_STALE_ESCALATE_MS)
-                : 30 * 60 * 1000);
+        : geometryAlreadyRecentered
+            // Do not re-center again for the same fill. Out of the escalation
+            // ladder entirely: a fill (or the pivot TTL) is the only heal.
+            ? Number.POSITIVE_INFINITY
+            : geometryBlocked
+                ? geometryEscalateMs
+                : (Number(TIMING?.SPREAD_STALE_ESCALATE_MS) > 0
+                    ? Number(TIMING.SPREAD_STALE_ESCALATE_MS)
+                    : 30 * 60 * 1000);
+    if (geometryAlreadyRecentered && staleMs >= warnMs && bot._geometryResyncWarnedPivotKey !== geometryPivotKey) {
+        bot._geometryResyncWarnedPivotKey = geometryPivotKey;
+        bot._log(
+            `[SPREAD-STALE] Still out of tolerance ${staleMin}min after re-centering on fill pivot ` +
+            `${geometryPivotKey.split('|')[0]}: the pivot is outside this generation's placeable side, so a re-center ` +
+            `cannot clear it. A fill (buy back below / sell above the pivot) or pivot expiry restores the side; ` +
+            `no further re-center will be requested for this pivot.`,
+            'warn'
+        );
+    }
     if (staleMs >= warnMs && !bot._outOfSpreadStaleWarned) {
         bot._outOfSpreadStaleWarned = true;
         const stall = bot._spreadCorrectionStall ? `, stall=${bot._spreadCorrectionStall}` : '';
@@ -2900,6 +2944,7 @@ export function trackOutOfSpreadStaleness(bot: BotLike, spreadChecked: boolean, 
         const lastAt = Number(bot._lastSpreadStaleResyncAt) || 0;
         if (now - lastAt >= cooldownMs) {
             bot._lastSpreadStaleResyncAt = now;
+            if (geometryBlocked && geometryPivotKey) bot._lastGeometryResyncPivotKey = geometryPivotKey;
             bot._log(
                 `[SPREAD-STALE] Spread out of tolerance for ${staleMin}min despite corrections` +
                 `${oversubscribedFresh ? ' (rail oversubscribed — re-sizing from chain truth)' : ''}` +

@@ -228,6 +228,14 @@ class DEXBot implements BotLike {
     _lastHeldChainOrderSignatureSince!: number;
     _lastHeldChainOrderWarnAt!: number;
     _lastSpreadStaleResyncAt!: number;
+    /**
+     * Fill pivot (`price|type`) the geometry-bind escalation already re-centered
+     * for. A re-center cannot move the pivot, so the same fill is never
+     * re-centered twice — churn guard, cleared when the spread heals.
+     */
+    _lastGeometryResyncPivotKey!: string;
+    /** Pivot key the "re-center cannot clear this" warning was already logged for. */
+    _geometryResyncWarnedPivotKey!: string;
     _marketAdapterWatchdogInFlight!: boolean;
     _outOfSpreadSince!: number;
     _outOfSpreadStaleWarned!: boolean;
@@ -298,6 +306,8 @@ class DEXBot implements BotLike {
         // the first maintenance tick. Values mirror the lazy fallbacks in
         // trackOutOfSpreadStaleness.
         this._lastSpreadStaleResyncAt = 0;
+        this._lastGeometryResyncPivotKey = '';
+        this._geometryResyncWarnedPivotKey = '';
         this._outOfSpreadSince = 0;
         this._outOfSpreadStaleWarned = false;
         this._outOfSpreadTransientCount = 0;

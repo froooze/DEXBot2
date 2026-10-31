@@ -52,8 +52,8 @@ async function testRefreshFromQueuedSlotFill() {
     assert.strictEqual(bot._incomingFillQueue.length, 1, 'queue must NOT be drained');
     // With the stale pivot (954.11) a 965.65 sell passed; with the refreshed
     // pivot (971.47) it is blocked — the reported incident shape.
-    const stale = isLastFillGuardBlocked(965.65, 1, ORDER_TYPES.SELL, 954.11, ORDER_TYPES.BUY, INC);
-    const fresh = isLastFillGuardBlocked(965.65, 1, ORDER_TYPES.SELL, bot.manager._lastFilledPrice, bot.manager._lastFilledType, INC);
+    const stale = isLastFillGuardBlocked(965.65, ORDER_TYPES.SELL, 954.11, ORDER_TYPES.BUY);
+    const fresh = isLastFillGuardBlocked(965.65, ORDER_TYPES.SELL, bot.manager._lastFilledPrice, bot.manager._lastFilledType);
     assert.strictEqual(stale.blocked, false, 'stale pivot lets the violating sell through');
     assert.strictEqual(fresh.blocked, true, 'refreshed pivot blocks it');
     console.log('✓ SGP-1 passed');
@@ -120,7 +120,7 @@ async function testPerActionOriginStamping() {
     // The broadcast rule: correction CREATES bypass, rotations never do — so a
     // rotation merged into a correction plan is still guardable at helper level.
     const rotationBlocked = isLastFillGuardBlocked(
-        rotations[0].newPrice, rotations[0].newSize, ORDER_TYPES.SELL, 971.47, ORDER_TYPES.BUY, INC
+        rotations[0].newPrice, ORDER_TYPES.SELL, 971.47, ORDER_TYPES.BUY
     );
     assert.strictEqual(rotationBlocked.blocked, true, 'rotation repricing below sell threshold is guardable regardless of origin');
     // A plan without origin stamps nothing (safe default: guarded).

@@ -14,7 +14,7 @@ const { readOpenOrdersWithMetaSafe } = chainOrdersModule;
 import { BroadcastUncertainError as BroadcastUncertainErrorBinding } from './dexbot_credential_client.js';
 const BroadcastUncertainError = BroadcastUncertainErrorBinding;
 import * as orderUtils from './order/utils/order.js';
-import { sleep, setLastFillPivot, fireStructuralResync, evaluateSpreadCorrectionReadiness, resolveLastFillGuardReference, isLastFillGuardBlocked } from './order/utils/system.js';
+import { sleep, setLastFillPivot, fireStructuralResync, evaluateSpreadCorrectionReadiness, resolveLastFillGuardReference, resolveSpreadCrossingFloor, isLastFillGuardBlocked } from './order/utils/system.js';
 const {
     buildCreateOrderArgs,
     buildCreateOpFingerprint,
@@ -2920,11 +2920,34 @@ export function deriveRailBoundary(
     }
     const gap = Math.floor(rawGap);
     const isSide = (t: unknown): t is string => t === ORDER_TYPES.BUY || t === ORDER_TYPES.SELL;
+    // Base first: the proximity window below is measured from it.
+    const desired = Format.toKnownNumber(desiredBoundary);
+    const committed = Format.toKnownNumber((manager as { boundaryIdx?: unknown })?.boundaryIdx);
+    const gates = manager as unknown as JsonObj;
+    const coreBuy = Number((gates.config as { coreOrders?: { buy?: unknown } } | undefined)?.coreOrders?.buy);
+    const coreSell = Number((gates.config as { coreOrders?: { sell?: unknown } } | undefined)?.coreOrders?.sell);
+    const windowSize = Math.max(1, Number.isFinite(coreBuy) ? coreBuy : 1, Number.isFinite(coreSell) ? coreSell : 1);
+    // STRAY RULE: a MASTER rail order only speaks for this batch if it sits on
+    // its own side of the planned boundary — a BUY at/below it, a SELL at/above
+    // the implied sellStart. Anything else is a rail-typed order parked in the
+    // wrong zone (a refused-commit adoption at an old generation level, a
+    // SPREAD-GUARD stray, a stranded hold) and letting it clamp the boundary
+    // would SELF-LEGALIZE the corrupt state (live class: one live sell 18 slots
+    // below clamped 138 -> 115 and re-typed the whole window).
+    // Ops of THIS batch are always counted: a counter order is the rail fact.
+    const baseForProximity = Number.isFinite(desired) ? Number(desired) : (Number.isFinite(committed) ? Number(committed) : null);
+    // Kept for the report line: how many window slots this grid claims per side
+    // (informational; the stray rule needs no window size).
+    const proximityWindow = windowSize + gap + 1;
 
     // Start from the live master rails, then apply the kept ops as a delta.
     // This is the post-batch rail set: cancels remove, creates add, rotations
     // move (source -> destination), size updates stay.
-    const rails = new Map<string, string>();
+    // Rail index per entry is the LIVE ladder position where known (a slot id
+    // can be stale after a refused-commit adoption — same rule the fill, gap
+    // and crossing paths already use), with the slot id as fallback.
+    const rails = new Map<string, { side: string; idx: number | null; byOp: boolean }>();
+    const vacatedSlotIds = new Set<string>();
     const master = (manager as { orders?: unknown })?.orders;
     let maxSlotIdx: number | null = null;
     if (master instanceof Map) {
@@ -2936,7 +2959,10 @@ export function deriveRailBoundary(
                 maxSlotIdx = maxSlotIdx === null ? Number(parsed) : Math.max(maxSlotIdx, Number(parsed));
             }
             if (!o.orderId || (o.state !== ORDER_STATES.ACTIVE && o.state !== ORDER_STATES.PARTIAL)) continue;
-            if (isSide(o.type)) rails.set(String(o.id), o.type);
+            if (!isSide(o.type)) continue;
+            const live = orderUtils.resolveLiveOrderLadderPosition(o, manager?.assets, manager?._genesis);
+            const idx = live.idx !== null && Number.isFinite(Number(live.idx)) ? Number(live.idx) : null;
+            rails.set(String(o.id), { side: o.type, idx, byOp: false });
         }
     }
 
@@ -2946,7 +2972,10 @@ export function deriveRailBoundary(
             if (!ctx) continue;
             if (ctx.kind === 'cancel') {
                 const id = (ctx.order as JsonObj | undefined)?.id;
-                if (id != null) rails.delete(String(id));
+                if (id != null) {
+                    rails.delete(String(id));
+                    vacatedSlotIds.add(String(id));
+                }
             } else if (ctx.kind === 'create') {
                 const id = ctx.id;
                 const side = (ctx.order as JsonObj | undefined)?.type;
@@ -2955,35 +2984,67 @@ export function deriveRailBoundary(
                     if (parsedId !== null && parsedId !== undefined && Number.isFinite(Number(parsedId))) {
                         maxSlotIdx = maxSlotIdx === null ? Number(parsedId) : Math.max(maxSlotIdx, Number(parsedId));
                     }
+                    if (isSide(side)) {
+                        rails.set(String(id), {
+                            side,
+                            idx: parsedId !== null && parsedId !== undefined && Number.isFinite(Number(parsedId)) ? Number(parsedId) : null,
+                            byOp: true
+                        });
+                    }
                 }
-                if (id != null && isSide(side)) rails.set(String(id), side);
             } else if (ctx.kind === 'rotation') {
                 const rotation = ctx.rotation as JsonObj | undefined;
                 const oldId = (rotation?.oldOrder as JsonObj | undefined)?.id;
                 const newId = rotation?.newGridId;
                 const side = rotation?.type;
-                if (oldId != null) rails.delete(String(oldId));
+                if (oldId != null) {
+                    rails.delete(String(oldId));
+                    vacatedSlotIds.add(String(oldId));
+                }
                 if (newId != null) {
                     const parsedId = parseSlotIndex(String(newId));
                     if (parsedId !== null && parsedId !== undefined && Number.isFinite(Number(parsedId))) {
                         maxSlotIdx = maxSlotIdx === null ? Number(parsedId) : Math.max(maxSlotIdx, Number(parsedId));
                     }
+                    if (isSide(side)) {
+                        rails.set(String(newId), {
+                            side,
+                            idx: parsedId !== null && parsedId !== undefined && Number.isFinite(Number(parsedId)) ? Number(parsedId) : null,
+                            byOp: true
+                        });
+                    }
                 }
-                if (newId != null && isSide(side)) rails.set(String(newId), side);
             } else if (ctx.kind === 'size-update') {
                 const o = (ctx.updateInfo as JsonObj | undefined)?.partialOrder as JsonObj | undefined;
-                if (o?.id != null && isSide(o.type)) rails.set(String(o.id), o.type);
+                if (o?.id != null && isSide(o.type)) {
+                    const parsedId = parseSlotIndex(String(o.id));
+                    rails.set(String(o.id), {
+                        side: o.type,
+                        idx: parsedId !== null && parsedId !== undefined && Number.isFinite(Number(parsedId)) ? Number(parsedId) : null,
+                        byOp: true
+                    });
+                }
             }
         }
     }
 
     let maxBuyIdx: number | null = null;
     let minSellIdx: number | null = null;
-    for (const [id, side] of rails) {
-        const parsed = parseSlotIndex(id);
-        if (parsed === null || parsed === undefined || !Number.isFinite(Number(parsed))) continue;
-        const idx = Number(parsed);
-        if (side === ORDER_TYPES.BUY) maxBuyIdx = maxBuyIdx === null ? idx : Math.max(maxBuyIdx, idx);
+    let ignoredStrays = 0;
+    const sellStartForStray = baseForProximity !== null ? baseForProximity + gap + 1 : null;
+    for (const [, rail] of rails) {
+        const idx = rail.idx;
+        if (idx === null || !Number.isFinite(idx)) continue;
+        if (!rail.byOp && baseForProximity !== null) {
+            const stray = rail.side === ORDER_TYPES.BUY
+                ? idx > baseForProximity
+                : (sellStartForStray !== null && idx < sellStartForStray);
+            if (stray) {
+                ignoredStrays++;
+                continue;
+            }
+        }
+        if (rail.side === ORDER_TYPES.BUY) maxBuyIdx = maxBuyIdx === null ? idx : Math.max(maxBuyIdx, idx);
         else minSellIdx = minSellIdx === null ? idx : Math.min(minSellIdx, idx);
     }
     if (maxBuyIdx === null && minSellIdx === null) {
@@ -3004,9 +3065,7 @@ export function deriveRailBoundary(
         };
     }
 
-    const desired = Format.toKnownNumber(desiredBoundary);
-    const committed = Format.toKnownNumber((manager as { boundaryIdx?: unknown })?.boundaryIdx);
-    let base = Number.isFinite(desired) ? Number(desired) : (Number.isFinite(committed) ? Number(committed) : null);
+    let base = baseForProximity;
     if (base === null) {
         base = maxBuyIdx !== null ? maxBuyIdx : (Number.isFinite(upper) ? upper : 0);
     }
@@ -3033,12 +3092,51 @@ export function deriveRailBoundary(
     if (maxBuyIdx !== null) next = Math.max(next, maxBuyIdx);
     next = Math.max(0, next);
 
+    // FINAL GATE — the SAME validator the restore and commit paths use
+    // (validatePersistedBoundary), so the rail clamp can never legalize a
+    // boundary that strands a live order inside the implied band. Slots this
+    // batch vacates (cancels / rotation sources) are allow-listed: they will
+    // not be placed after the batch, so judging them as stranding would refuse
+    // every legitimate evacuation clamp.
+    //
+    // Dense-ladder condition: validateBoundaryCommit derives its sell-rail
+    // ceiling from the SORTED ARRAY LENGTH (`slots.length - 1`), which only
+    // equals the grid ceiling when the master map holds every slot 0..N-1 (the
+    // production invariant). A sparse/partial map would make the gate reject
+    // every candidate as out-of-range, so it is skipped there — the clamp
+    // inequalities above stay the authority in that state.
+    {
+        const slotsForGate: unknown[] = master instanceof Map ? Array.from(master.values()) : [];
+        const dense = slotsForGate.length > 0
+            && maxSlotIdx !== null
+            && Number(maxSlotIdx) === slotsForGate.length - 1;
+        if (dense) {
+            const check = math.validatePersistedBoundary(
+                next,
+                slotsForGate,
+                gap,
+                vacatedSlotIds.size > 0 ? { allowInBandSlotIds: vacatedSlotIds } : undefined
+            );
+            if (!check || check.ok !== true) {
+                return {
+                    boundary: null,
+                    maxBuyIdx,
+                    minSellIdx,
+                    clamped: false,
+                    reason: `unsafe: ${check?.reason ?? 'unknown'}${check?.detail ? ` (${check.detail})` : ''}`
+                };
+            }
+        }
+    }
+
     return {
         boundary: next,
         maxBuyIdx,
         minSellIdx,
         clamped: next !== base,
-        ...(next !== base ? { reason: `rail-clamped maxBuy=${maxBuyIdx ?? 'none'} minSell=${minSellIdx ?? 'none'}` } : {})
+        ...(next !== base
+            ? { reason: `rail-clamped maxBuy=${maxBuyIdx ?? 'none'} minSell=${minSellIdx ?? 'none'}${ignoredStrays > 0 ? ` (${ignoredStrays} stray rail order(s) ignored)` : ''}` }
+            : (ignoredStrays > 0 ? { reason: `rail-steady (${ignoredStrays} stray rail order(s) ignored; window=${proximityWindow})` } : {}))
     };
 }
 /**
@@ -3954,6 +4052,8 @@ async function updateOrdersOnChainBatchCOWBody(
     // would spam big batches, so the guard emits one batch summary instead
     // (see the summary after the action loop below).
     const lastFillGuardStats = { checked: 0, passed: 0, skipped: 0, bypassed: 0, pivotOffGrid: 0 };
+    // One crossing-CREATE observation per batch (see warnCrossingCreate).
+    let crossingCreateWarned = false;
     // Fingerprints of the pending-broadcast entries recorded by THIS batch's
     // op-building (both CREATE paths). The final pivot gate's compaction
     // remaps these entries' stored opIndex/ctxIndex to their post-drop
@@ -4161,7 +4261,7 @@ async function updateOrdersOnChainBatchCOWBody(
                             || (actionOrigin == null && batchOrigin === COW_ORIGINS.SPREAD_CORRECTION))
                             && isSpreadCorrectionBypassAllowed(bot);
                         if (!isCorrectionCreate) {
-                            const { check, refreshed } = runLastFillGuardCheck(bot, createPrice, order.size, order.type, lastFillGuardStats, true);
+                            const { check, refreshed } = runLastFillGuardCheck(bot, createPrice, order.type, lastFillGuardStats, true);
                             if (refreshed) lastFillGuardPivotRefreshed = true;
                             if (check.blocked) {
                                 lastFillGuardStats.skipped++;
@@ -4178,6 +4278,21 @@ async function updateOrdersOnChainBatchCOWBody(
                             lastFillGuardStats.bypassed++;
                         }
                     } catch (_e) { /* guard is best-effort */ }
+
+                    // PLANNER/EXECUTION ASYMMETRY (observability only).
+                    // The spread-correction planner refuses a candidate that
+                    // crosses the live-market/fill floor (doesNotCrossMarket);
+                    // this generic CREATE path (reconcile refills, rotation
+                    // fallbacks) has no such gate — deliberately, because a hard
+                    // veto here would re-open the counter-order deadlock: after
+                    // a gap the counter lands on the better side of the market
+                    // by construction, and a gapped market can put the planned
+                    // level on the other side, where it executes at the BEST
+                    // available price (a taker fill, never a worse price).
+                    // So this is a fee/liquidity observation, not a safety veto.
+                    if (!crossingCreateWarned) {
+                        crossingCreateWarned = warnCrossingCreate(bot, createPrice, order.type, order.id);
+                    }
 
                     const args = buildCreateOrderArgs(effectiveOrder, assetA, assetB);
                     // GRID-PRICE-INVARIANT (blocking): the CREATE price must be
@@ -4484,7 +4599,7 @@ async function updateOrdersOnChainBatchCOWBody(
                             if (bypassedEvacuation) {
                                 lastFillGuardStats.bypassed++;
                             } else {
-                            const { check, refreshed } = runLastFillGuardCheck(bot, newPrice, newSize, orderType, lastFillGuardStats, true);
+                            const { check, refreshed } = runLastFillGuardCheck(bot, newPrice, orderType, lastFillGuardStats, true);
                             if (refreshed) lastFillGuardPivotRefreshed = true;
                             if (check.blocked) {
                                 lastFillGuardStats.skipped++;
@@ -4668,7 +4783,7 @@ async function updateOrdersOnChainBatchCOWBody(
                                 // so it obeys the same guard against the frozen
                                 // batch pivot — no origin bypass, same as rotations.
                                 try {
-                                    const { check: fbCheck, refreshed: fbRefreshed } = runLastFillGuardCheck(bot, fbPrice, fbSize, fbType, lastFillGuardStats, true);
+                                    const { check: fbCheck, refreshed: fbRefreshed } = runLastFillGuardCheck(bot, fbPrice, fbType, lastFillGuardStats, true);
                                     if (fbRefreshed) lastFillGuardPivotRefreshed = true;
                                     if (fbCheck.blocked) {
                                         lastFillGuardStats.skipped++;
@@ -5815,6 +5930,47 @@ function resolveOnGridPivot(manager: OrderManagerLike, rawPrice: unknown): { pri
 }
 
 /**
+ * Warn (once per batch) when a generic CREATE is emitted on the ADVERSE side of
+ * the crossing floor — the guard the spread-correction planner applies through
+ * `doesNotCrossMarket`.
+ *
+ * Non-blocking by design (see the call site): a crossing limit order executes at
+ * the BEST available price, so the risk is taker fees and unintended immediate
+ * execution, not a worse price. Blocking here would re-open the counter-order
+ * deadlock — after a gap the counter lands on the better side by construction,
+ * and a gapped market can put the planned level on the other side of the floor,
+ * where waiting for the market to return is worse than taking it.
+ *
+ * The floor is a pure read of already-cached evidence (a fresh live market read
+ * wins over the fill reference by recency), so this costs no chain call.
+ *
+ * @param {Object} bot
+ * @param {unknown} price - Emitted CREATE price
+ * @param {unknown} type - ORDER_TYPES.BUY/SELL
+ * @param {unknown} slotId - Slot the CREATE targets (log context)
+ * @returns {boolean} True when a warning was emitted (caller stops re-checking this batch)
+ */
+function warnCrossingCreate(bot: BotLike, price: unknown, type: unknown, slotId: unknown): boolean {
+    if (type !== ORDER_TYPES.BUY && type !== ORDER_TYPES.SELL) return false;
+    const p = Number(price);
+    if (!Number.isFinite(p) || p <= 0) return false;
+    let floor: number | null = null;
+    try { floor = resolveSpreadCrossingFloor(bot.manager); } catch { floor = null; }
+    if (floor == null || !Number.isFinite(floor) || floor <= 0) return false;
+    const crossing = type === ORDER_TYPES.BUY ? p >= floor : p <= floor;
+    if (!crossing) return false;
+    try {
+        bot.manager?.logger?.log?.(
+            `[COW-CROSS-GUARD] CREATE ${type} for ${String(slotId ?? 'unknown')} at ${Format.formatPrice6(p)} sits on the ` +
+            `crossing side of the floor ${Format.formatPrice6(floor)} (the planner refuses these; a generic refill does not) — ` +
+            `it executes at the best available price, so this is a taker-fee observation, not a veto. Once per batch.`,
+            'warn'
+        );
+    } catch { /* logging is best-effort */ }
+    return true;
+}
+
+/**
  * Run the last-fill guard probe: optionally refresh the pivot from
  * still-queued fills, read the durable pivot, and evaluate
  * isLastFillGuardBlocked. Consolidates the identical probe pattern in the
@@ -5831,13 +5987,12 @@ function resolveOnGridPivot(manager: OrderManagerLike, rawPrice: unknown): { pri
  * operations/opContexts as the filtered arrays.
  * @param {Object} bot
  * @param {number} price - Target order price
- * @param {number} size - Order size
  * @param {string} type - ORDER_TYPES.BUY/SELL
  * @param {Object} stats - lastFillGuardStats tracker (checked++ here)
  * @param {boolean} [skipRefresh=false] - Skip the queued-fill pivot refresh
  * @returns {{check: Object, refreshed: boolean}}
  */
-function runLastFillGuardCheck(bot: BotLike, price: number, size: number, type: string, stats: LastFillGuardStats, skipRefresh: boolean = false): { check: LastFillGuardResult; refreshed: boolean } {
+function runLastFillGuardCheck(bot: BotLike, price: number, type: string, stats: LastFillGuardStats, skipRefresh: boolean = false): { check: LastFillGuardResult; refreshed: boolean } {
     let refreshed = false;
     // The batch-start freeze (see broadcast loop head) owns pivot refreshes;
     // per-action refreshes are disabled so every action in a batch is judged
@@ -5851,7 +6006,6 @@ function runLastFillGuardCheck(bot: BotLike, price: number, size: number, type: 
     const lastRef = resolveLastFillGuardReference(bot.manager);
     const lastPrice = lastRef.price;
     const lastType = lastRef.type;
-    const inc = resolveLastFillGuardIncrement(bot);
     // Validate the pivot onto the ladder before use (see resolveOnGridPivot).
     // Reported once per probe at warn when the raw pivot was NOT a grid level:
     // that is the ratchet precondition, and it is otherwise invisible because
@@ -5885,7 +6039,7 @@ function runLastFillGuardCheck(bot: BotLike, price: number, size: number, type: 
         } catch { /* logging is best-effort */ }
         stats.pivotOffGrid = (stats.pivotOffGrid || 0) + 1;
     }
-    const check = isLastFillGuardBlocked(price, size, type, onGrid.price, lastType, inc);
+    const check = isLastFillGuardBlocked(price, type, onGrid.price, lastType);
     stats.checked++;
     return { check, refreshed };
 }
@@ -6026,21 +6180,18 @@ function runFinalPivotGate(bot: BotLike, operations: unknown[], opContexts: OpPh
         }
         const dropIdx = new Set<number>();
         const dropped: JsonObj[] = [];
-        const inc = resolveLastFillGuardIncrement(bot);
         const onGrid = resolveOnGridPivot(bot.manager, liveRef.price);
         for (let i = 0; i < opContexts.length; i++) {
             const ctx = opContexts[i];
             if (!ctx || ctx.kind === 'cancel' || ctx.kind === 'size-update') continue;
             let price: number | null = null;
             let type: string | null = null;
-            let size: number | null = null;
             let slotId: string | null = null;
             let action: CowAction | null = null;
             if (ctx.kind === 'create') {
                 slotId = (ctx.id as string | undefined) || ctx.order?.id || null;
                 price = Number(ctx.order?.price);
                 type = ctx.order?.type || null;
-                size = Number(ctx.order?.size);
                 action = (slotId && actionBySlot.get(slotId)) || null;
                 // Spread-correction CREATE bypass (mirrors the build loop:
                 // per-action origin, batch origin as back-compat fallback).
@@ -6056,7 +6207,6 @@ function runFinalPivotGate(bot: BotLike, operations: unknown[], opContexts: OpPh
                 slotId = (rot.newGridId as string | undefined) || (rot.oldOrder as JsonObj | undefined)?.id as string | undefined || null;
                 price = Number(rot.newPrice);
                 type = (rot.type as string | undefined) || null;
-                size = Number(rot.newSize);
                 // Rotation UPDATEs are keyed by DESTINATION slot (the
                 // emitted price is the destination's level) — EXCEPT the
                 // same-slot size-only form (no newGridId, or newGridId ===
@@ -6140,7 +6290,7 @@ function runFinalPivotGate(bot: BotLike, operations: unknown[], opContexts: OpPh
             // violation the gate cannot prove).
             if (!Number.isFinite(price as number) || (price as number) <= 0) continue;
             if (type !== ORDER_TYPES.BUY && type !== ORDER_TYPES.SELL) continue;
-            const check = isLastFillGuardBlocked(price, size, type, onGrid.price, liveType, inc);
+            const check = isLastFillGuardBlocked(price as number, type, onGrid.price, liveType);
             if (stats) stats.checked = (Number(stats.checked) || 0) + 1;
             if (!check.blocked) {
                 if (stats) stats.passed = (Number(stats.passed) || 0) + 1;
@@ -6550,7 +6700,7 @@ async function processBatchResults(bot: BotLike, result: JsonObj, opContexts: Op
         rotationOperationCount
     };
 }
-export { isSpreadCorrectionBypassAllowed, isLastFillGuardBlocked, resolveOnGridPivot, checkGridPriceInvariant, recordRestampBuyAboveAnchor, collectGapBandPlacementShadowSlots, deriveRotationPrice, refreshLastFillPivotFromQueue, runFinalPivotGate, buildOutsideInPairGroupsForOrders, buildOutsideInPairGroupsForCreateEntries, markMissingCreateResultsAsStructuralBlocker, formatUnmatchedChainOrderForLog, recordPendingBroadcast, clearPendingBroadcasts, popPushedWorkingGrid, findChainOrderForSlot, reconcileAfterUncertainBroadcast, executeWithRetryOnUncertain, executeChunkedWithRetryOnUncertain, formatPartialBroadcastSummary, buildActionsFromPlan, buildCowResultFromPlan, applyRotationTransitionsToWorkingGrid, updateOrdersOnChainBatchCOW, processBatchResults, adoptPlacedBatchFromChain, resolveRefillBoundaryHold, toRefillSlotIdSet, trackBoundaryHold };
+export { isSpreadCorrectionBypassAllowed, isLastFillGuardBlocked, resolveOnGridPivot, warnCrossingCreate, checkGridPriceInvariant, recordRestampBuyAboveAnchor, collectGapBandPlacementShadowSlots, deriveRotationPrice, refreshLastFillPivotFromQueue, runFinalPivotGate, buildOutsideInPairGroupsForOrders, buildOutsideInPairGroupsForCreateEntries, markMissingCreateResultsAsStructuralBlocker, formatUnmatchedChainOrderForLog, recordPendingBroadcast, clearPendingBroadcasts, popPushedWorkingGrid, findChainOrderForSlot, reconcileAfterUncertainBroadcast, executeWithRetryOnUncertain, executeChunkedWithRetryOnUncertain, formatPartialBroadcastSummary, buildActionsFromPlan, buildCowResultFromPlan, applyRotationTransitionsToWorkingGrid, updateOrdersOnChainBatchCOW, processBatchResults, adoptPlacedBatchFromChain, resolveRefillBoundaryHold, toRefillSlotIdSet, trackBoundaryHold };
 // Exported for regression tests (issue #23 sibling): the uncertain-broadcast
 // discard path must never drop a placement silently when master lost the slot.
 export { restoreDiscardedCreates };

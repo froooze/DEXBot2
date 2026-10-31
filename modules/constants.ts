@@ -382,9 +382,12 @@ let TIMING = {
     // SPREAD_STALE_GEOMETRY_ESCALATE_MS: escalated window used when the
     // correction reports the geometry bind 'last-fill-blocked' — every
     // tightening slot on the corrected side sits at/through the last fill, i.e.
-    // the sell window itself is behind the last sale (boundary/crawl lag). No
-    // amount of waiting fixes that; a re-center does. Waiting the structural
-    // 30 minutes just leaves the side unquoted.
+    // the window itself is behind the last fill (boundary/crawl lag). No
+    // amount of waiting fixes that; a re-center does, because it re-derives the
+    // center AROUND that same pivot. Waiting the structural 30 minutes just
+    // leaves the side unquoted. Capped at ONE re-center per pivot value
+    // (`_lastGeometryResyncPivotKey`): the pivot does not move with the grid, so
+    // a second attempt re-derives the identical veto.
     SPREAD_STALE_GEOMETRY_ESCALATE_MS: 10 * 60 * 1000,  // 10 minutes
     // SPREAD_CORRECTION_MAX_ATTEMPTS: bounded attempts for one spread-correction
     // cycle (initial broadcast + fresh-master re-plan retries). Kept next to the

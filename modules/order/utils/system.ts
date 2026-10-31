@@ -1454,38 +1454,11 @@ export function evaluateSpreadCorrectionReadiness(
  * @returns {number|null} Reference price or null
  */
 export function resolveSpreadMarketReference(manager: OrderManagerLike): number | null {
-    const live = Number(manager?._lastFilledPrice);
-    const liveType = manager?._lastFilledType;
-    if (manager?.lastFillPivotSource === 'fill' && Number.isFinite(live) && live > 0 && (liveType === ORDER_TYPES.BUY || liveType === ORDER_TYPES.SELL)) {
-        return live;
-    }
-    const market = Number(manager?._lastMarketFillPrice);
-    const marketType = manager?._lastMarketFillType;
-    if (Number.isFinite(market) && market > 0 && (marketType === ORDER_TYPES.BUY || marketType === ORDER_TYPES.SELL)) {
-        return market;
-    }
-    return null;
+    // ONE predicate: the price-only reader and the price+side reader must never
+    // disagree about what counts as a fill-provenanced market reference.
+    return resolveFillProvenancedReference(manager).price;
 }
 
-/**
- * Resolve the reference the generic LAST-FILL-GUARD judges against.
- *
- * Prefers the live armed pivot. When that is cold (a grid regeneration
- * cleared it, or a rejected-snapshot reset ran) it falls back to the
- * bot-scoped last-market-fill row — the same market truth spread correction
- * already uses. This is what stops a rebuild from silently un-arming the
- * guard until the next fill: the price the account last traded at is known,
- * so a CREATE/rotation must still not cross it.
- *
- * Read-time fallback only: it does NOT mutate the pivot or persist an
- * old-generation value, so the genesis-bound pivot/persist contract is
- * unchanged. The guard still validates the value onto the CURRENT ladder via
- * resolveOnGridPivot at the call site (off-ladder → raw value + warn), so a
- * regenerated geometry stays the authority on which placements are off-grid.
- *
- * @param {Object} manager - OrderManager instance
- * @returns {{price: number|null, type: string|null}} Effective pivot (both null when cold)
- */
 /**
  * Re-anchor the boundary so the newest REAL fill sits outside its own window.
  *
@@ -1503,13 +1476,26 @@ export function resolveSpreadMarketReference(manager: OrderManagerLike): number 
  *
  * Only a genuine on-ladder fill price is accepted (same one-increment drift
  * bound as `resolveOnGridPivot`), and the candidate must pass the same
- * placed-order-aware validation the boundary commit gate uses, so a re-anchor
- * can never strand a live order inside the re-typed band.
+ * placed-order-aware validation the boundary commit gate uses
+ * (`validatePersistedBoundary` — the SAME gate the restore and commit paths
+ * use), so a re-anchor can never strand a live order inside the re-typed band.
+ *
+ * ELIGIBILITY (same rule as the crawl, see deriveTargetBoundary):
+ *   - EDGE-pinned insurance fills never anchor. An edge fill is by definition
+ *     outside the window it would move, and it is a book event (a fat-finger
+ *     wick), not market movement — the crawl already excludes it, and an
+ *     absolute anchor from a grid-edge price would teleport the window to that
+ *     edge. Such fills also never arm the pivot (recordLastFilledPrices skips
+ *     them), so the reference can only be a window fill.
+ *   - PARTIAL fills DO anchor: a partial at the far slot is still a real trade
+ *     at a real price, and the residual it leaves at the anchor slot is
+ *     explicitly allow-listed below (otherwise the geometry deadlocks).
  *
  * @param {Object} manager - OrderManager (pivot + genesis)
  * @param {number|null} boundaryIdx - Boundary the derivation would commit
  * @param {Array<Object>} slots - Grid slots (current generation)
  * @param {number} gapSlots - Gap band width
+ * @param {Array<Object>} [fills] - Current fill batch (extremum resolution)
  * @returns {{boundaryIdx: number|null, reanchored: boolean, from?: number|null, to?: number, side?: string, fillSlot?: number, reason?: string}}
  */
 export function reanchorBoundaryFromLastFill(manager: OrderManagerLike, boundaryIdx: number | null | undefined, slots: ManagedOrder[] | null | undefined, gapSlots: number, fills: Array<{ id?: string; type?: string; price?: unknown }> | null | undefined = null): { boundaryIdx: number | null; reanchored: boolean; from?: number | null; to?: number; side?: string; fillSlot?: number; reason?: string } {
@@ -1558,47 +1544,14 @@ export function reanchorBoundaryFromLastFill(manager: OrderManagerLike, boundary
     // incident: one sweep's pivot bounced 1366 -> 1349 -> 1361). Anchoring on
     // the last chunk under-advances the window and leaves the furthest fill's
     // counter-order in-band. The rail must clear the FURTHEST fill of the side:
-    // max slot for SELL fills, min slot for BUY fills. Prices are the real
-    // execution prices (sync_engine stamps them from the chain), with the slot
-    // id as a fallback for legacy fill records.
+    // max slot for SELL fills, min slot for BUY fills.
     let anchorIdx = idx;
     let anchorPrice = price;
-    if (Array.isArray(fills) && fills.length > 0) {
-        let best: { idx: number; price: number } | null = null;
-        for (const f of fills) {
-            if (!f || f.type !== side) continue;
-            let fIdx: number | null = null;
-            let fPrice: number | null = null;
-            const rawPrice = Number(f.price);
-            if (Number.isFinite(rawPrice) && rawPrice > 0) {
-                try {
-                    const candidateIdx = Number(MathUtils.slotIndexForPrice(rawPrice, genesis));
-                    const candidateLevel = Number(MathUtils.priceForSlot(candidateIdx, genesis));
-                    if (Number.isFinite(candidateIdx) && candidateIdx >= 0
-                        && Number.isFinite(candidateLevel) && candidateLevel > 0
-                        && Math.abs(candidateLevel - rawPrice) / rawPrice <= maxDrift) {
-                        fIdx = candidateIdx;
-                        fPrice = rawPrice;
-                    }
-                } catch { /* fall back to the slot id */ }
-            }
-            if (fIdx === null) {
-                const idIdx = OrderUtils.parseSlotIndex(f.id);
-                if (idIdx !== null && idIdx !== undefined && Number.isFinite(Number(idIdx)) && Number(idIdx) >= 0) {
-                    fIdx = Number(idIdx);
-                    try { fPrice = Number(MathUtils.priceForSlot(fIdx, genesis)); } catch { fPrice = null; }
-                }
-            }
-            if (fIdx === null) continue;
-            if (best === null
-                || (side === ORDER_TYPES.SELL && fIdx > best.idx)
-                || (side === ORDER_TYPES.BUY && fIdx < best.idx)) {
-                best = { idx: fIdx, price: Number.isFinite(Number(fPrice)) && Number(fPrice) > 0 ? Number(fPrice) : anchorPrice };
-            }
-        }
-        if (best !== null) {
-            anchorIdx = best.idx;
-            anchorPrice = best.price;
+    const batchExtremum = resolveFillAnchorIndex(fills, side, genesis, maxDrift);
+    if (batchExtremum) {
+        anchorIdx = batchExtremum.idx;
+        if (batchExtremum.price != null && Number.isFinite(batchExtremum.price) && batchExtremum.price > 0) {
+            anchorPrice = batchExtremum.price;
         }
     }
     const gap = Number.isFinite(Number(gapSlots)) && Number(gapSlots) >= 0 ? Math.floor(Number(gapSlots)) : 0;
@@ -1663,6 +1616,70 @@ export function reanchorBoundaryFromLastFill(manager: OrderManagerLike, boundary
 }
 
 /**
+ * Resolve the EXTREMUM fill of one side in a fill batch, mapped onto the
+ * genesis ladder.
+ *
+ * The pivot is the LAST-processed fill, which a chunked sweep overwrites per
+ * chunk, so the geometry anchor must be the batch's furthest fill of that side
+ * (max slot for SELL, min slot for BUY) — otherwise the furthest fill's
+ * counter-order lands inside the implied band. Prices are the real execution
+ * prices (sync_engine stamps them from the chain), with the slot id as a
+ * legacy fallback for fill records that carry no price.
+ *
+ * Pure: reads the batch only, no manager state.
+ *
+ * @param {Array<Object>} fills - Fill batch
+ * @param {string} side - ORDER_TYPES.BUY / SELL (entries of the other side are ignored)
+ * @param {Object} genesis - Genesis ladder
+ * @param {number} maxDrift - One-increment drift bound for a price to count as on-ladder
+ * @returns {{idx: number, price: number|null}|null} Extremum, or null when the batch has no usable entry for the side
+ */
+function resolveFillAnchorIndex(
+    fills: Array<{ id?: string; type?: string; price?: unknown }> | null | undefined,
+    side: string,
+    genesis: Parameters<typeof MathUtils.slotIndexForPrice>[1],
+    maxDrift: number
+): { idx: number; price: number | null } | null {
+    if (!Array.isArray(fills) || fills.length === 0) return null;
+    let best: { idx: number; price: number | null } | null = null;
+    for (const f of fills) {
+        if (!f || f.type !== side) continue;
+        let fIdx: number | null = null;
+        let fPrice: number | null = null;
+        const rawPrice = Number(f.price);
+        if (Number.isFinite(rawPrice) && rawPrice > 0) {
+            try {
+                const candidateIdx = Number(MathUtils.slotIndexForPrice(rawPrice, genesis));
+                const candidateLevel = Number(MathUtils.priceForSlot(candidateIdx, genesis));
+                if (Number.isFinite(candidateIdx) && candidateIdx >= 0
+                    && Number.isFinite(candidateLevel) && candidateLevel > 0
+                    && Math.abs(candidateLevel - rawPrice) / rawPrice <= maxDrift) {
+                    fIdx = candidateIdx;
+                    fPrice = rawPrice;
+                }
+            } catch { /* fall back to the slot id */ }
+        }
+        if (fIdx === null) {
+            const idIdx = OrderUtils.parseSlotIndex(f.id);
+            if (idIdx !== null && idIdx !== undefined && Number.isFinite(Number(idIdx)) && Number(idIdx) >= 0) {
+                fIdx = Number(idIdx);
+                try { fPrice = Number(MathUtils.priceForSlot(fIdx, genesis)); } catch { fPrice = null; }
+            }
+        }
+        if (fIdx === null) continue;
+        if (best === null
+            || (side === ORDER_TYPES.SELL && fIdx > best.idx)
+            || (side === ORDER_TYPES.BUY && fIdx < best.idx)) {
+            best = {
+                idx: fIdx,
+                price: Number.isFinite(Number(fPrice)) && Number(fPrice) > 0 ? Number(fPrice) : null
+            };
+        }
+    }
+    return best;
+}
+
+/**
  * Resolve a FILL-PROVENANCED reference for absolute geometry repairs.
  *
  * `resolveLastFillGuardReference` intentionally accepts a one-sided book seed
@@ -1690,6 +1707,29 @@ function resolveFillProvenancedReference(manager: OrderManagerLike): { price: nu
     return { price: null, type: null };
 }
 
+/**
+ * Resolve the reference the generic LAST-FILL-GUARD judges against.
+ *
+ * Prefers the live armed pivot. When that is cold (a grid regeneration
+ * cleared it, or a rejected-snapshot reset ran) it falls back to the
+ * bot-scoped last-market-fill row — the same market truth spread correction
+ * already uses. This is what stops a rebuild from silently un-arming the
+ * guard until the next fill: the price the account last traded at is known,
+ * so a CREATE/rotation must still not cross it.
+ *
+ * Read-time fallback only: it does NOT mutate the pivot or persist an
+ * old-generation value, so the genesis-bound pivot/persist contract is
+ * unchanged. The guard still validates the value onto the CURRENT ladder via
+ * resolveOnGridPivot at the call site (off-ladder → raw value + warn), so a
+ * regenerated geometry stays the authority on which placements are off-grid.
+ *
+ * The rebuild path re-arms the pivot explicitly (rearmLastFillPivotFromMarketFill)
+ * so this fallback covers only the window before that write, not the whole
+ * post-rebuild lifetime.
+ *
+ * @param {Object} manager - OrderManager instance
+ * @returns {{price: number|null, type: string|null}} Effective pivot (both null when cold)
+ */
 export function resolveLastFillGuardReference(manager: OrderManagerLike): { price: number | null; type: string | null } {
     const livePrice = Number(manager?._lastFilledPrice);
     const liveType = manager?._lastFilledType;
@@ -1719,18 +1759,21 @@ export function resolveLastFillGuardReference(manager: OrderManagerLike): { pric
  * we actually did: a BUY below the last sell, a SELL above the last buy. Equal
  * price counts as blocked — that is a re-place at the just-filled level, the
  * immediate re-fill loop this guard exists to prevent. Cold (no numeric pivot,
- * or no fill side recorded — e.g. a book-seeded pivot) => disabled. The grid
- * increment takes no part (kept in the signature for call-site stability).
+ * or no fill side recorded — e.g. a book-seeded pivot) => disabled.
+ *
+ * Signature note: the old band rule also consumed order size and the grid
+ * increment (it judged against `pivot ± increment/2`). Both are gone on
+ * purpose — re-adding an increment term re-opens retrospective §9.7 (a BUY
+ * below a SELL fill was blocked, a SELL one tick above our cost was blocked,
+ * and spread tightening became structurally impossible after any fill).
  *
  * @param {number} price - Target order price
- * @param {number} _size - Order size (unused, kept for compat)
  * @param {string} type - ORDER_TYPES.BUY/SELL
  * @param {number|null} lastPrice - Most recent fill price
  * @param {string|null} lastType - Most recent fill side; null keeps the guard cold
- * @param {number|any} _incrementPercent - Unused (kept for signature compat)
  * @returns {{blocked: boolean, pivot: number|null, threshold?: number|null}}
  */
-export function isLastFillGuardBlocked(price: number, _size: number, type: unknown, lastPrice: number | null, lastType: string | null, _incrementPercent?: number): { blocked: boolean; pivot: number|null; threshold?: number|null } {
+export function isLastFillGuardBlocked(price: number, type: unknown, lastPrice: number | null, lastType: string | null): { blocked: boolean; pivot: number|null; threshold?: number|null } {
     const numPrice = Number(price);
     if (!Number.isFinite(numPrice)) return { blocked: false, pivot: null };
     if (lastPrice == null || !Number.isFinite(Number(lastPrice)) || lastType == null) return { blocked: false, pivot: null };
@@ -1783,6 +1826,41 @@ export function restoreLastMarketFill(manager: OrderManagerLike, persisted: unkn
     manager._lastMarketFillAt = row.fillsAt;
     manager.logger?.log?.(
         `[SPREAD-CORRECTION] Restored last-market-fill ${row.price}(${row.type}) age=${Math.round((now - row.fillsAt) / 1000)}s — spread correction will not trade through it`,
+        'info'
+    );
+    return true;
+}
+
+/**
+ * Re-arm the LAST-FILL-GUARD pivot from the bot-scoped market-fill row.
+ *
+ * The grid-rebuild path deliberately clears the armed pivot (a new generation).
+ * The guard must NOT stay cold afterwards: the price the account last traded at
+ * is still market truth, so the pivot is re-armed on the NEW generation
+ * explicitly, through the single shared writer, at the original fill timestamp.
+ * That makes the documented contract real ("the guard re-arms against the new
+ * ladder") instead of relying on the read-time fallback in
+ * `resolveLastFillGuardReference` for the whole post-rebuild lifetime — a
+ * fallback that cannot be re-validated, persisted or logged.
+ *
+ * Provenance stays 'fill' (a book seed never qualifies). The price is not
+ * rewritten: an off-new-ladder value is handled by the same one-increment
+ * `resolveOnGridPivot` rule every other probe uses.
+ *
+ * @param {Object} manager - OrderManager instance
+ * @returns {boolean} True when a pivot was re-armed
+ */
+export function rearmLastFillPivotFromMarketFill(manager: OrderManagerLike): boolean {
+    if (!manager) return false;
+    const ref = resolveFillProvenancedReference(manager);
+    const price = Number(ref?.price);
+    const type = ref?.type;
+    if (!Number.isFinite(price) || price <= 0 || (type !== ORDER_TYPES.BUY && type !== ORDER_TYPES.SELL)) return false;
+    const at = Number(manager?._lastFilledAt) || Number(manager?._lastMarketFillAt) || Date.now();
+    if (!setLastFillPivot(manager, type, price, 'fill', at)) return false;
+    manager.logger?.log?.(
+        `[LAST-FILL-GUARD] Re-armed on the new generation: ${price}(${type}) from the last real fill ` +
+        `(age ${Math.max(0, Math.round((Date.now() - at) / 1000))}s) — the guard survives a rebuild by design`,
         'info'
     );
     return true;

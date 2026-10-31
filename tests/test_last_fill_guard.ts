@@ -7,16 +7,16 @@
  * The increment takes no part: the old pivot ± increment/2 band blocked
  * profitable placements within half a step of the pivot (which is exactly where
  * spread correction places — the spread edge on a grid slot), and it blocked
- * buy-backs below a SELL fill. Cold (null pivot/type) => disabled.
+ * buy-backs below a SELL fill. The band parameters were REMOVED from the
+ * signature (LFG-5 pins the arity), so re-adding an increment term cannot
+ * happen without touching this test. Cold (null pivot/type) => disabled.
  */
 const assert = require('assert');
 const { isLastFillGuardBlocked, resolveOnGridPivot } = require('../modules/dexbot_cow_runtime');
 const { ORDER_TYPES } = require('../modules/constants');
 
-const INC = 0.5; // grid increment — accepted by the signature, must have no effect
-
-const blocked = (price: number, type: string, pivot: number | null, lastType: string | null, inc: any = INC) =>
-    isLastFillGuardBlocked(price, 1, type, pivot, lastType, inc).blocked;
+const blocked = (price: number, type: string, pivot: number | null, lastType: string | null) =>
+    isLastFillGuardBlocked(price, type, pivot, lastType).blocked;
 
 async function testColdStartDisabled() {
     console.log('\n[LFG-1] cold start (null) => disabled');
@@ -75,19 +75,23 @@ async function testSpreadEdgeAfterFillIsAllowed() {
 }
 
 async function testIncrementHasNoEffect() {
-    console.log('\n[LFG-5] the increment argument no longer changes the verdict');
+    console.log('\n[LFG-5] the band parameters are gone (direction rule only)');
     const pivot = 1000;
     const price = 999.9; // below the pivot: allowed under the direction rule
-    for (const inc of [0.1, 0.5, 2, 5]) {
-        assert.strictEqual(blocked(price, ORDER_TYPES.BUY, pivot, ORDER_TYPES.BUY, inc), false,
-            `BUY 999.9 must be allowed for increment ${inc}%`);
-        assert.strictEqual(blocked(1000.1, ORDER_TYPES.BUY, pivot, ORDER_TYPES.BUY, inc), true,
-            `BUY 1000.1 must be blocked for increment ${inc}%`);
-    }
-    // Legacy assets-object 6th arg must not crash or change the verdict.
-    const assets = { assetA: { precision: 5 }, assetB: { precision: 5 } };
-    assert.strictEqual(blocked(999.9, ORDER_TYPES.BUY, pivot, ORDER_TYPES.BUY, assets), false);
-    assert.strictEqual(blocked(1000, ORDER_TYPES.BUY, pivot, ORDER_TYPES.BUY, assets), true);
+    assert.strictEqual(blocked(price, ORDER_TYPES.BUY, pivot, ORDER_TYPES.BUY), false,
+        'BUY 999.9 must be allowed');
+    assert.strictEqual(blocked(1000.1, ORDER_TYPES.BUY, pivot, ORDER_TYPES.BUY), true,
+        'BUY 1000.1 must be blocked');
+    // ARITY PIN: isLastFillGuardBlocked(price, type, lastPrice, lastType).
+    // The old signature carried (price, size, type, lastPrice, lastType,
+    // increment) — no increment term is reachable through this function, which
+    // is what makes a silent band-rule reintroduction a compile error at every
+    // call site instead of a runtime surprise.
+    assert.strictEqual(isLastFillGuardBlocked.length, 4,
+        'the guard must take exactly (price, type, lastPrice, lastType)');
+    // Trailing arguments must not resurrect a band.
+    const withExtras: any = (isLastFillGuardBlocked as any)(price, ORDER_TYPES.BUY, pivot, ORDER_TYPES.BUY, 0.5, { irrelevant: true });
+    assert.strictEqual(withExtras.blocked, false, 'trailing arguments must not change the verdict');
     console.log('✓ LFG-5 passed');
 }
 

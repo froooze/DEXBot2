@@ -557,7 +557,7 @@ import {
     liveWindowIdSet,
     getOrderTypeFromUpdatedFlags
 } from './utils/order.js';
-import { loadAmaCenterPrice, loadAmaCenterSnapshot, withBlockchainRetry, restoreLastFillPivot, resetLastFillPivot, evaluateSpreadCorrectionReadiness, maybeRefreshLiveMarketPrice, resolveLastFillGuardReference, isLastFillGuardBlocked } from './utils/system.js';
+import { loadAmaCenterPrice, loadAmaCenterSnapshot, withBlockchainRetry, restoreLastFillPivot, resetLastFillPivot, rearmLastFillPivotFromMarketFill, evaluateSpreadCorrectionReadiness, maybeRefreshLiveMarketPrice, resolveLastFillGuardReference, isLastFillGuardBlocked } from './utils/system.js';
 import * as MathUtils from './utils/math.js';
 import { derivePriceWithPoolRef, resolveStartPriceMode } from './utils/withPoolRef.js';
 import { getWhitelistFlags } from '../market_adapter_whitelist.js';
@@ -1787,16 +1787,20 @@ export async function initializeGrid(manager: OrderManagerLike): Promise<void> {
 
         // Same generation contract for the LAST-FILL-GUARD pivot: it was
         // armed against the previous ladder, and restoreLastFillPivot would
-        // refuse it against the new genesis anyway. Drop it now so the guard
-        // re-arms on the first real fill of the new generation (the startup
-        // book seed may arm a heuristic pivot in the meantime, which is
-        // in-memory-only by provenance).
+        // refuse it against the new genesis anyway. Drop it now, then RE-ARM it
+        // from the bot-scoped last real fill (rearmLastFillPivotFromMarketFill)
+        // — the guard must not stay cold after a rebuild, and the re-arm is an
+        // explicit, logged, persistable write instead of the read-time fallback
+        // in resolveLastFillGuardReference doing the same job silently for the
+        // rest of the run. Provenance stays 'fill', so a book seed never
+        // qualifies.
         try {
             if (typeof manager._resetLastFillPivot === 'function') {
                 manager._resetLastFillPivot('grid rebuild');
             } else {
                 resetLastFillPivot(manager, 'grid rebuild');
             }
+            rearmLastFillPivotFromMarketFill(manager);
         } catch {}
 
         // RC-8: Update boundary with notification to dependent systems
@@ -3721,11 +3725,9 @@ export function determineOrderSideByFunds(manager: OrderManagerLike, currentMark
             if (c?.price == null || !Number.isFinite(Number(c.price))) return false;
             return isLastFillGuardBlocked(
                 Number(c.price),
-                Number(c.size) || 0,
                 railType,
                 lastFillPivot,
-                lastFillSide,
-                manager.config?.incrementPercent
+                lastFillSide
             ).blocked === true;
         };
         let lastFillExcluded = 0;

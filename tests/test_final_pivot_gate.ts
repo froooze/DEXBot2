@@ -365,7 +365,6 @@ async function testCancelsAndSizeUpdatesNeverGated() {
 async function testHelperParityWithGuard() {
     console.log('\n[FG-9] gate verdicts match isLastFillGuardBlocked 1:1 on the incident prices');
     // The gate must not implement its own threshold math — spot-check parity.
-    const inc = INC;
     for (const [price, type, pivot, ptype, expectBlocked] of [
         [879.304566, ORDER_TYPES.SELL, SELL_PIVOT, ORDER_TYPES.SELL, true],
         [881.950417, ORDER_TYPES.SELL, SELL_PIVOT, ORDER_TYPES.SELL, true],
@@ -373,7 +372,7 @@ async function testHelperParityWithGuard() {
         [820.593305, ORDER_TYPES.BUY, SELL_PIVOT, ORDER_TYPES.SELL, false],
         [879.304566, ORDER_TYPES.SELL, 866.193898, ORDER_TYPES.BUY, false], // stale pivot passes (the bug)
     ]) {
-        const check = isLastFillGuardBlocked(price, 1, type, pivot, ptype, inc);
+        const check = isLastFillGuardBlocked(price, type, pivot, ptype);
         assert.strictEqual(check.blocked, expectBlocked, `price ${price} vs pivot ${pivot}`);
     }
     // And the refresh helper the gate relies on resolves the queued sell.

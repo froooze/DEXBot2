@@ -312,12 +312,12 @@ async function testLFP9_GuardFallsBackToMarketFillWhenPivotCold() {
     );
     const { price, type } = resolveLastFillGuardReference(cold);
     assert.strictEqual(
-        isLastFillGuardBlocked(100, 1, ORDER_TYPES.BUY, price, type, 0.5).blocked,
+        isLastFillGuardBlocked(100, ORDER_TYPES.BUY, price, type).blocked,
         true,
         'a BUY at/above the last fill is blocked via the fallback (guard not cold)'
     );
     assert.strictEqual(
-        isLastFillGuardBlocked(99.5, 1, ORDER_TYPES.BUY, price, type, 0.5).blocked,
+        isLastFillGuardBlocked(99.5, ORDER_TYPES.BUY, price, type).blocked,
         false,
         'a BUY below the fallback floor is still allowed'
     );

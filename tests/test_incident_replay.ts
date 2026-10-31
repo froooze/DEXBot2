@@ -151,7 +151,7 @@ async function testREP003_GuardWouldVetoButBypassAllows() {
     for (const r of rotations) {
         // The plain guard (no bypass) vetoes every evacuation — the exact
         // 19:14 failure that stranded the band.
-        const veto = isLastFillGuardBlocked(r.newPrice, r.newSize, ORDER_TYPES.SELL, pivot, ORDER_TYPES.SELL, INC);
+        const veto = isLastFillGuardBlocked(r.newPrice, ORDER_TYPES.SELL, pivot, ORDER_TYPES.SELL);
         assert.strictEqual(veto.blocked, true, `guard without bypass must veto ${r.id} -> ${r.newGridId}`);
         // Bypass route 1: the runtime gate keys on the frozen B-stamp fields.
         assert.strictEqual(r.origin, 'gap-evacuation');
