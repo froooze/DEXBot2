@@ -120,7 +120,26 @@ The per-action LAST-FILL-GUARD rule is direction-only relative to that pivot —
 a BUY is blocked at/above it, a SELL at/below it (equal price is a re-place at
 the just-filled level). The spread-correction planner applies the SAME predicate
 to its candidates before planning, so a correction batch never contains an op
-the guard would drop.
+the guard would drop. The predicate takes exactly `(price, type, lastPrice,
+lastType)`: there is no size or increment argument, because the old
+`pivot ± increment/2` band was what blocked profitable placements.
+
+**What may become the pivot.** Only a real WINDOW trade. EDGE-pinned insurance
+fills (grid floor/ceiling) are skipped by `recordLastFilledPrices` via the
+shared classifier `collectEdgePinnedFillIds`, matching the crawl's own edge
+exclusion: an edge order is static fat-finger insurance, not market movement,
+and the pivot is also the absolute geometry anchor for
+`reanchorBoundaryFromLastFill` — a rail-edge pivot would teleport the window to
+that edge. PARTIAL fills do arm it (a real trade at a real price). The pivot
+then survives a grid rebuild: `_resetLastFillPivot` clears it with the
+old generation and `rearmLastFillPivotFromMarketFill` re-arms it immediately
+from the bot-scoped last-market-fill row, provenance `'fill'`.
+
+*Operational consequence (deliberate):* after an edge fill the affected side
+stays vetoed relative to the last WINDOW trade until a window fill (or the 24h
+pivot TTL) re-arms it — e.g. a floor insurance BUY does not license selling that
+inventory below the last window sale. Moving the geometry to the edge instead
+(the pre-fix behaviour) re-typed and cancelled the whole window on a wick.
 
 The per-action LAST-FILL-GUARD checks run against the pivot frozen at batch
 start. A fill queued between that freeze and the broadcast passes every

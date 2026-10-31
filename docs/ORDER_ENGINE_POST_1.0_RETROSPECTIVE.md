@@ -44,6 +44,7 @@
 - 7. Consolidated verification — grid-correction check as regression gate
 - 8. Provenance & supersession record
 - 9. COW Broadcast, Resync & Geometry Safety (v1.6.4 → v1.6.14) — addendum
+  - 9.10 Review pass over v1.6.12 → v1.6.17 (findings P1–P5)
 - A. Grid-Price Invariant — former failure trace (appendix)
 
 ---
@@ -758,6 +759,28 @@ independent round trips, so sizes stop following the side budget. Spread repair
 must stay fund-driven from the side pool: a SELL fill returns quote while the
 same-side repair needs base, so no fill can ever fund its own side, and pairing
 would hide that asymmetry instead of resolving it.
+
+#### 9.10 Review pass over v1.6.12 → v1.6.17 (unreleased)
+
+A code review of the whole 1.6.12→1.6.17 order-engine arc (90 commits) against
+the three stated goals — buy-low/sell-high counter orders, never trading through
+the last real fill, and repairing a stale/out-of-spread book from free funds —
+found the arc sound and identified five gaps. All five are fixed here.
+
+| # | Finding | Fix |
+|---|---|---|
+| P1 | The re-anchor ignored the crawl's EDGE-fill exclusion: `recordLastFilledPrices` armed the pivot on every fill, and the re-anchor is absolute, so one wick on a floor insurance BUY teleported the window to the grid floor (repro: boundary 29 → 0 on a 60-slot ladder; mirror at the ceiling). | Eligibility now lives at the single pivot writer: `collectEdgePinnedFillIds` (the placement pickers' own classifier) is applied in `recordLastFilledPrices`, so an edge fill can neither arm the guard nor anchor the geometry. Partials still anchor (a real trade; residual allow-listed). Pinned by `tests/test_edge_fill_pivot.ts`. |
+| P2 | The rebuild site claimed "the guard re-arms on the first real fill of the new generation" while the read-time fallback silently kept the old-generation pivot — so after a re-center in a market that had moved away, one whole side read `last-fill-blocked` forever AND the 10-minute geometry clock rebuilt the new generation again every cooldown, with no way to succeed. | Re-arm is explicit and logged (`rearmLastFillPivotFromMarketFill`, provenance `fill`, original timestamp) so code and docs agree; the geometry escalation is capped at ONE re-center per pivot (`_lastGeometryResyncPivotKey`) and then reports that only a fill or the pivot TTL restores the side. The pivot's survival is the decision, not an accident. Pinned by `tests/test_last_fill_pivot_rearm.ts` and SLF-11. |
+| P3 | `deriveRailBoundary` clamped the boundary to EVERY live rail order: one stray order 18 slots off clamped 138 → 115 and re-typed the whole window (self-legalizing the corrupt state), and it classified rails by slot id while the rest of the engine had moved to live chain prices. | Rail membership = the batch's own op destinations + master orders on their own side of the planned boundary; strays are skipped and named in the log; rail indices come from `resolveLiveOrderLadderPosition`; the result passes the shared `validatePersistedBoundary` gate (cancel/rotation sources allow-listed, sparse ladders excluded because that gate's ceiling is array-derived). Pinned by RAIL-10..14. |
+| P4 | The crossing floor (`doesNotCrossMarket`) exists only in the spread-correction planner, so a generic reconcile/re-fill CREATE can execute as a taker fill where the planner would refuse. | Deliberately NOT blocked (a hard veto re-opens the counter-order deadlock: after a gap the counter sits across the floor by construction and executes at the best available price). Made visible instead: `warnCrossingCreate`, once per batch, from cached evidence only. Pinned by SLF-12. |
+| P5 | `analysis/grid_correction_check.ts` still implemented the OLD `pivot ± increment/2` band and claimed to mirror the guard 1:1, so it reported the tightening placements the direction-only guard allows as violations. | Predicate reduced to the live direction rule (arity-pinned in LFG-5), report/help text updated, `--increment` documented as informational, edge-fill false-positive class documented. |
+
+Simplifications landed with the fixes: one pivot resolver (two identical copies
+merged), one boundary validator for the re-anchor and the rail clamp, one
+eligibility rule for the crawl, the pivot and the anchor, the dead
+`size`/`increment` parameters of `isLastFillGuardBlocked` removed (an increment
+term is no longer reachable through it — LFG-5 pins the arity), and the batch
+extremum extracted as `resolveFillAnchorIndex` (pure, batch-only).
 
 ---
 

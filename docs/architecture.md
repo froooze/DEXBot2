@@ -500,7 +500,8 @@ The correction path is fund-only and never manufactures budget by shrinking a re
    bind: every tightening slot on that side is at/through the last fill, so a
    sell slot below the last sale means the boundary/crawl is behind the fill —
    placement cannot repair it and the re-center can, so it escalates on the
-   short geometry window.
+   short geometry window (at most once per fill pivot: a re-center does not move
+   the pivot, so a repeat attempt would only churn the new generation).
    Every cause arms the targeted
    balances + open-orders refresh: the local snapshot the check reasoned over
    may be stale (`no-candidates` can mean a missed fill left an ACTIVE slot
@@ -590,14 +591,26 @@ must be `fill`; a book-seeded max-bid/min-ask heuristic never anchors, and the
 bot-scoped last-market-fill row is the fallback), an on-ladder price within one
 increment (`off-ladder-fill`), a target that actually puts the fill outside the
 window after the grid-ceiling clamp (`ceiling-clamped`), and the candidate must
-pass `validatePersistedBoundary`. A live order inside the re-typed band still
-refuses the re-anchor (`unsafe: placed_order_in_band`) with one deliberate
-exception: the fill's **own PARTIAL residual** at the anchor slot (same side,
-same ladder level) is allow-listed, because any boundary that puts the fill
-outside its window necessarily puts that remainder inside the band. A partial
-fill therefore no longer deadlocks the geometry; GAP-EVAC cleans the residual
-afterwards. Because that remainder is persisted in-band, the startup and
-recovery load paths pass `tolerateTransientStranding` and keep the boundary
+pass `validatePersistedBoundary` — the SAME gate the restore and commit paths
+use, so every boundary writer ends in one validator.
+
+**Eligibility is the crawl's eligibility.** EDGE-pinned insurance fills never
+arm the pivot (`recordLastFilledPrices` skips them via
+`collectEdgePinnedFillIds`) and therefore never anchor: an edge order is static
+fat-finger insurance, not market movement, and an absolute anchor from a
+rail-edge price would teleport the window to that edge (observed: boundary 29 →
+0 after a floor insurance BUY filled on a 60-slot ladder). PARTIAL fills DO
+anchor — a partial at a far slot is still a real trade, and its residual is the
+allow-listed case below.
+
+A live order inside the re-typed band still refuses the re-anchor
+(`unsafe: placed_order_in_band`) with one deliberate exception: the fill's
+**own PARTIAL residual** at the anchor slot (same side, same ladder level) is
+allow-listed, because any boundary that puts the fill outside its window
+necessarily puts that remainder inside the band. A partial fill therefore no
+longer deadlocks the geometry; GAP-EVAC cleans the residual afterwards.
+Because that remainder is persisted in-band, the startup and recovery load
+paths pass `tolerateTransientStranding` and keep the boundary
 (warn + load) instead of rebuilding it away. Every accepted re-anchor is logged
 at warn with the fill slot, the pivot price and the boundary move.
 
@@ -626,8 +639,9 @@ held behind boundary 133, then sells were rotated onto 1345.728664 — the exact
 price of the buy that had just filled; visible spread 1.5% → 0.3%).
 
 `deriveRailBoundary` (`dexbot_cow_runtime.ts`, pre-broadcast) therefore clamps
-the boundary to the batch's resulting rails — live master orders plus kept op
-destinations (creates / rotations, cancels removed):
+the boundary to the batch's resulting rails — the batch's own op destinations
+plus the master rail orders that sit on their own side of the planned boundary
+(a BUY at/below it, a SELL at/above the implied sellStart):
 
 ```text
 maxBuyIdx <= boundary <= minSellIdx - gapSlots - 1
@@ -635,9 +649,24 @@ maxBuyIdx <= boundary <= minSellIdx - gapSlots - 1
 
 Counter orders win over empty refill holes. When the batch placed nothing above
 the committed boundary, the clamp is a no-op and the refill hold is unchanged.
+
+**Strays do not clamp, and rail indices come from the live price.** A master
+rail order parked on the wrong side of the planned boundary is a *stray* — a
+refused-commit adoption at an old generation level, a SPREAD-GUARD straggler, a
+stranded hold — and is skipped (counted in the log line), because letting it
+clamp would SELF-LEGALIZE the corrupt state (live class: one live sell 18 slots
+below clamped the boundary 138 → 115 and re-typed the whole window). Its rail
+index is the order's LIVE chain price mapped onto the ladder
+(`resolveLiveOrderLadderPosition`), not the slot id, for the same reason the
+fill/gap/crossing paths are live-price: a stale slot id misplaces the order.
+
 A crossed or over-ceiling rail fails closed (`rail-crossed` /
 `rail-exceeds-grid`): keep the previous boundary, never legalize the overlap;
-GAP-EVAC / the next plan owns the offending order.
+GAP-EVAC / the next plan owns the offending order. The result is then passed
+through the shared `validatePersistedBoundary` gate (skipped only for a sparse
+ladder, whose array-length ceiling would reject everything), with the slots the
+batch cancels or rotates away allow-listed — so the rail clamp and the re-anchor
+cannot disagree about what "stranded in the band" means.
 
 ### Live-Price Provenance (fill, gap, crossing)
 
