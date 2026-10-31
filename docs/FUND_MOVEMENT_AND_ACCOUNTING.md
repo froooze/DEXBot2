@@ -27,7 +27,7 @@ $$Available = \max(0, \text{ChainFree} - \text{Virtual} - \text{FeesOwed} - \tex
 **Critical Invariants:**
 1.  **Virtual represents Plan.** Orders remain in `Virtual` only while they are truly uncommitted. As soon as they move to `ACTIVE`, they move to `Committed` (Chain), even if the blockchain transaction is still in flight. This maintains the `Total = Free + Committed` invariant.
 2.  **Available Funds = True Spending Power.** This formula is the single source of truth for how much capital can be deployed immediately.
-3.  **Non-BTS pair reservation.** When neither asset is BTS, the formula adds an extra proportional deduction: any BTS fee-budget deficit (formula budget minus `funds.btsBalance.free`) is split across `buyFree` + `sellFree` proportional to each side's free balance, and the side's share is subtracted from `Available`. See `calculateAvailableFundsValue()` in `modules/order/utils/math.ts` (lines 407–425).
+3.  **Non-BTS pair reservation.** When neither asset is BTS, the formula adds an extra proportional deduction: any BTS fee-budget deficit (formula budget minus `funds.btsBalance.free`) is split across `buyFree` + `sellFree` proportional to each side's free balance, and the side's share is subtracted from `Available`. See `calculateAvailableFundsValue()` in `modules/order/utils/math.ts`.
 
 ### 1.3 Capital Allocation Pipeline
 
@@ -52,7 +52,7 @@ funds.allocated → _getSizingContext()       (budget for spread correction)
 **Key points:**
 - `botFunds` percentage applies to **total** capital (free + locked in orders), not just free. A bot at `"50%"` gets half of everything, not half of what's currently idle.
 - `funds.allocated` is the ceiling for each side. Existing orders already consume part of it; the remaining free portion is available for new placements.
-- The downstream `applyBotFundsAllocation()` (`manager.ts:1287`) also caps `funds.available` to `<= allocated` as a safety net, but the primary budget chokepoint is `getSideBudget` / `_getSizingContext` reading `allocated` directly (v1.2.6).
+- The downstream `applyBotFundsAllocation()` (`order/manager.ts`) also caps `funds.available` to `<= allocated` as a safety net, but the primary budget chokepoint is `getSideBudget` / `_getSizingContext` reading `allocated` directly (v1.2.6).
 - `funds.available[side] = max(0, chainFree − virtualReservation − fees)`. When the empty rail already reserves more than the chain holds, this reads 0 while the side still holds inventory — the **rail oversubscribed** state. Spread correction names it in the log, flags it on the manager, and the out-of-spread watchdog escalates it on `TIMING.SPREAD_STALE_FUND_ESCALATE_MS`: the durable repair is re-sizing the rail from chain truth (structural re-center).
 - For a KNOWN candidate set the reservation must not veto the placement it describes: `deriveChainTruthFundBudget` (`utils/math.ts`) re-derives `min(chainFree, min(virtualReservation, Σ candidate ideals))` when `available` reads 0, so an over-sized projection cannot deadlock placement. The chain rejects an over-commit at broadcast, so this cannot spend more than exists.
 
@@ -69,7 +69,7 @@ Mixed BUY/SELL batches are validated per asset using a signed-delta **peak** run
 
 #### Implementation Location
 
-File: `modules/dexbot_cow_runtime.ts` — `validateOperationFunds()` (line 1655), called from the COW batch broadcast path at line 4457.
+File: `modules/dexbot_cow_runtime.ts` — `validateOperationFunds()`, called from the COW batch broadcast path.
 
 ```javascript
 // Per-asset peak requirement vs. quantized chain-free snapshot.
@@ -114,7 +114,7 @@ See [developer_guide.md#order-state-helper-functions](developer_guide.md#order-s
 
 #### Gap-Slot Batch Fill Processing
 
-**Mechanism**: Fill events arrive via `modules/dexbot_fill_runtime.ts` (the fill-runtime module), which pushes them into `bot._incomingFillQueue` (declared in `modules/dexbot_class.ts`). The drain loop in `dexbot_fill_runtime.ts` then chunks the queue into capped batches and calls `modules/order/manager.ts::processFilledOrders` (line 1811) once per chunk to run the full rebalance pipeline.
+**Mechanism**: Fill events arrive via `modules/dexbot_fill_runtime.ts` (the fill-runtime module), which pushes them into `bot._incomingFillQueue` (declared in `modules/dexbot_class.ts`). The drain loop in `dexbot_fill_runtime.ts` then chunks the queue into capped batches and calls `modules/order/manager.ts::processFilledOrders` once per chunk to run the full rebalance pipeline.
 
 **Batch Sizing Algorithm**: Batch size is derived from the grid gap-slot count + 1 (`DEXBot._getGapSlotBatchSize`): a queue depth at or below gapSlots+1 is processed as one unified batch; deeper queues are chunked into repeated batches of gapSlots+1 (the last chunk may be smaller). The same gapSlots+1 size caps order operations per broadcast transaction (oversized op batches are split into sequential broadcasts).
 
@@ -125,7 +125,7 @@ See [developer_guide.md#order-state-helper-functions](developer_guide.md#order-s
 **Per-Batch Execution**:
 
 1. **Peek & Pop**: Check `_incomingFillQueue`, pop up to N fills (batch size)
-2. **Replay-safe Accounting Pass**: Each fill is accounted individually via `processFillAccounting(fillOp, fillKey)` with replay-safe dedup (`applyReplaySafeFillAccounting`, `dexbot_fill_runtime.ts:300`)
+2. **Replay-safe Accounting Pass**: Each fill is accounted individually via `processFillAccounting(fillOp, fillKey)` with replay-safe dedup (`applyReplaySafeFillAccounting`, `dexbot_fill_runtime.ts`)
    - Proceeds credited directly to `chainFree` (via `adjustTotalBalance`)
    - Same-order fill batching (sync_engine Phase 6 cumulative transition) aggregates multiple fill transitions on one order before a single rebalance
    - All proceeds immediately available to next rebalance cycle (not split across cycles)
@@ -139,7 +139,7 @@ See [developer_guide.md#order-state-helper-functions](developer_guide.md#order-s
 
 **Result**: 29 fills now processed in ~8 broadcasts (~24s) instead of 29 broadcasts (~90s).
 
-**Residual Dust Cancellation** (post-1.4.12): After a sub-dust fill leaves a residual order on chain (e.g. the quote-side value truncates to 0 on `bitshares-core` `maybe_cull_small_order`), the fill runtime explicitly cancels those residuals via `cancelResidualOrders()` (`dexbot_fill_runtime.ts:191`, `[RESIDUAL]` tag) so a leftover of ≥1 base unit cannot be re-adopted into a grid slot by maintenance.
+**Residual Dust Cancellation** (post-1.4.12): After a sub-dust fill leaves a residual order on chain (e.g. the quote-side value truncates to 0 on `bitshares-core` `maybe_cull_small_order`), the fill runtime explicitly cancels those residuals via `cancelResidualOrders()` (`dexbot_fill_runtime.ts`, `[RESIDUAL]` tag) so a leftover of ≥1 base unit cannot be re-adopted into a grid slot by maintenance.
 
 #### Grid Regeneration Trigger (Available Funds Ratio — bidirectional)
 
@@ -401,7 +401,7 @@ targetSlot.orderId = newOrderId;
 
 ### 3.6 Orphan-Fill Deduplication & Double-Credit Prevention
 
-**Location**: `modules/dexbot_class.ts` — constructor, `_recoverExplicitStaleOrders()` (line 448); orphan-fill guard in the fill drain loop and pruning pass after each cycle now live in `modules/dexbot_fill_runtime.ts` (guard ~lines 628-646, pruning ~lines 934-946).
+**Location**: `modules/dexbot_class.ts` — constructor, `_recoverExplicitStaleOrders()`; orphan-fill guard in the fill drain loop and pruning pass after each cycle now live in `modules/dexbot_fill_runtime.ts` (the orphan-fill guard and the post-cycle pruning pass).
 
 #### Stale-Cleaned Order ID Tracking with TTL + Recycled-Slot Guard
 
@@ -558,7 +558,7 @@ These are deducted from the *proceeds* of a fill.
 
 For BTS fees, the system returns a structured object (not a simple number) with multiple fields for accounting precision.
 
-**Location**: `modules/order/utils/math.ts::getAssetFees()` (line 312). The fee cache itself is populated by `modules/order/utils/system.ts::initializeFeeCache()` (line 665).
+**Location**: `modules/order/utils/math.ts::getAssetFees()`. The fee cache itself is populated by `modules/order/utils/system.ts::initializeFeeCache()`.
 
 #### BTS Fee Object (Always Object)
 
@@ -672,7 +672,7 @@ Floating-point arithmetic drifts from true blockchain integer representations ov
 
 #### 5.5.1 Core Quantization Functions
 
-**Location**: `modules/order/utils/math.ts` (line 265)
+**Location**: `modules/order/utils/math.ts` (`quantizeFloat`)
 
 ##### `quantizeFloat(value, precision)` - Eliminate Accumulation Errors
 
@@ -774,7 +774,7 @@ This prevents the bug where `available = chainFree + required` created a tautolo
 
 ## 6. Safety & Invariants
 
-The `Accountant` enforces strict mathematical invariants to detect bugs or manual interference. Invariants are checked by `_verifyFundInvariants()` (`modules/order/accounting.ts` line 501) after every blockchain sync cycle. The verification reads from a snapshot captured under `_fundLock` — `actualBuy`/`actualSell` are captured at snapshot time, not read live outside the lock, closing a TOCTOU window. When a violation is detected, the system logs a `CRITICAL` error and attempts automatic recovery via `manager.accountant.recalculateFunds()` (`modules/order/accounting.ts` line 346, delegated from `modules/order/manager.ts` lines 981–990) — resetting internal state to match on-chain reality. If the grid lock is held (mid-rebalance), recovery is deferred until the lock is released. The bot continues operating throughout; it does **not** halt on invariant violations.
+The `Accountant` enforces strict mathematical invariants to detect bugs or manual interference. Invariants are checked by `_verifyFundInvariants()` (`modules/order/accounting.ts`) after every blockchain sync cycle. The verification reads from a snapshot captured under `_fundLock` — `actualBuy`/`actualSell` are captured at snapshot time, not read live outside the lock, closing a TOCTOU window. When a violation is detected, the system logs a `CRITICAL` error and attempts automatic recovery via `manager.accountant.recalculateFunds()` (`modules/order/accounting.ts`, delegated from `modules/order/manager.ts`) — resetting internal state to match on-chain reality. If the grid lock is held (mid-rebalance), recovery is deferred until the lock is released. The bot continues operating throughout; it does **not** halt on invariant violations.
 
 ### 6.1 The Equality Invariant
 Total funds on chain must equal free plus committed.

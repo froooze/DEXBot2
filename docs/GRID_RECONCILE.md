@@ -80,14 +80,14 @@ Phase 2 and 3 both respect the `dryRun` flag: when true, no on-chain mutations a
 
 **Source:** `reconcileGridOrders()` Phase 1 in `grid_reconcile.ts`.
 
-1. **Phantom order sanitization** (lines 216-245): For each `isOrderPlaced()` order whose `orderId` is not in the chain snapshot, reset it to VIRTUAL with `skipAccounting` to prevent fund inflation. Two absence-decision guards make this safe:
-   - **Freshly-assigned deferral** (lines 226-235): an `orderId` assigned within `TIMING.SYNC_LOCK_TIMEOUT_MS` (via `manager._orderIdAssignedAt`) may be an in-flight create/adopt whose broadcast has not landed or is not yet visible to a lagging/truncated read — virtualizing it and re-creating would duplicate a real live order (the reconcile-timeout death-spiral root cause). It is skipped (deferred) rather than virtualized.
-   - **Ghost heuristic** (line 229): an order with `size <= 0` && `PARTIAL` (a known filled ghost) still passes through so known fills get cleaned up.
+1. **Phantom order sanitization** (the `isOrderPlaced()` absence pass in `reconcileGridOrders()`): For each `isOrderPlaced()` order whose `orderId` is not in the chain snapshot, reset it to VIRTUAL with `skipAccounting` to prevent fund inflation. Two absence-decision guards make this safe:
+   - **Freshly-assigned deferral** (the `_orderIdAssignedAt` freshness guard): an `orderId` assigned within `TIMING.SYNC_LOCK_TIMEOUT_MS` may be an in-flight create/adopt whose broadcast has not landed or is not yet visible to a lagging/truncated read — virtualizing it and re-creating would duplicate a real live order (the reconcile-timeout death-spiral root cause). It is skipped (deferred) rather than virtualized.
+   - **Ghost heuristic** (same absence pass): an order with `size <= 0` && `PARTIAL` (a known filled ghost) still passes through so known fills get cleaned up.
    - Virtualization always uses `{ skipAccounting: true }` so startup cleanup never inflates `ChainFree`.
 
-2. **Duplicate detection** (lines 258-331): For each unmatched chain order, find the nearest active same-side grid order. If its price equals that grid order's slot price exactly (`priceSlotEqual` at the asset precision), flag it as a suspected duplicate and queue for a Phase 2 cancel (never cancelled under lock). Non-equal neighbours are only logged with nearest-same-side diagnostics and continue into per-side reconciliation. Duplicate IDs are removed from the unmatched set so they aren't also paired for updates/creates.
+2. **Duplicate detection** (the unmatched-order duplicate pass): For each unmatched chain order, find the nearest active same-side grid order. If its price equals that grid order's slot price exactly (`priceSlotEqual` at the asset precision), flag it as a suspected duplicate and queue for a Phase 2 cancel (never cancelled under lock). Non-equal neighbours are only logged with nearest-same-side diagnostics and continue into per-side reconciliation. Duplicate IDs are removed from the unmatched set so they aren't also paired for updates/creates.
 
-3. **Per-side reconciliation** via `_reconcileStartupSide(planOnly=true)` (lines 343-372):
+3. **Per-side reconciliation** via `_reconcileStartupSide(planOnly=true)` (`grid_reconcile_internal.ts`):
    - Count `matchedOnGrid` (active grid orders with `orderId`)
    - `neededSlots = targetCount - matchedOnGrid`; pick virtual slots to activate
    - Match sorted unmatched chain orders to virtual slots → `plannedUpdates`

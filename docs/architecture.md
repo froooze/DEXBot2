@@ -904,7 +904,7 @@ PIPELINE_TIMING: {
 - `isPipelineEmpty()` tracks when pipeline operations started blocking via `_pipelineBlockedSince` timestamp
 - If blockage exceeds 5 minutes, `clearStalePipelineOperations()` is called
 - Non-destructive recovery: clears operation flags only, does NOT delete orders or modify grid state
-- Recovery called from `_executeMaintenanceLogic()` during periodic maintenance checks
+- Recovery called from `executeMaintenanceLogic()` during periodic maintenance checks
 
 **Location**: `modules/order/manager.ts` (`isPipelineEmpty()` and `clearStalePipelineOperations()`)
 
