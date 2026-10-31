@@ -318,12 +318,9 @@ export {
     BTS_ID,
     assetSymbol,
     assetPrec,
-    toReal,
-    isValidFillAmounts,
     matchesAssetRef,
     classifyFill,
     resolveAssetPrecisions,
     fetchAllFills,
     FillRecord,
-    ClassifiedFill,
 };

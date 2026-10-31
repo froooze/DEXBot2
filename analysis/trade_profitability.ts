@@ -1393,7 +1393,7 @@ async function run(argv: string[] = process.argv.slice(2)) {
     }
 }
 
-export { analyzePair, classifyFills, computeMetrics, parseArgs, run, reportFileName, TradeFill, FillRecord, RealizedPnl, PairAnalysis, TradingMetrics, WindowRange };
+export { analyzePair, classifyFills, computeMetrics, parseArgs, run, reportFileName, TradeFill, FillRecord, PairAnalysis, TradingMetrics };
 
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {
     run().then(() => process.exit(0)).catch(e => {

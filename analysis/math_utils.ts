@@ -145,7 +145,7 @@ function geometricRange(
  * Parse a candle JSON file with format detection:
  * flat array → {candles: [...]} → {data: [...]}
  */
-export interface CandleFile {
+interface CandleFile {
     candles: Record<string, unknown>[];
     meta: Record<string, unknown> | null;
 }

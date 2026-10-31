@@ -117,6 +117,7 @@
     "build:clean": "npm run clean && npm run build",
     "build:tests": "tsc -p tsconfig.tests.json && cp tests/package.json dist/tests/package.json && cp tests/helpers/esm_mock_hooks.mjs tests/helpers/esm_mock_loader.mjs dist/tests/helpers/",
     "typecheck": "tsc --noEmit",
+    "typecheck:analysis": "tsc -p analysis/tsconfig.json",
     "check:any": "npm run build && node dist/scripts/check_any.js",
     "check:any:update": "npm run build && node dist/scripts/check_any.js --update",
     "check:any:list": "npm run build && node dist/scripts/check_any.js --list",

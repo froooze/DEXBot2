@@ -34,21 +34,21 @@ import { MARKET_ADAPTER } from '../../modules/constants.js';
 export type HuberScaleMode = 'none' | 'df' | 'mscale';
 
 /** One-bar diagnostic snapshot returned alongside the slope. */
-export interface HuberDiagnostics {
+interface HuberDiagnostics {
     slopePct: number;
     scale: number;
     outlierFraction: number;
 }
 
 /** Accumulated stats attached to an estimator built by {@link createHuberEstimator}. */
-export interface HuberEstimatorStats {
+interface HuberEstimatorStats {
     calls: number;
     outlierFractionSum: number;
     scaleSum: number;
 }
 
 /** Estimator function shape accepted by simulateGridResetSeries (cfg.slopeEstimator). */
-export interface HuberConsts {
+interface HuberConsts {
     C?: number;
     ITERATIONS?: number;
     SCALE_FLOOR?: number;

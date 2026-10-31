@@ -1,6 +1,6 @@
 ## Bot Fitting Backtest
 
-This folder contains parameter sweep backtests that simulate grid fills for the four AMA winners from `analysis/ama_fitting`.
+This folder contains parameter sweep backtests that simulate grid fills for the four AMA winners produced by the optimizer in `analysis/ama_fitting/` (results land in `analysis/results/`).
 
 ### What it optimizes
 
@@ -74,7 +74,7 @@ microstructure, and no consolidation/dust-cancel/COW/collision mechanics.
 Both scripts require:
 
 - **LP candles JSON** (recommended 1h), from `market_adapter/data/lp/` — pass via `--data`
-- **AMA optimization winners JSON**, from `analysis/ama_fitting/` — for `backtest_ama_sweep.ts`, pass via `--results`
+- **AMA optimization winners JSON**, from `analysis/results/` — for `backtest_ama_sweep.ts`, pass via `--results`
 
 ### Run
 
@@ -99,7 +99,7 @@ node dist/analysis/bot_fitting/backtest_lookback_drawdown.js \
 > builds on it and reports the paired per-lookback deltas.
 
 > `backtest_bot_fitting.ts` auto-derives `--results` from the `--data` filename
-> (`analysis/ama_fitting/optimization_results_<base>_w<λ1>_<λ2>_<λ3>_<λ4>.json`,
+> (`analysis/results/optimization_results_<base>_w<λ1>_<λ2>_<λ3>_<λ4>.json`,
 > newest `_w*` file matching the base name; falls back to the legacy
 > `optimization_results_<base>.json`) when omitted.
 > `backtest_ama_sweep.ts` requires `--results` explicitly.

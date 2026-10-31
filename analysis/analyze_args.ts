@@ -12,7 +12,7 @@
 import type { SourceConfig } from './resolve_source.js';
 
 /** Fields every analysis CLI config shares. */
-export interface AnalysisBaseConfig {
+interface AnalysisBaseConfig {
     source: { type: string; config: SourceConfig };
     quiet: boolean;
     listBots: boolean;

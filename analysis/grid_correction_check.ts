@@ -108,7 +108,7 @@ interface AggregatedOrder {
     isMaker: boolean;
 }
 
-// ─── LAST-FILL-GUARD helper (1:1 with order/utils/system.ts) ────────────────
+// ─── LAST-FILL-GUARD helper (1:1 with modules/order/utils/system.ts) ────────────
 
 /**
  * LAST-FILL-GUARD helper — DIRECTION ONLY relative to the last fill price.
@@ -155,7 +155,7 @@ Usage: node dist/analysis/grid_correction_check.js --bot-key <key> [options]
 Validates LAST-FILL-GUARD discipline (DIRECTION ONLY relative to the last fill):
   BUY must be < last fill price, SELL must be > last fill price.
   Equal price counts as blocked (a re-place at the just-filled level).
-  Mirrors order/utils/system:isLastFillGuardBlocked 1:1.
+  Mirrors modules/order/utils/system:isLastFillGuardBlocked 1:1.
   Cold start (no previous fill) is disabled.
 
 Required:
@@ -174,7 +174,6 @@ Options:
   --increment <pct>      Grid increment percent, informational only — the
                          direction-only guard does not use a band
                          (default: from bot config or ${Number(C.DEFAULT_CONFIG?.incrementPercent ?? 0.5)})
-  --tolerance <pct>      Deprecated alias for --increment (kept for compat, prefer --increment)
   --per-fill             Check at fill granularity (default: per-order aggregated)
   --include-cross-pair   Check consecutive fills across different pairs (default: same pair only)
   --json <file>          Export violations as JSON
@@ -246,15 +245,6 @@ function parseArgs(): CliOpts {
             case '--per-fill': opts.perFill = true; break;
             case '--include-cross-pair': opts.includeCrossPair = true; break;
             case '--increment': opts.incrementPercent = parseFloat(args[++i]); break;
-            case '--tolerance': {
-                const v = parseFloat(args[++i]);
-                // Back-compat: old --tolerance was the adverse pct before flagging; --increment is
-                // informational only now (the guard is direction-only), so this mapping only feeds
-                // the report label. Prefer explicit --increment; don't overwrite if already set.
-                if (opts.incrementPercent == null) opts.incrementPercent = v > 0 ? v * 2 : null;
-                console.warn(`[warn] --tolerance is deprecated, use --increment <pct> (e.g. --increment ${v > 0 ? (v*2) : 0.5})`);
-                break;
-            }
             case '--json': opts.json = args[++i]; break;
             case '--csv': opts.csv = args[++i]; break;
             case '--verbose': opts.verbose = true; break;

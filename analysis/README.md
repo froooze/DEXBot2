@@ -1,6 +1,6 @@
 # Analysis
 
-Tools that inspect DEXBot trading behavior and the market data it operates on. Output is interactive HTML charts written to `charts/` (regenerated on each run, not committed); none of this runs in production.
+Tools that inspect DEXBot trading behavior and the market data it operates on. Output is mostly interactive HTML charts written to `charts/` (regenerated on each run, not committed) and JSON results under `results/`; the trade analyzers can also export CSV/JSON to a caller-supplied path. The runners are research-only, but their shared chart and bot-key helpers are imported by the production market adapter.
 
 ## Contents
 
@@ -76,14 +76,14 @@ node dist/analysis/analyze_dynamic_weight.js --bot-key <bot-key>
 npm run analysis:trade-pnl -- 1.2.123456 --hours 168
 ```
 
-> The market adapter source reads from `market_adapter/state/market_adapter_centers.json` — run the bot first to populate state.
+> The market adapter source prefers the bot's cached candle file and falls back to `market_adapter/state/market_adapter_centers.json` — run the bot first to populate state.
 > Prefer the `npm run analysis:*` shortcuts; they wrap the compiled runners with the same flags (see [npm Script Shortcuts](#npm-script-shortcuts) for the full mapping).
 
 ## Data Prerequisites
 
 Most runners expect candle data. Two paths to get it:
 
-**Market adapter source** (default for most runners) — reads from `market_adapter/state/market_adapter_centers.json`. No setup needed; just run the bot first to populate state.
+**Market adapter source** (default for most runners) — resolves the bot's cached candle file first, then falls back to `market_adapter/state/market_adapter_centers.json`. No setup needed; just run the bot first to populate state.
 
 **LP candle files** — for deeper analysis with full OHLC data:
 
@@ -289,10 +289,9 @@ Exit code `0` = pass, `2` = violations found, `1` = fatal error. Bot keys resolv
 | `--start <iso>` / `--end <iso>` | — | Absolute time window |
 | `--account <id>` | bot `preferredAccount` | Override account ID or name |
 | `--refresh-account` | off | Force re-resolution of `preferredAccount` and update the stored `accountId` when it changed |
-| `--increment <pct>` | bot config / `0.5` | Grid increment used to derive the half-increment guard band |
+| `--increment <pct>` | bot config / `0.5` | Grid increment (informational only — the guard is direction-only and uses no band) |
 | `--per-fill` | off | Check at fill granularity instead of per-order aggregated |
 | `--include-cross-pair` | off | Also check consecutive fills across different pairs |
-| `--tolerance <pct>` | — | Deprecated compatibility alias for `--increment`; its value is doubled and a warning is emitted |
 | `--json <file>` / `--csv <file>` | — | Export violations |
 | `--verbose` | off | Print the fetched trade sequence before checking |
 | `--list-bots` | — | List available bot keys and exit |
