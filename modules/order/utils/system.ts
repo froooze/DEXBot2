@@ -87,6 +87,7 @@ import { PATHS } from '../../paths.js';
 import { toFiniteNumber, isValidNumber, toKnownNumber } from '../format.js';
 import * as MathUtils from './math.js';
 import * as OrderUtils from './order.js';
+import { parseSlotIndex } from './slot.js';
 import Logger from '../../order/logger.js';
 import { runtime } from '../../runtime.js';
 import { getErrorMessage, sleepMs } from '../../utils/errors.js';
@@ -1202,7 +1203,7 @@ function buildLastMarketFillPayload(manager: OrderManagerLike): { price: number;
 }
 
 /** Why spread correction is degraded or refused for a cycle. */
-export type SpreadCorrectionRefusalReason = 'cold-book' | 'stale-snapshot' | 'unmatched-orders';
+type SpreadCorrectionRefusalReason = 'cold-book' | 'stale-snapshot' | 'unmatched-orders';
 
 export interface SpreadCorrectionReadiness {
     /** False => hard refusal (cold book): the planner must not act this cycle. */
@@ -1224,7 +1225,7 @@ export interface SpreadCorrectionReadiness {
 }
 
 /** Narrowed read-only view of an unmatched chain order used by the readiness gate. */
-export interface UnmatchedChainOrderLike extends Record<string, unknown> {
+interface UnmatchedChainOrderLike extends Record<string, unknown> {
     price?: number;
     orderId?: string;
     chainOrderId?: string;
@@ -1660,7 +1661,7 @@ function resolveFillAnchorIndex(
             } catch { /* fall back to the slot id */ }
         }
         if (fIdx === null) {
-            const idIdx = OrderUtils.parseSlotIndex(f.id);
+            const idIdx = parseSlotIndex(f.id);
             if (idIdx !== null && idIdx !== undefined && Number.isFinite(Number(idIdx)) && Number(idIdx) >= 0) {
                 fIdx = Number(idIdx);
                 try { fPrice = Number(MathUtils.priceForSlot(fIdx, genesis)); } catch { fPrice = null; }
@@ -2337,9 +2338,7 @@ export async function applyGridDivergenceCorrections(manager: OrderManagerLike, 
                     // rotation pairing downstream); only true gap-band slots
                     // become side-neutral SPREAD.
                     const holeGeoType = OrderUtils.geometryTypeForSlotIndex(
-                        OrderUtils.parseSlotIndex
-                            ? OrderUtils.parseSlotIndex(current?.id)
-                            : null,
+                        parseSlotIndex(current?.id),
                         workingBoundaryIdx,
                         gapSlots
                     );

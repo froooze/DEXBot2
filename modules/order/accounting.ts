@@ -91,7 +91,8 @@ const require = createRequire(import.meta.url);
 
 import { ORDER_TYPES, ORDER_STATES, PIPELINE_TIMING, TIMING, FEE_PARAMETERS, GRID_LIMITS } from '../constants.js';
 import { resolveAccountRef } from './utils/system.js';
-import { resolveSpreadOrderSide, parseSlotIndex, parseChainOrder, applyChainSizeToGridOrder, convertToSpreadPlaceholder, resolveEdgeCount } from './utils/order.js';
+import { resolveSpreadOrderSide, parseChainOrder, applyChainSizeToGridOrder, convertToSpreadPlaceholder, resolveEdgeCount } from './utils/order.js';
+import { parseSlotIndex } from './utils/slot.js';
 import { isSlotInRail, floatToBlockchainInt } from './utils/math.js';
 import * as Format from './format.js';
 import * as fundRegistry from '../fund_registry.js';

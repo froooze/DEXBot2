@@ -68,7 +68,7 @@ const NAMES = {
         'isOrderGoneErrorMessage', 'isOrderHealthy', 'isOrderOnChain',
         'isOrderPlaced', 'isOrderVirtual', 'isPhantomOrder', 'isShiftEligibleFill',
         'isNonBlockingUnmatchedOrder',
-        'isSlotAvailable', 'parseChainOrder', 'parseSlotIndex', 'edgeOrderIdSet', 'liveWindowIdSet', 'collectEdgePinnedFillIds',
+        'isSlotAvailable', 'parseChainOrder', 'edgeOrderIdSet', 'liveWindowIdSet', 'collectEdgePinnedFillIds',
         'resolveConfiguredPriceBound', 'resolveLiveEdgeAnchorPrice',
         'resolveOnChainRetypeType', 'resolveEdgeCount',
         'resolveSpreadOrderSide', 'selectEdgeSlots', 'shouldFlagOutOfSpread', 'virtualizeOrder',

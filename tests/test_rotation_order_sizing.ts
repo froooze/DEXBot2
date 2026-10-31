@@ -53,8 +53,6 @@ const initialGridSizes = OrderUtils.calculateOrderSizes(
     config,
     2000,  // 2000 BTS total for sell orders
     1000,  // 1000 USDT total for buy orders
-    0,     // no min size
-    0,     // no min size
     8,     // BTS precision
     3      // USDT precision
 );
@@ -129,7 +127,6 @@ const buyRotationSizes = OrderUtils.calculateRotationOrderSizes(
     5,             // 5 new rotation orders
     ORDER_TYPES.BUY,
     config,
-    0,             // no min size
     buySizesPrecision
 );
 
@@ -153,7 +150,6 @@ const sellRotationSizes = OrderUtils.calculateRotationOrderSizes(
     5,             // 5 new rotation orders
     ORDER_TYPES.SELL,
     config,
-    0,             // no min size
     sellSizesPrecision
 );
 

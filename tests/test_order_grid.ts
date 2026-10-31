@@ -22,7 +22,7 @@ const sellFunds = 10;
 const buyFunds = 5;
 // Use a default precision for test determinism and compare integer totals
 const PRECISION = 8;
-const sized = calculateOrderSizes(orders, cfg, sellFunds, buyFunds, 0, 0, PRECISION, PRECISION);
+const sized = calculateOrderSizes(orders, cfg, sellFunds, buyFunds, PRECISION, PRECISION);
 assert(Array.isArray(sized), 'calculateOrderSizes should return an array');
 
 const { floatToBlockchainInt } = require('../modules/order/utils/math');

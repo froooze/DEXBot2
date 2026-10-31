@@ -58,10 +58,10 @@ import {
     convertToSpreadPlaceholder,
     toRailHolePlaceholder,
     geometryTypeForSlotIndex,
-    parseSlotIndex,
     hasOnChainId,
     isOrderPlaced
 } from "./utils/order.js";
+import { parseSlotIndex } from "./utils/slot.js";
 import type { OrderManagerLike, ManagedOrder, GridConfig, AssetPair, ProjectedFunds } from "../types.js";
 
 interface FillInput {

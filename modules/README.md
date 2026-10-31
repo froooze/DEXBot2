@@ -46,6 +46,8 @@ modules/
 ├── config.ts                      load-time process.env snapshot
 ├── env.ts                         isBrowser/hasProcess detection
 ├── runtime.ts                     process abstraction singleton
+├── lazy_shim.ts                   lazy named-export passthrough (require-on-call)
+├── runtime_mode.ts                runtime mode detection and status routing
 ├── runtime_settings.ts            per-bot runtime settings resolver
 ├── paths.ts                       guarded path resolution
 ├── path_api.ts                    portable path abstraction for ESM/browser

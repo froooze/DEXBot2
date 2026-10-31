@@ -239,7 +239,7 @@ export const SPREAD_CORRECTION_REFUSAL = Object.freeze({
     BATCH_NOT_EXECUTED: 'batch-not-executed'
 } as const);
 
-export type SpreadCorrectionRefusalCause =
+type SpreadCorrectionRefusalCause =
     (typeof SPREAD_CORRECTION_REFUSAL)[keyof typeof SPREAD_CORRECTION_REFUSAL];
 
 /**
@@ -308,7 +308,7 @@ export function recordSpreadCorrectionRefusal(manager: OrderManagerLike, cause: 
  * invalidating corrections. Counter-only; never throws.
  * @param {Object} manager - OrderManager instance
  */
-export function recordSpreadCorrectionRetry(manager: OrderManagerLike): void {
+function recordSpreadCorrectionRetry(manager: OrderManagerLike): void {
     try {
         const m = (manager as unknown as { _metrics?: Record<string, unknown> })?._metrics;
         if (!m) return;
@@ -366,7 +366,7 @@ export function getOccupiedCorrectionSlots(manager: OrderManagerLike, correction
  * @param {Object|null|undefined} correction - Prepared spread correction
  * @returns {number} Number of actions the COW plan will execute
  */
-export function getSpreadCorrectionActionCount(correction: SpreadCorrection | null | undefined): number {
+function getSpreadCorrectionActionCount(correction: SpreadCorrection | null | undefined): number {
     return (correction?.ordersToPlace?.length || 0) + (correction?.ordersToRotate?.length || 0);
 }
 
@@ -430,7 +430,7 @@ export async function replanSpreadCorrectionFromFreshMaster(manager: OrderManage
  * - 'replanned': a destination was taken and a fresh correction was derived.
  * - 'blocked': a destination was taken and no fresh correction exists — refuse.
  */
-export type OccupiedCorrectionResolution =
+type OccupiedCorrectionResolution =
     | { action: 'broadcast' }
     | { action: 'replanned'; correction: SpreadCorrection; occupied: string[] }
     | { action: 'blocked'; occupied: string[] };
@@ -547,7 +547,6 @@ import {
     isOrderPlaced,
     hasOnChainId,
     isEmptyGridSlot,
-    parseSlotIndex,
     calculateIdealBoundary,
     assignGridRoles,
     resolveOnChainRetypeType,
@@ -557,6 +556,7 @@ import {
     liveWindowIdSet,
     getOrderTypeFromUpdatedFlags
 } from './utils/order.js';
+import { parseSlotIndex } from './utils/slot.js';
 import { loadAmaCenterPrice, loadAmaCenterSnapshot, withBlockchainRetry, restoreLastFillPivot, resetLastFillPivot, rearmLastFillPivotFromMarketFill, evaluateSpreadCorrectionReadiness, maybeRefreshLiveMarketPrice, resolveLastFillGuardReference, isLastFillGuardBlocked } from './utils/system.js';
 import * as MathUtils from './utils/math.js';
 import { derivePriceWithPoolRef, resolveStartPriceMode } from './utils/withPoolRef.js';
@@ -1836,8 +1836,6 @@ export async function initializeGrid(manager: OrderManagerLike): Promise<void> {
             manager.config,
             sellCtx.budget,
             buyCtx.budget,
-            minSellSize,
-            minBuySize,
             precA,
             precB
         );
@@ -2202,7 +2200,6 @@ function _computeCommittedSizeDriftSync(manager: OrderManagerLike): { buyUpdated
                     allSideSlots.length,
                     s.orderType,
                     manager.config,
-                    0,
                     ctx.precision
                 );
             } catch (_err) {
@@ -2410,7 +2407,6 @@ export async function _recalculateGridOrderSizesFromBlockchain(manager: OrderMan
             allSideSlots.length,
             orderType,
             manager.config,
-            0,
             ctx.precision
         );
 
@@ -2697,7 +2693,6 @@ export async function compareGrids(calculatedGrid: unknown[], persistedGrid: unk
                     sideSlots.length,
                     type,
                     manager.config,
-                    0,
                     ctx.precision
                 );
 
@@ -3428,7 +3423,6 @@ async function _computeDustThresholdMap(manager: OrderManagerLike, type: OrderTy
                 (manager.config.weightDistribution ?? {})[side],
                 (manager.config.incrementPercent ?? 0) / 100,
                 type === ORDER_TYPES.BUY,
-                0,
                 ctx.precision
             )
             : [];
@@ -4255,7 +4249,6 @@ export function determineOrderSideByFunds(manager: OrderManagerLike, currentMark
                 (manager.config.weightDistribution ?? {})[sideName],
                 (manager.config.incrementPercent ?? 0) / 100,
                 railType === ORDER_TYPES.BUY,
-                0,
                 ctx.precision
             )
             : [];

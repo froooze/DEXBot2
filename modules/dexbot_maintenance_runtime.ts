@@ -117,7 +117,7 @@ function getCoreOrdersTotal(config: unknown) { return require('./order/utils/ord
 const correctAllPriceMismatches = lazyShim('./order/utils/order', 'correctAllPriceMismatches');
 const isOrderOnChain = lazyShim('./order/utils/order', 'isOrderOnChain');
 const parseChainOrder = lazyShim('./order/utils/order', 'parseChainOrder');
-const parseSlotIndex = lazyShim('./order/utils/order', 'parseSlotIndex');
+const parseSlotIndex = lazyShim('./order/utils/slot', 'parseSlotIndex');
 
 const CODE_ROOT = path.join(__dirname, '..');
 const PROFILES_DIR = PATHS.PROFILES_DIR;

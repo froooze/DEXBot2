@@ -179,7 +179,6 @@ async function runTests() {
             manager.config.weightDistribution.buy,
             manager.config.incrementPercent / 100,
             true,
-            0,
             ctx.precision
         );
         const partialIdx = sideSlots.findIndex(s => (s as any).id === partialId);
@@ -427,7 +426,7 @@ async function runTests() {
             // Virtual slots already carry the fill-pipeline sizing (they absorbed
             // the deposit); the committed window is the stale leg under test.
             const ideal = calculateRotationOrderSizes(
-                BUDGET, 0, slots.length, ORDER_TYPES.SELL, config, 0, PRECISION
+                BUDGET, 0, slots.length, ORDER_TYPES.SELL, config, PRECISION
             );
             for (let i = 0; i < SLOT_COUNT; i++) {
                 slots[i].size = i < COMMITTED_COUNT ? ideal[i] * committedFactor : ideal[i];
@@ -469,7 +468,7 @@ async function runTests() {
         // committed side is genuinely ~5% under-sized. Pin that scaling trap.
         const committedIdeals = calculateRotationOrderSizes(
             BUDGET, 0, SLOT_COUNT, ORDER_TYPES.SELL,
-            { incrementPercent: 0.5, weightDistribution: { buy: 1, sell: 1 } }, 0, PRECISION
+            { incrementPercent: 0.5, weightDistribution: { buy: 1, sell: 1 } }, PRECISION
         );
         const committedIdealSum = committedIdeals.slice(0, COMMITTED_COUNT).reduce((a, b) => a + b, 0);
         const underAllocatedPct = (committedIdealSum * 0.05 / BUDGET) * 100;

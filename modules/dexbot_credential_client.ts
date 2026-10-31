@@ -47,7 +47,7 @@ interface CredentialDaemonMeta {
     batchId?: string | null;
 }
 
-export interface CredentialDaemonResponse {
+interface CredentialDaemonResponse {
     success?: boolean;
     error?: string;
     code?: string;

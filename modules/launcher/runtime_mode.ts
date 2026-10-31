@@ -30,7 +30,7 @@ import { normalizeControlTarget, readLiveMonolithicPid, botNotFoundMessage, stat
 
 const storage = getStorage();
 
-export type RuntimeMode = 'monolithic' | 'isolated' | 'pm2' | 'none';
+type RuntimeMode = 'monolithic' | 'isolated' | 'pm2' | 'none';
 
 export interface Pm2Proc {
     pid?: number | string;
@@ -78,7 +78,7 @@ export function isConfiguredBotName(name: string): boolean {
     return false;
 }
 
-export interface StatusTargetCheck {
+interface StatusTargetCheck {
     error: string | null;
     notice: string | null;
 }
@@ -97,7 +97,7 @@ export function checkStatusTarget(target?: string | null): StatusTargetCheck {
     return { error: null, notice: statusIgnoresTargetMessage(requested) };
 }
 
-export type StatusRoute = 'unlock' | 'pm2' | 'empty';
+type StatusRoute = 'unlock' | 'pm2' | 'empty';
 
 /**
  * Which branch `dexbot status` takes. PM2 wins when PM2 bots are running (even

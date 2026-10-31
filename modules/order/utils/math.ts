@@ -1335,11 +1335,10 @@ function validateOrderSize(orderSize: number, orderType: string, assets: AssetPa
  * @param {number} weight - Weight factor (0-1) controlling distribution steepness
  * @param {number} incrementFactor - Increment factor (typically 0.01 for 1% grid spacing)
  * @param {boolean} [reverse=false] - If true, allocate larger sizes to higher indices
- * @param {number} [minSize=0] - Minimum size for each allocation (currently unused, for future validation)
  * @param {number} [precision=null] - Asset precision; if provided, quantize to blockchain integers
  * @returns {Array<number>} Array of n allocation sizes
  */
-function allocateFundsByWeights(totalFunds: number, n: number, weight: unknown, incrementFactor: number, reverse: boolean = false, _minSize: number = 0, precision: number | null = null): number[] {
+function allocateFundsByWeights(totalFunds: number, n: number, weight: unknown, incrementFactor: number, reverse: boolean = false, precision: number | null = null): number[] {
     if (n <= 0) return [];
     if (!Number.isFinite(totalFunds) || totalFunds <= 0) return new Array(n).fill(0);
 
@@ -1391,13 +1390,11 @@ function allocateFundsByWeights(totalFunds: number, n: number, weight: unknown, 
  * @param {Object} config - Configuration with incrementPercent and weightDistribution
  * @param {number} sellFunds - Total funds available for SELL orders
  * @param {number} buyFunds - Total funds available for BUY orders
- * @param {number} [minSellSize=0] - Minimum size for sell allocations
- * @param {number} [minBuySize=0] - Minimum size for buy allocations
  * @param {number} [precisionA=null] - Precision for assetA (SELL asset)
  * @param {number} [precisionB=null] - Precision for assetB (BUY asset)
  * @returns {Array<Object>} Orders array with size property added to each
  */
-function calculateOrderSizes(orders: ManagedOrder[], config: GridConfig, sellFunds: number, buyFunds: number, minSellSize: number = 0, minBuySize: number = 0, precisionA: number | null = null, precisionB: number | null = null): ManagedOrder[] {
+function calculateOrderSizes(orders: ManagedOrder[], config: GridConfig, sellFunds: number, buyFunds: number, precisionA: number | null = null, precisionB: number | null = null): ManagedOrder[] {
     const incrementPercent = config.incrementPercent ?? 0;
     const sellWeight = config.weightDistribution?.sell ?? 0;
     const buyWeight = config.weightDistribution?.buy ?? 0;
@@ -1406,8 +1403,8 @@ function calculateOrderSizes(orders: ManagedOrder[], config: GridConfig, sellFun
     const sellOrders = orders.filter((o) => o.type === ORDER_TYPES.SELL);
     const buyOrders = orders.filter((o) => o.type === ORDER_TYPES.BUY);
 
-    const sellSizes = allocateFundsByWeights(sellFunds, sellOrders.length, sellWeight, incrementFactor, false, minSellSize, precisionA);
-    const buySizes = allocateFundsByWeights(buyFunds, buyOrders.length, buyWeight, incrementFactor, true, minBuySize, precisionB);
+    const sellSizes = allocateFundsByWeights(sellFunds, sellOrders.length, sellWeight, incrementFactor, false, precisionA);
+    const buySizes = allocateFundsByWeights(buyFunds, buyOrders.length, buyWeight, incrementFactor, true, precisionB);
 
     const sellState = { sizes: sellSizes, index: 0 };
     const buyState = { sizes: buySizes, index: 0 };
@@ -1435,11 +1432,10 @@ function calculateOrderSizes(orders: ManagedOrder[], config: GridConfig, sellFun
  * @param {number} orderCount - Number of orders to size
  * @param {string} orderType - Order type (BUY or SELL)
  * @param {Object} config - Configuration with incrementPercent and weightDistribution
- * @param {number} [minSize=0] - Minimum size for each allocation
  * @param {number} [precision=null] - Asset precision for quantization
  * @returns {Array<number>} Array of order sizes
  */
-function calculateRotationOrderSizes(availableFunds: number, totalGridAllocation: number, orderCount: number, orderType: string, config: GridConfig, minSize: number = 0, precision: number | null = null): number[] {
+function calculateRotationOrderSizes(availableFunds: number, totalGridAllocation: number, orderCount: number, orderType: string, config: GridConfig, precision: number | null = null): number[] {
     if (orderCount <= 0) return [];
     const totalFunds = availableFunds + totalGridAllocation;
     if (!Number.isFinite(totalFunds) || totalFunds <= 0) return new Array(orderCount).fill(0);
@@ -1450,7 +1446,7 @@ function calculateRotationOrderSizes(availableFunds: number, totalGridAllocation
     const weight = (orderType === ORDER_TYPES.SELL) ? (weightDistribution.sell ?? 0) : (weightDistribution.buy ?? 0);
     const reverse = (orderType === ORDER_TYPES.BUY);
 
-    return allocateFundsByWeights(totalFunds, orderCount, weight, incrementFactor, reverse, minSize, precision);
+    return allocateFundsByWeights(totalFunds, orderCount, weight, incrementFactor, reverse, precision);
 }
 
 /**
@@ -1517,7 +1513,7 @@ function calculateGridSideDivergenceMetric(calculatedOrders: ManagedOrder[], per
  * Works for all pairs — returns the BTS fee budget needed for order operations.
  * 
  * @param {string} assetA - First asset symbol
- * @param {string} assetB - Second asset symbol (unused in calculation, kept for signature compat)
+ * @param {string} assetB - Second asset symbol (used only to label the fee-cache warning)
  * @param {number} totalOrders - Number of orders to create
  * @param {number} [feeMultiplier=BTS_RESERVATION_MULTIPLIER] - Multiplier for reservation (typically 5x)
  * @returns {number} Total fee amount (fallback BTS_FALLBACK_FEE if fee lookup fails; warning logged)
