@@ -40,7 +40,7 @@
  * 6. Log shutdown status
  * 7. Exit process
  *
- * USAGE:
+ * USAGE (from the repo root):
  * import { registerCleanup } from './modules/graceful_shutdown.js';
  *
  * // Register cleanups (executed in reverse order on shutdown)

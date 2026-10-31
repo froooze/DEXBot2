@@ -437,9 +437,10 @@ is divergence telemetry built on `calculateGridSideDivergenceMetric`.
 
 **A grid with no price ladder is not a degraded grid — it is an undefined one.**
 Every consumer of the invariant reads `priceForSlot(idx, genesis)`, and each one
-silently degrades without it: nearest-slot adoption, the materialize
-descriptor-price fallback, `resolveLiveEdgeAnchorPrice` tiers 3/4, and the
-`isSlotInRail` fail-open. That degradation is the tolerance
+silently degrades without it: nearest-slot adoption (`sync_engine.ts`), the
+materialize descriptor-price fallback (`sync_engine.ts`), edge anchoring via
+`resolveLiveEdgeAnchorPrice` (`order/utils/order.ts`), and the `isSlotInRail`
+fail-open (`order/utils/math.ts`). That degradation is the tolerance
 matcher, which is exactly the path on which an off-grid price becomes grid
 evidence. So the ladder is treated as a **required** part of a snapshot, not a
 nice-to-have.

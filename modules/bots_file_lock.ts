@@ -33,7 +33,7 @@
  *
  * ===============================================================================
  *
- * USAGE:
+ * USAGE (from the repo root):
  * import { readBotsFileWithLock, writeBotsFileWithLock, readBotsFileSync } from './modules/bots_file_lock.js';
  * const { config } = await readBotsFileWithLock('./profiles/bots.json', JSON.parse);
  * await writeBotsFileWithLock('./profiles/bots.json', updatedConfig);

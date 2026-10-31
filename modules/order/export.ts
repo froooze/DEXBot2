@@ -4,7 +4,7 @@
  * Trading history extraction and CSV export engine.
  * Parses PM2 log files to extract trading fills and exports to standardized format.
  *
- * Usage:
+ * Usage (from the repo root):
  *   import * as exporter from './modules/order/export.js';
  *   const result = await exporter.exportBotTrades(botKey, botConfig, outputDir);
  *

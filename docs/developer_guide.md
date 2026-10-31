@@ -279,6 +279,18 @@ const normalized = normalizeInt(currentSizeInt, assetPrecision);
 
 ---
 
+## Export Surface & Test Seams
+
+Three rules keep the module surface honest once you start narrowing it.
+
+**1. Declaration emit is a real consumer.** A type used only inside its own module can still be unnameable from a dependent package's `.d.ts`. The claw wrapper infers `Promise<CredentialDaemonResponse>` from `modules/dexbot_credential_client.ts`, so de-exporting that interface broke `npm run build --prefix claw` with `TS4058` even though nothing imports it by name. Before narrowing an export, run `npm run build --prefix claw` as well as `npm run typecheck`; when a type must stay exported purely for emit, say so in its JSDoc.
+
+**2. The shipped `dist/` is a public API.** The package publishes compiled JS plus declarations, so dropping an optional positional parameter is breaking even when every in-repo caller is updated (for example `calculateOrderSizes`, `calculateRotationOrderSizes` and `allocateFundsByWeights` lost their unused `minSize` arguments). The changelog is written at release time, so call the break out in the next release entry instead of leaving it implicit.
+
+**3. Test-only helpers live in one `__test` object.** White-box helpers that only tests call are grouped as `export const __test = { ... }` instead of individual named exports, so a dead-export scan does not have to special-case them. Nothing outside the defining module may reference `__test` — `tests/test_public_surface_guard.ts` fails the suite if production code imports the seam or if it is touched more than once in its own module.
+
+---
+
 ## Module Deep Dive
 
 ### OrderManager (`modules/order/manager.ts`)

@@ -3,7 +3,7 @@
  *
  * Provides a unified IStorageAdapter interface for all filesystem operations.
  *
- * Usage:
+ * Usage (from the repo root):
  *   import { getStorage } from './modules/storage/index.js';
  *   const storage = getStorage();
  *   const data = storage.readJSON('/path/to/file.json');
