@@ -38,7 +38,7 @@ modules/
 ├── cli_start_onboarding.ts        first-run setup routing for `dexbot start`
 ├── cli_start_output.ts            launcher notice formatting
 ├── cli_colors.ts                  shared CLI color helpers
-├── credential_runtime.ts          credential daemon lifecycle
+├── credential_runtime.ts          daemon socket/path helpers + private-path security
 ├── credential_policy.ts           signing policy validation
 ├── credential_session_cache.ts    encrypted session cache
 ├── constants.ts                   central config and tuning params
@@ -47,7 +47,6 @@ modules/
 ├── env.ts                         isBrowser/hasProcess detection
 ├── runtime.ts                     process abstraction singleton
 ├── lazy_shim.ts                   lazy named-export passthrough (require-on-call)
-├── runtime_mode.ts                runtime mode detection and status routing
 ├── runtime_settings.ts            per-bot runtime settings resolver
 ├── paths.ts                       guarded path resolution
 ├── path_api.ts                    portable path abstraction for ESM/browser
@@ -64,11 +63,11 @@ modules/
 ├── bots_file_lock.ts              profile write serialization
 ├── account_bots.ts                bots.json read/write
 ├── broadcast_failure.ts           broadcast failure classification
-├── chain_keys.ts                  blockchain key helpers
-├── daemon_node_health.ts          daemon-side node health checks
-├── node_failure_ledger.ts         node failure tracking
-├── node_health_cache.ts           node health tracking
-├── socket_json_client.ts          JSON-RPC socket client
+├── chain_keys.ts                  master-password vault + signing-key retrieval
+├── daemon_node_health.ts          daemon-side node failure ledger (shared rules)
+├── node_failure_ledger.ts         node failure counting shared by bot + daemon
+├── node_health_cache.ts           shared node-health cache file I/O + ordering
+├── socket_json_client.ts          newline-delimited JSON Unix-socket client
 ├── market_adapter_whitelist.ts    adapter whitelist I/O
 ├── types.ts                       shared type definitions
 │
@@ -85,7 +84,7 @@ modules/
 ├── storage/                       portable storage abstraction
 │   ├── index.ts                   barrel export
 │   ├── types.ts                   storage adapter interface
-│   ├── browser_adapter.ts         in-memory Map-based adapter
+│   ├── browser_adapter.ts         in-memory Map backed by IndexedDB
 │   └── node_adapter.ts            fs.*Sync based adapter
 │
 ├── order/                         order lifecycle and grid management
@@ -95,9 +94,9 @@ modules/
 │   ├── strategy.ts                grid rebalancing, consolidation, rotation
 │   ├── accounting.ts              fund tracking, fee accounting
 │   ├── sync_engine.ts             blockchain sync, fill detection, reconciliation
-│   ├── genesis_policy.ts          missing-ladder refusal + rebuild/halt policy ([doc](../docs/GRID_PRICE_INVARIANT.md))
-│   ├── grid_reconcile.ts          startup grid reconciliation ([doc](../docs/GRID_RECONCILE.md))
-│   ├── grid_reconcile_internal.ts  internal grid reconciliation helpers
+│   ├── genesis_policy.ts          missing-ladder refusal + rebuild policy (docs/GRID_PRICE_INVARIANT.md)
+│   ├── grid_reconcile.ts          startup grid reconciliation (docs/GRID_RECONCILE.md)
+│   ├── grid_reconcile_internal.ts internal grid reconciliation helpers
 │   ├── index.ts                   barrel export
 │   ├── logger.ts                  order-scoped logging
 │   ├── logger_state.ts            logger state management
@@ -128,6 +127,7 @@ modules/
 │   ├── market_adapter_watchdog.ts adapter process watchdog
 │   ├── monolithic_runtime.ts      monolithic bot runtime
 │   ├── runtime_entry.ts           bot process entry
+│   ├── runtime_mode.ts            runtime mode detection and status routing
 │   ├── status_reporting.ts        process status reporter
 │   └── supervisor_control.ts      supervisor orchestration
 │
@@ -144,14 +144,14 @@ modules/
 │   └── crypto/                    cryptographic primitives
 │
 └── utils/
-    ├── asset_symbols.ts          asset symbol/object-id canonicalization helpers
+    ├── asset_symbols.ts           asset symbol/object-id canonicalization helpers
     ├── base58check.ts             Base58Check encoding
     ├── build_dir.ts               BUILD_DIR constant helper
     ├── chain_logs.ts              shared chain log helpers
     ├── errors.ts                  getErrorMessage helper
     ├── sanitize_key.ts            shared sanitizeKey helper
     ├── text_width.ts              display-width-aware text measurement (CJK/emoji tables)
-    └── time_range.ts             month→hour lookback conversion (analysis range flags)
+    └── time_range.ts              month→hour lookback conversion (analysis range flags)
 ```
 
 ## Key Relationships
@@ -180,10 +180,10 @@ External consumers — other parts of DEXBot2 interact with modules through thes
 
 ## Design Principles
 
-- **Zero runtime dependencies** — no npm trading/blockchain libraries; the native client, crypto, and serialization are all in `bitshares-native/`. This eliminates supply-chain risk and keeps the bot fully self-contained.
+- **Zero runtime dependencies** — no npm trading/blockchain libraries; the native client and serialization live in `bitshares-native/`, and the cross-environment crypto providers (Web Crypto / Node crypto plus pure-JS fallbacks) in `crypto/`. `package.json` declares no `dependencies`, which eliminates supply-chain risk and keeps the bot fully self-contained.
 - **Copy-on-write** — `order/working_grid.ts` provides isolated COW mutations; master grid is immutable during rebalance. The grid is never modified in-place; a working copy is built, mutated, and committed atomically only after blockchain operations succeed.
 - **Fund-driven sizing, fill-driven boundary** — available funds set order sizing and budget allocation, not the boundary position; no forced allocations. The boundary moves only through boundary crawl on fills or spread promotion onto orders placed in the same atomic batch.
-- **Replay-safe accounting** — fill processing in `dexbot_fill_runtime.ts` uses `processed_fill_store.ts` to prevent double-counting. If the bot restarts mid-fill, it can safely replay without creating duplicate orders.
+- **Replay-safe accounting** — `dexbot_class.ts` constructs `order/processed_fill_store.ts`, `dexbot_fill_runtime.ts` configures it and hands it to the `OrderManager`, and `order/accounting.ts` consults it before counting a fill. If the bot restarts mid-fill, it can safely replay without creating duplicate orders.
 - **Daemon-backed signing** — the credential daemon holds decrypted keys; modules never handle raw private keys. If the main bot crashes, keys stay encrypted on disk — only the small daemon process sees them.
 - **Gap-slot batch processing** — each fill batch and broadcast is capped at the current grid's gap-slot count + 1. A queue at or below that depth is processed as one unified batch; deeper queues are chunked at the same deterministic cap.
 
@@ -196,5 +196,7 @@ External consumers — other parts of DEXBot2 interact with modules through thes
 - [Fund movement & accounting](../docs/FUND_MOVEMENT_AND_ACCOUNTING.md) — fund tracking algorithms and formulas
 - [Credential security](../docs/CREDENTIAL_SECURITY.md) — key handling and daemon-backed signing details
 - [Grid recalculation](../docs/GRID_RECALCULATION.md) — when and how the grid resets or regenerates
+- [Grid price invariant](../docs/GRID_PRICE_INVARIANT.md) — genesis ladder as the only authoritative slot price
+- [Grid reconcile](../docs/GRID_RECONCILE.md) — startup reconciliation of the persisted grid
 - [Market adapter](../market_adapter/README.md) — AMA pricing, dynamic weights, and signal pipeline
 - [Claw bridge](../claw/README.md) — AI layer integration and command dispatch

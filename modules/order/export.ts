@@ -5,7 +5,7 @@
  * Parses PM2 log files to extract trading fills and exports to standardized format.
  *
  * Usage:
- *   const exporter = require('./order/export');
+ *   import * as exporter from './modules/order/export.js';
  *   const result = await exporter.exportBotTrades(botKey, botConfig, outputDir);
  *
  * Output Format:

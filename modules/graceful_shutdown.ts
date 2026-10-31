@@ -41,7 +41,7 @@
  * 7. Exit process
  *
  * USAGE:
- * const { registerCleanup } = require('./modules/graceful_shutdown');
+ * import { registerCleanup } from './modules/graceful_shutdown.js';
  *
  * // Register cleanups (executed in reverse order on shutdown)
  * registerCleanup('Database', async () => db.close());

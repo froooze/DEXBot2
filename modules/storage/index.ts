@@ -4,7 +4,8 @@
  * Provides a unified IStorageAdapter interface for all filesystem operations.
  *
  * Usage:
- *   const storage = require('./modules/storage').getStorage();
+ *   import { getStorage } from './modules/storage/index.js';
+ *   const storage = getStorage();
  *   const data = storage.readJSON('/path/to/file.json');
  *   storage.writeJSON('/path/to/file.json', { hello: 'world' });
  *   if (storage.exists('/path/to/file.json')) { ... }

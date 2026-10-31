@@ -30,7 +30,7 @@
  *
  * In bitshares_client.ts:
  *
- *   const NodeManager = require('./node_manager').default;
+ *   import NodeManager from './node_manager.js';
  *   const nodeManager = new NodeManager(config);
  *   await nodeManager.checkAllNodes();
  *   const bestNode = nodeManager.getBestNode();
