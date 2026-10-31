@@ -3536,7 +3536,7 @@ function generateHTML(data: TvChartInput, title: string = 'TradingView Style Res
             document.getElementById('ama-init-offset').disabled = !currentAmaInitOffsetEnabled;
             document.getElementById('ama-init-offset-val').textContent = currentAmaInitOffset + '%';
             currentVwapEnabled = document.getElementById('vwap-toggle').checked;
-            currentVwapBars = clamp(Math.round(Number(document.getElementById('vwap-bars').value) || 500), 24, 2000);
+            currentVwapBars = clamp(Math.round(Number(document.getElementById('vwap-bars').value) || 500), 10, 2000);
             currentRangeEnabled = document.getElementById('range-toggle').checked;
             currentRangeScaleEnabled = document.getElementById('range-scale-toggle').checked;
             currentRangeSpan = Math.min(${RANGE_SPAN_MAX}, Math.max(${RANGE_SPAN_MIN}, Math.round((Number(document.getElementById('range-span').value) || ${RANGE_SPAN_DEFAULT}) * 20) / 20));
@@ -3665,8 +3665,8 @@ function generateHTML(data: TvChartInput, title: string = 'TradingView Style Res
             addHold(dec, -1);
             addHold(inc, 1);
         }
-        makeStepper('sma-period', 1, 1, 0);
-        makeStepper('vwap-bars', 1, 24, 0);
+        makeStepper('sma-period', 10, 10, 0);
+        makeStepper('vwap-bars', 10, 10, 0);
         makeStepper('ama-er', 10, 1, 0);
         makeStepper('ama-fast', 0.1, 0.1, 1);
         makeStepper('ama-slow', 1, 0.1, 1);
