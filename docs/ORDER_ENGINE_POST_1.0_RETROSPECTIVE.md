@@ -43,7 +43,7 @@
 - 6. Consolidated invariants
 - 7. Consolidated verification — grid-correction check as regression gate
 - 8. Provenance & supersession record
-- 9. COW Broadcast, Resync & Geometry Safety (v1.6.4 → v1.6.14) — addendum
+- 9. COW Broadcast, Resync & Geometry Safety (v1.6.4 → v1.6.17) — addendum
   - 9.10 Review pass over v1.6.12 → v1.6.17 (findings P1–P5)
 - A. Grid-Price Invariant — former failure trace (appendix)
 
@@ -68,7 +68,7 @@ local state.
 |---|---|---|
 | **Orphan orders** | Live chain orders absent from local state; locked funds, accidental cancels, re-placement | Adoption, committed-order protection, durable orphan gates — fixed/re-broken repeatedly |
 | **Ghost / phantom orders** | Local slot with no real order, or a live order no slot owns; `size > 0` with no `orderId` | Virtualization guards, ghost-order cleanup, dust cancel |
-| **Self-trading / crossing** | Re-pricing a BUY above own SELLs (or vice versa) | `LAST-FILL-GUARD` (pivot formula revised twice) + final pre-broadcast pivot gate |
+| **Self-trading / crossing** | Re-pricing a BUY above own SELLs (or vice versa) | `LAST-FILL-GUARD` (pivot formula revised **three** times — the third removed the band entirely, §9.7/§9.10) + final pre-broadcast pivot gate + an offline mirror that must BE the same predicate, not a copy of it |
 | **Grid-price invariant** | Two sources of truth for a slot price (genesis ladder vs mutable `slot.price`); orphan adoption corrupted the ladder | Enforce ladder price at every emission site; escalate persistent violations to resync |
 | **Boundary drift / gap band** | Buy/sell split index moved without matching fills, stranding live orders in the band | Prevention plans P1–P6 landed, then largely reverted; replaced by fill-driven boundary + last-fill guard |
 | **Fund-accounting races** | Stale totals, optimistic deductions, "orphan-fill death spiral" | Lag guards, tolerance widening, rebuild-from-chain, invariant escalation |
@@ -96,6 +96,11 @@ notes; the grid-price invariant has its own doc — [GRID_PRICE_INVARIANT.md](GR
    socket leaks, shutdown races, node failover. The demons were *policy* for uncertain
    state; you can restart a daemon, you can only *model* an ambiguous broadcast, and the
    model kept being wrong.
+5. **One rule, several implementations.** "A fill must not be traded through" is decided in
+   the runtime guard, the spread-correction planner, the rail clamp and the offline checker.
+   Every copy drifted on its own schedule: the planner used the crossing floor, the checker
+   kept the old band, the rail clamp kept the old slot ids (§9.7, §9.10). The fix that
+   sticks is one exported predicate and callers that re-implement nothing.
 
 ### R4. What actually fixed it
 
@@ -111,6 +116,17 @@ notes; the grid-price invariant has its own doc — [GRID_PRICE_INVARIANT.md](GR
   ambiguity — see §9.1.
 - **Fail-closed geometry (v1.6.14+):** an unknown boundary/gap is no longer coerced to a
   valid-looking `0` — see §9.1.
+- **One eligibility rule (§9.10):** what may become the pivot — and therefore the absolute
+  geometry anchor — is decided by the same classifier the crawl uses
+  (`collectEdgePinnedFillIds`), so a static edge fill can never drive the geometry.
+- **One validator (§9.10):** the fill re-anchor and the rail clamp both end in
+  `validatePersistedBoundary`, the gate the restore and commit paths already used, instead of
+  each path carrying its own idea of "stranded".
+- **Live identity over local keys (§9.10, `531edeb4`):** every rail/geometry decision maps the
+  order's LIVE chain price onto the ladder; a slot id is a hint, never the fact.
+- **Observability instead of a veto (§9.10/P4):** where a hard guard would re-create a
+  deadlock (a counter order crossing the floor by construction), log it once and let the
+  chain price it as a taker fill.
 
 The winning strategy was **removing writers and sources of truth**, not adding handlers.
 
@@ -125,7 +141,22 @@ The winning strategy was **removing writers and sources of truth**, not adding h
 5. Make deferred work **level-triggered** — never let a retry depend on a future event.
 6. If a fix class keeps returning, the model is wrong, not the fix.
 7. Treat **ambiguity as deferral, not destruction** — a reset that clears guard state is
-   another writer, and `Number(null) === 0` is how "unknown" becomes a confident `0`.
+   another writer, and `Number(null) === 0` is how "unknown" becomes a confident `0`. The
+   mirror case is the same bug from the other side: if clearing guard state is a writer,
+   *restoring* it is one too — a pivot that a rebuild silently re-arms (or silently keeps)
+   is a guard whose lifetime nobody decided (§9.10/P2).
+8. **A guard needs a lifetime, not just a predicate.** Which price is the reference, how
+   long it stays valid, who re-arms it after a rebuild, and what happens when the grid it was
+   armed against no longer exists are all part of the rule. A predicate that is correct and
+   an arming policy that is accidental is still a broken guard.
+9. **Eligibility must be defined once.** "What counts as a real fill" (edge insurance?
+   partial? off-ladder price?) cannot be answered separately by the crawl, the pivot and the
+   anchor; the first divergence is a window teleport (§9.10/P1).
+10. **Bound a repair by the evidence that justifies it.** The rail clamp may move the boundary
+    only inside the window the batch itself placed into — strays do not vote (§9.10/P3). A
+    repair that can cite one stray order is not a repair.
+11. **When a veto would deadlock, ship the observation.** A taker-fee risk earns a log line,
+    not a rule that re-creates the deadlock the previous fix removed (§9.10/P4).
 
 ---
 
@@ -152,7 +183,7 @@ plans, `LANDED`/`REVERTED`/`SUPERSEDED` statuses, commit hashes, and verificatio
 
 **Grid terms:** `boundary` = discrete sell/buy split index; `gap band` = `SPREAD/virtual` slots around boundary; `sellStartIdx = splitIdx - floor(gap/2) - 1`; center-priced ladder `createOrderGrid` = `startPrice × step^(k+½)` (`modules/order/grid.ts:441,449`); `MarketAnchor` = fill-derived `lastFillPrice/maxFilledSellPrice/minFilledBuyPrice/lastFillSide`; tolerance helpers `calculatePriceTolerance = (1/satsA+1/satsB)×price` (`modules/order/utils/math.ts:820-824`), `PRICE_TOLERANCE_MAX_PERCENT 0.01` (`constants.ts:461`).
 
-**Validation tool:** `analysis/grid_correction_check.ts` (test-only, mirrors `analysis/trade_profitability.ts` Kibana path `https://kibana.bitshares.dev`, `bitshares-*`, `operation_type:4` `fill_order` only; `buildFillQuery`, paginated `search_after`, `_source` `block_data` fields). **Invariants:** `sell→sell` with no `buy` between must rise (`curr > prev`, equal OK), `buy→buy` must fall (`curr < prev`); `per-order` aggregated default (weighted avg collapses multi-fill `1.7.x`), `--per-fill` raw. Resolution via `bot_key_utils.ts` `loadBotMeta/computeBotKey`. Reports violations, `%`, daily histogram, time/range, table with price/Δ%/times/orderIds; `--json/--csv` export; exit `0` pass / `2` fail. Strict sat-level is ground truth (`--tolerance P` allows `b < a*(1-P/100)` sell / `b > a*(1+P/100)` buy). Used as regression gate below; pre-fix per-account baselines are intentionally omitted here — §7 states the targets (`0` violations).
+**Validation tool:** `analysis/grid_correction_check.ts` (test-only, mirrors `analysis/trade_profitability.ts` Kibana path `https://kibana.bitshares.dev`, `bitshares-*`, `operation_type:4` `fill_order` only; `buildFillQuery`, paginated `search_after`, `_source` `block_data` fields). **Invariants:** `sell→sell` with no `buy` between must rise (`curr > prev`, **equal is a violation** — a re-place at the just-filled level), `buy→buy` must fall (`curr < prev`); `per-order` aggregated default (weighted avg collapses multi-fill `1.7.x`), `--per-fill` raw. Resolution via `bot_key_utils.ts` `loadBotMeta/computeBotKey`. Reports violations, `%`, daily histogram, time/range, table with price/Δ%/times/orderIds; `--json/--csv` export; exit `0` pass / `2` fail. Strict sat-level is ground truth — the verdict is **direction only** (equal price is a violation); `--tolerance` / `--increment` are deprecated and **informational only** (the band they used to express is gone, §9.10/P5). Used as regression gate below; pre-fix per-account baselines are intentionally omitted here — §7 states the targets (`0` violations).
 
 ---
 
@@ -469,7 +500,7 @@ Goal (Phase 2): I1–I6 property pass, full suite green, harness random, 48h per
 
 - **Gap-band (amended `3713c496`/`e2898e51`; **P3 reverted `e7231534`**):** in-gap chain orders are never cancelled as a self-healing net; they are adopted by the normal reconcile path once the boundary is re-derived via `calculateIdealBoundary` (P3 `validateBoundaryAgainstChainEvidence` gate removed `e7231534`). Placement into the band is prevented by `LAST-FILL-GUARD` / `findCrossedOrder`, not by P3 cancellation sweeps.
 - **Identity:** every resync (incl. startup reconcile) leaves no live order unmanaged (adopted-or-cancelled-as-surplus, surplus = `chainCount-targetCount` farthest-first).
-- **Monotonicity (grid-check):** adjacent same-direction fills monotonic rising sell / falling buy (equal OK).
+- **Monotonicity (grid-check):** adjacent same-direction fills monotonic rising sell / falling buy. Equal price is **not** OK — the guard blocks a re-place at the just-filled level, and the checker mirrors that verdict. **Failure = place `sell→sell` lower-or-equal / `buy→buy` higher-or-equal.**
 - **I1–I6 PRICE_FIRST** plus COW-commit-only boundary writes and price-less degrades conservatively.
 
 ---
@@ -481,7 +512,7 @@ Goal (Phase 2): I1–I6 property pass, full suite green, harness random, 48h per
 npm run analysis:grid-check -- --bot-key <bot-key> --account 1.2.xxxxx --hours 168
 npm run analysis:grid-check -- --bot-key <bot-key> --account 1.2.xxxxx --hours 720
 npm run analysis:grid-check -- --bot-key <bot-key> --account 1.2.xxxxx --hours 168 --json out.json --csv out.csv
-# cross-pair opt: --include-cross-pair ; per-fill opt: --per-fill ; tolerance opt: --tolerance 0.1
+# cross-pair opt: --include-cross-pair ; per-fill opt: --per-fill ; --increment / --tolerance are informational (direction-only verdict)
 ```
 Pairs-checked base excludes cross-pair unless flagged; strict sat-level detection (`detectViolations`, `aggregateByOrder`).
 
@@ -493,8 +524,9 @@ Pairs-checked base excludes cross-pair unless flagged; strict sat-level detectio
 - Post-broadcast read-back retry: bot-B `06:43` no `14` piled / forced resync mid-broadcast. *(Addressed v1.6.13–1.6.14 by the resync-cascade break (`7eb65c8e`) and the fresh-placement cancel grace (`85a7e7f0`); see §9.)*
 - COW commit never places inside gap; pre-broadcast existence check: bot-B `<order-4/5>` + bot-D/D2 `GAP-BAND` fixtures → `0`. *(Amended: the commit-time in-gap cancel sweep was reverted `e2898e51` — current expectation is adoption-after-chain-evidence-correction; `0` unmanaged in-gap orders remains the target.)*
 - Aug 28 burst `17:09–17:16` (3 regs/6m, sells 1110–1176) → `0` orphans, `0` sells below asks.
+- *(Direction rule, post-`8e5e1a3c`):* the checker reports `sell→sell` at/below the previous sell and `buy→buy` at/above the previous buy. A run that only passed because equal prices were tolerated is a **regression signal**, not a baseline.
 - **Orphan regression over ~7h post-`cd690000` on bot-A/B/C:** distinct `Unmatched` `58/60/91 → ~0` (full `229/107/172 → ~0`), `Fund invariant violation` `0` (was `3077.07→3184.93` etc.), `ORPHAN-FILL` `0` (was `7/33/22`), repeated `[BOUNDARY-EVIDENCE]` `0`, deferred minutes `0`, `[MAINT] n/m failed` `0`.
-- **Grid-correction soak (external, strict):** pre-fix baselines on the affected markets showed double-digit `%` same-direction inversion rates over 7d/30d windows → `0` sustained. Sustain 48h per-bot (Phase 2) and 14-day zero-guard/divergence (Phase 3). *(Phase 2/3 soak gates moot since `3713c496` — projection removed; the divergence telemetry remains as a monitoring signal.)* **Failure = place `sell→sell` lower / `buy→buy` higher.**
+- **Grid-correction soak (external, strict):** pre-fix baselines on the affected markets showed double-digit `%` same-direction inversion rates over 7d/30d windows → `0` sustained. Sustain 48h per-bot (Phase 2) and 14-day zero-guard/divergence (Phase 3). *(Phase 2/3 soak gates moot since `3713c496` — projection removed; the divergence telemetry remains as a monitoring signal.)* **Failure = place `sell→sell` lower-or-equal / `buy→buy` higher-or-equal.**
 
 Original doc regression excerpts preserved: GAP P6 A/B/C; LADDER §2.8 checks (10 bullets); ORPHAN §3 guardrails; PRICE §4.7/4.10 kill-switch. The randomized chaos/property harness was the PRICE_FIRST Phase 2 gate (§4.6), not part of LADDER §2.8.
 
@@ -506,14 +538,15 @@ Original doc regression excerpts preserved: GAP P6 A/B/C; LADDER §2.8 checks (1
 - [x] No other doc/index lists the four (verified 2026-08-31); `analysis/README.md` documents the `grid_correction_check` tool.
 - [x] Stale `*.md` filename references in code comments/tests updated to the consolidated doc (9 module files, 6 test files), then re-pointed to this hub when it absorbed the summary.
 
-*Generated 2026-08-31 from the 4 test-only docs at their HEAD contents; statuses corrected against `test` HEAD `a54863ca` the same day, then refreshed against `1382f267` (2026-09-13) and extended through v1.6.14 at `f6c0df32` (2026-10-12; see §9). Landed/reverted/superseded annotations carry commit hashes where known; **line references in §§1-4 were re-verified at `a54863ca` and are subject to drift** — treat them as pointers, not assertions. The GRID-PRICE-INVARIANT guard is **BLOCKING** at all six emission sites (CREATE / UPDATE / CREATE-FALLBACK in `modules/dexbot_cow_runtime.ts`, RECONCILE-CREATE / RECONCILE-UPDATE / STARTUP-CREATE in `modules/order/grid_reconcile_internal.ts`): an off-grid emission is skipped, not merely counted, so a `violated>0` line means an emission was *prevented* rather than a writer merely *pinned*. Counters are still reported (`site=`, `checked=`, `violated=`, `unchecked=`) for observability — see `docs/GRID_PRICE_INVARIANT.md`.*
+*Generated 2026-08-31 from the 4 test-only docs at their HEAD contents; statuses corrected against `test` HEAD `a54863ca` the same day, then refreshed against `1382f267` (2026-09-13), extended through v1.6.14 at `f6c0df32` (2026-10-12), through v1.6.17 at `78ccbb8e`, and then through the post-1.6.17 review pass (`§9.10`: `f4d6da8c`, `a2bf6ba5`, `56481b16`, `3d16f9e4`). Landed/reverted/superseded annotations carry commit hashes where known; **line references in §§1-4 were re-verified at `a54863ca` and are subject to drift** — treat them as pointers, not assertions. The GRID-PRICE-INVARIANT guard is **BLOCKING** at all six emission sites (CREATE / UPDATE / CREATE-FALLBACK in `modules/dexbot_cow_runtime.ts`, RECONCILE-CREATE / RECONCILE-UPDATE / STARTUP-CREATE in `modules/order/grid_reconcile_internal.ts`): an off-grid emission is skipped, not merely counted, so a `violated>0` line means an emission was *prevented* rather than a writer merely *pinned*. Counters are still reported (`site=`, `checked=`, `violated=`, `unchecked=`) for observability — see `docs/GRID_PRICE_INVARIANT.md`.*
 
 ---
 
-### 9. COW Broadcast, Resync & Geometry Safety (v1.6.4 → v1.6.14)
+### 9. COW Broadcast, Resync & Geometry Safety (v1.6.4 → v1.6.17)
 
-> **Source:** `CHANGELOG.md` v1.6.4 → v1.6.14 · **Snapshot:** `f6c0df32` (2026-10-12).
+> **Source:** `CHANGELOG.md` v1.6.4 → v1.6.17 · **Snapshot:** `78ccbb8e` (v1.6.17 tag).
 > Extends the §§1–8 ledger; the `§0`–`§8` numbers are unchanged (code and tests cite them).
+> `§9.10` and the last two ledger rows cover the **post-1.6.17** work, which is unreleased.
 
 Sections 1–4 end with the prevention sweeps reverted: a cancel sweep on ambiguous evidence
 proved worse than the orphan it targets. The post-1.6.3 arc is the constructive inverse —
@@ -523,8 +556,10 @@ proved worse than the orphan it targets. The post-1.6.3 arc is the constructive 
 
 R4's fixes (genesis determinism, one writer, the last-fill guard) closed the *orphan* family.
 The remaining harm was self-inflicted: **structural resyncs fired on evidence that did not
-justify them**, and each reset clears the LAST-FILL-GUARD pivot and any gap-evacuation streak.
-The engine now treats uncertainty as *defer, never rebuild*:
+justify them**, and each reset clears the LAST-FILL-GUARD pivot and any gap-evacuation streak
+(since §9.10/P2 the pivot is then re-armed explicitly from the last real fill, so a rebuild no
+longer silently un-arms the guard). The engine now treats uncertainty as *defer, never
+rebuild*:
 
 - **Uncertain-broadcast reconciliation is master-aware** (`7eb65c8e`, v1.6.13):
   `resyncIfUnreconciled` treats a chain order as reconciled if master already tracks it
@@ -601,7 +636,7 @@ fail-closed behind `_assertGenesisInvariant`. This is R4's "removing writers and
 truth" carried to its end: the no-ladder state that Appendix A's `slot.price` corruption
 required is no longer reachable at runtime.
 
-#### 9.5 Ledger (order-engine commits, v1.6.4 → v1.6.14)
+#### 9.5 Ledger (order-engine commits, v1.6.4 → v1.6.17 + unreleased)
 
 | Commit | Release | Change |
 |---|---|---|
@@ -632,6 +667,16 @@ required is no longer reachable at runtime.
 | `750386ac` | 1.6.14 | Guard unknown boundary in the gap-band shadow |
 | `dc87ce01` | 1.6.14 | Close missed 1.6.13 regressions in absent geometry and the rebuild guard |
 | `249016e4` | 1.6.14 | Keep `validateBoundaryCommit` fail-closed for garbage boundaries |
+| `6c86d505` | 1.6.15 | Level identity is the price, not the asset amount (adoption/compare) |
+| `8e5e1a3c` | 1.6.17 | Last-fill guard blocks only higher buys and lower sells (band removed, §9.7) |
+| `62312e60` | 1.6.17 | Plan only placeable tightening slots; name the stall causes |
+| `276cd504` | 1.6.17 | Fund from chain truth and re-anchor the boundary from the fill (§9.9) |
+| `2e618197` | 1.6.17 | Consume only the owed fill crawls a derivation applied (§9.8) |
+| `d99b8685` | post-1.6.17 | Harden partial-fill re-anchor and recovery (residual allow-list, tolerant load) |
+| `531edeb4` | post-1.6.17 | Keep the boundary on the placed rails; use live fill prices for geometry |
+| `f4d6da8c` | post-1.6.17 | Edge-pinned fills never arm the pivot or the anchor (§9.10/P1) |
+| `a2bf6ba5` | post-1.6.17 | Guard arity, explicit pivot re-arm, stray-aware rail clamp, crossing observation (§9.10/P2-P4) |
+| `56481b16` | post-1.6.17 | Offline checker judges by the same direction-only predicate (§9.10/P5) |
 
 #### 9.6 Invariants added
 
@@ -642,6 +687,16 @@ required is no longer reachable at runtime.
   wire; no `limit_order_update` may abort a chunk.
 - **Placed is not surplus:** an order inside `SURPLUS_CANCEL_GRACE_MS` is never cancelled by a
   sweep running on a stale snapshot.
+- **Only a window trade may become the pivot:** edge-pinned insurance fills are skipped at the
+  single pivot writer, so they can neither veto a side nor anchor the geometry (§9.10/P1).
+- **One boundary validator:** a boundary write that can strand a live order in the implied
+  band is refused by `validatePersistedBoundary`, whoever computed it — re-anchor, rail clamp,
+  restore, commit (§9.10/P2/P3).
+- **A rail clamp only cites its own evidence:** the batch's op destinations and the master
+  orders on their own side of the planned boundary; strays are ignored and named (§9.10/P3).
+- **The pivot has a lifetime:** re-armed explicitly after a rebuild from the last real fill,
+  bounded by the same 24h TTL, and a re-center is requested at most once per pivot because a
+  re-center cannot move it (§9.10/P2).
 
 #### 9.7 The guard was a band, not an economic rule (`c86b4b0e`)
 
@@ -679,9 +734,11 @@ SELL blocked if price <= pivot    // never place a lower SELL
 
 Equal price stays blocked (re-place at the filled level). The predicate lives in
 `order/utils/system.ts` next to `resolveLastFillGuardReference`; `dexbot_cow_runtime`
-re-exports it. The planner now filters every candidate pool (and boundary promotion) with
-the **same** predicate before the quota slice, so a batch is never built out of ops the
-guard will drop, and an unplaceable side reports it honestly.
+re-exports it. Its signature is now `(price, type, lastPrice, lastType)`: the dead `size`
+and `increment` parameters were removed in §9.10, so an increment term can no longer reach
+the predicate at all (LFG-5 pins the arity). The planner now filters every candidate pool
+(and boundary promotion) with the **same** predicate before the quota slice, so a batch is
+never built out of ops the guard will drop, and an unplaceable side reports it honestly.
 
 **Deliberately not relaxed.** A lower SELL is still refused **when the last fill was a
 SELL**: after a fill the sell window must move *up*, so a sell slot below the last sale is
@@ -750,7 +807,9 @@ resting inventory. The cheapest repair (rotate the stranded orders down) is
 itself a lower sell, which the same guard forbids — three locks, no key. The fill
 is the anchor: `SELL fill at f => boundary ≥ f − gapSlots`, `BUY fill at f =>
 boundary ≤ f − 1` (`reanchorBoundaryFromLastFill`), subject to a real
-fill-provenanced pivot, an on-ladder price and `validatePersistedBoundary`.
+fill-provenanced pivot, an on-ladder price and `validatePersistedBoundary` — and, since
+§9.10, subject to the fill being a **window** trade: edge-pinned insurance fills never arm
+the pivot, so they can never anchor the geometry.
 
 **Deliberately rejected: the pair ledger.** Making each fill mint its counter
 order (reserve the exact proceeds) would prove per-trade funding and delete the
@@ -781,6 +840,11 @@ eligibility rule for the crawl, the pivot and the anchor, the dead
 `size`/`increment` parameters of `isLastFillGuardBlocked` removed (an increment
 term is no longer reachable through it — LFG-5 pins the arity), and the batch
 extremum extracted as `resolveFillAnchorIndex` (pure, batch-only).
+
+**Commits:** `f4d6da8c` (P1) · `a2bf6ba5` (P2–P4 plus the arity and the anchor
+extraction) · `56481b16` (P5) · `3d16f9e4` (this document, the doc-level invariants
+and the log rows it cites). **Unreleased:** no version bump and no `CHANGELOG.md`
+entry — both belong to the release step, not to this pass.
 
 ---
 

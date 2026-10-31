@@ -592,7 +592,9 @@ bot-scoped last-market-fill row is the fallback), an on-ladder price within one
 increment (`off-ladder-fill`), a target that actually puts the fill outside the
 window after the grid-ceiling clamp (`ceiling-clamped`), and the candidate must
 pass `validatePersistedBoundary` — the SAME gate the restore and commit paths
-use, so every boundary writer ends in one validator.
+use (`validatePersistedBoundary` is the disk-trust wrapper over
+`validateBoundaryCommit`: in-band placement rejection plus an optional
+allow-list), so every boundary writer ends in one validator.
 
 **Eligibility is the crawl's eligibility.** EDGE-pinned insurance fills never
 arm the pivot (`recordLastFilledPrices` skips them via
