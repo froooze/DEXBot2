@@ -386,6 +386,30 @@ function testCrossingCreateIsObserved() {
     console.log('  ✓ SLF-12 passed');
 }
 
+/**
+ * The "Excluded N" line must count SLOTS, not pool visits: an empty in-rail slot
+ * normalized to SPREAD qualifies for both the SPREAD pool and the orphan pool,
+ * so before de-duplication every vetoed slot was reported twice.
+ */
+async function testExcludedCountIsPerSlot() {
+    console.log('\n[SLF-13] the excluded count is per slot, not per candidate pool...');
+    const { manager, logs } = await buildVoidedMidGrid();
+    // SELL pivot above both sell-side slots (1.05, 1.06) => both are vetoed.
+    setPivot(manager, 1.07, ORDER_TYPES.SELL);
+    setLiveMarket(manager, 0.90);
+    const result = await Grid.prepareSpreadCorrectionOrders(manager, ORDER_TYPES.SELL, 1);
+    assert.strictEqual(result.ordersToPlace.length, 0, 'both sell-side slots are vetoed');
+    const lines = logsMatching(logs, 'Excluded ');
+    assert.strictEqual(lines.length, 1, `exactly one summary line must be emitted (got ${JSON.stringify(lines)})`);
+    const reported = Number(/Excluded (\d+)/.exec(lines[0].msg)?.[1]);
+    // Slots 5 (1.05) and 6 (1.06) are the two sell-side slots, and BOTH qualify
+    // twice: typed SPREAD + empty (SPREAD pool) and VIRTUAL + no orderId (orphan
+    // pool). Counting pool visits reported 4; the line must say 2.
+    assert.strictEqual(reported, 2,
+        `the count must be per slot (2), not per pool visit (4): ${lines[0].msg}`);
+    console.log('  ✓ SLF-13 passed');
+}
+
 async function main() {
     await testPlannerExcludesPivotViolatingCandidate();
     await testPlannerKeepsCandidateWithHeadroom();
@@ -399,6 +423,7 @@ async function main() {
     testGeometryBindEscalatesEarly();
     testGeometryBindRecenterIsCappedPerPivot();
     testCrossingCreateIsObserved();
+    await testExcludedCountIsPerSlot();
     console.log('\nAll spread last-fill planning tests passed.');
 }
 

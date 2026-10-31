@@ -3731,8 +3731,22 @@ export function determineOrderSideByFunds(manager: OrderManagerLike, currentMark
             ).blocked === true;
         };
         let lastFillExcluded = 0;
+        // A slot can legitimately appear in MORE than one candidate pool (an
+        // empty in-rail slot normalized to SPREAD qualifies for both the SPREAD
+        // pool and the orphan pool; the merge below dedupes them), so count the
+        // excluded SLOTS, not the pool visits — otherwise each vetoed slot is
+        // reported twice and the "Excluded N" line overstates how much of the
+        // side the pivot blocked, exactly when the pools overlap most.
+        const lastFillExcludedSlotIds = new Set<string>();
         const passesLastFill = (c: ManagedOrder): boolean => {
             if (!lastFillBlocks(c)) return true;
+            const slotId = c?.id != null ? String(c.id) : '';
+            if (slotId === '') {
+                lastFillExcluded++;
+                return false;
+            }
+            if (lastFillExcludedSlotIds.has(slotId)) return false;
+            lastFillExcludedSlotIds.add(slotId);
             lastFillExcluded++;
             return false;
         };
