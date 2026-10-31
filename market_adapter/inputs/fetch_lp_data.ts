@@ -136,7 +136,27 @@ Options:
   --apiKey <key>          Kibana API key, when the endpoint requires auth
   --out <file>            Explicit output path
   --help, -h              Show this help
+
+Flags accept \`--flag value\` or \`--flag=value\`; use the second form when the
+value itself starts with \`--\`.
 `);
+}
+
+/** Parse an integer option, rejecting non-numeric or out-of-range input. */
+function parseIntOption(flag: string, raw: string, min: number): number {
+    const value = raw.trim() === '' ? Number.NaN : Number(raw);
+    if (!Number.isInteger(value) || value < min) {
+        throw new Error(`${flag}: invalid value "${raw}" (expected an integer >= ${min})`);
+    }
+    return value;
+}
+
+/** Reject an empty string option (a blank path or API key is never intended). */
+function requireNonEmpty(flag: string, raw: string): string {
+    if (raw.trim() === '') {
+        throw new Error(`${flag}: expected a non-empty value`);
+    }
+    return raw;
 }
 
 function parseArgs() {
@@ -178,13 +198,13 @@ function parseArgs() {
                 }
                 config.lookbackHours = hours;
             },
-            '--chunkMonths': (val) => { config.chunkMonths = parseInt(val, 10); },
-            '--precA': (val) => { precA = parseInt(val, 10); },
-            '--precB': (val) => { precB = parseInt(val, 10); },
-            '--apiKey': (val) => { config.apiKey = val; },
+            '--chunkMonths': (val) => { config.chunkMonths = parseIntOption('--chunkMonths', val, 1); },
+            '--precA': (val) => { precA = parseIntOption('--precA', val, 0); },
+            '--precB': (val) => { precB = parseIntOption('--precB', val, 0); },
+            '--apiKey': (val) => { config.apiKey = requireNonEmpty('--apiKey', val); },
             '--start': (val) => { config.timeRange = { ...(config.timeRange || {}), gte: val }; },
             '--end': (val) => { config.timeRange = { ...(config.timeRange || {}), lte: val }; },
-            '--out': (val) => { config.outPath = val; },
+            '--out': (val) => { config.outPath = requireNonEmpty('--out', val); },
         },
     });
 
@@ -739,5 +759,5 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
 export { fetchCandlesSequentially, outputPath }
 
 /** Internal seams exercised directly by tests. */
-export const __test = { applyPrecisionOverrides, parseBotsConfig, selectBot, loadCachedFetchContext };
+export const __test = { applyPrecisionOverrides, parseBotsConfig, selectBot, loadCachedFetchContext, parseArgs };
 

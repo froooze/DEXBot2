@@ -8,7 +8,7 @@ console.log('Running fetch_lp_data parsing tests');
 
 const {
     fetchCandlesSequentially,
-    __test: { applyPrecisionOverrides, parseBotsConfig, selectBot, loadCachedFetchContext },
+    __test: { applyPrecisionOverrides, parseBotsConfig, selectBot, loadCachedFetchContext, parseArgs },
 } = require('../market_adapter/inputs/fetch_lp_data');
 
 {
@@ -181,10 +181,73 @@ function testLoadCachedFetchContextReadsShardOnlyCache() {
     }
 }
 
+function testCliArgValidation() {
+    const originalArgv = process.argv;
+    const withArgv = <T,>(args: string[], fn: () => T): T => {
+        process.argv = ['node', 'fetch_lp_data.js', ...args];
+        try {
+            return fn();
+        } finally {
+            process.argv = originalArgv;
+        }
+    };
+
+    assert.throws(
+        () => withArgv(['--chunkMonths', 'abc'], parseArgs),
+        /--chunkMonths: invalid value "abc" \(expected an integer >= 1\)/,
+        'non-numeric --chunkMonths should be rejected'
+    );
+    assert.throws(
+        () => withArgv(['--chunkMonths', '0'], parseArgs),
+        /--chunkMonths: invalid value "0"/,
+        'zero --chunkMonths should be rejected'
+    );
+    assert.throws(
+        () => withArgv(['--precA', '-1'], parseArgs),
+        /--precA: invalid value "-1"/,
+        'negative precision should be rejected'
+    );
+    assert.throws(
+        () => withArgv(['--precB', '1.5'], parseArgs),
+        /--precB: invalid value "1.5"/,
+        'fractional precision should be rejected'
+    );
+    assert.throws(
+        () => withArgv(['--precA='], parseArgs),
+        /--precA: invalid value ""/,
+        'an empty inline integer should be rejected, not read as zero'
+    );
+    assert.throws(
+        () => withArgv(['--out', ''], parseArgs),
+        /--out: expected a non-empty value/,
+        'empty output path should be rejected'
+    );
+    assert.throws(
+        () => withArgv(['--apiKey', '--nope'], parseArgs),
+        /Flag --apiKey expects a value/,
+        'a flag-shaped value should be reported as missing'
+    );
+
+    const parsed = withArgv(
+        ['--chunkMonths=7', '--precA=8', '--precB', '3', '--out=--odd.json', '--apiKey=abc123'],
+        parseArgs
+    ) as {
+        precA: number | null;
+        precB: number | null;
+        config: { chunkMonths: number; outPath?: string; apiKey: string | null };
+    };
+    assert.strictEqual(parsed.config.chunkMonths, 7, 'inline --chunkMonths should parse');
+    assert.strictEqual(parsed.precA, 8, 'inline --precA should parse');
+    assert.strictEqual(parsed.precB, 3, 'bare --precB should parse');
+    assert.strictEqual(parsed.config.outPath, '--odd.json', 'inline value may start with --');
+    assert.strictEqual(parsed.config.apiKey, 'abc123', 'inline --apiKey should parse');
+}
+
 (async () => {
     testLoadCachedFetchContextReadsShardOnlyCache();
     await testLpSequentialCachesAndReuses();
     await testLpSequentialRetriesFailedRange();
+    testCliArgValidation();
 })()
     .then(() => {
         console.log('fetch_lp_data parsing tests passed');
