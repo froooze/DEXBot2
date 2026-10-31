@@ -357,4 +357,7 @@ function computeRegimeMultiplier(closes: unknown, opts: RegimeOpts = {}): Regime
     };
 }
 
-export { computeRegimeMultiplier, _resetRegimeCache, _locateResume, _analyzerBufferSize }
+export { computeRegimeMultiplier }
+
+/** Internal seams exercised directly by tests. */
+export const __test = { _resetRegimeCache, _locateResume, _analyzerBufferSize };

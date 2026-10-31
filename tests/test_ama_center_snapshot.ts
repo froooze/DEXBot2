@@ -215,7 +215,7 @@ async function testAdapterStateMergePreservesBotResetMetadata() {
   }, null, 2) + '\n', 'utf8');
 
   try {
-    const { mergeGridResetMetadataFromDynamicGrid } = require('../market_adapter/market_adapter');
+    const { mergeGridResetMetadataFromDynamicGrid } = require('../market_adapter/market_adapter').__test;
     const state = {
       bots: {
         [botKey]: {

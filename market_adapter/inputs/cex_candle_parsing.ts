@@ -11,7 +11,7 @@
 
 export type CandleRow = [number, number, number, number, number, number];
 
-export interface OhlcIndexes {
+interface OhlcIndexes {
     minLength: number;
     ts: number;
     open: number;
@@ -32,7 +32,7 @@ export const OHLC_GATE: OhlcIndexes = { minLength: 7, ts: 0, open: 5, high: 3, l
 export const OHLC_KRAKEN: OhlcIndexes = { minLength: 7, ts: 0, open: 1, high: 2, low: 3, close: 4, volume: 6 };
 
 /** Normalize a seconds- or milliseconds-epoch timestamp to milliseconds. */
-export function normalizeTimestamp(raw: unknown): number {
+function normalizeTimestamp(raw: unknown): number {
     const ts = Number(raw);
     if (!Number.isFinite(ts)) return Number.NaN;
     return ts >= 1e12 ? Math.trunc(ts) : Math.trunc(ts * 1000);
@@ -70,3 +70,6 @@ export function parseHtxObjectRow(row: unknown): CandleRow | null {
     if (!Number.isFinite(ts) || ![open, high, low, close].every(Number.isFinite)) return null;
     return [ts, open, high, low, close, Number.isFinite(volume) ? volume : 0];
 }
+
+/** Internal seams exercised directly by tests. */
+export const __test = { normalizeTimestamp };

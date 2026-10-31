@@ -18,7 +18,6 @@ interface RpcClient {
     BitShares: {
         db: RpcProxy;
         history: RpcProxy;
-        tradeHistory?: (...args: unknown[]) => Promise<unknown>;
         [method: string]: unknown;
     };
 }
@@ -31,7 +30,7 @@ interface BitsharesClient extends RpcClient {
 }
 
 /** Resolved asset identity used by the pool/context helpers. */
-export interface ResolvedAsset {
+interface ResolvedAsset {
     id: string;
     precision: number;
     symbol: string;
@@ -201,7 +200,7 @@ function normalizePoolId(id: unknown): string | null {
     return s.startsWith('1.19.') ? s : `1.19.${s}`;
 }
 
-export interface ResolvedBotContext {
+interface ResolvedBotContext {
     assetA: ResolvedAsset;
     assetB: ResolvedAsset;
     poolId: string | null;

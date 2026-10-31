@@ -113,7 +113,7 @@ function _resolveLockPayload(lockPath: string, opts: AcquireLockOptions, timeout
     const buildPayloadFn = opts.buildPayload;
     const buildPayload = typeof buildPayloadFn === 'function'
         ? () => ({ ...buildPayloadFn(), ownerId })
-        : () => ({ pid: _lockOwnerId(), at: Date.now(), ownerId });
+        : () => ({ pid: runtime.pid, at: Date.now(), ownerId });
     const alreadyRunningMsg = opts.alreadyRunningMsg;
     const resolveRunningMsg = typeof alreadyRunningMsg === 'function'
         ? alreadyRunningMsg

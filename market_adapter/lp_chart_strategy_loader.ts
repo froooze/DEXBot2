@@ -219,5 +219,8 @@ function loadStrategiesForLpChart({ dataFile, meta, profilesFile, extraSearchDir
     return loadStrategiesFromProfiles(profilesFile, meta);
 }
 
-export { loadStrategiesForLpChart, loadStrategiesFromProfiles }
+export { loadStrategiesForLpChart }
+
+/** Internal seams exercised directly by tests. */
+export const __test = { loadStrategiesFromProfiles };
 

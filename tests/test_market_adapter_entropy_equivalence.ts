@@ -3,7 +3,7 @@
 const assert = require('assert');
 const { PermutationEntropyAnalyzer } = require('../market_adapter/core/signals/permutation_entropy_analyzer');
 const { HurstAnalyzer } = require('../market_adapter/core/signals/hurst_analyzer');
-const { computeRegimeMultiplier, _resetRegimeCache, _locateResume } = require('../market_adapter/core/strategies/regime_gate');
+const { computeRegimeMultiplier, __test: { _resetRegimeCache, _locateResume } } = require('../market_adapter/core/strategies/regime_gate');
 const { MARKET_ADAPTER } = require('../modules/constants');
 const { roundTo } = require('../modules/order/utils/math');
 
@@ -428,7 +428,7 @@ function testRegimeSeriesHasNoHolesWhenABarIsRejected() {
 function testResumeUsesTheAnalyzersOwnBufferSize() {
     const { HurstAnalyzer } = require('../market_adapter/core/signals/hurst_analyzer');
     const { PermutationEntropyAnalyzer } = require('../market_adapter/core/signals/permutation_entropy_analyzer');
-    const { _analyzerBufferSize } = require('../market_adapter/core/strategies/regime_gate');
+    const { _analyzerBufferSize } = require('../market_adapter/core/strategies/regime_gate').__test;
 
     const hurst = new HurstAnalyzer({});
     const pe = new PermutationEntropyAnalyzer({});

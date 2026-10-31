@@ -451,5 +451,8 @@ function generateLpChartBundle(options: BundleChartOptions = {}): { dataFile: st
     };
 }
 
-export { DEFAULT_COMPARISON_STRATEGIES, calculateMetrics, defaultMarketChartPath, findLatestLpData, generateComparisonLpChart, generateLpChartBundle, generateMarketLpChart, loadLpDataFile, parseLpChartCliArgs }
+export { calculateMetrics, defaultMarketChartPath, findLatestLpData, generateComparisonLpChart, generateLpChartBundle, generateMarketLpChart, loadLpDataFile, parseLpChartCliArgs }
+
+/** Internal seams exercised directly by tests. */
+export const __test = { DEFAULT_COMPARISON_STRATEGIES };
 

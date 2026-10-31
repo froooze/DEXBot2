@@ -15,7 +15,7 @@ const {
     parseArgs,
 } = require('../scripts/generate_lp_chart');
 const {
-    DEFAULT_COMPARISON_STRATEGIES,
+    __test: { DEFAULT_COMPARISON_STRATEGIES },
 } = require('../market_adapter/lp_chart_runner');
 const {
     DEFAULT_STRATEGIES,

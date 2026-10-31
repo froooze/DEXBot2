@@ -1,7 +1,7 @@
 const assert = require('assert');
 const { 
-    parseNativeMarketHistoryTimestamp, 
-    normalizeNativeMarketHistoryCandles 
+    normalizeNativeMarketHistoryCandles,
+    __test: { parseNativeMarketHistoryTimestamp },
 } = require('../market_adapter/utils/native_history');
 
 console.log('Running market_adapter integration core tests (BitShares Core 7.0.x parity)');

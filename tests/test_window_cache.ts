@@ -3,18 +3,10 @@ const assert = require('assert');
 console.log('Running window_cache pruning tests');
 
 const {
-    findMissingBucketRanges,
-    mergeGapRanges,
-    planWindowReuse,
-    pruneImmutableGaps,
-    persistCacheChunk,
-    readCacheChunk,
-    loadBucketCache,
     unionQueriedRanges,
     rangesCoveredBy,
     coverageSatisfied,
     compactCoverage,
-    settleCoverage,
     allQueriedRanges,
     verifiedAt,
     shardKeyForTimestamp,
@@ -23,10 +15,20 @@ const {
     shardPathFor,
     buildFetchWindowsFromRange,
     runCachedWindows,
-    GAP_SETTLE_HORIZON_MS,
     TAIL_SETTLE_LAG_MS,
-    TAIL_REFRESH_HOURS,
     MAX_COVERAGE_SPANS,
+    __test: {
+        findMissingBucketRanges,
+        mergeGapRanges,
+        planWindowReuse,
+        pruneImmutableGaps,
+        persistCacheChunk,
+        readCacheChunk,
+        loadBucketCache,
+        settleCoverage,
+        GAP_SETTLE_HORIZON_MS,
+        TAIL_REFRESH_HOURS,
+    },
 } = require('../market_adapter/inputs/window_cache');
 
 const H = 3600 * 1000;

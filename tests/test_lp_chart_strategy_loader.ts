@@ -18,7 +18,7 @@ const {
 const { loadLatestLpSeries, loadLpSeriesFromPath, loadLpSeriesFromBasePath } = require('../market_adapter/utils/data_discovery');
 const {
     loadStrategiesForLpChart,
-    loadStrategiesFromProfiles,
+    __test: { loadStrategiesFromProfiles },
 } = require('../market_adapter/lp_chart_strategy_loader');
 
 function writeJson(filePath, payload) {

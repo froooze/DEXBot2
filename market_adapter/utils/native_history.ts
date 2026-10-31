@@ -5,7 +5,7 @@ import type { UnknownRecord } from '../../modules/types.js';
 import { isUnknownRecord } from '../../modules/types.js';
 
 /** Asset identity/precision needed to convert chain amounts. */
-export interface NativeHistoryAssetMeta {
+interface NativeHistoryAssetMeta {
     id?: unknown;
     precision?: number;
 }
@@ -30,7 +30,7 @@ interface HistoryEntry extends UnknownRecord {
 }
 
 /** Normalized OHLCV candle: [tsMs, open, high, low, close, volume]. */
-export type NativeHistoryCandle = [number, number, number, number, number, number];
+type NativeHistoryCandle = [number, number, number, number, number, number];
 interface PairOrientation {
     baseIsAssetA: boolean;
     baseIsAssetB: boolean;
@@ -197,5 +197,8 @@ function normalizeNativeMarketHistoryCandles(history: unknown, assetA: NativeHis
     return candles.sort((a, b) => a[0] - b[0]);
 }
 
-export { parseNativeMarketHistoryTimestamp, normalizeNativeMarketHistoryCandles }
+export { normalizeNativeMarketHistoryCandles }
+
+/** Internal seams exercised directly by tests. */
+export const __test = { parseNativeMarketHistoryTimestamp };
 

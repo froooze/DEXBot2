@@ -7,7 +7,7 @@ const {
     isBotWhitelisted,
     isBotDynamicWeightWhitelisted,
     isBotAsymmetricBoundsWhitelisted,
-    _resetCycleCache,
+    __test: { _resetCycleCache },
 } = require('../market_adapter/market_adapter');
 
 const {

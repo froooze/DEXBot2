@@ -942,16 +942,12 @@ async function runCachedWindows(opts: RunCachedWindowsOptions): Promise<Candle[]
 }
 
 export {
-    TAIL_REFRESH_HOURS,
     TAIL_SETTLE_LAG_MS,
-    GAP_SETTLE_HORIZON_MS,
     MAX_COVERAGE_SPANS,
     shardKeyForTimestamp,
     shardBoundsForKey,
     shardKeysForRange,
     shardPathFor,
-    readCacheChunk,
-    loadBucketCache,
     unionQueriedRanges,
     compactCoverage,
     rangesCoveredBy,
@@ -959,14 +955,22 @@ export {
     verifiedAt,
     timestampMs,
     allQueriedRanges,
-    settleCoverage,
     buildFetchWindowsFromRange,
+    formatWindowLine,
+    runCachedWindows,
+};
+
+/** Internal seams exercised directly by tests. */
+export const __test = {
+    TAIL_REFRESH_HOURS,
+    GAP_SETTLE_HORIZON_MS,
+    readCacheChunk,
+    loadBucketCache,
+    settleCoverage,
     findMissingBucketRanges,
     mergeGapRanges,
     pruneImmutableGaps,
     persistCacheChunk,
     planWindowReuse,
-    formatWindowLine,
-    runCachedWindows,
 };
 export type { QueriedRange } from '../utils/month_shards.js';

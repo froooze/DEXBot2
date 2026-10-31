@@ -722,17 +722,8 @@ function applyBotDerivedConfig(config: CexConfig): { config: CexConfig; botConte
         next.quote = normalizeCexAssetSymbol(botContext.bot.assetB);
     }
 
-    const baseCfg = MARKET_ADAPTER_DEFAULTS || {
-        amaSlope: {
-            lookbackBars: MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS,
-        },
-    };
-    const botCfg = typeof resolveBotCfg === 'function'
-        ? resolveBotCfg(botContext.bot, baseCfg)
-        : baseCfg;
-    const botAma = typeof resolveAmaForBot === 'function'
-        ? resolveAmaForBot(botContext.bot, null, botCfg)
-        : null;
+    const botCfg = resolveBotCfg(botContext.bot, MARKET_ADAPTER_DEFAULTS);
+    const botAma = resolveAmaForBot(botContext.bot, null, botCfg);
 
     return { config: next, botContext, botCfg, botAma };
 }

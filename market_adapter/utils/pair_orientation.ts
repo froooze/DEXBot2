@@ -28,14 +28,14 @@
 import { path } from '../../modules/path_api.js';
 import { slugPart } from '../interval_utils.js';
 
-export interface OrientableAsset {
+interface OrientableAsset {
     id?: string | null;
     precision?: unknown;
     symbol?: string | null;
 }
 
 /** The asset legs stored on every shard meta and cache request key. */
-export interface AssetPairLike {
+interface AssetPairLike {
     assetA?: { id?: string | null; precision?: unknown } | null;
     assetB?: { id?: string | null; precision?: unknown } | null;
 }

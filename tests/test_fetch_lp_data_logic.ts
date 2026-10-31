@@ -7,11 +7,8 @@ const { getErrorMessage } = require('../modules/utils/errors');
 console.log('Running fetch_lp_data parsing tests');
 
 const {
-    applyPrecisionOverrides,
-    parseBotsConfig,
-    selectBot,
     fetchCandlesSequentially,
-    loadCachedFetchContext,
+    __test: { applyPrecisionOverrides, parseBotsConfig, selectBot, loadCachedFetchContext },
 } = require('../market_adapter/inputs/fetch_lp_data');
 
 {

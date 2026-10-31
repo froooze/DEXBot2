@@ -405,6 +405,10 @@ node dist/market_adapter/inputs/fetch_lp_data.js --pool <poolId> --precA <precA>
 npm run lp:chart -- --data market_adapter/data/lp/<pair>/lp_pool_<id>_<interval>.json
 ```
 
+The LP exporter also accepts `--chunkMonths <n>` (fetch window size in months),
+`--apiKey <key>` (Kibana API key when the endpoint requires auth), `--out <file>`
+(explicit output path), and `--help`. Unknown flags are rejected.
+
 Research and calibration:
 
 ```bash
@@ -445,8 +449,9 @@ operation:
 node dist/market_adapter/market_adapter.js
 ```
 
-The adapter acts only on closed 1h candles. It can poll more often, but live
-updates wait for the next completed candle.
+The adapter acts only on closed candles at the configured interval (default
+1h). It can poll more often, but live updates wait for the next completed
+candle.
 
 ### Signal Pipeline
 
@@ -485,7 +490,7 @@ Per cycle, per processed bot, the adapter can produce:
 4. Read `startPrice` to choose the candle source: `pool`, `book`, or fixed.
 5. Sync candle data from Kibana or native BitShares data, using the selected source.
 6. Repair missing candle gaps: auto-fill gaps ≤24 candles directly (no Kibana), query Kibana only for gaps beyond that threshold. Kibana returning empty is treated as verified no-trade. Writes are suppressed while gaps remain unresolved.
-7. Ignore still-forming 1h candles.
+7. Ignore still-forming candles at the configured interval.
 8. Compute AMA center, trend, ATR, weights, and collateral hint.
 9. Persist the first accepted center, compare center delta, and compare whitelisted range-scaling slope delta.
 10. Suppress live writes if the bot is not whitelisted or candle data is stale.
@@ -866,7 +871,7 @@ are merged in, or an empty response is treated as verified no-trade (all gaps
 in the queried window are synthesized). Gaps remaining after both steps
 suppress writes via `unresolved_candle_gaps` until repaired on a future cycle.
 The adapter prunes old candles to the required AMA window and acts only on
-closed 1h candles.
+closed candles at the configured interval.
 
 #### Shared Month-Shard Cache and Fetch Robustness
 

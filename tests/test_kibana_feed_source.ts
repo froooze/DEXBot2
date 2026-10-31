@@ -4,16 +4,18 @@ const { getErrorMessage } = require('../modules/utils/errors');
 console.log('Running kibana feed source tests');
 
 const {
-    OP_TYPE_FEED,
-    backingPerMpa,
-    hitToFeedPrice,
-    buildFeedDocumentQuery,
-    bucketPricesToCandles,
-    invertCandles,
-    crossPointsToRatios,
-    getFeedCandlesForMpa,
-    getFeedCandlesForPair,
-    getFeedCandlesForMpaCross,
+    __test: {
+        OP_TYPE_FEED,
+        backingPerMpa,
+        hitToFeedPrice,
+        buildFeedDocumentQuery,
+        bucketPricesToCandles,
+        invertCandles,
+        crossPointsToRatios,
+        getFeedCandlesForMpa,
+        getFeedCandlesForPair,
+        getFeedCandlesForMpaCross,
+    },
 } = require('../market_adapter/inputs/kibana_feed_source');
 
 const MPA = { id: '1.3.5649', precision: 4, symbol: 'HONEST.USD' };

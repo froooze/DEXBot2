@@ -1159,27 +1159,13 @@ async function fetchNativeMarketHistorySince(assetA: unknown, assetB: unknown, s
 
     const startDate = new Date(Number.isFinite(sinceMs) ? sinceMs : Date.now());
     const stopDate = new Date(Number.isFinite(untilMs) ? untilMs : Date.now());
-    let history = null;
-
-    if (typeof BitShares.history?.getMarketHistory === 'function') {
-        history = await BitShares.history.getMarketHistory(
-            b.id,
-            a.id,
-            intervalSeconds,
-            startDate.toISOString().slice(0, -5),
-            stopDate.toISOString().slice(0, -5)
-        );
-    } else if (typeof BitShares.tradeHistory === 'function') {
-        history = await BitShares.tradeHistory(
-            b.symbol || b.id,
-            a.symbol || a.id,
-            startDate,
-            stopDate,
-            intervalSeconds
-        );
-    } else {
-        throw new Error('native market history source unavailable');
-    }
+    const history = await BitShares.history.getMarketHistory(
+        b.id,
+        a.id,
+        intervalSeconds,
+        startDate.toISOString().slice(0, -5),
+        stopDate.toISOString().slice(0, -5)
+    );
 
     let candles = normalizeNativeMarketHistoryCandles(history, a as Parameters<typeof normalizeNativeMarketHistoryCandles>[1], b as Parameters<typeof normalizeNativeMarketHistoryCandles>[2]);
     if (candles.length > 0 && typeof options.fillCandleGaps === 'function') {
@@ -1769,5 +1755,14 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
         });
 }
 
-export { main, runOnceForAma, DEFAULT_AMA, DEFAULTS, calculateBotThreshold, buildAmaRecord, computeCandleStaleness, normalizeMarketSource, sleepUntilAlignedBoundary, computeStartupDelayMs, evaluateStartupSleep, resolveAmaForBot, resolveDeltaThresholdPercentFromGeneralSettings, resolveAmaSlopeDeltaThresholdPercentFromGeneralSettings, applyRuntimeDefaultsFromGeneralSettings, resolveBotCfg, usesAmaGridPrice, isBotWhitelisted, isBotDynamicWeightWhitelisted, isBotAsymmetricBoundsWhitelisted, _resetCycleCache, writeCenterSnapshot, writeBotDynamicGrid, writeGridResetTrigger, mergeGridResetMetadataFromDynamicGrid, normalizeNativeMarketHistoryCandles, fetchNativeMarketHistorySince, setBitsharesClientForTests as _setBitsharesClientForTests, loadMarketAdapterSettings, findPairForBot }
+export { main, runOnceForAma, DEFAULT_AMA, DEFAULTS, calculateBotThreshold, buildAmaRecord, computeCandleStaleness, normalizeMarketSource, sleepUntilAlignedBoundary, computeStartupDelayMs, evaluateStartupSleep, resolveAmaForBot, applyRuntimeDefaultsFromGeneralSettings, resolveBotCfg, usesAmaGridPrice, isBotWhitelisted, isBotDynamicWeightWhitelisted, isBotAsymmetricBoundsWhitelisted, writeCenterSnapshot, writeBotDynamicGrid, writeGridResetTrigger, normalizeNativeMarketHistoryCandles, fetchNativeMarketHistorySince, loadMarketAdapterSettings, findPairForBot }
+
+/** Internal seams exercised directly by tests. */
+export const __test = {
+    resolveDeltaThresholdPercentFromGeneralSettings,
+    resolveAmaSlopeDeltaThresholdPercentFromGeneralSettings,
+    _resetCycleCache,
+    mergeGridResetMetadataFromDynamicGrid,
+    _setBitsharesClientForTests: setBitsharesClientForTests,
+};
 

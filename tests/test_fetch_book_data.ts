@@ -7,10 +7,8 @@ const { getErrorMessage } = require('../modules/utils/errors');
 console.log('Running fetch book data tests');
 
 const {
-    bookCacheKey,
-    bookOutputPath,
-    isBookChunkMatch,
     fetchMarketCandlesSequentially,
+    __test: { bookCacheKey, bookOutputPath, isBookChunkMatch },
 } = require('../market_adapter/inputs/fetch_book_data');
 const { discoverPoolAssets } = require('../market_adapter/inputs/kibana_source');
 

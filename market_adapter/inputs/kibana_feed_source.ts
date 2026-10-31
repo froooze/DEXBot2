@@ -683,7 +683,10 @@ async function fetchFeedCandlesSequentially(feedCtx: FeedContext, assetA: AssetR
     return flipped ? (invertCandles(merged) as number[][]) : merged;
 }
 
-export {
+export { fetchFeedCandlesSequentially }
+
+/** Internal seams exercised directly by tests. */
+export const __test = {
     OP_TYPE_FEED,
     backingPerMpa,
     hitToFeedPrice,
@@ -694,5 +697,4 @@ export {
     getFeedCandlesForMpa,
     getFeedCandlesForPair,
     getFeedCandlesForMpaCross,
-    fetchFeedCandlesSequentially,
-}
+};

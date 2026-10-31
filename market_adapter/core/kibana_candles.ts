@@ -517,5 +517,8 @@ async function fetchKibanaClosePrices(params: KibanaCandlesParams): Promise<numb
     return candles.map((candle) => candle[4]);
 }
 
-export { buildDirectionalDocumentQuery, resolveRequestedFillRange, fetchKibanaCandles, fetchKibanaClosePrices, sourceFieldsForFieldMap, hitSortKey, hitSequence }
+export { buildDirectionalDocumentQuery, resolveRequestedFillRange, fetchKibanaCandles, fetchKibanaClosePrices, hitSortKey, hitSequence }
+
+/** Internal seams exercised directly by tests. */
+export const __test = { sourceFieldsForFieldMap };
 

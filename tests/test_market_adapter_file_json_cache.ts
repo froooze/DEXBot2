@@ -5,7 +5,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { readCachedJson, noteJsonWritten, clearJsonCache } = require('../market_adapter/utils/file_json_cache');
+const { readCachedJson, noteJsonWritten, __test: { clearJsonCache } } = require('../market_adapter/utils/file_json_cache');
 
 /**
  * The candle-file read cache must be a pure speedup: it may only ever hand back

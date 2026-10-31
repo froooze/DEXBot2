@@ -47,6 +47,7 @@ import { shardStemFromName } from '../utils/month_shards.js';
 import * as bitsharesClient from '../../modules/bitshares_client.js';
 import { getErrorMessage, resolveSeamMs } from '../../modules/utils/errors.js';
 import { isSameBotName } from '../../modules/utils/sanitize_key.js';
+import { walkCliArgs } from '../cli_args.js';
 import { pathToFileURL } from 'node:url';
 
 const storage = getStorage();
@@ -118,8 +119,27 @@ interface FetchWindow {
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
 
+function printHelp() {
+    console.log(`Usage:
+  node dist/market_adapter/inputs/fetch_lp_data.js [options]
+
+Options:
+  --bot <name>            Read pool/assets/interval from profiles/bots.json
+  --pool <id>             Liquidity pool id (1.19.N or N)
+  --interval <label>      Candle interval (1m|5m|15m|30m|1h|2h|4h|6h|12h|1d|1w or seconds)
+  --lookback <hours>      Trailing window in hours (accepts a trailing \`h\`)
+  --start <date>          Absolute ISO start time (pairs with --end)
+  --end <date>            Absolute ISO end time (pairs with --start)
+  --chunkMonths <n>       Fetch window size in months (default ${DEFAULT_CONFIG.chunkMonths})
+  --precA <n>             Override asset A precision
+  --precB <n>             Override asset B precision
+  --apiKey <key>          Kibana API key, when the endpoint requires auth
+  --out <file>            Explicit output path
+  --help, -h              Show this help
+`);
+}
+
 function parseArgs() {
-    const args   = process.argv.slice(2);
     const config = { ...DEFAULT_CONFIG };
     let poolId: string | null = null;   // null = auto-discover from bots.json
     let botName: string | null = null;
@@ -135,41 +155,38 @@ function parseArgs() {
         '1d': 86400, '1w': 604800, '7d': 604800,
     };
 
-    for (let i = 0; i < args.length; i++) {
-        const arg = args[i];
-        const val = args[i + 1];
-
-        switch (arg) {
-            case '--bot':      botName                = val; i++; break;
-            case '--pool':     poolId                 = val; i++; break;
-            case '--interval': {
-                let seconds = (intervalMap as Record<string, number>)[val];
+    walkCliArgs(process.argv.slice(2), {
+        onHelp: () => {
+            printHelp();
+            process.exit(0);
+        },
+        value: {
+            '--bot': (val) => { botName = val; },
+            '--pool': (val) => { poolId = val; },
+            '--interval': (val) => {
+                let seconds = intervalMap[val];
                 if (seconds == null) seconds = parseInt(val, 10);
                 if (!Number.isFinite(seconds) || seconds <= 0) {
                     throw new Error(`--interval: unsupported value "${val}" (use ${Object.keys(intervalMap).join(', ')} or seconds)`);
                 }
                 config.intervalSeconds = seconds;
-                i++;
-                break;
-            }
-            case '--lookback': {
+            },
+            '--lookback': (val) => {
                 const hours = parseInt(String(val).replace('h', ''), 10);
                 if (!Number.isFinite(hours) || hours <= 0) {
                     throw new Error(`--lookback: invalid value "${val}" (expected hours, e.g. 48 or 48h)`);
                 }
                 config.lookbackHours = hours;
-                i++;
-                break;
-            }
-            case '--chunkMonths': config.chunkMonths  = parseInt(val, 10); i++; break;
-            case '--precA':    precA                  = parseInt(val, 10); i++; break;
-            case '--precB':    precB                  = parseInt(val, 10); i++; break;
-            case '--apiKey':   config.apiKey          = val; i++; break;
-            case '--start':    config.timeRange       = { ...(config.timeRange || {}), gte: val }; i++; break;
-            case '--end':      config.timeRange       = { ...(config.timeRange || {}), lte: val }; i++; break;
-            case '--out':      config.outPath         = val; i++; break;
-        }
-    }
+            },
+            '--chunkMonths': (val) => { config.chunkMonths = parseInt(val, 10); },
+            '--precA': (val) => { precA = parseInt(val, 10); },
+            '--precB': (val) => { precB = parseInt(val, 10); },
+            '--apiKey': (val) => { config.apiKey = val; },
+            '--start': (val) => { config.timeRange = { ...(config.timeRange || {}), gte: val }; },
+            '--end': (val) => { config.timeRange = { ...(config.timeRange || {}), lte: val }; },
+            '--out': (val) => { config.outPath = val; },
+        },
+    });
 
     return { poolId, botName, precA, precB, config };
 }
@@ -719,5 +736,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     });
 }
 
-export { applyPrecisionOverrides, parseBotsConfig, selectBot, fetchCandlesSequentially, outputPath, loadCachedFetchContext }
+export { fetchCandlesSequentially, outputPath }
+
+/** Internal seams exercised directly by tests. */
+export const __test = { applyPrecisionOverrides, parseBotsConfig, selectBot, loadCachedFetchContext };
 

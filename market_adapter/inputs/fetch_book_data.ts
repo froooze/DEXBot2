@@ -192,9 +192,7 @@ async function fetchMarketCandlesSequentially(assetA: AssetRef, assetB: AssetRef
     return flipped ? (invertCandleSeries(merged, { volume: 'scale' }) as number[][]) : merged;
 }
 
-export {
-    bookCacheKey,
-    bookOutputPath,
-    isBookChunkMatch,
-    fetchMarketCandlesSequentially,
-};
+export { fetchMarketCandlesSequentially };
+
+/** Internal seams exercised directly by tests. */
+export const __test = { bookCacheKey, bookOutputPath, isBookChunkMatch };

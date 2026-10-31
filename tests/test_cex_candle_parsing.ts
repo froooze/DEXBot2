@@ -7,10 +7,10 @@ const {
     OHLC_CLOSE_HIGH_LOW,
     OHLC_GATE,
     OHLC_KRAKEN,
-    normalizeTimestamp,
     parseCandleRow,
     parseCandleRows,
     parseHtxObjectRow,
+    __test: { normalizeTimestamp },
 } = require('../market_adapter/inputs/cex_candle_parsing');
 
 function testNormalizeTimestamp() {

@@ -13,7 +13,7 @@
  * the `process.exit` policy via `onHelp`, so this module stays browser-safe.
  */
 
-export interface CliArgHandlers {
+interface CliArgHandlers {
     /** Flags that take a value; receives the raw next argv token (never missing or flag-shaped). */
     value?: Record<string, (raw: string) => void>;
     /** Flags that take no value. */

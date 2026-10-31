@@ -12,20 +12,22 @@ const {
     buildAmaRecord,
     computeCandleStaleness,
     resolveAmaForBot,
-    resolveDeltaThresholdPercentFromGeneralSettings,
-    resolveAmaSlopeDeltaThresholdPercentFromGeneralSettings,
     normalizeMarketSource,
     normalizeNativeMarketHistoryCandles,
     fetchNativeMarketHistorySince,
     usesAmaGridPrice,
     applyRuntimeDefaultsFromGeneralSettings,
-    _setBitsharesClientForTests,
+    __test: {
+        resolveDeltaThresholdPercentFromGeneralSettings,
+        resolveAmaSlopeDeltaThresholdPercentFromGeneralSettings,
+        _setBitsharesClientForTests,
+    },
 } = require('../market_adapter/market_adapter');
 const { resolveMarketSourceForBot } = require('../market_adapter/utils/chain');
-const { parseNativeMarketHistoryTimestamp } = require('../market_adapter/utils/native_history');
+const { parseNativeMarketHistoryTimestamp } = require('../market_adapter/utils/native_history').__test;
 const { detectMissingCandleTimestamps, fillCandleGaps, pruneStaleTail, tradesToCandles } = require('../market_adapter/candle_utils');
 const { MarketAdapterService } = require('../market_adapter/core/market_adapter_service');
-const { loadStrategiesFromProfiles } = require('../market_adapter/lp_chart_strategy_loader');
+const { loadStrategiesFromProfiles } = require('../market_adapter/lp_chart_strategy_loader').__test;
 const { ensureDir, writeJSON } = require('../modules/storage').getStorage();
 
 const MARKET_PROFILES_FILE = PATHS.PROFILES.MARKET_PROFILES_JSON;

@@ -115,4 +115,7 @@ function clearJsonCache(): void {
     _cache.clear();
 }
 
-export { readCachedJson, noteJsonWritten, clearJsonCache }
+export { readCachedJson, noteJsonWritten }
+
+/** Internal seams exercised directly by tests. */
+export const __test = { clearJsonCache };

@@ -7,7 +7,7 @@ const {
     buildDirectionalDocumentQuery,
     fetchKibanaCandles,
     resolveRequestedFillRange,
-    sourceFieldsForFieldMap,
+    __test: { sourceFieldsForFieldMap },
 } = require('../market_adapter/core/kibana_candles');
 
 const FIELD_MAP = {
