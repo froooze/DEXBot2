@@ -22,7 +22,7 @@ Tools that inspect DEXBot trading behavior and the market data it operates on. O
 |------|----------------|------------------|
 | [`trade_profitability.ts`](#trade-profitability-analyzer-trade_profitabilityts) | "Is my bot making money?" — PnL, R-multiples, drawdown | `npm run analysis:trade-pnl -- <account-id>` |
 | [`dexbot pnl`](#pnl-html-report-dexbot-pnl) | "Give me a readable PnL report" — self-contained HTML with a lot table | `dexbot pnl <bot\|account> --month 3` |
-| [`grid_correction_check.ts`](#last-fill-guard-check-grid_correction_checkts) | "Are fills respecting the pivot ± half-increment guard?" | `npm run analysis:grid-check -- --bot-key <bot-key>` |
+| [`grid_correction_check.ts`](#last-fill-guard-check-grid_correction_checkts) | "Are fills respecting the direction-only last-fill guard?" | `npm run analysis:grid-check -- --bot-key <bot-key>` |
 | [`analyze_risk_profile.ts`](#risk-profile-analyzer-analyze_risk_profilets) | "How wide should my Safe Range clamps be?" | `node dist/analysis/analyze_risk_profile.js --bot-key <bot-key>` |
 | [`analyze_trade_heatmap.ts`](#trade-heatmap-analyze_trade_heatmapts) | "Where did trade volume cluster vs the AMA?" | `node dist/analysis/analyze_trade_heatmap.js --bot-key <bot-key>` |
 | [`tradingview/analyze_tradingview.ts`](#tradingview-chart-tradingviewanalyze_tradingviewts) | "Just give me a candle chart" | `dexbot tv <bot-key>` |
@@ -258,9 +258,11 @@ All amounts use the shared 4-significant-figure formatter (compact `K`/`M`, sign
 
 ### LAST-FILL-GUARD Check (`grid_correction_check.ts`)
 
-Validates LAST-FILL-GUARD discipline from the same Kibana fill pipeline as `trade_profitability.ts`. For a previous fill at price `x` and grid increment `i`, the next order must satisfy `BUY < x × (1 − i/2/100)` and `SELL > x × (1 + i/2/100)`, regardless of the previous fill's side. A violation is a buy or sell fill inside the prohibited half-increment band around its pivot.
+Validates LAST-FILL-GUARD discipline from the same Kibana fill pipeline as `trade_profitability.ts`. The rule is **direction only** (v1.6.16+): with the previous fill at price `p`, the next order must satisfy `BUY < p` and `SELL > p` (equal price is blocked — a re-place at the just-filled level). There is no increment band: the older `pivot ± i/2` rule blocked a BUY below a SELL fill and a SELL one tick above our cost, i.e. it flagged the tightening placements the engine legitimately makes. A violation is a buy fill at/above its pivot or a sell fill at/below it.
 
-**Pipeline:** Kibana `fill_order` query (paginated `search_after`) → on-chain asset precision resolution → buy/sell classification → chronological sort → per-order/price-epoch aggregation (partial fills at one price collapsed to weighted-average; repriced order lifetimes kept separate) → consecutive pivot-band comparison → violation report with daily histogram.
+**Offline limits:** the tool reconstructs pivots from consecutive fills, so it cannot see the runtime's edge-pinned-fill exclusion (no slot identity per fill) nor the spread-correction bypass — expect rare false positives on wick/insurance fills.
+
+**Pipeline:** Kibana `fill_order` query (paginated `search_after`) → on-chain asset precision resolution → buy/sell classification → chronological sort → per-order/price-epoch aggregation (partial fills at one price collapsed to weighted-average; repriced order lifetimes kept separate) → consecutive direction comparison → violation report with daily histogram.
 
 ```bash
 # Per-order aggregated check (default), last 7 days
@@ -272,7 +274,7 @@ npm run analysis:grid-check -- --bot-key <bot-key> --hours 720 --json out.json -
 # Raw fill granularity instead of per-order aggregation
 npm run analysis:grid-check -- --bot-key <bot-key> --per-fill --hours 168
 
-# Override the bot's configured grid increment
+# Override the bot's configured grid increment (informational: the guard has no band)
 npm run analysis:grid-check -- --bot-key <bot-key> --hours 168 --increment 0.5
 ```
 
