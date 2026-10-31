@@ -66,7 +66,7 @@ import {
     buildSuccessResult,
     evaluateCommit
 } from './utils/validate.js';
-import { resolveSpreadOrderSide, resolveLiveOrderLadderPosition, parseSlotIndex, parseChainOrder, geometryTypeForSlotIndex, isOrderOnChain, resolveEdgeCount, resolveLiveEdgeAnchorPrice, compareEdge, collectRefillSlotIds, recordOrderPlacement, isFreshlyPlacedOrder } from './utils/order.js';
+import { resolveSpreadOrderSide, resolveLiveOrderLadderPosition, parseSlotIndex, parseChainOrder, geometryTypeForSlotIndex, isOrderOnChain, resolveEdgeCount, resolveLiveEdgeAnchorPrice, compareEdge, collectRefillSlotIds, recordOrderPlacement, isFreshlyPlacedOrder, collectEdgePinnedFillIds } from './utils/order.js';
 import { getErrorMessage, getErrorCode } from '../utils/errors.js';
 import type { GridGenesis } from './utils/math.js';
 import type {
@@ -2208,15 +2208,28 @@ class OrderManager implements OrderManagerLike {
      * discriminator (null => disabled). The per-side fields are not read by the
      * guard itself; they feed the book-seed cold-check and per-side seeding in
      * seedLastFilledPricesFromBook.
+     *
+     * EDGE-PINNED FILLS ARE SKIPPED. An edge order is static fat-finger
+     * insurance resting at the grid floor/ceiling, not market movement: the
+     * boundary crawl already excludes its fills, and the pivot doubles as the
+     * geometry anchor for reanchorBoundaryFromLastFill. Letting a wick on an
+     * edge order arm the pivot at a rail-edge price would both veto that whole
+     * side of the book and (as an absolute anchor) teleport the window to the
+     * edge. Skipping keeps the reference on the last WINDOW trade, matching
+     * the crawl's classification (collectEdgePinnedFillIds is the shared
+     * definition).
      * @param {Array} fills
      */
     recordLastFilledPrices(fills: COWFillLike[]): void {
         if (!Array.isArray(fills) || fills.length === 0) return;
+        const edgeFillIds = collectEdgePinnedFillIds(this as unknown as Parameters<typeof collectEdgePinnedFillIds>[0], fills as Array<{ id?: string; type?: string }>);
         let recorded = 0;
+        let skippedEdge = 0;
         let lastKind = 'unknown';
         let lastPriceSrc = 'direct';
         for (const f of fills) {
             if (!f || (f.type !== ORDER_TYPES.BUY && f.type !== ORDER_TYPES.SELL)) continue;
+            if (f.id != null && edgeFillIds.has(String(f.id))) { skippedEdge++; continue; }
             let price: number | null = Number(f.price ?? f.order?.price);
             let priceSrc = 'direct';
             if (!Number.isFinite(price) || (price as number) <= 0) {
@@ -2242,7 +2255,15 @@ class OrderManager implements OrderManagerLike {
                 this.logger?.log?.(
                     `[FILL-PIVOT] pivot=${fmt(this._lastFilledPrice)}(${this._lastFilledType}) ` +
                     `buy=${fmt(this._lastFilledBuyPrice)} sell=${fmt(this._lastFilledSellPrice)} ` +
-                    `n=${recorded} src=${lastKind}/${lastPriceSrc}`,
+                    `n=${recorded} src=${lastKind}/${lastPriceSrc}` +
+                    `${skippedEdge > 0 ? ` edge-skipped=${skippedEdge}` : ''}`,
+                    'info'
+                );
+            } catch { /* logging is best-effort */ }
+        } else if (skippedEdge > 0) {
+            try {
+                this.logger?.log?.(
+                    `[FILL-PIVOT] ${skippedEdge} edge-pinned fill(s) ignored — the guard pivot and the boundary anchor stay on the last window trade`,
                     'info'
                 );
             } catch { /* logging is best-effort */ }

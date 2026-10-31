@@ -220,5 +220,46 @@ run('REANCHOR-17 opposite-side fills in the batch are ignored by the extremum', 
     assert.strictEqual(r.boundaryIdx, 4);
 });
 
+run('REANCHOR-18 a PARTIAL fill anchors (decided: a real trade, residual allow-listed)', () => {
+    // Eligibility is pinned deliberately: the crawl only counts a partial when
+    // it is a delayed-rotation trigger (isShiftEligibleFill), but the ANCHOR
+    // accepts one — a partial at a far slot is still a real trade at a real
+    // price, and its residual is allow-listed below so the geometry cannot
+    // deadlock. EDGE-pinned fills are the opposite case and never anchor
+    // (they do not even arm the pivot — see test_edge_fill_pivot).
+    const mgr = makeManager(106, ORDER_TYPES.SELL);
+    // Slot 6 is SELL-typed in the fixture; a partial fill leaves its residual
+    // AT the anchor slot, which is inside the implied band by construction.
+    const slots = makeSlots([], [6]);
+    const r = reanchorBoundaryFromLastFill(mgr, 2, slots, 1, [
+        { id: 'slot-6', type: ORDER_TYPES.SELL, price: 106, isPartial: true }
+    ]);
+    assert.strictEqual(r.reanchored, true, `a partial fill must anchor, got ${JSON.stringify(r)}`);
+    assert.strictEqual(r.boundaryIdx, 5, 'SELL partial at 6 => boundary 5 (sellStart 7)');
+    // Only the fill's OWN PARTIAL residual at the anchor slot may sit in band.
+    const foreign = makeSlots([], [6]);
+    foreign[6].type = ORDER_TYPES.BUY;
+    const refused = reanchorBoundaryFromLastFill(mgr, 2, foreign, 1, [
+        { id: 'slot-6', type: ORDER_TYPES.SELL, price: 106, isPartial: true }
+    ]);
+    assert.strictEqual(refused.reanchored, false, 'a foreign in-band residual must still refuse the re-anchor');
+    assert.ok(/unsafe/.test(String(refused.reason)), `refusal must name the strand: ${JSON.stringify(refused)}`);
+});
+
+run('REANCHOR-19 an edge-pinned fill can never anchor (pivot is not armed by one)', () => {
+    // The eligibility rule is enforced at the WRITER (recordLastFilledPrices
+    // skips edge fills), so the reference handed to the re-anchor can only be a
+    // window trade. This case pins the contract from the consumer side: a cold
+    // pivot (the edge fill never armed one) refuses instead of teleporting the
+    // window to the grid edge.
+    const mgr = makeManager(null, null);
+    const r = reanchorBoundaryFromLastFill(mgr, 5, makeSlots([0, 3, 4, 5, 7, 8]), 1, [
+        { id: 'slot-10', type: ORDER_TYPES.SELL, price: 110 }
+    ]);
+    assert.strictEqual(r.reanchored, false);
+    assert.strictEqual(r.reason, 'cold-pivot');
+    assert.strictEqual(r.boundaryIdx, 5, 'the boundary must not move');
+});
+
 console.log(`\nREANCHOR summary: ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

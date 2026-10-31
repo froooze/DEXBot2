@@ -3118,6 +3118,46 @@ function windowIdSetFromSlots(allSlots: SlotLike[], config: OrderConfigView | nu
 }
 
 /**
+ * Collect the fill ids that belong to EDGE-pinned insurance orders.
+ *
+ * Edge orders (grid floor / ceiling) are static fat-finger insurance, not
+ * market movement: the boundary crawl already excludes their fills
+ * (`deriveTargetBoundary`), and the same exclusion must apply to the fill
+ * reference the LAST-FILL-GUARD pivots on and the boundary re-anchor uses.
+ * Without it, one wick that triggers a far-out insurance order would arm the
+ * guard at that price AND re-anchor the window to the grid edge — the exact
+ * "teleport" class the geometry guards exist to prevent.
+ *
+ * Uses the SAME classification the placement pickers use (live window ids
+ * excluded, live edge anchor) so "edge" cannot mean two things.
+ *
+ * @param {Object} manager - OrderManager (orders Map, config, boundary)
+ * @param {Array<Object>} fills - Fill batch
+ * @returns {Set<string>} Slot ids of edge-pinned fills (empty when none/unknown)
+ */
+function collectEdgePinnedFillIds(manager: OrderManagerLike, fills: Array<{ id?: string; type?: string }> | null | undefined): Set<string> {
+    const out = new Set<string>();
+    if (!manager || !Array.isArray(fills) || fills.length === 0) return out;
+    try {
+        const slots = manager.orders && typeof manager.orders.values === 'function'
+            ? Array.from(manager.orders.values())
+            : [];
+        if (slots.length === 0) return out;
+        for (const side of [ORDER_TYPES.BUY, ORDER_TYPES.SELL] as OrderType[]) {
+            const windowIds = liveWindowIdSet(manager, side);
+            const edgeIds = edgeOrderIdSet(slots, manager?.config, side, resolveLiveEdgeAnchorPrice(manager, side), windowIds);
+            if (!edgeIds || edgeIds.size === 0) continue;
+            for (const f of fills) {
+                if (!f || f.type !== side) continue;
+                const id = String(f.id ?? '');
+                if (id && edgeIds.has(id)) out.add(id);
+            }
+        }
+    } catch { /* classification is best-effort: never block fill intake */ }
+    return out;
+}
+
+/**
  * Window member ids for one side from the live manager (see
  * windowIdSetFromSlots). Delegates so the manager and explicit-geometry
  * callers share one definition.
@@ -3626,7 +3666,7 @@ function collectKnownOnChainOrderIds(mgr: OrderManagerLike, placedResults: unkno
     return { masterIds: [...masterIds], createIds: [...createIds], all: [...all] };
 }
 
-export { parseChainOrder, resolveLiveOrderLadderPosition, applyChainSizeToGridOrder,  buildFillKey, correctOrderPriceOnChain, correctAllPriceMismatches, _validatePriceCorrectionEntry, _stampCorrectionProvenance, findLiveOrderOwnerByChainId, buildCreateOrderArgs, getOrderTypeFromUpdatedFlags, resolveConfiguredPriceBound, virtualizeOrder, convertToSpreadPlaceholder, toRailHolePlaceholder, geometryTypeForSlotIndex, detectGapEvacuationCandidates, updateGapEvacuationStreaks, resolveSpreadOrderSide, chainOrderMatchesSlot, chainOrderMatchesSlotWithTolerance, crossingCandidateChainId, isCrossingCheckCandidate, buildCrossingCheckCandidates, parseSlotIndex, filterOrdersByType, buildOutsideInPairGroups, extractBatchOperationResults, formatUnmatchedChainOrder, isNonBlockingUnmatchedOrder, isStrandedHoldOrder, isOrderOnChain, isOrderVirtual, hasOnChainId, isOrderPlaced, isPhantomOrder, isSlotAvailable, isEmptyGridSlot, isOrderHealthy, checkSizeThreshold, checkSizesBeforeMinimum, calculateIdealBoundary, assignGridRoles, resolveOnChainRetypeType, shouldFlagOutOfSpread, buildIndexes, validateIndexes, ordersEqual, buildDelta, deriveTargetBoundary, isShiftEligibleFill, resolveEdgeCount, resolveEdgeOrders, selectEdgeSlots, getCoreOrdersTotal, getSideBudget, calculateBudgetedSizes, buildCreateOpFingerprint, isOrderGoneErrorMessage, recordDuplicateOrphanDetection, clearDuplicateOrphanDetection, duplicateOrphanLogInfo, chainOrderUnchangedFromCache, detectCrossedBookPlan, collectKnownOnChainOrderIds, edgeOrderIdSet, liveWindowIdSet, checkGridPriceInvariant, reportGridPriceInvariant };
+export { parseChainOrder, resolveLiveOrderLadderPosition, applyChainSizeToGridOrder,  buildFillKey, correctOrderPriceOnChain, correctAllPriceMismatches, _validatePriceCorrectionEntry, _stampCorrectionProvenance, findLiveOrderOwnerByChainId, buildCreateOrderArgs, getOrderTypeFromUpdatedFlags, resolveConfiguredPriceBound, virtualizeOrder, convertToSpreadPlaceholder, toRailHolePlaceholder, geometryTypeForSlotIndex, detectGapEvacuationCandidates, updateGapEvacuationStreaks, resolveSpreadOrderSide, chainOrderMatchesSlot, chainOrderMatchesSlotWithTolerance, crossingCandidateChainId, isCrossingCheckCandidate, buildCrossingCheckCandidates, parseSlotIndex, filterOrdersByType, buildOutsideInPairGroups, extractBatchOperationResults, formatUnmatchedChainOrder, isNonBlockingUnmatchedOrder, isStrandedHoldOrder, isOrderOnChain, isOrderVirtual, hasOnChainId, isOrderPlaced, isPhantomOrder, isSlotAvailable, isEmptyGridSlot, isOrderHealthy, checkSizeThreshold, checkSizesBeforeMinimum, calculateIdealBoundary, assignGridRoles, resolveOnChainRetypeType, shouldFlagOutOfSpread, buildIndexes, validateIndexes, ordersEqual, buildDelta, deriveTargetBoundary, isShiftEligibleFill, resolveEdgeCount, resolveEdgeOrders, selectEdgeSlots, getCoreOrdersTotal, getSideBudget, calculateBudgetedSizes, buildCreateOpFingerprint, isOrderGoneErrorMessage, recordDuplicateOrphanDetection, clearDuplicateOrphanDetection, duplicateOrphanLogInfo, chainOrderUnchangedFromCache, detectCrossedBookPlan, collectKnownOnChainOrderIds, collectEdgePinnedFillIds, edgeOrderIdSet, liveWindowIdSet, checkGridPriceInvariant, reportGridPriceInvariant };
 export type { CrawlEntry }
 export { resolveEdgeAnchorPrice, resolveLiveEdgeAnchorPrice, compareEdge, collectRefillSlotIds, recordOrderPlacement, isFreshlyPlacedOrder, _filterUnmatchedChainOrders };
 
