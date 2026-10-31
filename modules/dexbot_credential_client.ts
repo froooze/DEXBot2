@@ -47,7 +47,12 @@ interface CredentialDaemonMeta {
     batchId?: string | null;
 }
 
-interface CredentialDaemonResponse {
+/**
+ * Typed daemon reply. Exported because downstream wrapper modules infer it as
+ * the return type of `executeOperationsViaCredentialDaemon`; declaration emit
+ * cannot name a module-private type there (TS4058).
+ */
+export interface CredentialDaemonResponse {
     success?: boolean;
     error?: string;
     code?: string;

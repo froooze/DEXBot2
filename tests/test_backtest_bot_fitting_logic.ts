@@ -1,4 +1,5 @@
 const assert = require('assert');
+const { MARKET_ADAPTER } = require('../modules/constants');
 
 console.log('Running backtest bot fitting logic tests');
 
@@ -71,9 +72,10 @@ const ROTATION_GROSS_PCT = (U1 / B1 - 1) * 100;
 
 // ── computeGridPriceOffsetPct (service.ts:92-119 port) ───────────────────────
 {
-    approx(computeGridPriceOffsetPct(0.09, 2), 1, 1e-6, 'full-strength slope -> half spread');
-    approx(computeGridPriceOffsetPct(-0.045, 2), -0.5, 1e-6, 'half-strength down slope');
-    approx(computeGridPriceOffsetPct(0.01, 2), 0.111111, 1e-6, 'sub-strength slope scaled by ratio');
+    const maxSlopePct = MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_MAX_SLOPE_PCT;
+    approx(computeGridPriceOffsetPct(maxSlopePct, 2), 1, 1e-6, 'full-strength slope -> half spread');
+    approx(computeGridPriceOffsetPct(-maxSlopePct / 2, 2), -0.5, 1e-6, 'half-strength down slope');
+    approx(computeGridPriceOffsetPct(maxSlopePct / 9, 2), 0.111111, 1e-6, 'sub-strength slope scaled by ratio');
     assert.strictEqual(computeGridPriceOffsetPct(0, 2), 0, 'zero slope stays neutral');
     assert.strictEqual(computeGridPriceOffsetPct(NaN, 2), 0, 'non-finite slope -> no offset');
 }
