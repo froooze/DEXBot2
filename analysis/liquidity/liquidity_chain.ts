@@ -15,6 +15,7 @@
 
 import { blockchainToFloat } from '../../modules/order/utils/math.js';
 import { poolAssetIds, resolvePoolRef } from '../../modules/liquidity_pool_ref.js';
+import { resolveAssetRef } from '../../modules/asset_lookup.js';
 import type { BookSides, PoolState, RawOrderBook } from './liquidity_depth_model.js';
 import { normalizeOrderBook } from './liquidity_depth_model.js';
 
@@ -48,14 +49,12 @@ interface RawPool {
     taker_fee_percent?: number;
 }
 
-const ASSET_ID_RE = /^1\.3\.\d+$/;
-
 async function resolveAsset(client: ChainDbClient, ref: string): Promise<ChainAsset> {
     const probe = String(ref || '').trim();
     if (!probe) throw new Error('Asset reference is empty');
-    const method = ASSET_ID_RE.test(probe) ? 'get_assets' : 'lookup_asset_symbols';
-    const raw = await client.db(method, [[probe]]);
-    const asset = Array.isArray(raw) ? raw[0] as Partial<ChainAsset> | null : null;
+    // Shared case-insensitive lookup (modules/asset_lookup.ts): "token.sym",
+    // "TOKEN.SYM" and "1.3.x" all reach the same asset object.
+    const asset = await resolveAssetRef((method, args) => client.db(method, args), probe);
     if (!asset?.id || !asset.symbol || typeof asset.precision !== 'number') {
         throw new Error(`Cannot resolve asset '${probe}' on chain`);
     }

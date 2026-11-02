@@ -119,21 +119,22 @@ function testResolveByIdToleratesNestedAndWrappedShapes() {
 
 function testResolveByPoolToken() {
     const { read, calls } = stubRead({
-        lookup_asset_symbols: [{ id: '1.3.3', symbol: 'POOLTOK' }],
+        get_assets: [{ id: '1.3.3', symbol: 'POOLTOK' }],
         get_liquidity_pools_by_share_asset: [{ pool: POOL }],
     });
     return resolvePoolRef(read, 'POOLTOK').then((pool) => {
         assert.strictEqual(pool.id, '1.19.9');
         assert.deepStrictEqual(calls, [
-            ['lookup_asset_symbols', [['POOLTOK']]],
+            ['get_assets', [['POOLTOK']]],
             ['get_liquidity_pools_by_share_asset', [['1.3.3'], false, false]],
         ]);
     });
 }
 
-function testResolveByPoolTokenRetriesUppercase() {
+function testResolveByPoolTokenIsCaseInsensitive() {
+    // A lowercase pool token resolves through the shared lookup's canonical form.
     const { read, calls } = stubRead({
-        lookup_asset_symbols: (args?: unknown[]) => {
+        get_assets: (args?: unknown[]) => {
             const symbol = (args?.[0] as string[] | undefined)?.[0];
             return symbol === 'POOLTOK' ? [{ id: '1.3.3', symbol: 'POOLTOK' }] : [null];
         },
@@ -142,8 +143,7 @@ function testResolveByPoolTokenRetriesUppercase() {
     return resolvePoolRef(read, 'pooltok').then((pool) => {
         assert.strictEqual(pool.id, '1.19.9');
         assert.deepStrictEqual(calls.map(([method, args]) => [method, args?.[0]]), [
-            ['lookup_asset_symbols', ['pooltok']],
-            ['lookup_asset_symbols', ['POOLTOK']],
+            ['get_assets', ['POOLTOK']],
             ['get_liquidity_pools_by_share_asset', ['1.3.3']],
         ]);
     });
@@ -156,7 +156,7 @@ function testResolveErrors() {
         /Liquidity pool 1\.19\.13 not found on chain/,
     ).then(() => {
         const notAToken = stubRead({
-            lookup_asset_symbols: [{ id: '1.3.44', symbol: 'PLAIN' }],
+            get_assets: [{ id: '1.3.44', symbol: 'PLAIN' }],
             get_liquidity_pools_by_share_asset: [],
         });
         return assert.rejects(
@@ -164,7 +164,7 @@ function testResolveErrors() {
             /'PLAIN' \(1\.3\.44\) is not a liquidity-pool token/,
         );
     }).then(() => {
-        const unknownToken = stubRead({ lookup_asset_symbols: [null] });
+        const unknownToken = stubRead({ get_assets: [null] });
         return assert.rejects(
             () => resolvePoolRef(unknownToken.read, 'NOPE'),
             /Pool token 'NOPE' not found on chain/,
@@ -182,7 +182,7 @@ const tests: Array<[string, () => void | Promise<void>]> = [
     ['resolvePoolRef: pool id', testResolveById],
     ['resolvePoolRef: nested/wrapped get_objects shapes', testResolveByIdToleratesNestedAndWrappedShapes],
     ['resolvePoolRef: pool token', testResolveByPoolToken],
-    ['resolvePoolRef: pool token retries UPPERCASE', testResolveByPoolTokenRetriesUppercase],
+    ['resolvePoolRef: pool token is case-insensitive', testResolveByPoolTokenIsCaseInsensitive],
     ['resolvePoolRef: error messages', testResolveErrors],
 ];
 

@@ -20,7 +20,7 @@
  * entries (ephemeral RPC client) and unit tests (stubs).
  */
 
-import { normalizeAssetSymbol } from './utils/asset_symbols.js';
+import { resolveAssetRef } from './asset_lookup.js';
 
 interface RawPoolLike {
     id?: string;
@@ -120,14 +120,13 @@ async function resolvePoolRef(read: ChainRead, ref: unknown): Promise<RawPoolLik
     return pools[0];
 }
 
-/** Look up the LP share asset by symbol (as typed, then UPPERCASE). */
+/** Look up the LP share asset by symbol, case-insensitively (shared resolver). */
 async function resolveShareAsset(read: ChainRead, symbol: string): Promise<{ id: string; symbol: string }> {
-    for (const candidate of [...new Set([symbol, normalizeAssetSymbol(symbol)].filter(Boolean))]) {
-        const raw = await read('lookup_asset_symbols', [[candidate]]);
-        const asset = (Array.isArray(raw) ? raw[0] : null) as { id?: string; symbol?: string } | null;
-        if (asset?.id) return { id: String(asset.id), symbol: String(asset.symbol ?? candidate) };
+    const asset = await resolveAssetRef(read, symbol);
+    if (!asset?.id) {
+        throw new Error(`Pool token '${symbol}' not found on chain (expected the pool's LP share-asset symbol or a pool id like 133/1.19.133)`);
     }
-    throw new Error(`Pool token '${symbol}' not found on chain (expected the pool's LP share-asset symbol or a pool id like 133/1.19.133)`);
+    return { id: String(asset.id), symbol: String(asset.symbol ?? symbol) };
 }
 
 export { normalizePoolRef, isPoolIdRef, isPoolRefLike, poolAssetIds, resolvePoolRef };

@@ -3,8 +3,9 @@
  *
  * BitShares stores asset symbols canonically UPPERCASE, so the assetA and
  * assetB symbols of a bot pair are always UPPERCASE on chain.
- * `lookup_asset_symbols` is case-sensitive: a lowercase symbol resolves to
- * null (not an error), so a lowercase input silently drops the asset. Casing
+ * The chain's asset lookups (`get_assets` / `lookup_asset_symbols`) are
+ * case-sensitive: a lowercase symbol resolves to null (not an error), so a
+ * lowercase input silently drops the asset. Casing
  * also leaks into everything built from a resolved symbol: the `symbol` field
  * we attach to assets, chart titles, cache-file names, Kibana query terms, and
  * strict in-process comparisons such as `assetA === 'CORE'`. That is a
@@ -52,6 +53,23 @@ export function normalizeAssetSymbol(value: unknown): string {
  */
 export function normalizeAssetRef(value: unknown): string {
   return normalizeAssetSymbol(value);
+}
+
+/**
+ * Both spellings of a human-typed asset reference: the reference as typed
+ * (trimmed) and its canonical UPPERCASE form. Resolvers query the canonical form
+ * first and retry the as-typed spelling only when that misses (see
+ * modules/asset_lookup.ts), because `get_assets` is case-sensitive and a node
+ * may still hold a non-canonical symbol. Object ids collapse to one entry.
+ *
+ * @returns [] for empty input, otherwise 1-2 distinct spellings.
+ */
+export function assetSymbolCandidates(value: unknown): string[] {
+  if (value === null || value === undefined) return [];
+  const typed = String(value).trim();
+  if (!typed) return [];
+  const canonical = normalizeAssetSymbol(typed);
+  return typed === canonical ? [canonical] : [typed, canonical];
 }
 
 /** Case- and whitespace-insensitive asset-symbol equality. */

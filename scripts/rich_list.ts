@@ -16,12 +16,12 @@
  */
 
 import { pathToFileURL } from 'node:url';
-import { normalizeAssetSymbol } from '../modules/utils/asset_symbols.js';
+import { lookupAssetRefs } from '../modules/asset_lookup.js';
 
 const DB_API = 0;          // database_api is always registered first
 const LOGIN_API = 1;       // login_api (registered second)
 const FALLBACK_HOLDER_LIMIT = 100;  // used when the node does not report api_limit_get_asset_holders
-const LOOKUP_PAGE = 100;   // chunk size for lookup_asset_symbols / get_objects
+const LOOKUP_PAGE = 100;   // get_objects chunk size for the 2.3.x supply fetch
 
 /** Nodes known to expose `asset_api` to anonymous logins come first. */
 const DEFAULT_NODES = [
@@ -73,12 +73,6 @@ interface Row {
     holders: Holder[];
     count: number | null;
     supply?: string | null;
-}
-
-interface AssetObject {
-    id: string;
-    symbol: string;
-    precision: number;
 }
 
 interface DynamicAssetObject {
@@ -289,21 +283,19 @@ async function readHolderLimit(client: RpcClient): Promise<number> {
 // ---------------------------------------------------------------------------
 
 export async function lookupSymbols(session: Session, symbolsOrIds: string[]): Promise<AssetRef[]> {
-    const out: AssetRef[] = [];
-    for (let i = 0; i < symbolsOrIds.length; i += LOOKUP_PAGE) {
-        const slice = symbolsOrIds.slice(i, i + LOOKUP_PAGE);
-        // `lookup_asset_symbols` is case-sensitive: a lowercase symbol returns
-        // null on-chain, so canonicalize before handing it to the node. Asset
-        // object ids ("1.3.x") pass through untouched. `request` keeps the
-        // caller's spelling so "asset not found" still echoes the input.
-        const refs = slice.map((s) => normalizeAssetSymbol(s));
-        const res = await session.client.call<(AssetObject | null)[]>(
-            session.dbApi, 'lookup_asset_symbols', [refs]);
-        res.forEach((a, j) => out.push(a
-            ? { request: slice[j], found: true, id: a.id, symbol: a.symbol, precision: a.precision }
-            : { request: slice[j], found: false }));
-    }
-    return out;
+    // Shared case-insensitive lookup (modules/asset_lookup.ts): one batched
+    // get_assets call for the whole list, `request` keeps the caller's spelling
+    // so "asset not found" still echoes the input.
+    const looked = await lookupAssetRefs(
+        (method, args) => session.client.call<unknown>(session.dbApi, method, args),
+        symbolsOrIds,
+    );
+    // An object missing its symbol/precision is useless downstream, so treat it
+    // exactly like a miss instead of formatting amounts with `undefined`.
+    return looked.map(({ request, asset }): AssetRef => (asset && asset.id && asset.symbol
+        && typeof asset.precision === 'number'
+        ? { request, found: true, id: asset.id, symbol: asset.symbol, precision: asset.precision }
+        : { request, found: false }));
 }
 
 /**
