@@ -26,11 +26,6 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-import { loadBotMeta, loadBotSettings, computeBotKey } from '../analysis/bot_key_utils.js';
 import type { BotEntry } from '../modules/bot_settings.js';
 
 interface AssetMeta {
@@ -64,9 +59,11 @@ import { fetchCandlesSequentially, outputPath } from '../market_adapter/inputs/f
 import { fetchMarketCandlesSequentially } from '../market_adapter/inputs/fetch_book_data.js';
 import { fetchFeedCandlesSequentially } from '../market_adapter/inputs/kibana_feed_source.js';
 import { muteChainLogs } from '../modules/utils/chain_logs.js';
-import { isSameBotName, sanitizeKey } from '../modules/utils/sanitize_key.js';
+import { sanitizeKey } from '../modules/utils/sanitize_key.js';
 import { slugPart, parseChainTimeToMs } from '../market_adapter/interval_utils.js';
 import { monthsToHours } from '../modules/utils/time_range.js';
+import { findBotByTarget, isPoolIdTarget, knownTargetsHint } from './chart_targets.js';
+import { runAnalysisScript } from './analysis_runner.js';
 
 const INTERVAL_SECONDS = 3600;
 const DEFAULT_MONTHS = 3;
@@ -264,26 +261,6 @@ function parseArgs(argv: string[], cmd: ChartCmd = 'tv'): { target: string | nul
     return { target, months, chart, source, help };
 }
 
-function isPoolIdTarget(target: string): boolean {
-    return /^(1\.19\.\d+|\d+)$/.test(target.trim());
-}
-
-function findBotByTarget(target: string): { botKey: string; meta: BotEntry } | null {
-    const settings = loadBotSettings();
-    const entries: BotEntry[] = Array.isArray(settings?.bots) ? settings.bots : [];
-    for (let i = 0; i < entries.length; i++) {
-        const entry = entries[i];
-        if (!entry) continue;
-        if (isSameBotName(entry.name, target)) return { botKey: computeBotKey(entry, i) ?? '', meta: entry };
-    }
-    const meta = loadBotMeta(target);
-    if (meta) {
-        const idx = entries.indexOf(meta);
-        return { botKey: computeBotKey(meta, idx >= 0 ? idx : 0) ?? '', meta };
-    }
-    return null;
-}
-
 function monthsLabel(months: number): string {
     return Number.isInteger(months) ? `${months}m` : `${String(months).replace('.', 'p')}m`;
 }
@@ -361,10 +338,7 @@ async function run(cmd: ChartCmd): Promise<void> {
     // the exported HTML all speak the same UPPERCASE symbols.
     const pairParts = pairTarget ? splitPairTarget(target) : [];
     if (!botHit && !poolTarget && !pairTarget) {
-        const settings = loadBotSettings();
-        const entries: BotEntry[] = Array.isArray(settings?.bots) ? settings.bots : [];
-        const keys = entries.map((b, i) => computeBotKey(b, i)).filter(Boolean);
-        throw new Error(`Unknown target "${target}". Use a bot name/key${keys.length ? ` (${keys.slice(0, 8).join(', ')}${keys.length > 8 ? ', …' : ''})` : ''}, a pool id (e.g. 133), or AssetA/AssetB.`);
+        throw new Error(`Unknown target "${target}". ${knownTargetsHint(true)}`);
     }
     if (pairTarget && pairParts.length !== 2) throw new Error(`Invalid pair "${target}". Use AssetA/AssetB, e.g. TOKENA/TOKENB (case is normalized to uppercase)`);
 
@@ -483,8 +457,6 @@ async function run(cmd: ChartCmd): Promise<void> {
         // Everything above this point is identical for every command; only the
         // RENDERERS entry below differs.
         const renderer = RENDERERS[cmd];
-        const analyzer = path.join(__dirname, '..', 'analysis', ...renderer.analyzerRel);
-        if (!fs.existsSync(analyzer)) throw new Error(`${renderer.exporterName} not found at ${analyzer} (run npm run build first)`);
         const feedSuffix = feedCtx ? '_feed' : '';
         const baseName = botKey
             ? `${cmd}_${sanitizeKey(botKey)}${feedSuffix}`
@@ -504,8 +476,7 @@ async function run(cmd: ChartCmd): Promise<void> {
         // bounds + order overlay). Explicit --ama-*-period forwarding was
         // dropped on purpose: it duplicated that resolution.
         if (botKey) analyzerArgs.push('--bot-key', botKey);
-        const result = spawnSync(process.execPath, [analyzer, ...analyzerArgs], { stdio: 'inherit' });
-        if (result.status !== 0) throw new Error(`${renderer.exporterName} exited with status ${result.status}`);
+        runAnalysisScript(renderer.analyzerRel, analyzerArgs, renderer.exporterName);
         try { fs.unlinkSync(tmpFile); } catch (_) { /* keep on failure path only */ }
         tmpFile = null;
     } finally {

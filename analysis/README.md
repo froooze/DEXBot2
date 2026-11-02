@@ -26,6 +26,7 @@ Tools that inspect DEXBot trading behavior and the market data it operates on. O
 | [`analyze_risk_profile.ts`](#risk-profile-analyzer-analyze_risk_profilets) | "How wide should my Safe Range clamps be?" | `node dist/analysis/analyze_risk_profile.js --bot-key <bot-key>` |
 | [`analyze_trade_heatmap.ts`](#trade-heatmap-analyze_trade_heatmapts) | "Where did trade volume cluster vs the AMA?" | `node dist/analysis/analyze_trade_heatmap.js --bot-key <bot-key>` |
 | [`tradingview/analyze_tradingview.ts`](#tradingview-chart-tradingviewanalyze_tradingviewts) | "Just give me a candle chart" | `dexbot tv <bot-key>` |
+| [`analyze_liquidity.ts`](#liquidity-depth-chart-analyze_liquidityts) | "Where is the pair's real liquidity — order book, AMM pool, or both?" | `npm run analysis:liquidity -- --pair TOKENA/TOKENB` |
 | [`analyze_dynamic_weight.ts`](#dynamic-weight-research-analyze_dynamic_weightts) | "Are buy/sell weights tuned for this regime?" | `dexbot dw <bot-key>` |
 | [`analyze_volatility.ts`](#volatility-analyze_volatilityts) | "Both weights clipped too hard / not enough?" | `node dist/analysis/analyze_volatility.js --bot-key <bot-key>` |
 | [`analyze_regime.ts`](#supporting-sub-signals) | "Is the trend/chaos gate too aggressive?" | `node dist/analysis/analyze_regime.js --bot-key <bot-key>` |
@@ -302,6 +303,84 @@ Exit code `0` = pass, `2` = violations found, `1` = fatal error. Bot keys resolv
 
 ## Charts & Visualization
 
+### Liquidity Depth Chart (`analyze_liquidity.ts`)
+
+Blends one pair's live limit-order book with its constant-product AMM pool into a
+single cumulative-depth chart (the PoolTool depth view, rebuilt with the vendored
+uPlot runtime). The chart plots **both** liquidity sources side by side as
+independent curves — they are deliberately **not summed**, because an on-chain
+order and an AMM reserve are different claims on liquidity. You can see which
+source supplies the depth at a given price, where the pool price sits relative
+to the book mid, and how far the two diverge.
+
+- **Price axis**: quote per base (B/A), e.g. `QUOTE per BASE`
+- **Depth axis**: cumulative quote liquidity (e.g. BTS) at or better than that price;
+  click the right y-axis to toggle the same curves into cumulative base units
+  (e.g. BASE) — both are precomputed server-side
+- **Click the x-axis to invert price** (`1/p`, e.g. `BASE per QUOTE`). Inversion
+  also swaps bid/ask roles and flips the depth asset to the new quote, so the
+  chart stays a valid book view rather than a mirrored picture with the wrong sides
+- **Bids**: order-book bids (`quote` of every bid at price >= p) drawn next to
+  the pool's `quoteReserve * (1 - sqrt(p / p0))` curve
+- **Asks**: order-book asks (`quote` of every ask at price <= p) drawn next to
+  the pool's `quoteReserve * (sqrt(p / p0) - 1)` curve
+
+The window is symmetric around the pool price (book mid when there is no pool),
+so the whole `0.5x .. 1.5x` range is visible by default. The chain's
+`get_order_book` side convention is handled by the tool. Pool depth is the exact
+constant-product solution (verified against the `x*y = k` swap invariant); the
+AMM taker fee is **not** applied to the curve — matching PoolTool — and is shown
+in the header as metadata only. PoolTool's `depthchart.py` plots the same curves
+with the reciprocal price convention (`amount_y * (sqrt(p_pool/p) - 1)` for buys
+and `amount_y * (1 - sqrt(p_pool/p))` for sells).
+
+Order-book depth prefers `get_limit_orders` (up to ~300 levels per side) over
+`get_order_book`, which many nodes cap at 50 — otherwise thin far levels are
+silently missing from the curves. If the wider call is unavailable the tool
+falls back to the classic 50-level endpoint.
+
+All displayed numbers use DEXBot's existing 4-active-digit formatters —
+`formatCurrency` for prices/percentages and `formatFundsValue` for amounts
+(`modules/order/format.ts`) — embedded into the generated page so it renders
+identically offline.
+
+```bash
+# Default example pair
+npm run analysis:liquidity -- --pair TOKENA/TOKENB
+
+# CLI wrapper: resolves a bot key or pair, then runs the same generator
+dexbot liquid TOKENA/TOKENB --range 0.25
+dexbot liquid <bot-key>
+
+# Tighter window, deeper book, explicit pool
+node dist/analysis/analyze_liquidity.js \
+  --pair TOKENA/TOKENB --range 0.25 --depth 50 --pool 1.19.123 --json liquidity.json
+
+# Any pair by symbol or asset id
+node dist/analysis/analyze_liquidity.js --base 1.3.123 --quote TOKENB --chart /tmp/lp.html
+```
+
+<details><summary><mark>Options (click to expand)</mark></summary>
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--base` / `--quote` | — | Assets by symbol or `1.3.x` id (required via `--pair` or `--base` + `--quote`) |
+| `--pair <base>/<quote>` | — | Shorthand for `--base` + `--quote` (also accepts `:`) |
+| `--pool` | deepest pool | Restrict to one `1.19.x` liquidity pool |
+| `--depth` | `300` | Order-book levels per side; fetched via `get_limit_orders` (commonly capped at 300) with a `get_order_book` fallback |
+| `--range` | `0.5` | Window half-width as a fraction of the center price |
+| `--steps` | `400` | Price samples across the window (exact book levels are always added) |
+| `--chart` | `analysis/charts/liquidity_<base>_<quote>.html` | HTML output path |
+| `--json` | — | Optional JSON dump of the sampled series and summary |
+| `--quiet` | off | Suppress the console summary |
+
+</details>
+
+Generation is read-only and uses an ephemeral chain connection (`analysis/chain_pool.ts`),
+so it never disturbs a running bot. The output is a single self-contained HTML file
+(uPlot inlined, no CDN or sibling assets); hovering shows book/pool depth at
+the cursor price, scroll zooms, drag pans, double-click resets.
+
 ### Trade Heatmap (`analyze_trade_heatmap.ts`)
 
 Generates a 2D heatmap + summed histogram showing where trade volume concentrates relative to AMA deviation. Time-slice rows show how the distribution evolved; the bottom histogram shows the aggregate bell-curve shape with threshold annotations.
@@ -543,6 +622,7 @@ These npm scripts wrap common analysis runners:
 | `npm run analysis:tradingview` | `node dist/analysis/tradingview/analyze_tradingview.js` |
 | `npm run analysis:trade-pnl` | `node dist/analysis/trade_profitability.js` |
 | `npm run analysis:grid-check` | `node dist/analysis/grid_correction_check.js` |
+| `npm run analysis:liquidity` | `node dist/analysis/analyze_liquidity.js` |
 | `npm run ama:chart:lp-local` | `node dist/analysis/ama_fitting/generate_unified_comparison_chart.js` (chart also auto-generated by optimizer) |
 
 All accept `--` forwarded flags.
@@ -553,6 +633,9 @@ npm run analysis:tradingview -- --source market_adapter --bot-key <bot-key>
 
 # Trade PnL
 npm run analysis:trade-pnl -- 1.2.123456 --hours 720
+
+# Liquidity depth (order book + AMM pool)
+npm run analysis:liquidity -- --pair TOKENA/TOKENB --range 0.5
 
 # LAST-FILL-GUARD check
 npm run analysis:grid-check -- --bot-key <bot-key> --hours 168

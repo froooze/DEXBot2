@@ -97,6 +97,7 @@
     "ama:chart:lp-local": "npm run build && node dist/analysis/ama_fitting/generate_unified_comparison_chart.js",
     "analysis:trade-pnl": "npm run build && node dist/analysis/trade_profitability.js",
     "analysis:grid-check": "npm run build && node dist/analysis/grid_correction_check.js",
+    "analysis:liquidity": "npm run build && node dist/analysis/analyze_liquidity.js",
     "analysis:resolve-accounts": "npm run build && node dist/analysis/resolve_bot_accounts.js",
     "richlist": "npm run build && node dist/scripts/rich_list.js",
     "distribution": "npm run build && node dist/scripts/bts_distribution.js",
