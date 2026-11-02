@@ -1,7 +1,7 @@
 # DEXBot vs DEXBot2 — Detailed Comparison Report
 
 > **Date:** 2026-09-02 *(metrics refreshed against local source trees)*
-> **Scope:** Full architectural, functional, and operational comparison between the original [DEXBot](https://github.com/Codaone/DEXBot) (Python, v1.0.0) and DEXBot2 (TypeScript, v1.6.18).
+> **Scope:** Full architectural, functional, and operational comparison between the original [DEXBot](https://github.com/Codaone/DEXBot) (Python, v1.0.0) and DEXBot2 (TypeScript, v1.7.0).
 > **Audience:** Developers, contributors, and operators evaluating or migrating between the two projects.
 
 ---
@@ -36,7 +36,7 @@
 
 | Attribute | DEXBot (original) | DEXBot2 |
 |---|---|---|
-| **Release Track** | 1.0.0 | v1.6.18 |
+| **Release Track** | 1.0.0 | v1.7.0 |
 | **Language** | Python 3.6+ | TypeScript 5.x |
 | **Status** | Released 1.0.0, unmaintained | Active development |
 | **Last Repo Activity** | May 23, 2020 | 2026-09-02 |
@@ -776,13 +776,13 @@ Where:
 
 | Metric | DEXBot | DEXBot2 |
 |---|---|---|
-| **Release Track** | 1.0.0 | v1.6.18 |
+| **Release Track** | 1.0.0 | v1.7.0 |
 | **Active Since** | ~2018 | December 2025 |
-| **Last Commit** | May 23, 2020 | 2026-11-01 |
-| **Total Commits** | 2281 | 2,457 (current HEAD, v1.6.18 line) |
+| **Last Commit** | May 23, 2020 | 2026-11-02 |
+| **Total Commits** | 2281 | 2,468 (current HEAD, v1.7.0 line) |
 | **Lines of Code** | ~10,846 Python LOC in `dexbot/` | Large TypeScript runtime + adapter + Claw + analysis + tests |
 | **Source Files** | 72 Python files in `dexbot/` | ~656 TS files across the repo |
-| **Test Files** | 16 Python test files | 327 `test_*.ts` files (310 `tests/` + 17 `claw/tests/`, auto-discovered via `globSync`) |
+| **Test Files** | 16 Python test files | 355 `test_*.ts` files (338 `tests/` + 17 `claw/tests/`, auto-discovered via `globSync`) |
 | **Documentation** | Sphinx docs + README | 60+ Markdown docs plus Claw skills/references |
 | **Strategies** | 3 + plugins | 1 |
 | **Max Concurrent Bots** | Many (one process) | Many (one monolithic process by default; per-bot via `--isolated`/PM2) |

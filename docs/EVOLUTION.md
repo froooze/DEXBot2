@@ -2,14 +2,14 @@
 
 ## Executive Summary
 
-DEXBot2 is a sophisticated decentralized exchange trading bot for the BitShares blockchain. This report documents the complete evolution of the project from its inception in December 2025 through the current 1.6.18 release.
+DEXBot2 is a sophisticated decentralized exchange trading bot for the BitShares blockchain. This report documents the complete evolution of the project from its inception in December 2025 through the current 1.7.0 release.
 
 ### Key Milestones
 - **Project Inception**: December 2, 2025
-- **Growth Phase**: 2,457 commits over ~9 active months
+- **Growth Phase**: 2,468 commits over ~9 active months
 - **Code Maturity**: Evolution from basic utilities to a ~100,000+ LoC intelligent TypeScript system
-- **Stability**: Progression from manual testing to a suite of 328 automated test files
-- **Releases**: 150 version entries in the changelog (v0.1.0 to v1.6.18)
+- **Stability**: Progression from manual testing to a suite of 341 automated test files
+- **Releases**: 151 version entries in the changelog (v0.1.0 to v1.7.0)
 
 > **Post-1.0.0 "why":** the thematic story behind the hardening releases — root cause, recurring
 > bug families, and lessons — lives in
@@ -149,7 +149,7 @@ Evolved from a basic README to a comprehensive framework (50+ docs entries, 80%+
 
 ## Version History
 
-Compact, era-level view; commit counts are `git rev-list --count <tag>..<tag>` over the current history (2026-11-01). The 107 commits up to and including the `v0.1.0` tag are not attributed to an era, so the current totals are 2,350 (`v0.1.0..HEAD`) and 2,457 (`HEAD`); the `v1.4.x` era rows overlap slightly because `v1.4.13` is not an ancestor of `v1.4.25` in the current history. Per-release detail lives in [CHANGELOG.md](../CHANGELOG.md); the thematic post-1.0.0 story in [ORDER_ENGINE_POST_1.0_RETROSPECTIVE.md](ORDER_ENGINE_POST_1.0_RETROSPECTIVE.md).
+Compact, era-level view; commit counts are `git rev-list --count <tag>..<tag>` over the current history (2026-11-02). The 107 commits up to and including the `v0.1.0` tag are not attributed to an era, so the current totals are 2,361 (`v0.1.0..HEAD`) and 2,468 (`HEAD`); the `v1.4.x` era rows overlap slightly because `v1.4.13` is not an ancestor of `v1.4.25` in the current history. Per-release detail lives in [CHANGELOG.md](../CHANGELOG.md); the thematic post-1.0.0 story in [ORDER_ENGINE_POST_1.0_RETROSPECTIVE.md](ORDER_ENGINE_POST_1.0_RETROSPECTIVE.md).
 
 | Era | Commits | Theme |
 |-----|--------:|-------|
@@ -176,11 +176,12 @@ Compact, era-level view; commit counts are `git rev-list --count <tag>..<tag>` o
 | v1.6.15 → v1.6.16 | 14 | Monolithic per-bot control routing, orientation-shared candle cache, market-profile orientation tolerance, chart log-axis hang fix + viewport-clipped draw hooks, Firefox Playwright chart suite, adapter-whitelist rename/copy sync, `dexbot rich` symbol canonicalization, doc reconciliation |
 | v1.6.16 → v1.6.17 | 11 | Last-fill direction guard, placeable-slot spread planning with named stalls, chain-truth funding + fill-anchored boundary re-anchor, owed-crawl consumption, restart auth-before-stop with cleared vault secret, pool-priced LP-share collateral, AMA slowPeriod/slope retune, BTS & per-token supply distribution analyzers |
 | v1.6.17 → v1.6.18 | 19 | Partial-fill re-anchor recovery (stale-evac skip, residual allow-list, crawl subsumption, rotation-only repair), rail-derived boundary + live fill/chain prices, edge-fill pivot exclusion, guard arity pinning with explicit re-arm, per-slot last-fill exclusion count, CLI `--flag=value` walker, `__test` seam guard, export-surface cleanup |
+| v1.6.18 → v1.7.0 | 11 | Liquidity depth chart + `dexbot liquid`/`liq`/`liqu`, `dexbot asset` supply distribution shortcut, pool id/pool-token chart targets + shared spawn runner, case-insensitive asset lookup, asset-report chain-request cuts, shared CLI terminal output, orphan-fill attribution + dark-level revive, stale-grid re-buy discipline, pivot clock provenance & read-time TTL |
 
 ---
 
 **Report Originally Generated**: February 19, 2026
-**Last Updated**: November 1, 2026
-**Total Commits**: 2,457
-**Date Range**: December 2, 2025 – November 1, 2026
+**Last Updated**: November 2, 2026
+**Total Commits**: 2,468
+**Date Range**: December 2, 2025 – November 2, 2026
 **Repository**: DEXBot2 (BitShares DEX Trading Bot)
