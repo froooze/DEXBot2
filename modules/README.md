@@ -37,9 +37,11 @@ modules/
 ├── version_notice.ts              passive npm-registry version check + status line
 ├── cli_start_onboarding.ts        first-run setup routing for `dexbot start`
 ├── cli_start_output.ts            launcher notice formatting
-├── cli_colors.ts                  shared CLI color helpers
-├── cli_progress.ts                shared `[Tag]` progress/saved status lines
+├── cli_colors.ts                  shared CLI color palette + `colorize()`
+├── cli_progress.ts                shared `[Tag]` lines: progress, section, warnings, summary, saved link
 ├── liquidity_pool_ref.ts          pool id / pool token resolution (shared by liq/tv/dw)
+├── chain_scan.ts                  batched object-id walk for list-less types (1.13/1.15)
+├── asset_lookup.ts                case-insensitive asset refs (symbol/id) for every CLI
 ├── credential_runtime.ts          daemon socket/path helpers + private-path security
 ├── credential_policy.ts           signing policy validation
 ├── credential_session_cache.ts    encrypted session cache

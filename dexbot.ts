@@ -180,7 +180,7 @@ const CLI_EXAMPLES = [
     { title: 'Show live credit positions', command: 'dexbot credit', notes: 'Summed MPA + borrowed-credit positions per bot.' },
     { title: 'Asset rich list', command: 'dexbot rich <asset> [<asset...>]', notes: 'Top holder(s) per asset from the chain asset holders API.' },
     { title: 'Chart a bot, pool, or pair', command: 'dexbot tv <bot|pool|AssetA/AssetB> --month 3', notes: 'OHLC chart; pool = id (133) or pool token (LP share asset); --feed charts MPA price-feed history.' },
-    { title: 'Liquidity depth chart', command: 'dexbot liq <bot|pool|AssetA/AssetB>', notes: 'Order-book + AMM pool cumulative depth; pool = id or pool token. Canonical: liquid; aliases: liqu, liquidity.' },
+    { title: 'Liquidity depth chart', command: 'dexbot liquid <bot|pool|AssetA/AssetB>', notes: 'Order-book + AMM pool cumulative depth; pool = id or pool token (aliases: liq, liqu, liquidity).' },
     { title: 'Asset supply distribution', command: 'dexbot a bts', notes: 'Where BTS sits (collateral, pools, locks, residual) + HTML report. A bare symbol (dexbot a <symbol>) covers an issued asset; canonical: asset.' },
     { title: 'PnL report', command: 'dexbot pnl <bot|account> --month 3 [--pair BASE/QUOTE]', notes: 'Self-contained HTML PnL report for the resolved bot or chain account.' }
 ];
@@ -235,16 +235,19 @@ function printCLIUsage() {
             ['default', 'Reset generated settings to defaults.'],
             ['update', 'Update DEXBot2 and restart active bots.'],
         ]],
+        // Ordered by the investigation an operator actually runs: grid state and its
+        // data export, then market research, then accounting/chain context. Keep the
+        // README "Bot Management" block in the same order so the two cannot drift.
         ['Analysis', [
             ['order [<bot>]', 'Analyze persisted order grids; --export for HTML.'],
             ['export <bot>', 'Export bot trades/settings to CSV/JSON.'],
-            ['credit [<bot>]', 'Show live MPA and borrowed-credit positions.'],
-            ['rich <asset...>', 'Per-asset rich list / top holder; --top N, --json.'],
             ['tv <target>', 'OHLC chart for <bot|pool|AssetA/AssetB> (pool = id or pool token); --month N (default 3), --feed for MPA price-feed history.'],
             ['dw <target>', 'Dynamic-weight research chart; same targets and flags as tv.'],
-            ['liq <target>', 'Liquidity depth chart for <bot|pool|AssetA/AssetB> (pool = id or pool token); --range, --depth, --steps (canonical: liquid; aliases: liqu, liquidity).'],
-            ['asset <bts|symbol>', 'Supply distribution: bts = core asset, bare symbol/id = issued asset; --json, --html (shorthand: a, e.g. dexbot a bts).'],
+            ['liquid <target>', 'Liquidity depth chart for <bot|pool|AssetA/AssetB> (pool = id or pool token); --range, --depth, --steps (aliases: liq, liqu, liquidity).'],
             ['pnl <account>', 'HTML PnL report for a bot or account; --month N, optional --pair BASE/QUOTE filter.'],
+            ['credit [<bot>]', 'Show live MPA and borrowed-credit positions.'],
+            ['asset <bts|symbol>', 'Supply distribution: bts = core asset, bare symbol/id = issued asset; --json, --html (shorthand: a, e.g. dexbot a bts).'],
+            ['rich <asset...>', 'Per-asset rich list / top holder; --top N, --json.'],
         ]],
         ['Files', [
             ['clear', 'Delete log files. Stop the runtime first.'],

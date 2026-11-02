@@ -317,6 +317,7 @@ Defaults in [`modules/constants.ts`](modules/constants.ts) are overridable at gl
 `dexbot start` is the recommended production runtime (global install). Repo-root users can run `./unlock` instead. It runs the selected bot set as one monolithic bot process, with the credential daemon and market adapter in separate helper processes. Monolithic start/stop/reload/restart controls apply to the whole runtime, not to individual bots: a bot argument (e.g. `dexbot reload <bot>`) is validated and then folds into the whole-runtime action with a notice. Per-bot control needs `--isolated` (one supervisor process per bot, then `stop`/`reload`/`restart <bot>` acts on just that bot). `delete` and `status` are whole-runtime only. `dexbot help` detects which runtime is up (monolithic, isolated, or PM2) and lists the controls for that mode.
 
 ```bash
+dexbot status              # Runtime health: credential daemon, adapter, bots
 dexbot start/stop          # Stop/start the monolithic runtime
 dexbot start --dryrun      # Dry-run (no transactions broadcast)
 dexbot reload [<bot>]      # Reload (monolithic: whole runtime; isolated: one bot)
@@ -329,26 +330,29 @@ First-run details and common mistakes are covered in the [BitShares Onboarding T
 ## 🛠️ Bot Management
 
 ```bash
-dexbot key                 # Master password/keyring
-dexbot bot                 # Interactive bot configurator
+dexbot key                    # Master password/keyring
+dexbot bot                    # Interactive bot configurator
 
-dexbot reset {all|<bot>}   # Regenerate grid
-dexbot disable {all|<bot>} # Disable bot in config
-dexbot enable {all|<bot>}  # Enable bot in config
+dexbot reset {all|<bot>}      # Regenerate grid
+dexbot disable {all|<bot>}    # Disable bot in config
+dexbot enable {all|<bot>}     # Enable bot in config
 
-dexbot stat                # Runtime status (unlock or PM2)
-dexbot order [<bot>]       # Analyze order grids (--export → HTML to analysis/charts/)
-dexbot tv <bot|pool|A/B>   # TradingView 1h chart with AMA overlay (default: 3 months)
-dexbot liq <bot|pool|A/B>  # Liquidity depth chart; pool = id or pool token (canonical: liquid)
-dexbot pnl <bot|account>   # HTML PnL report (--month N, optional --pair A/B)
-dexbot credit [<bot>]      # Live summed MPA + borrowed-credit positions
-dexbot asset <bts/token>   # Supply distribution + HTML report (short: dexbot a <bts/token>)
-dexbot export <bot>        # Export trades + settings (CSV/JSON) for analysis/
+dexbot order [<bot>]          # Grid state: spread, increment, funds (--export → HTML)
+dexbot export <bot>           # Trades + settings → CSV/JSON for analysis/
 
-dexbot update              # Update DEXBot2
-dexbot clear               # Delete log files in <profiles>/logs
-dexbot default             # Reset settings to defaults
-dexbot help                # Grouped command reference
+dexbot tv <bot|pool|A/B>      # TradingView 1h chart with AMA overlay (default: 3 months)
+dexbot dw <bot|pool|A/B>      # Dynamic-weight research chart (same targets/flags as tv)
+dexbot liquid <bot|pool|A/B>  # Liquidity depth: order book + AMM pool (aliases: liq, liqu)
+
+dexbot pnl <bot|account>      # HTML PnL report (--month N, optional --pair A/B)
+dexbot credit [<bot>]         # Live summed MPA + borrowed-credit positions
+dexbot asset <bts|symbol>     # Supply distribution + HTML report (short: dexbot a bts)
+dexbot rich <asset...>        # Top holders per asset
+
+dexbot update                 # Update DEXBot2
+dexbot clear                  # Delete log files in <profiles>/logs
+dexbot default                # Reset settings to defaults
+dexbot help                   # Grouped command reference (runtime, trading, config, analysis, files)
 ```
 
 ## 🎯 PM2 Process Management

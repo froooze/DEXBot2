@@ -2,6 +2,15 @@
 
 This guide provides a terminal-focused reference for the maintenance and diagnostic utilities available in the `scripts/` directory.
 
+Every command that writes a file prints the same trailer
+(`[Tag] ✓ <kind> saved. Open <kind>: (file://…)`) plus the shared section/warning/summary
+blocks, all from `modules/cli_progress.ts` (`savedLine`, `section`, `warningsBlock`, `summaryLine`).
+
+Asset symbols are case-insensitive wherever a command takes one (`dexbot asset token.sym`,
+`dexbot rich token.sym`, `dexbot liq A/B`, `dexbot tv <pool-token>`, `--base`/`--quote`): every
+path resolves through `modules/asset_lookup.ts`, which looks the symbol up in its canonical UPPERCASE
+form and keeps `1.3.x` ids untouched.
+
 ---
 
 ## 🛠️ CORE MAINTENANCE
@@ -118,6 +127,11 @@ node dist/scripts/bts_distribution.js --json           # JSON (HTML still writte
 node dist/scripts/bts_distribution.js --circulating <reference-supply>
 node dist/scripts/bts_distribution.js --holders all    # full rich list (~5 min)
 ```
+Vesting (1.13.x) and legacy (1.15.x) objects have no list API, so both are enumerated by probing
+ids with `get_objects` in 1000-id batches (`modules/chain_scan.ts`, halving on nodes that refuse
+big batches) and filtered to BTS client-side — the walk covers every asset the node stores there,
+because the chain exposes no per-asset index. `--gap N` controls how far past the last live object
+the walk continues (default 20000); `--vesting-max` caps the 1.13.x probe.
 Call-order collateral uses `api_helper_indexes` `total_in_collateral` (falls back to summing
 `get_call_orders`). Top liquid holders come from `asset_api::get_asset_holders`, retrying on a
 node that exposes it; exchange tags are name heuristics, not verified identities. `--holders all`
@@ -140,9 +154,7 @@ npm run token-distribution -- <token>
 node dist/scripts/token_distribution.js <asset-id> --json
 node dist/scripts/token_distribution.js <token> --no-orders   # skip the ~6k order queries
 ```
-Limit orders have no by-asset index in bitshares-core, so the exact scan queries every listed
-asset concurrently (~20s); vesting balances scan 1.13.x with a gap tolerance. Read-only: no keys,
-no transactions. BTS itself is rejected; use `npm run distribution`.
+Read-only: no keys, no transactions. BTS itself is rejected; use `npm run distribution`.
 
 ### Configuration Audit
 **File:** `validate_bots.ts`
