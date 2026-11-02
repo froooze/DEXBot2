@@ -69,6 +69,18 @@ const TESTS: BundleTest[] = [
     externalizeNodeBuiltins: true,
   },
   {
+    label: 'modules/chain_scan.ts (browser-safe)',
+    entry: 'modules/chain_scan.ts',
+    expectFail: false,
+    externalizeNodeBuiltins: true,
+  },
+  {
+    label: 'modules/asset_lookup.ts (browser-safe)',
+    entry: 'modules/asset_lookup.ts',
+    expectFail: false,
+    externalizeNodeBuiltins: true,
+  },
+  {
     label: 'modules/crypto/index.ts (browser-safe)',
     entry: 'modules/crypto/index.ts',
     expectFail: false,

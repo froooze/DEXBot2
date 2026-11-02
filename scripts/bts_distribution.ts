@@ -71,7 +71,10 @@ import { pathToFileURL } from 'node:url';
 import { NODE_MANAGEMENT } from '../modules/constants.js';
 import { PATHS } from '../modules/paths.js';
 import { CLI_COLORS as colors } from '../modules/cli_colors.js';
-import { CLI_TAGS, clearProgressLine, savedLine, taggedProgress } from '../modules/cli_progress.js';
+import {
+    CLI_TAGS, clearProgressLine, loadingLine, savedLine, section, summaryLine, taggedProgress, warningsBlock,
+} from '../modules/cli_progress.js';
+import { scanIdRange, DENSE_SPACE_GAP } from '../modules/chain_scan.js';
 import { toFileUrl } from '../analysis/chart_utils.js';
 
 // ---------------------------------------------------------------------------
@@ -87,6 +90,7 @@ const NAME_BATCH = 50;            // get_accounts ids per call
 const DEFAULT_DETAIL = 10;
 const DEFAULT_VESTING_MAX = 200_000;
 const DEFAULT_SCAN_GAP = 20_000;
+const SYMBOL_BATCH = 500;         // asset ids per symbol lookup
 const DEFAULT_HTML = path.join(PATHS.ANALYSIS.CHARTS_DIR, 'bts-distribution.html');
 const DEFAULT_HOLDERS = 100;
 const MAX_HOLDERS = 1000;
@@ -250,6 +254,7 @@ interface NodeConfig {
     api_limit_get_liquidity_pools?: number;
     api_limit_get_samet_funds?: number;
     api_limit_get_credit_offers?: number;
+    api_limit_get_collateral_bids?: number;
     api_limit_list_htlcs?: number;
     api_limit_get_call_orders?: number;
     api_limit_get_asset_holders?: number;
@@ -876,12 +881,12 @@ async function fetchObjects<T>(session: Session, ids: string[]): Promise<(T | nu
 }
 
 /**
- * Paginate a `list_*` endpoint whose signature is `(limit, start_id)`.
+ * Paginate a `list_*`/`get_*_by_asset` endpoint. The caller owns the argument
+ * order (most take `(limit, start_id)`, `list_htlcs` takes `(start_id, limit)`).
  * Every page is de-duplicated by id, so an inclusive lower bound cannot loop.
  */
 async function listPages<T extends { id: string }>(
-    session: Session,
-    method: string,
+    fetchPage: (start: string | null) => Promise<T[]>,
     limit: number,
     maxPages = 5000,
 ): Promise<T[]> {
@@ -889,8 +894,8 @@ async function listPages<T extends { id: string }>(
     const out: T[] = [];
     let start: string | null = null;
     for (let page = 0; page < maxPages; page++) {
-        const rows: T[] = await callDb<T[]>(session, method, [limit, start]);
-        if (!rows || rows.length === 0) break;
+        const rows = await fetchPage(start);
+        if (!Array.isArray(rows) || rows.length === 0) break;
         let fresh = 0;
         for (const row of rows) {
             if (!row || typeof row.id !== 'string' || seen.has(row.id)) continue;
@@ -905,64 +910,17 @@ async function listPages<T extends { id: string }>(
 }
 
 /**
- * Enumerate every asset via `list_assets` (symbol-ordered, inclusive lower
- * bound). Assets are keyed by symbol, so pagination advances on the last
- * symbol and duplicates are ignored.
+ * Fetch asset objects by id/symbol in `SYMBOL_BATCH`-sized `get_assets` chunks.
+ * get_assets has no page limit, but keeping requests bounded survives every
+ * node and keeps a huge MPA set from becoming one oversized message.
  */
-async function listAllAssets(session: Session): Promise<AssetObject[]> {
-    const limit = Math.max(1, Math.min(session.config.api_limit_get_assets ?? 100, 1000));
-    const seen = new Set<string>();
+async function fetchAssetObjects(session: Session, refs: string[]): Promise<AssetObject[]> {
     const out: AssetObject[] = [];
-    let lower = '';
-    for (let page = 0; page < 5000; page++) {
-        const rows = await callDb<AssetObject[]>(session, 'list_assets', [lower, limit]);
-        if (!Array.isArray(rows) || rows.length === 0) break;
-        let fresh = 0;
-        for (const row of rows) {
-            if (!row || seen.has(row.id)) continue;
-            seen.add(row.id);
-            out.push(row);
-            fresh++;
-        }
-        if (rows.length < limit) break;
-        const lastSymbol = rows[rows.length - 1]?.symbol;
-        if (typeof lastSymbol !== 'string') break;
-        if (fresh === 0) break;
-        lower = lastSymbol;
+    for (let i = 0; i < refs.length; i += SYMBOL_BATCH) {
+        const rows = await callDb<(AssetObject | null)[]>(session, 'get_assets', [refs.slice(i, i + SYMBOL_BATCH)]);
+        for (const row of rows || []) if (row && typeof row.id === 'string') out.push(row);
     }
     return out;
-}
-
-/**
- * Scan a dense-ish object id range (`prefix.N`) with a gap tolerance. Object
- * ids are allocated monotonically but are never reused, so a range contains
- * holes; the scan stops once it has walked `gap` ids past the last live object.
- */
-async function scanIdRange<T>(
-    session: Session,
-    prefix: string,
-    maxId: number,
-    gap: number,
-    onProgress?: (scannedHint: number) => void,
-): Promise<{ objects: T[]; scannedTo: number; hitLimit: boolean }> {
-    const objects: T[] = [];
-    let index = 0;
-    let lastSeen = -1;
-    while (index <= maxId && index - lastSeen <= gap) {
-        const count = Math.min(OBJECT_BATCH, maxId - index + 1);
-        const ids = Array.from({ length: count }, (_, i) => `${prefix}.${index + i}`);
-        const page = await callDb<(T | null)[]>(session, 'get_objects', [ids]);
-        for (let j = 0; j < count; j++) {
-            const obj = page?.[j];
-            if (obj) {
-                lastSeen = index + j;
-                objects.push(obj);
-            }
-        }
-        index += count;
-        onProgress?.(index);
-    }
-    return { objects, scannedTo: index, hitLimit: index > maxId && index - lastSeen <= gap };
 }
 
 async function resolveAccountNames(session: Session, ids: string[]): Promise<Map<string, string>> {
@@ -1035,27 +993,60 @@ async function collect(session: Session, opts: Options): Promise<Report> {
 
     const global = await callDb<DynamicGlobalProperties>(session, 'get_dynamic_global_properties', []);
 
-    // ---- All assets: MPAs, symbols, fee pools -------------------------------
-    progress(showProgress, 'enumerating assets ...');
-    const assets = await listAllAssets(session);
-    const assetById = new Map(assets.map((a) => [a.id, a]));
-    const symbolOf = (id: string): string => assetById.get(id)?.symbol ?? id;
-
-    progress(showProgress, `fetching dynamic data for ${assets.length} assets ...`);
-    const dynamicIds = assets.map((a) => a.dynamic_asset_data_id).filter(Boolean);
-    const dynamicRows = await fetchObjects<DynamicAssetObject>(session, dynamicIds);
-    const dynamicById = new Map<string, DynamicAssetObject>();
-    for (const dyn of dynamicRows) if (dyn) dynamicById.set(dyn.id, dyn);
-
-    const mpaAssets = assets.filter((a) => typeof a.bitasset_data_id === 'string' && a.bitasset_data_id);
-    const bitassetRows = await fetchObjects<BitassetObject>(
-        session,
-        mpaAssets.map((a) => a.bitasset_data_id as string),
-    );
-    const bitassetById = new Map<string, BitassetObject>();
-    bitassetRows.forEach((bit) => {
-        if (bit) bitassetById.set(bit.id, bit);
+    // ---- Smart assets (2.4.x) and fee pools (2.3.x) -------------------------
+    // bitshares-core has no per-asset index for the legacy object spaces and no
+    // "list smart assets" call, but both implementation spaces are small and
+    // dense: 2.4.x holds one object per smart asset (with asset_id and
+    // options.short_backing_asset) and 2.3.x one tiny object per asset, whose
+    // fee_pool is documented as "in core asset". Walking those two spaces is
+    // far cheaper than list_assets (100 assets per page over ~6.5k assets) just
+    // to find the ~380 BTS-backed ones.
+    progress(showProgress, 'listing smart assets (2.4.x) ...');
+    const bitassetScan = await scanIdRange<BitassetObject>({
+        read: (method, args) => callDb(session, method, args),
+        prefix: '2.4',
+        maxId: 200_000,
+        gap: DENSE_SPACE_GAP,
+        onProgress: (n) => progress(showProgress, `listing smart assets (2.4.x) ... ${n} ids`),
     });
+    const bitassets = bitassetScan.objects;
+    if (bitassetScan.hitLimit) {
+        warnings.push('Smart-asset scan hit its 200,000-id limit; MPA collateral totals may be incomplete.');
+    }
+    const bitassetById = new Map(bitassets.map((bit) => [bit.id, bit]));
+    const mpaIds = [...new Set(bitassets.map((bit) => bit.asset_id).filter(Boolean))];
+    // get_assets() returns extended_asset_object, i.e. the MPA metadata plus
+    // total_in_collateral / total_backing_collateral.
+    const mpaAssets = await fetchAssetObjects(session, mpaIds);
+
+    progress(showProgress, 'scanning asset dynamic data (2.3.x fee pools) ...');
+    const dynamicScan = await scanIdRange<DynamicAssetObject>({
+        read: (method, args) => callDb(session, method, args),
+        prefix: '2.3',
+        maxId: 200_000,
+        gap: DENSE_SPACE_GAP,
+        onProgress: (n) => progress(showProgress, `scanning asset dynamic data (2.3.x) ... ${n} ids`),
+    });
+    const dynamicRows = dynamicScan.objects;
+    if (dynamicScan.hitLimit) {
+        warnings.push('Asset dynamic-data scan hit its 200,000-id limit; fee-pool totals may be incomplete.');
+    }
+    const dynamicById = new Map(dynamicRows.map((dyn) => [dyn.id, dyn]));
+
+    // Symbols are looked up for the ids the report prints, never for every
+    // asset: 2.3.x/2.4.x carry ids only.
+    const symbolById = new Map<string, string>([[coreId, core.symbol]]);
+    const symbolOf = (id: string): string => symbolById.get(id) ?? id;
+    const resolveSymbols = async (ids: Array<string | null | undefined>): Promise<void> => {
+        const missing = [...new Set(ids.filter(
+            (id): id is string => !!id && id.startsWith('1.3.') && !symbolById.has(id),
+        ))];
+        if (missing.length === 0) return;
+        for (const row of await fetchAssetObjects(session, missing)) {
+            if (row.symbol) symbolById.set(row.id, row.symbol);
+        }
+    };
+    for (const mpa of mpaAssets) symbolById.set(mpa.id, mpa.symbol);
 
     const btsBackedMpas = mpaAssets.filter((a) => {
         const bit = a.bitasset_data_id ? bitassetById.get(a.bitasset_data_id) : undefined;
@@ -1064,17 +1055,21 @@ async function collect(session: Session, opts: Options): Promise<Report> {
 
     // ---- Fee pools (fee_pool is denominated in the core asset) --------------
     let feePoolTotal = 0n;
-    const feePoolRows: FeePoolRow[] = [];
+    const feePoolCandidates: Array<{ assetId: string; amount: bigint }> = [];
     for (const dyn of dynamicRows) {
         if (!dyn) continue;
         const value = toBig(dyn.fee_pool);
         feePoolTotal += value;
-        if (value > 0n) {
-            const asset = assetById.get(dyn.id.replace(/^2\.3\./, '1.3.'));
-            feePoolRows.push({ symbol: asset?.symbol ?? dyn.id, amount: value });
-        }
+        if (value > 0n) feePoolCandidates.push({ assetId: dyn.id.replace(/^2\.3\./, '1.3.'), amount: value });
     }
-    feePoolRows.sort((a, b) => compareDesc(a.amount, b.amount));
+    // Thousands of assets have a (tiny) fee pool; only the printed rows need a
+    // symbol, so the top detail rows are resolved after sorting.
+    feePoolCandidates.sort((a, b) => compareDesc(a.amount, b.amount));
+    const feePoolTop = feePoolCandidates.slice(0, opts.detail);
+    await resolveSymbols(feePoolTop.map((row) => row.assetId));
+    const feePoolRows: FeePoolRow[] = feePoolTop.map(
+        (row) => ({ symbol: symbolOf(row.assetId), amount: row.amount }),
+    );
 
     // ---- Call-order collateral ---------------------------------------------
     let collateral: bigint;
@@ -1189,12 +1184,15 @@ async function collect(session: Session, opts: Options): Promise<Report> {
     // ---- Collateral bids (only meaningful after a global settlement) --------
     let bidCount = 0;
     let bidTotal = 0n;
+    // `limit` may not exceed the node's configured maximum, so use that value:
+    // fewer round trips per settled smart asset.
+    const bidLimit = Math.max(1, Math.min(session.config.api_limit_get_collateral_bids ?? 100, 1000));
     for (const mpa of globallySettled) {
         let start = 0;
         for (let page = 0; page < 100; page++) {
             let rows: CollateralBidObject[];
             try {
-                rows = await callDb<CollateralBidObject[]>(session, 'get_collateral_bids', [mpa.id, 100, start]);
+                rows = await callDb<CollateralBidObject[]>(session, 'get_collateral_bids', [mpa.id, bidLimit, start]);
             } catch {
                 break;
             }
@@ -1205,14 +1203,17 @@ async function collect(session: Session, opts: Options): Promise<Report> {
                 bidTotal += amountOf(row.inv_swan_price.base);
             }
             start += rows.length;
-            if (rows.length < 100) break;
+            if (rows.length < bidLimit) break;
         }
     }
 
     // ---- Tickets (voting / governance locks) --------------------------------
     progress(showProgress, 'listing governance tickets ...');
     const ticketLimit = Math.max(1, Math.min(session.config.api_limit_get_tickets ?? 100, 1000));
-    const tickets = await listPages<TicketObject>(session, 'list_tickets', ticketLimit);
+    const tickets = await listPages<TicketObject>(
+        (start) => callDb<TicketObject[]>(session, 'list_tickets', [ticketLimit, start]),
+        ticketLimit,
+    );
     let ticketTotal = 0n;
     const ticketByType = new Map<string, TypeRow>();
     const ticketByStatus = new Map<string, TypeRow>();
@@ -1241,10 +1242,13 @@ async function collect(session: Session, opts: Options): Promise<Report> {
 
     // ---- Vesting balances (1.13.x) ------------------------------------------
     progress(showProgress, 'scanning vesting balances (1.13.x) ...');
-    const vestingScan = await scanIdRange<VestingObject>(
-        session, '1.13', opts.vestingMax, opts.gap,
-        (n) => progress(showProgress, `scanning vesting balances (1.13.x) ... ${n}`),
-    );
+    const vestingScan = await scanIdRange<VestingObject>({
+        read: (method, args) => callDb(session, method, args),
+        prefix: '1.13',
+        maxId: opts.vestingMax,
+        gap: opts.gap,
+        onProgress: (n) => progress(showProgress, `scanning vesting balances (1.13.x) ... ${n} ids`),
+    });
     let vestingTotal = 0n;
     const vestingByType = new Map<string, TypeRow>();
     const vestingByOwner = new Map<string, bigint>();
@@ -1267,8 +1271,16 @@ async function collect(session: Session, opts: Options): Promise<Report> {
         .slice(0, opts.detail);
 
     // ---- Legacy 1.15.x balance objects --------------------------------------
-    progress(showProgress, 'scanning legacy balances (1.15.x) ...');
-    const genesisScan = await scanIdRange<BalanceObject>(session, '1.15', 200_000, opts.gap);
+    // The node exposes no per-asset index for 1.15.x objects, so the walk is
+    // global and the requested asset is filtered out below.
+    progress(showProgress, 'scanning legacy balance objects (1.15.x) ...');
+    const genesisScan = await scanIdRange<BalanceObject>({
+        read: (method, args) => callDb(session, method, args),
+        prefix: '1.15',
+        maxId: 200_000,
+        gap: opts.gap,
+        onProgress: (n) => progress(showProgress, `scanning legacy balance objects (1.15.x) ... ${n} ids`),
+    });
     if (genesisScan.hitLimit) {
         warnings.push('Legacy 1.15.x scan hit its 200,000-id probe limit; the legacy bucket may be incomplete.');
     }
@@ -1287,7 +1299,12 @@ async function collect(session: Session, opts: Options): Promise<Report> {
     // ---- Liquidity pools (1.19.x) -------------------------------------------
     progress(showProgress, 'listing liquidity pools ...');
     const poolLimit = Math.max(1, Math.min(session.config.api_limit_get_liquidity_pools ?? 100, 1000));
-    const pools = await listPages<LiquidityPoolObject>(session, 'list_liquidity_pools', poolLimit);
+    const pools = await listPages<LiquidityPoolObject>(
+        (start) => callDb<LiquidityPoolObject[]>(session, 'list_liquidity_pools', [poolLimit, start]),
+        poolLimit,
+    );
+    // The pool table prints both legs; resolve just those symbols.
+    await resolveSymbols(pools.flatMap((pool) => [pool.asset_a, pool.asset_b]));
     let poolTotal = 0n;
     let poolsWithBts = 0;
     const poolRows: PoolRow[] = [];
@@ -1309,7 +1326,25 @@ async function collect(session: Session, opts: Options): Promise<Report> {
     // ---- SameT funds (1.20.x) -----------------------------------------------
     progress(showProgress, 'listing SameT funds ...');
     const sametLimit = Math.max(1, Math.min(session.config.api_limit_get_samet_funds ?? 100, 1000));
-    const sametFunds = await listPages<SametFundObject>(session, 'list_samet_funds', sametLimit);
+    // `get_samet_funds_by_asset` returns only this asset's funds; the plain
+    // list_* fallback keeps older nodes working.
+    let sametFunds: SametFundObject[] = [];
+    try {
+        sametFunds = await listPages<SametFundObject>(
+            (start) => callDb<SametFundObject[]>(session, 'get_samet_funds_by_asset', [coreId, sametLimit, start]),
+            sametLimit,
+        );
+    } catch {
+        try {
+            const all = await listPages<SametFundObject>(
+                (start) => callDb<SametFundObject[]>(session, 'list_samet_funds', [sametLimit, start]),
+                sametLimit,
+            );
+            sametFunds = all.filter((fund) => fund.asset_type === coreId);
+        } catch (e) {
+            warnings.push(`SameT funds unavailable: ${(e as Error).message}`);
+        }
+    }
     let sametTotal = 0n;
     let sametBtsCount = 0;
     const sametRows: FundRow[] = [];
@@ -1325,7 +1360,24 @@ async function collect(session: Session, opts: Options): Promise<Report> {
     // ---- Credit offers / deals (1.21.x / 1.22.x) ----------------------------
     progress(showProgress, 'listing credit offers and deals ...');
     const creditLimit = Math.max(1, Math.min(session.config.api_limit_get_credit_offers ?? 100, 1000));
-    const offers = await listPages<CreditOfferObject>(session, 'list_credit_offers', creditLimit);
+    // Asset-scoped endpoints only return BTS rows; list_* stays as the fallback.
+    let offers: CreditOfferObject[] = [];
+    try {
+        offers = await listPages<CreditOfferObject>(
+            (start) => callDb<CreditOfferObject[]>(session, 'get_credit_offers_by_asset', [coreId, creditLimit, start]),
+            creditLimit,
+        );
+    } catch {
+        try {
+            const all = await listPages<CreditOfferObject>(
+                (start) => callDb<CreditOfferObject[]>(session, 'list_credit_offers', [creditLimit, start]),
+                creditLimit,
+            );
+            offers = all.filter((offer) => offer.asset_type === coreId);
+        } catch (e) {
+            warnings.push(`Credit offers unavailable: ${(e as Error).message}`);
+        }
+    }
     let offerTotal = 0n;
     let btsOfferCount = 0;
     for (const offer of offers) {
@@ -1333,7 +1385,24 @@ async function collect(session: Session, opts: Options): Promise<Report> {
         btsOfferCount++;
         offerTotal += toBig(offer.current_balance);
     }
-    const deals = await listPages<CreditDealObject>(session, 'list_credit_deals', creditLimit);
+    let deals: CreditDealObject[] = [];
+    try {
+        deals = await listPages<CreditDealObject>(
+            (start) => callDb<CreditDealObject[]>(
+                session, 'get_credit_deals_by_collateral_asset', [coreId, creditLimit, start]),
+            creditLimit,
+        );
+    } catch {
+        try {
+            const all = await listPages<CreditDealObject>(
+                (start) => callDb<CreditDealObject[]>(session, 'list_credit_deals', [creditLimit, start]),
+                creditLimit,
+            );
+            deals = all.filter((deal) => deal.collateral_asset === coreId);
+        } catch (e) {
+            warnings.push(`Credit deals unavailable: ${(e as Error).message}`);
+        }
+    }
     let dealTotal = 0n;
     let btsDealCount = 0;
     for (const deal of deals) {
@@ -1346,15 +1415,21 @@ async function collect(session: Session, opts: Options): Promise<Report> {
     progress(showProgress, 'listing HTLCs ...');
     let htlcTotal = 0n;
     let htlcCount = 0;
-    for (let index = 0; index < 100_000; index += OBJECT_BATCH) {
-        const ids = Array.from({ length: OBJECT_BATCH }, (_, i) => `1.16.${index + i}`);
-        const rows = await fetchObjects<HtlcObject>(session, ids);
-        const live = rows.filter((r): r is HtlcObject => !!r);
-        for (const row of live) {
-            htlcCount++;
-            if (row.transfer?.asset_id === coreId) htlcTotal += toBig(row.transfer.amount);
-        }
-        if (live.length === 0) break;
+    // `list_htlcs` is the paginated list for this space (the id walk it replaces
+    // scanned 1.16.0..1.16.99,999 whenever any HTLC existed).
+    let htlcs: HtlcObject[] = [];
+    const htlcLimit = Math.max(1, Math.min(session.config.api_limit_list_htlcs ?? 100, 1000));
+    try {
+        htlcs = await listPages<HtlcObject>(
+            (start) => callDb<HtlcObject[]>(session, 'list_htlcs', [start ?? '1.16.0', htlcLimit]),
+            htlcLimit,
+        );
+    } catch (e) {
+        warnings.push(`HTLCs unavailable: ${(e as Error).message}`);
+    }
+    for (const htlc of htlcs) {
+        htlcCount++;
+        if (htlc.transfer?.asset_id === coreId) htlcTotal += toBig(htlc.transfer.amount);
     }
 
     // ---- Build buckets ------------------------------------------------------
@@ -1635,7 +1710,7 @@ async function collect(session: Session, opts: Options): Promise<Report> {
             lockedPerCirculating,
         },
         details: {
-            assetCount: assets.length,
+            assetCount: dynamicRows.length,
             mpaCount: btsBackedMpas.length,
             mpaBackedCollateral,
             collateralFromApi,
@@ -1770,12 +1845,9 @@ function renderTerminal(report: Report, opts: Options): void {
         + `${money(report.identified + report.residual)} = supply`));
 
     // ---- Detail sections ----------------------------------------------------
-    const section = (title: string): void => {
-        console.log();
-        console.log(c(colors.bold + colors.yellow, `  ── ${title} ${'─'.repeat(Math.max(0, 66 - title.length))}`));
-    };
+    const heading = (title: string): void => { console.log(section(title, 66)); };
 
-    section(`Settlement pools (${report.details.mpaCount} BTS-backed MPAs)`);
+    heading(`Settlement pools (${report.details.mpaCount} BTS-backed MPAs)`);
     console.log(
         c(colors.gray, '  Global: ' + money(report.buckets.find((b) => b.key === 'settlementFund')?.amount ?? 0n))
         + c(colors.gray, '  ·  Individual: ')
@@ -1784,25 +1856,25 @@ function renderTerminal(report: Report, opts: Options): void {
     printMpaTable(report, opts.detail, money, c);
     printSettlementTable(report, money, c);
 
-    section('Governance tickets by lock type');
+    heading('Governance tickets by lock type');
     printTypeTable(report.details.tickets.byType, supply, money, c);
 
-    section('Vesting balances by balance type');
+    heading('Vesting balances by balance type');
     printTypeTable(report.details.vesting.byType, supply, money, c);
     if (report.details.vesting.hitLimit) {
         console.log(c(colors.sell, `  warning: vesting scan reached --vesting-max ${opts.vestingMax}; totals may be incomplete`));
     }
 
-    section('Top governance ticket holders');
+    heading('Top governance ticket holders');
     printHolderTable(report.details.tickets.top, money, c);
 
-    section('Top vesting balance owners');
+    heading('Top vesting balance owners');
     printHolderTable(report.details.vesting.top, money, c);
 
-    section('Liquidity pools with BTS');
+    heading('Liquidity pools with BTS');
     printPoolTable(report, opts.detail, money, c);
 
-    section(`Top liquid holders (rich list, ${report.details.holders.count} fetched)`);
+    heading(`Top liquid holders (rich list, ${report.details.holders.count} fetched)`);
     const holders = report.details.holders;
     if (holders.top.length === 0) {
         console.log(c(colors.gray, '  (asset_api unavailable — no holder data)'));
@@ -1868,23 +1940,23 @@ function renderTerminal(report: Report, opts: Options): void {
         }
     }
 
-    section('Credit & SameT');
+    heading('Credit & SameT');
     const credit = report.details.credit;
     console.log(`  credit offers      ${padStart(money(credit.offerTotal), 20)}  ${c(colors.gray, `${credit.btsOfferCount}/${credit.offerCount} offers in ${report.asset.symbol}`)}`);
     console.log(`  credit collateral  ${padStart(money(credit.dealTotal), 20)}  ${c(colors.gray, `${credit.btsDealCount}/${credit.dealCount} deals collateralised in ${report.asset.symbol}`)}`);
     console.log(`  SameT funds        ${padStart(money(report.details.samet.total), 20)}  ${c(colors.gray, `${report.details.samet.btsCount}/${report.details.samet.count} funds in ${report.asset.symbol}`)}`);
 
-    section('Asset fee pools (held in BTS)');
+    heading('Asset fee pools (held in BTS)');
     console.log(`  total              ${padStart(money(report.details.feePools.total), 20)}`);
     for (const row of report.details.feePools.top) {
         console.log(`  ${padEnd(row.symbol.slice(0, 22), 22)} ${padStart(money(row.amount), 20)}`);
     }
 
-    section('Legacy 1.15.x balances');
+    heading('Legacy 1.15.x balances');
     console.log(`  claimable objects  ${padStart(money(report.details.genesis.total), 20)}  ${c(colors.gray, `${report.details.genesis.count} object(s), ${report.details.genesis.claimableCount} without vesting policy`)}`);
 
     // ---- Final comparison against circulating supply ----------------------
-    section('Circulating supply comparison');
+    heading('Circulating supply comparison');
     const circ = report.circulating;
     const circWidth = 24;
     console.log(
@@ -1938,20 +2010,16 @@ function renderTerminal(report: Report, opts: Options): void {
         );
     }
     console.log(c(colors.gray, `  ${'─'.repeat(labelWidth + amountWidth + pctWidth * 2 + 3)}`));
-    console.log(
-        c(colors.gray, '  Float = supply − identified/dormant. BitShares has no protocol-level '
-        + '"circulating" field; this is a derived float.'),
-    );
 
     if (report.details.warnings.length > 0) {
-        section('Warnings');
-        for (const warning of report.details.warnings) console.log(c(colors.sell, `  ! ${warning}`));
+        console.log(warningsBlock(report.details.warnings, 66));
     }
-
     console.log();
-    if (opts.html) console.log(c(colors.brightGreen, `  HTML report: ${opts.html}`));
-    console.log(c(colors.gray, '  Collateral: api_helper_indexes total_in_collateral; rest via list_* / get_objects scans.'));
-    console.log();
+    // Same trailing pattern as `dexbot asset <token>`: one muted summary line,
+    // then the shared `[Assets] Report saved … file://` link from the caller.
+    console.log(summaryLine(
+        'float = supply − identified/dormant (no protocol-level "circulating" field); '
+        + 'collateral via api_helper_indexes total_in_collateral'));
 }
 
 function printMpaTable(
@@ -2543,7 +2611,7 @@ ${warningHtml}
 
 <footer>
   <p><strong>Residual</strong> = current supply − all identified holdings. It contains account balances (2.5.x), limit-order escrow (1.7.x), blinded balances (${money(report.supply.confidential)} BTS) and any object type not listed above. It is derived, not enumerated.</p>
-  <p>Sources: bitshares-core 7.0.x database_api — <code>list_assets</code>, <code>get_objects</code>, <code>list_tickets</code>, <code>list_liquidity_pools</code>, <code>list_samet_funds</code>, <code>list_credit_offers</code>, <code>list_credit_deals</code>, <code>list_htlcs</code>, <code>get_collateral_bids</code>${report.details.collateralFromApi ? ', <code>total_in_collateral</code>' : ''}${holders.sourceNode ? ', <code>asset_api::get_asset_holders</code>' : ''}. Read-only; no keys, no transactions. Exchange tags are name heuristics, not verified identities.</p>
+  <p>Sources: bitshares-core 7.0.x database_api — <code>get_objects</code> (1.13.x vesting, 1.15.x balances, 2.3.x dynamic data, 2.4.x smart assets), <code>get_assets</code>, <code>list_tickets</code>, <code>list_liquidity_pools</code>, <code>get_samet_funds_by_asset</code>, <code>get_credit_offers_by_asset</code>, <code>get_credit_deals_by_collateral_asset</code>, <code>list_htlcs</code>, <code>get_collateral_bids</code>${report.details.collateralFromApi ? ', <code>total_in_collateral</code>' : ''}${holders.sourceNode ? ', <code>asset_api::get_asset_holders</code>' : ''}. Read-only; no keys, no transactions. Exchange tags are name heuristics, not verified identities.</p>
   <p>Generated by <code>scripts/bts_distribution.ts</code> · block ${esc(formatInteger(BigInt(report.blockNum)))} · ${esc(report.blockTime)} UTC.</p>
 </footer>
 </body>
@@ -2571,7 +2639,7 @@ async function main(): Promise<void> {
         return;
     }
 
-    if (!opts.json) console.log(`${LOG_TAG} Loading BTS supply distribution from chain...`);
+    if (!opts.json) console.log(loadingLine(LOG_TAG, 'Loading BTS supply distribution from chain...'));
     const nodes = opts.nodes.length > 0 ? opts.nodes : [...NODE_MANAGEMENT.DEFAULT_NODES];
     const session = await openSession(nodes);
     try {

@@ -51,7 +51,11 @@ import { pathToFileURL } from 'node:url';
 import { NODE_MANAGEMENT } from '../modules/constants.js';
 import { PATHS } from '../modules/paths.js';
 import { CLI_COLORS as colors } from '../modules/cli_colors.js';
-import { CLI_TAGS, clearProgressLine, savedLine, taggedProgress } from '../modules/cli_progress.js';
+import {
+    CLI_TAGS, clearProgressLine, loadingLine, savedLine, section, summaryLine, taggedProgress, warningsBlock,
+} from '../modules/cli_progress.js';
+import { scanIdRange, DENSE_SPACE_GAP } from '../modules/chain_scan.js';
+import { resolveAssetRef } from '../modules/asset_lookup.js';
 import { toFileUrl } from '../analysis/chart_utils.js';
 
 // ---------------------------------------------------------------------------
@@ -66,7 +70,13 @@ const NAME_BATCH = 50;
 const DEFAULT_DETAIL = 15;
 const DEFAULT_VESTING_MAX = 200_000;
 const DEFAULT_SCAN_GAP = 20_000;
-const DEFAULT_CONCURRENCY = 12;
+// One get_limit_orders call per asset (core exposes no per-asset order index);
+// 32 concurrent reads measured ~2x faster than 12 with an identical report.
+const DEFAULT_CONCURRENCY = 32;
+// Holder pages are offset-addressable (asset_api walks by_asset_balance by
+// position), so the rich list is fetched in parallel pages. The asset_api nodes
+// tolerate this well; 8 keeps ~800 holders in flight.
+const HOLDER_PAGE_CONCURRENCY = 8;
 const DEFAULT_HTML = path.join(PATHS.ANALYSIS.CHARTS_DIR, 'token-distribution.html');
 // Console tag for status lines, matching the `[Liquidity]` style used by the
 // other analysis entries.
@@ -359,8 +369,8 @@ Usage:
 Options:
   --node URL          BitShares node (repeatable; defaults to NODE_MANAGEMENT.DEFAULT_NODES)
   --detail N          Rows in top-holder / P2P / vesting tables (default ${DEFAULT_DETAIL})
-  --no-orders         Skip the per-asset limit-order scan (saves ~20s on mainnet)
-  --concurrency N     Concurrent get_limit_orders calls (default ${DEFAULT_CONCURRENCY})
+  --no-orders         Skip the per-asset limit-order scan (~6.5k calls; saves ~15s)
+  --concurrency N     Concurrent get_limit_orders calls (default ${DEFAULT_CONCURRENCY}, max 64)
   --vesting-max N     Highest 1.13.x object id to scan (default ${DEFAULT_VESTING_MAX})
   --gap N             Stop the 1.13.x scan after N consecutive missing ids (default ${DEFAULT_SCAN_GAP})
   --html PATH         HTML output path (default ${DEFAULT_HTML})
@@ -614,60 +624,7 @@ async function listPages<T extends { id: string }>(
     return out;
 }
 
-/** Enumerate every asset via list_assets (symbol-ordered, inclusive lower bound). */
-async function listAllAssets(session: Session): Promise<AssetObject[]> {
-    const limit = Math.max(1, Math.min(session.config.api_limit_get_assets ?? 100, 100));
-    const seen = new Set<string>();
-    const out: AssetObject[] = [];
-    let lower = '';
-    for (let page = 0; page < 10000; page++) {
-        const rows = await callDb<AssetObject[]>(session, 'list_assets', [lower, limit]);
-        if (!Array.isArray(rows) || rows.length === 0) break;
-        let fresh = 0;
-        for (const row of rows) {
-            if (!row || seen.has(row.id)) continue;
-            seen.add(row.id);
-            out.push(row);
-            fresh++;
-        }
-        if (rows.length < limit || fresh === 0) break;
-        const lastSymbol = rows[rows.length - 1]?.symbol;
-        if (typeof lastSymbol !== 'string') break;
-        lower = lastSymbol;
-    }
-    return out;
-}
 
-/**
- * Scan a dense-ish object id range with a gap tolerance. Used for 1.13.x
- * vesting balances, which have no global by-asset index.
- */
-async function scanIdRange<T>(
-    session: Session,
-    prefix: string,
-    maxId: number,
-    gap: number,
-    onProgress?: (scanned: number) => void,
-): Promise<{ objects: T[]; scannedTo: number; hitLimit: boolean }> {
-    const objects: T[] = [];
-    let index = 0;
-    let lastSeen = -1;
-    while (index <= maxId && index - lastSeen <= gap) {
-        const count = Math.min(OBJECT_BATCH, maxId - index + 1);
-        const ids = Array.from({ length: count }, (_, i) => `${prefix}.${index + i}`);
-        const page = await callDb<(T | null)[]>(session, 'get_objects', [ids]);
-        for (let j = 0; j < count; j++) {
-            const obj = page?.[j];
-            if (obj) {
-                lastSeen = index + j;
-                objects.push(obj);
-            }
-        }
-        index += count;
-        onProgress?.(index);
-    }
-    return { objects, scannedTo: index, hitLimit: index > maxId && index - lastSeen <= gap };
-}
 
 async function resolveAccountNames(session: Session, ids: string[]): Promise<Map<string, string>> {
     const names = new Map<string, string>();
@@ -685,22 +642,19 @@ async function resolveAccountNames(session: Session, ids: string[]): Promise<Map
 }
 
 async function resolveAsset(session: Session, input: string): Promise<AssetObject> {
-    let stub: AssetObject | null = null;
-    if (/^1\.3\.\d+$/.test(input)) {
-        const rows = await callDb<(AssetObject | null)[]>(session, 'get_assets', [[input]]);
-        stub = rows?.[0] ?? null;
-    } else {
-        const rows = await callDb<(AssetObject | null)[]>(session, 'lookup_asset_symbols', [[input]]);
-        stub = rows?.[0] ?? null;
-        if (!stub && input.toLowerCase().startsWith('bit')) {
-            const retry = await callDb<(AssetObject | null)[]>(
-                session, 'lookup_asset_symbols', [[input.slice(3)]]);
-            stub = retry?.[0] ?? null;
-        }
+    // Shared case-insensitive lookup (modules/asset_lookup.ts), so a lowercase
+    // symbol such as `token.sym` resolves to the on-chain TOKEN.SYM. The legacy
+    // `bit*` MPA aliases were renamed on chain, so those are retried with the
+    // prefix stripped.
+    const read = (method: string, args: unknown[]) => callDb<unknown>(session, method, args);
+    let stub = await resolveAssetRef(read, input) as AssetObject | null;
+    if (!stub && input.toLowerCase().startsWith('bit')) {
+        stub = await resolveAssetRef(read, input.slice(3)) as AssetObject | null;
     }
     if (!stub) throw new Error(`asset not found: ${input}`);
-    const full = await callDb<(AssetObject | null)[]>(session, 'get_assets', [[stub.id]]);
-    return { ...stub, ...(full?.[0] ?? {}) };
+    // The shared resolver fetches through get_assets, so this is already the
+    // extended object (float/dynamic ids included): no second round trip.
+    return stub;
 }
 
 async function fetchAssetHolders(
@@ -710,9 +664,73 @@ async function fetchAssetHolders(
 ): Promise<{ rows: AssetHolderObject[]; totalCount: number | null; complete: boolean }> {
     if (session.assetApi === null) throw new Error('asset_api unavailable on this node');
     const api = session.assetApi;
+    // The node caps holders per call (api_limit_get_asset_holders, commonly 100).
     const pageSize = Math.max(1, Math.min(session.config.api_limit_get_asset_holders ?? 100, 100));
+    let totalCount: number | null = null;
+    try {
+        const count = await session.client.call<number>(api, 'get_asset_holders_count', [assetId]);
+        if (typeof count === 'number' && count >= 0) totalCount = count;
+    } catch {
+        // optional: only used to plan the pages
+    }
+
     const rows: AssetHolderObject[] = [];
     let complete = false;
+    // Reported while the pages are still in flight (rows is empty until the
+    // parallel fetch is reassembled), so count the rows themselves.
+    let fetchedRows = 0;
+    let fetchedPages = 0;
+    const report = (rowsInPage: number): void => {
+        fetchedRows += rowsInPage;
+        fetchedPages += 1;
+        if (fetchedPages % 20 === 0) onProgress?.(fetchedRows);
+    };
+
+    // `get_asset_holders(asset, start, limit)` walks the by_asset_balance index by
+    // *position*, so offsets are independent. With the holder count known the
+    // whole rich list is fetched as parallel pages instead of one blocking chain
+    // (15k holders = 153 sequential calls today).
+    if (totalCount !== null && totalCount > pageSize) {
+        const offsets: number[] = [];
+        for (let start = 0; start < totalCount; start += pageSize) offsets.push(start);
+        // One sentinel page past the count: it absorbs a balance that appeared
+        // (or a rank that shifted) mid-scan, so a full last page cannot be
+        // mistaken for the whole list.
+        offsets.push(offsets[offsets.length - 1] + pageSize);
+        const pages = new Array<AssetHolderObject[]>(offsets.length);
+        let cursor = 0;
+        const worker = async (): Promise<void> => {
+            for (;;) {
+                const index = cursor++;
+                if (index >= offsets.length) return;
+                const page = await session.client.call<AssetHolderObject[]>(
+                    api, 'get_asset_holders', [assetId, offsets[index], pageSize]);
+                pages[index] = Array.isArray(page) ? page : [];
+                report(pages[index].length);
+            }
+        };
+        const workers = Math.min(HOLDER_PAGE_CONCURRENCY, offsets.length);
+        await Promise.all(Array.from({ length: workers }, () => worker()));
+        // Reassemble in rank order. A balance change mid-scan can shift ranks and
+        // repeat an account, so keep its highest-ranked occurrence only.
+        const seen = new Set<string>();
+        let shortPage = false;
+        for (const page of pages) {
+            for (const holder of page) {
+                if (!holder?.account_id || seen.has(holder.account_id)) continue;
+                seen.add(holder.account_id);
+                rows.push(holder);
+            }
+            if (page.length < pageSize) {
+                shortPage = true;
+                break;
+            }
+        }
+        complete = shortPage ? true : rows.length >= totalCount;
+        onProgress?.(rows.length);
+        return { rows, totalCount, complete };
+    }
+
     let nextProgress = 10000;
     for (let start = 0; start < 2_000_000; start += pageSize) {
         const page = await session.client.call<AssetHolderObject[]>(
@@ -730,13 +748,6 @@ async function fetchAssetHolders(
             complete = true;
             break;
         }
-    }
-    let totalCount: number | null = null;
-    try {
-        const count = await session.client.call<number>(api, 'get_asset_holders_count', [assetId]);
-        if (typeof count === 'number') totalCount = count;
-    } catch {
-        // optional
     }
     return { rows, totalCount, complete };
 }
@@ -1026,8 +1037,22 @@ async function collect(session: Session, opts: Options): Promise<Report> {
     const money = (value: bigint): string => formatUnits(value, precision);
 
     // ---- Assets (symbols + order scan universe) -----------------------------
-    progress(showProgress, 'listing assets ...');
-    const assets = await listAllAssets(session);
+    // Assets are enumerated by id instead of `list_assets` (100 assets per page):
+    // the 1.3.x space is dense and append-only, so a batched get_objects walk is
+    // the same payload with ~7 round trips instead of ~66. The object list also
+    // feeds the limit-order sweep below.
+    progress(showProgress, 'listing assets (1.3.x) ...');
+    const assetScan = await scanIdRange<AssetObject>({
+        read: (method, args) => callDb(session, method, args),
+        prefix: '1.3',
+        maxId: 200_000,
+        gap: DENSE_SPACE_GAP,
+        onProgress: (n) => progress(showProgress, `listing assets (1.3.x) ... ${n} ids`),
+    });
+    const assets = assetScan.objects;
+    if (assetScan.hitLimit) {
+        warnings.push('Asset enumeration hit its 200,000-id limit; the limit-order scan may miss newer assets.');
+    }
     const assetById = new Map(assets.map((row) => [row.id, row]));
     assetById.set(asset.id, asset);
     const symbolOf = (id: string): string => assetById.get(id)?.symbol ?? id;
@@ -1172,10 +1197,13 @@ async function collect(session: Session, opts: Options): Promise<Report> {
 
     // ---- Vesting balances (1.13.x) ------------------------------------------
     progress(showProgress, 'scanning vesting balances (1.13.x) ...');
-    const vestingScan = await scanIdRange<VestingObject>(
-        session, '1.13', opts.vestingMax, opts.gap,
-        (n) => progress(showProgress, `scanning vesting balances (1.13.x) ... ${n}`),
-    );
+    const vestingScan = await scanIdRange<VestingObject>({
+        read: (method, args) => callDb(session, method, args),
+        prefix: '1.13',
+        maxId: opts.vestingMax,
+        gap: opts.gap,
+        onProgress: (n) => progress(showProgress, `scanning vesting balances (1.13.x) ... ${n} ids`),
+    });
     let vestingTotal = 0n;
     let vestingCount = 0;
     const vestingByType = new Map<string, { amount: bigint; count: number }>();
@@ -1630,12 +1658,9 @@ function renderTerminal(report: Report, opts: Options): void {
             `  locked / float     ${(Number(report.locked * 10_000n / report.float) / 10_000).toFixed(2)}×`));
     }
 
-    const section = (title: string): void => {
-        console.log();
-        console.log(c(colors.bold + colors.yellow, `  ── ${title} ${'─'.repeat(Math.max(0, 70 - title.length))}`));
-    };
+    const heading = (title: string): void => { console.log(section(title)); };
 
-    section('Where the token sits');
+    heading('Where the token sits');
     console.log(c(colors.gray,
         `  ${padEnd('Category', 26)} ${padStart(symbol, 18)} ${padStart('% supply', 10)} ${padStart('% float', 10)}`));
     for (const bucket of report.buckets) {
@@ -1773,13 +1798,10 @@ function renderTerminal(report: Report, opts: Options): void {
         }
     }
 
-    if (report.warnings.length > 0) {
-        section('Warnings');
-        for (const warning of report.warnings) console.log(c(colors.sell, `  • ${warning}`));
-    }
+    if (report.warnings.length > 0) console.log(warningsBlock(report.warnings));
     console.log();
-    console.log(c(colors.gray,
-        `  reconcile: free ${money(report.free)} + locked ${money(report.locked)} `
+    console.log(summaryLine(
+        `reconcile: free ${money(report.free)} + locked ${money(report.locked)} `
         + `+ blinded ${money(report.supply.confidential)} + other ${money(report.residual)} = ${money(supply)}`));
 }
 
@@ -2211,7 +2233,7 @@ ${warnings}
 </div>
 
 <footer>
-  <p>Sources: bitshares-core 7.0.x database_api — <code>list_assets</code>, <code>get_liquidity_pools_by_one_asset</code>, <code>get_limit_orders</code>, <code>get_objects</code> (1.13.x), <code>get_credit_offers_by_asset</code>, <code>get_credit_deals_by_collateral_asset</code>, <code>get_credit_deals_by_debt_asset</code>, <code>get_samet_funds_by_asset</code>, <code>list_htlcs</code>${report.holders.sourceNode ? ', <code>asset_api::get_asset_holders</code>' : ''}.</p>
+  <p>Sources: bitshares-core 7.0.x database_api — <code>get_objects</code> (1.3.x assets, 1.13.x vesting), <code>get_limit_orders</code>, <code>get_liquidity_pools_by_one_asset</code>, <code>get_credit_offers_by_asset</code>, <code>get_credit_deals_by_collateral_asset</code>, <code>get_credit_deals_by_debt_asset</code>, <code>get_samet_funds_by_asset</code>, <code>list_htlcs</code>${report.holders.sourceNode ? ', <code>asset_api::get_asset_holders</code>' : ''}.</p>
   <p>Read-only; no keys, no transactions. Limit-order totals are per market and capped by the node's per-side limit.</p>
 </footer>
 </body>
@@ -2246,7 +2268,7 @@ async function main(): Promise<void> {
         return;
     }
 
-    if (!opts.json) console.log(`${LOG_TAG} Loading token distribution for ${opts.asset} from chain...`);
+    if (!opts.json) console.log(loadingLine(LOG_TAG, `Loading token distribution for ${opts.asset} from chain...`));
     const nodes = opts.nodes.length > 0 ? opts.nodes : [...NODE_MANAGEMENT.DEFAULT_NODES];
     const session = await openSession(nodes);
     try {
