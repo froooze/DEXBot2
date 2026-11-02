@@ -36,6 +36,8 @@
  * no keys, no transactions. Chain source of truth: bitshares-core 7.0.x.
  *
  * Usage:
+ *   dexbot asset <symbol|1.3.x> [options]            # CLI shortcut
+ *   dexbot a <symbol|1.3.x> [options]                # shorthand for the line above
  *   node dist/scripts/token_distribution.js <symbol|1.3.x>
  *   node dist/scripts/token_distribution.js <token> --json
  *   node dist/scripts/token_distribution.js <asset-id> --no-html
@@ -49,6 +51,7 @@ import { pathToFileURL } from 'node:url';
 import { NODE_MANAGEMENT } from '../modules/constants.js';
 import { PATHS } from '../modules/paths.js';
 import { CLI_COLORS as colors } from '../modules/cli_colors.js';
+import { toFileUrl } from '../analysis/chart_utils.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -64,6 +67,9 @@ const DEFAULT_VESTING_MAX = 200_000;
 const DEFAULT_SCAN_GAP = 20_000;
 const DEFAULT_CONCURRENCY = 12;
 const DEFAULT_HTML = path.join(PATHS.ANALYSIS.CHARTS_DIR, 'token-distribution.html');
+// Console tag for status lines, matching the `[Liquidity]` style used by the
+// other analysis entries.
+const LOG_TAG = '[Assets]';
 
 // asset_api (get_asset_holders) is allowlisted on only a few public nodes; this
 // mirrors scripts/rich_list.ts and scripts/bts_distribution.ts.
@@ -344,6 +350,7 @@ class UsageError extends Error {}
 const HELP = `BitShares token distribution analyzer (read-only)
 
 Usage:
+  dexbot asset <symbol|1.3.x> [options]      (shorthand: dexbot a <symbol|1.3.x>)
   node dist/scripts/token_distribution.js <symbol|1.3.x> [options]
 
 Options:
@@ -859,7 +866,7 @@ function esc(text: string): string {
 
 function progress(enabled: boolean, message: string): void {
     if (!enabled || !process.stderr.isTTY) return;
-    process.stderr.write(`\r\x1b[2K  ${message}`);
+    process.stderr.write(`\r\x1b[2K${LOG_TAG} ${message}`);
 }
 
 function clearProgress(enabled: boolean): void {
@@ -2235,7 +2242,7 @@ async function main(): Promise<void> {
         opts = parseArgs(process.argv.slice(2));
     } catch (e) {
         if (e instanceof UsageError) {
-            console.error(`Error: ${e.message}\n`);
+            console.error(`${LOG_TAG} Error: ${e.message}\n`);
             console.error(HELP);
             process.exit(2);
         }
@@ -2246,6 +2253,7 @@ async function main(): Promise<void> {
         return;
     }
 
+    if (!opts.json) console.log(`${LOG_TAG} Loading token distribution for ${opts.asset} from chain...`);
     const nodes = opts.nodes.length > 0 ? opts.nodes : [...NODE_MANAGEMENT.DEFAULT_NODES];
     const session = await openSession(nodes);
     try {
@@ -2262,7 +2270,7 @@ async function main(): Promise<void> {
             }, 2));
         } else {
             renderTerminal(report, opts);
-            if (htmlPath) console.log(`\n  HTML: ${htmlPath}`);
+            if (htmlPath) console.log(`\n${LOG_TAG} ✓ Report saved. Open report: (${toFileUrl(htmlPath)})`);
         }
     } finally {
         session.client.close();
@@ -2271,7 +2279,7 @@ async function main(): Promise<void> {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
     main().catch((e) => {
-        console.error(`\nError: ${(e as Error).message}`);
+        console.error(`\n${LOG_TAG} Error: ${(e as Error).message}`);
         process.exit(1);
     });
 }

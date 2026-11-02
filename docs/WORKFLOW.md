@@ -257,6 +257,7 @@ the canonical name is preferred in scripts and docs.
 | `dexbot dw <target>` | — | Dynamic-weight research chart: same targets/flags as `tv` |
 | `dexbot liquid <target>` | `liq` (default shorthand), `liqu`, `liquidity` | Blended order-book + AMM pool liquidity depth chart for `<bot|AssetA/AssetB>` (`--range`, `--depth`, `--steps`) |
 | `dexbot pnl <account>` | — | HTML PnL report for a bot/account over `--month N`, optional `--pair BASE/QUOTE` filter |
+| `dexbot asset <bts\|symbol\|1.3.x>` | `a` | Supply distribution: `bts` for the core asset (collateral, pools, locks, residual), a bare symbol/id for an issued asset; `--json`, `--html`/`--no-html`, `--detail`, `--holders` |
 | `dexbot git` | — | Analyze repository git history and write an added/deleted-lines HTML chart (`repo-stats.html`; source checkouts only) |
 | `dexbot status` | `stat`, `stats` | Unified runtime health — daemon, adapter, bots. Whole-runtime: an optional bot name is validated, then ignored |
 | `dexbot start` | `unlock` | Run credential daemon + bot (equivalent to running the `unlock` runtime, `dist/unlock.js`) |

@@ -104,7 +104,7 @@ the rename. Note:
 the `holders=` figure can be off by one.
 
 ### BTS Supply Distribution
-**File:** `bts_distribution.ts` (npm: `npm run distribution`)
+**File:** `bts_distribution.ts` (CLI: `dexbot asset bts`; npm: `npm run distribution`)
 **Purpose:** Live-chain breakdown of where BTS sits: call-order collateral, global/individual
 settlement funds (plus force-settlement debt and parameters), governance tickets, vesting and
 legacy balances, liquidity pools, SameT/credit funds, HTLC escrow and asset fee pools. The
@@ -112,7 +112,8 @@ remainder is reported as a derived liquid residual and compared with total suppl
 circulating float. Also writes a self-contained HTML donut report to
 `analysis/charts/bts-distribution.html` (`--html PATH`, `--no-html`).
 ```bash
-npm run distribution                                   # terminal + HTML
+dexbot asset bts                                       # terminal + HTML (shorthand: dexbot a bts)
+npm run distribution                                   # same, via npm
 node dist/scripts/bts_distribution.js --json           # JSON (HTML still written)
 node dist/scripts/bts_distribution.js --circulating <reference-supply>
 node dist/scripts/bts_distribution.js --holders all    # full rich list (~5 min)
@@ -124,7 +125,7 @@ also splits the residual into account balances, blinded balances and order books
 concentration plus balance bands. Read-only: no keys, no transactions.
 
 ### Token Distribution
-**File:** `token_distribution.ts` (npm: `npm run token-distribution`)
+**File:** `token_distribution.ts` (CLI: `dexbot asset <symbol|1.3.x>`; npm: `npm run token-distribution`)
 **Purpose:** Per-asset companion to BTS Supply Distribution. Buckets a token into free account
 balances, limit orders, liquidity pools, vesting balances, P2P credit offers and deal collateral,
 SameT funds, HTLC escrow, accumulated market fees and blinded supply, then reconciles the total
@@ -134,6 +135,8 @@ token sellable (price −3%) and buyable (+3%), orderbook + pool combined per ma
 as a share of total supply. Writes the report to
 `analysis/charts/token-<SYMBOL>-distribution.html`.
 ```bash
+dexbot asset <token>                                   # terminal + HTML (shorthand: dexbot a <token>)
+dexbot a <token>                                       # same, shorthand
 npm run token-distribution -- <token>
 node dist/scripts/token_distribution.js <asset-id> --json
 node dist/scripts/token_distribution.js <token> --no-orders   # skip the ~6k order queries

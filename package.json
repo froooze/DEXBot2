@@ -102,6 +102,7 @@
     "richlist": "npm run build && node dist/scripts/rich_list.js",
     "distribution": "npm run build && node dist/scripts/bts_distribution.js",
     "token-distribution": "npm run build && node dist/scripts/token_distribution.js",
+    "asset": "npm run build && node dist/scripts/asset.js",
     "native:release-gates": "npm run build && npm run build:tests && node dist/scripts/native_release_gates.js",
     "native:serial-snapshots": "npm run build && npm run build:tests && node dist/tests/test_native_serial_ops.js",
     "native:ecc-invariants": "npm run build && npm run build:tests && node dist/tests/test_native_ecc.js",

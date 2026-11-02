@@ -55,6 +55,7 @@
  * never touches a running bot's connection) and has no runtime dependencies.
  *
  * Usage:
+ *   dexbot asset bts [options]                            # CLI shortcut (also: dexbot a bts)
  *   node dist/scripts/bts_distribution.js                 # terminal + HTML
  *   node dist/scripts/bts_distribution.js --json          # JSON + HTML
  *   node dist/scripts/bts_distribution.js --no-html       # terminal only
@@ -70,6 +71,7 @@ import { pathToFileURL } from 'node:url';
 import { NODE_MANAGEMENT } from '../modules/constants.js';
 import { PATHS } from '../modules/paths.js';
 import { CLI_COLORS as colors } from '../modules/cli_colors.js';
+import { toFileUrl } from '../analysis/chart_utils.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -87,6 +89,9 @@ const DEFAULT_SCAN_GAP = 20_000;
 const DEFAULT_HTML = path.join(PATHS.ANALYSIS.CHARTS_DIR, 'bts-distribution.html');
 const DEFAULT_HOLDERS = 100;
 const MAX_HOLDERS = 1000;
+// Console tag for status lines, matching the `[Liquidity]` / `[TradingView]`
+// style used by the other analysis entries.
+const LOG_TAG = '[Assets]';
 
 // asset_api (get_asset_holders) is allowlisted on only a few public nodes; this
 // list mirrors the one in scripts/rich_list.ts, which solves the same problem.
@@ -433,6 +438,7 @@ balances. The remaining liquid supply (accounts, order books, blinded balances)
 is reported as a derived residual.
 
 Usage:
+  dexbot asset bts [options]
   node dist/scripts/bts_distribution.js [options]
 
 Options:
@@ -1001,7 +1007,7 @@ async function sumCallOrderCollateral(
 function progress(enabled: boolean, message: string): void {
     if (!enabled) return;
     if (!process.stderr.isTTY) return;
-    process.stderr.write(`\r\x1b[2K  ${message}`);
+    process.stderr.write(`\r\x1b[2K${LOG_TAG} ${message}`);
 }
 
 function clearProgress(enabled: boolean): void {
@@ -2562,7 +2568,7 @@ async function main(): Promise<void> {
         opts = parseArgs(process.argv.slice(2));
     } catch (e) {
         if (e instanceof UsageError) {
-            console.error(`Error: ${e.message}\n`);
+            console.error(`${LOG_TAG} Error: ${e.message}\n`);
             printHelp();
             process.exit(2);
         }
@@ -2573,6 +2579,7 @@ async function main(): Promise<void> {
         return;
     }
 
+    if (!opts.json) console.log(`${LOG_TAG} Loading BTS supply distribution from chain...`);
     const nodes = opts.nodes.length > 0 ? opts.nodes : [...NODE_MANAGEMENT.DEFAULT_NODES];
     const session = await openSession(nodes);
     try {
@@ -2589,6 +2596,7 @@ async function main(): Promise<void> {
             }, 2));
         } else {
             renderTerminal(report, opts);
+            if (opts.html) console.log(`\n${LOG_TAG} ✓ Report saved. Open report: (${toFileUrl(opts.html)})`);
         }
     } finally {
         session.client.close();
@@ -2597,7 +2605,7 @@ async function main(): Promise<void> {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
     main().catch((e) => {
-        console.error(`\nError: ${(e as Error).message}`);
+        console.error(`\n${LOG_TAG} Error: ${(e as Error).message}`);
         process.exit(1);
     });
 }

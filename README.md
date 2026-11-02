@@ -342,6 +342,8 @@ dexbot tv <bot|pool|A/B>   # TradingView 1h chart with AMA overlay (default: 3 m
 dexbot liq <bot|A/B>       # Liquidity depth chart (canonical: liquid; aliases: liqu, liquidity)
 dexbot pnl <bot|account>   # HTML PnL report (--month N, optional --pair A/B)
 dexbot credit [<bot>]      # Live summed MPA + borrowed-credit positions
+dexbot asset bts           # BTS supply distribution + HTML report (shorthand: dexbot a bts)
+dexbot asset <sym>         # Per-token supply distribution; `dexbot a <sym>` is the shorthand
 dexbot export <bot>        # Export trades + settings (CSV/JSON) for analysis/
 
 dexbot update              # Update DEXBot2

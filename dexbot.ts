@@ -50,6 +50,7 @@ const __dirname = _esmDirname(__filename);
  * Config:    dexbot bot | key | enable {all|<bot>} | disable {all|<bot>} | default | update
  * Analysis:  dexbot order [<bot>] | export <bot> | credit [<bot>] | rich <asset...>
  *            dexbot tv <target> | dw <target> | liquid <target> | pnl <account>
+ *            dexbot asset <bts|symbol> (shorthand: dexbot a <bts|symbol>)
  * Files:     dexbot clear | clear-orders | clear-market-adapter | clear-all
  *
  * NPM SCRIPTS (alternative invocation):
@@ -162,8 +163,8 @@ if (typeof credentialPolicy.checkPolicyFileSecurity === 'function') credentialPo
 const PROFILES_BOTS_FILE = PATHS.PROFILES.BOTS_JSON;
 const PROFILES_DIR = PATHS.PROFILES_DIR;
 
-const CLI_COMMANDS = ['start', 'test', 'reset', 'default', 'disable', 'enable', 'drystart', 'key', 'bot', 'pm2', 'update', 'export', 'order', 'credit', 'rich', 'tv', 'dw', 'liquid', 'pnl', 'git', 'clear', 'clear-orders', 'clear-market-adapter', 'clear-all', 'status', 'unlock', 'delete', 'stop', 'restart', 'reload', 'help'];
-const COMMAND_ALIASES: Record<string, string> = { orders: 'order', keys: 'key', bots: 'bot', stat: 'status', stats: 'status', start: 'unlock', defaults: 'default', stp: 'stop', stopall: 'stop', restartall: 'restart', reloadall: 'reload', liq: 'liquid', liqu: 'liquid', liquidity: 'liquid' };
+const CLI_COMMANDS = ['start', 'test', 'reset', 'default', 'disable', 'enable', 'drystart', 'key', 'bot', 'pm2', 'update', 'export', 'order', 'credit', 'rich', 'tv', 'dw', 'liquid', 'pnl', 'asset', 'git', 'clear', 'clear-orders', 'clear-market-adapter', 'clear-all', 'status', 'unlock', 'delete', 'stop', 'restart', 'reload', 'help'];
+const COMMAND_ALIASES: Record<string, string> = { orders: 'order', keys: 'key', bots: 'bot', stat: 'status', stats: 'status', start: 'unlock', defaults: 'default', stp: 'stop', stopall: 'stop', restartall: 'restart', reloadall: 'reload', liq: 'liquid', liqu: 'liquid', liquidity: 'liquid', a: 'asset' };
 const CLI_HELP_FLAGS = ['-h', '--help'];
 const CLI_EXAMPLES_FLAG = '--cli-examples';
 const CLI_EXAMPLES = [
@@ -180,6 +181,7 @@ const CLI_EXAMPLES = [
     { title: 'Asset rich list', command: 'dexbot rich <asset> [<asset...>]', notes: 'Top holder(s) per asset from the chain asset holders API.' },
     { title: 'Chart a bot, pool, or pair', command: 'dexbot tv <bot|pool-id|AssetA/AssetB> --month 3', notes: 'OHLC chart; --feed charts MPA price-feed history.' },
     { title: 'Liquidity depth chart', command: 'dexbot liq <bot|AssetA/AssetB>', notes: 'Order-book + AMM pool cumulative depth; --range/--depth/--steps. Canonical: liquid; aliases: liqu, liquidity.' },
+    { title: 'Asset supply distribution', command: 'dexbot a bts', notes: 'Where BTS sits (collateral, pools, locks, residual) + HTML report. A bare symbol (dexbot a <symbol>) covers an issued asset; canonical: asset.' },
     { title: 'PnL report', command: 'dexbot pnl <bot|account> --month 3 [--pair BASE/QUOTE]', notes: 'Self-contained HTML PnL report for the resolved bot or chain account.' }
 ];
 
@@ -241,6 +243,7 @@ function printCLIUsage() {
             ['tv <target>', 'OHLC chart for <bot|pool-id|AssetA/AssetB>; --month N (default 3), --feed for MPA price-feed history.'],
             ['dw <target>', 'Dynamic-weight research chart; same targets and flags as tv.'],
             ['liq <target>', 'Liquidity depth chart for <bot|AssetA/AssetB>; --range, --depth, --steps (canonical: liquid; aliases: liqu, liquidity).'],
+            ['asset <bts|symbol>', 'Supply distribution: bts = core asset, bare symbol/id = issued asset; --json, --html (shorthand: a, e.g. dexbot a bts).'],
             ['pnl <account>', 'HTML PnL report for a bot or account; --month N, optional --pair BASE/QUOTE filter.'],
         ]],
         ['Files', [
@@ -293,7 +296,7 @@ if (cliArgs.some(arg => CLI_HELP_FLAGS.includes(arg))) {
     // so the script prints its usage. Only scripts with offline help handling
     // belong here — forwarding to a script without it could misinterpret the
     // flag as input (e.g. a bot-name filter triggering live work).
-    const HELP_OWNING_COMMANDS = new Set(['credit', 'rich', 'tv', 'dw', 'liquid', 'pnl']);
+    const HELP_OWNING_COMMANDS = new Set(['credit', 'rich', 'tv', 'dw', 'liquid', 'pnl', 'asset']);
     const requestedCommand = COMMAND_ALIASES[cliArgs[0]] ?? cliArgs[0];
     if (!HELP_OWNING_COMMANDS.has(requestedCommand)) {
         printCLIUsage();
@@ -906,7 +909,7 @@ async function exportBotTrades(botName: string | undefined) {
 
 /**
  * Parse and execute CLI commands.
-  * Supported commands: test, drystart, reset, default, disable, enable, key, bot, pm2, update, export, order, credit, tv, dw, liquid, clear, status, unlock, help
+  * Supported commands: test, drystart, reset, default, disable, enable, key, bot, pm2, update, export, order, credit, tv, dw, liquid, pnl, asset, clear, status, unlock, help
  * @returns {Promise<boolean>} True if a command was handled, false otherwise
  */
 async function handleCLICommands() {
@@ -1115,7 +1118,8 @@ async function handleCLICommands() {
         case 'tv':
         case 'dw':
         case 'liquid':
-        case 'pnl': {
+        case 'pnl':
+        case 'asset': {
             const { spawnSync } = require('child_process') as typeof import('node:child_process');
             const scriptArgs = buildRuntimeScriptArgs({
                 codeRoot: __dirname,
