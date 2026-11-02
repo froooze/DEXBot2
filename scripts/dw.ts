@@ -2,7 +2,7 @@
 'use strict';
 /**
  * Usage:
- *   dexbot dw <bot|pool-id|AssetA/AssetB> [--month N] [--chart <path>] [--feed|--pool|--book]
+ *   dexbot dw <bot|pool|AssetA/AssetB> [--month N] [--chart <path>] [--feed|--pool|--book]
  *
  * Thin entry for the shared chart-command pipeline in scripts/chart_command.ts
  * (identical fetch/target logic as `dexbot tv`). This command renders through

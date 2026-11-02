@@ -63,6 +63,12 @@ const TESTS: BundleTest[] = [
     externalizeNodeBuiltins: true,
   },
   {
+    label: 'modules/liquidity_pool_ref.ts (browser-safe)',
+    entry: 'modules/liquidity_pool_ref.ts',
+    expectFail: false,
+    externalizeNodeBuiltins: true,
+  },
+  {
     label: 'modules/crypto/index.ts (browser-safe)',
     entry: 'modules/crypto/index.ts',
     expectFail: false,

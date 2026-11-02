@@ -136,7 +136,6 @@ as a share of total supply. Writes the report to
 `analysis/charts/token-<SYMBOL>-distribution.html`.
 ```bash
 dexbot asset <token>                                   # terminal + HTML (shorthand: dexbot a <token>)
-dexbot a <token>                                       # same, shorthand
 npm run token-distribution -- <token>
 node dist/scripts/token_distribution.js <asset-id> --json
 node dist/scripts/token_distribution.js <token> --no-orders   # skip the ~6k order queries
@@ -384,7 +383,8 @@ load `profiles/orders/<botKey>.json` automatically.
 **Output:** `tv_<bot|pool_<id>|<a>_<b>>_1h_<N>m.html` (`_feed` for feed charts)
 ```bash
 dexbot tv <bot>                                  # bot, 3 months
-dexbot tv 133 --month 6                          # pool
+dexbot tv 133 --month 6                          # pool by id
+dexbot tv <pool-token-symbol> --month 6          # pool by its LP share-asset symbol
 dexbot tv TOKENA/TOKENB --month 1 --chart analysis/charts/custom.html
 dexbot tv TOKENA/BTS --feed --month 1            # MPA price feed
 ```
@@ -398,6 +398,7 @@ Same pipeline and flags as `tv`; renders the dynamic-weight research chart
 ```bash
 dexbot dw <bot>
 dexbot dw 133 --month 6
+dexbot dw <pool-token-symbol> --month 6
 dexbot dw TOKENA/TOKENB --month 1 --chart analysis/charts/custom.html
 dexbot dw TOKENA/BTS --feed --month 1
 ```

@@ -5,8 +5,8 @@
  * Both entries (scripts/tv.ts, scripts/dw.ts) are thin wrappers around run(cmd).
  *
  * Usage:
- *   dexbot tv <bot|pool-id|AssetA/AssetB> [--month N] [--chart <path>] [--feed|--pool|--book]
- *   dexbot dw <bot|pool-id|AssetA/AssetB> [--month N] [--chart <path>] [--feed|--pool|--book]
+ *   dexbot tv <bot|pool|AssetA/AssetB> [--month N] [--chart <path>] [--feed|--pool|--book]
+ *   dexbot dw <bot|pool|AssetA/AssetB> [--month N] [--chart <path>] [--feed|--pool|--book]
  *
  * The pipeline owns everything up to the rendered HTML:
  *   1. parse target/flags (parseArgs),
@@ -53,7 +53,8 @@ interface FeedCtx {
     legs: MpaBackingCtx[];
 }
 import { PATHS } from '../modules/paths.js';
-import { normalizePoolId, resolveAsset, findPoolByAssets } from '../market_adapter/utils/chain.js';
+import { poolAssetIds, resolvePoolRef } from '../modules/liquidity_pool_ref.js';
+import { resolveAsset, findPoolByAssets } from '../market_adapter/utils/chain.js';
 import { normalizeAssetSymbol, splitPairTarget } from '../modules/utils/asset_symbols.js';
 import { fetchCandlesSequentially, outputPath } from '../market_adapter/inputs/fetch_lp_data.js';
 import { fetchMarketCandlesSequentially } from '../market_adapter/inputs/fetch_book_data.js';
@@ -62,7 +63,7 @@ import { muteChainLogs } from '../modules/utils/chain_logs.js';
 import { sanitizeKey } from '../modules/utils/sanitize_key.js';
 import { slugPart, parseChainTimeToMs } from '../market_adapter/interval_utils.js';
 import { monthsToHours } from '../modules/utils/time_range.js';
-import { findBotByTarget, isPoolIdTarget, knownTargetsHint } from './chart_targets.js';
+import { findBotByTarget, isPoolIdTarget, isPoolTarget, knownTargetsHint } from './chart_targets.js';
 import { runAnalysisScript } from './analysis_runner.js';
 
 const INTERVAL_SECONDS = 3600;
@@ -109,11 +110,11 @@ const RENDERERS: Record<ChartCmd, ChartRenderer> = {
 };
 
 function printUsage(cmd: ChartCmd = 'tv'): void {
-    console.log(`Usage: dexbot ${cmd} <bot|pool-id|AssetA/AssetB> [--month N] [--chart <path>] [--feed|--pool|--book]`);
+    console.log(`Usage: dexbot ${cmd} <bot|pool|AssetA/AssetB> [--month N] [--chart <path>] [--feed|--pool|--book]`);
     for (const line of RENDERERS[cmd].usageBlurb) console.log(line);
     console.log('');
     console.log('  <bot>          Bot name or key from profiles/bots.json');
-    console.log('  <pool-id>      Liquidity pool id, e.g. 133 or 1.19.133 (always pool candles)');
+    console.log('  <pool>         Pool id (133 or 1.19.133) or its pool token (LP share-asset symbol); always pool candles');
     console.log('  AssetA/AssetB  Pair symbols, e.g. TOKENA/TOKENB (pool-first, orderbook fallback)');
     console.log('                 Case-insensitive: assetA/assetB is uppercased before it reaches the chain');
     console.log('                 MPA pairs (e.g. BTS/HONEST.USD) can chart price-feed history via --feed');
@@ -251,11 +252,11 @@ function parseArgs(argv: string[], cmd: ChartCmd = 'tv'): { target: string | nul
             if (source !== 'auto' && source !== picked) throw new Error(`Conflicting source flags: --${source} with ${arg} (use only one of --feed, --pool, --book)`);
             source = picked;
         } else if (arg.startsWith('--')) {
-            throw new Error(`Unknown flag "${arg}". Usage: dexbot ${cmd} <bot|pool-id|AssetA/AssetB> [--month N]`);
+            throw new Error(`Unknown flag "${arg}". Usage: dexbot ${cmd} <bot|pool|AssetA/AssetB> [--month N]`);
         } else if (!target) {
             target = arg;
         } else {
-            throw new Error(`Unexpected argument "${arg}". Only one target is supported. Usage: dexbot ${cmd} <bot|pool-id|AssetA/AssetB> [--month N]`);
+            throw new Error(`Unexpected argument "${arg}". Only one target is supported. Usage: dexbot ${cmd} <bot|pool|AssetA/AssetB> [--month N]`);
         }
     }
     return { target, months, chart, source, help };
@@ -265,50 +266,54 @@ function monthsLabel(months: number): string {
     return Number.isInteger(months) ? `${months}m` : `${String(months).replace('.', 'p')}m`;
 }
 
-async function resolvePoolAssets(poolId: string, bitsharesClient: ChainClientLike): Promise<{ assetA: AssetMeta; assetB: AssetMeta }> {
-    const fullId = normalizePoolId(poolId) as string;
-    // Chain pool object via get_objects([poolId]) → asset_a / asset_b.
+async function resolvePoolAssets(poolRef: string, bitsharesClient: ChainClientLike): Promise<{ assetA: AssetMeta; assetB: AssetMeta; poolId: string }> {
     const db = bitsharesClient.BitShares?.db;
-    if (db && typeof db.get_objects === 'function') {
-        try {
-            const objs = await db.get_objects([fullId]) as AssetMeta[] | null;
-            const pool = (Array.isArray(objs) ? objs[0] : null) as { asset_a?: unknown; asset_b?: unknown; asset_ids?: unknown[] } | null;
-            const idA = pool?.asset_a || pool?.asset_ids?.[0];
-            const idB = pool?.asset_b || pool?.asset_ids?.[1];
-            if (idA && idB) {
-                const assets = typeof db.get_assets === 'function' ? await db.get_assets([String(idA), String(idB)]) : null;
-                // Tolerate both [..] and [[..]] result shapes.
-                const list = (Array.isArray(assets) ? assets.flat(Infinity) : []) as AssetMeta[];
-                const metaA = list.find((a) => String(a?.id) === String(idA));
-                const metaB = list.find((a) => String(a?.id) === String(idB));
-                if (metaA && metaB) {
-                    return {
-                        assetA: { id: String(metaA.id), precision: Number(metaA.precision), symbol: String(metaA.symbol || idA) },
-                        assetB: { id: String(metaB.id), precision: Number(metaB.precision), symbol: String(metaB.symbol || idB) },
-                    };
-                }
-            }
-        } catch (_) {
-            // Fall through to Kibana discovery below.
+    if (!db) throw new Error('BitShares client has no database API');
+
+    // `poolRef` is a pool id (133 / 1.19.133) or a pool token (LP share-asset
+    // symbol); modules/liquidity_pool_ref owns both spellings so `tv`, `dw` and
+    // `liq` cannot drift on which pools they accept.
+    const pool = await resolvePoolRef((method, args) => {
+        const call = db[method];
+        if (typeof call !== 'function') throw new Error(`Chain API '${method}' is not available on this node`);
+        return call(...(args ?? [])) as Promise<unknown>;
+    }, poolRef);
+    const poolId = String(pool.id);
+
+    const [idA, idB] = poolAssetIds(pool);
+    if (idA && idB && typeof db.get_assets === 'function') {
+        const assets = await db.get_assets([String(idA), String(idB)]).catch(() => null);
+        // Tolerate both [..] and [[..]] result shapes.
+        const list = (Array.isArray(assets) ? assets.flat(Infinity) : []) as AssetMeta[];
+        const metaA = list.find((a) => String(a?.id) === String(idA));
+        const metaB = list.find((a) => String(a?.id) === String(idB));
+        if (metaA && metaB) {
+            return {
+                assetA: { id: String(metaA.id), precision: Number(metaA.precision), symbol: String(metaA.symbol || idA) },
+                assetB: { id: String(metaB.id), precision: Number(metaB.precision), symbol: String(metaB.symbol || idB) },
+                poolId,
+            };
         }
     }
+
     // Fallback: Kibana discovery (what went into the pool) + chain precision lookup.
     const { discoverPoolAssets } = await import('../market_adapter/inputs/kibana_source.js');
-    const ids = await discoverPoolAssets(fullId, {});
+    const ids = await discoverPoolAssets(poolId, {});
     if (!Array.isArray(ids) || ids.length !== 2) {
-        throw new Error(`Pool ${fullId}: expected exactly 2 assets, discovered [${(ids || []).join(', ')}]. Pass AssetA/AssetB instead.`);
+        throw new Error(`Pool ${poolId}: expected exactly 2 assets, discovered [${(ids || []).join(', ')}]. Pass AssetA/AssetB instead.`);
     }
-    const [idA, idB] = ids.map(String);
-    if (!db || typeof db.get_assets !== 'function') throw new Error(`Pool ${fullId}: chain asset lookup unavailable`);
-    const assets = await db.get_assets([idA, idB]) as AssetMeta[] | null;
-    const metaA = (assets || []).find((a) => String(a?.id) === idA);
-    const metaB = (assets || []).find((a) => String(a?.id) === idB);
+    const [fallbackA, fallbackB] = ids.map(String);
+    if (typeof db.get_assets !== 'function') throw new Error(`Pool ${poolId}: chain asset lookup unavailable`);
+    const assets = await db.get_assets([fallbackA, fallbackB]) as AssetMeta[] | null;
+    const metaA = (assets || []).find((a) => String(a?.id) === fallbackA);
+    const metaB = (assets || []).find((a) => String(a?.id) === fallbackB);
     if (!metaA || !metaB || !Number.isFinite(Number(metaA.precision)) || !Number.isFinite(Number(metaB.precision))) {
-        throw new Error(`Pool ${fullId}: failed to resolve asset metadata for ${idA}/${idB}`);
+        throw new Error(`Pool ${poolId}: failed to resolve asset metadata for ${fallbackA}/${fallbackB}`);
     }
     return {
-        assetA: { id: idA, precision: Number(metaA.precision), symbol: String(metaA.symbol || idA) },
-        assetB: { id: idB, precision: Number(metaB.precision), symbol: String(metaB.symbol || idB) },
+        assetA: { id: fallbackA, precision: Number(metaA.precision), symbol: String(metaA.symbol || fallbackA) },
+        assetB: { id: fallbackB, precision: Number(metaB.precision), symbol: String(metaB.symbol || fallbackB) },
+        poolId,
     };
 }
 
@@ -328,16 +333,18 @@ async function run(cmd: ChartCmd): Promise<void> {
     const startMs = endMs - lookbackHours * 3600 * 1000;
     const timeRange = { gte: new Date(startMs).toISOString(), lte: new Date(endMs).toISOString() };
 
-    // Classify the target locally first so a typo'd bot / malformed pair
-    // fails fast without waiting for a chain connection.
+    // Classify the target locally first so a malformed pair fails fast without
+    // waiting for a chain connection. A bot is matched by name/key, a pair by
+    // its `/`; everything else is a pool reference (id or pool token), which is
+    // resolved on chain with a clear error when it is neither.
     const botHit = findBotByTarget(target as string);
-    const poolTarget = !botHit && isPoolIdTarget(target as string);
-    const pairTarget = !botHit && !poolTarget && (target as string).includes('/');
+    const pairTarget = !botHit && (target as string).includes('/');
+    const poolTarget = !botHit && !pairTarget && isPoolTarget(target as string);
     // A pair target may be typed in any case ("assetb/asseta"); the legs are
     // canonicalized here so the chain call, the cache keys, the chart title and
     // the exported HTML all speak the same UPPERCASE symbols.
     const pairParts = pairTarget ? splitPairTarget(target) : [];
-    if (!botHit && !poolTarget && !pairTarget) {
+    if (!botHit && !pairTarget && !poolTarget) {
         throw new Error(`Unknown target "${target}". ${knownTargetsHint(true)}`);
     }
     if (pairTarget && pairParts.length !== 2) throw new Error(`Invalid pair "${target}". Use AssetA/AssetB, e.g. TOKENA/TOKENB (case is normalized to uppercase)`);
@@ -378,8 +385,8 @@ async function run(cmd: ChartCmd): Promise<void> {
                 sourceLabel = poolId ? `pool ${poolId}` : 'orderbook';
             }
         } else if (poolTarget) {
-            poolId = normalizePoolId((target as string).trim()) as string;
-            const resolved = await resolvePoolAssets(poolId, bitsharesClient);
+            const resolved = await resolvePoolAssets(target as string, bitsharesClient);
+            poolId = resolved.poolId;
             assetA = resolved.assetA;
             assetB = resolved.assetB;
             sourceLabel = `pool ${poolId}`;

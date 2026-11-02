@@ -18,13 +18,12 @@
  * `node dist/scripts/token_distribution.js --help`.
  */
 
-import fs from 'node:fs';
 import path from 'node:path';
 import { dirname as _esmDirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { spawnSync } from 'node:child_process';
 import { PATHS } from '../modules/paths.js';
 import { getErrorMessage } from '../modules/utils/errors.js';
+import { runRuntimeScript } from '../modules/launcher/runtime_entry.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = _esmDirname(__filename);
@@ -159,20 +158,14 @@ function unknownFlagMessage(flag: string, kind: AssetKind): string {
     return `Unknown flag "${flag}".`;
 }
 
-/** Spawn the analyzer with inherited stdio and its own exit status. */
+/** Spawn the analyzer with inherited stdio and mirror its exit status. */
 function runAnalyzer(kind: AssetKind, scriptArgs: string[], asset: string | null): void {
     const { script, label } = ANALYZERS[kind];
-    const scriptPath = path.join(__dirname, script);
-    if (!fs.existsSync(scriptPath)) {
-        throw new Error(`${label} not found at ${scriptPath} (run npm run build first)`);
-    }
-    const args = asset ? [scriptPath, asset, ...scriptArgs] : [scriptPath, ...scriptArgs];
-    const result = spawnSync(process.execPath, args, {
+    const args = asset ? [asset, ...scriptArgs] : scriptArgs;
+    process.exitCode = runRuntimeScript(path.join(__dirname, script), args, {
+        label,
         cwd: PATHS.PROJECT_ROOT,
-        stdio: 'inherit',
     });
-    if (result.error) throw result.error;
-    process.exitCode = result.status ?? 1;
 }
 
 async function run(): Promise<void> {

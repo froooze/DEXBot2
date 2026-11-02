@@ -7,9 +7,14 @@
  * order-book/pool decoding can be unit-tested with a stub `db()` function.
  * Analysis connections never use the production singleton client (see
  * analysis/chain_pool.ts).
+ *
+ * Pool references (id or pool token) are resolved by the shared helper in
+ * modules/liquidity_pool_ref.ts, so `dexbot liq`, `dexbot tv`/`dw` and this
+ * analyzer accept the same spellings.
  */
 
 import { blockchainToFloat } from '../../modules/order/utils/math.js';
+import { poolAssetIds, resolvePoolRef } from '../../modules/liquidity_pool_ref.js';
 import type { BookSides, PoolState, RawOrderBook } from './liquidity_depth_model.js';
 import { normalizeOrderBook } from './liquidity_depth_model.js';
 
@@ -157,9 +162,12 @@ async function fetchPools(
     return Array.isArray(raw) ? raw as RawPool[] : [];
 }
 
-function poolAssetIds(pool: RawPool): [string | null, string | null] {
-    const ids = Array.isArray(pool.asset_ids) ? pool.asset_ids : [];
-    return [pool.asset_a ?? ids[0] ?? null, pool.asset_b ?? ids[1] ?? null];
+/**
+ * Resolve a pool by id (`133` / `1.19.133`) or by its pool token (LP share-asset
+ * symbol). Shared with `dexbot tv`/`dw` and the liquidity analyzer's `--pool`.
+ */
+async function resolvePool(client: ChainDbClient, ref: string): Promise<RawPool> {
+    return await resolvePoolRef((method, args) => client.db(method, args), ref) as RawPool;
 }
 
 /** Decode one raw pool into display reserves (base = asset A, quote = asset B). */
@@ -218,5 +226,5 @@ function selectPool(
     return decoded[0];
 }
 
-export { resolveAsset, fetchOrderBook, normalizeLimitOrders, fetchPools, decodePool, selectPool };
+export { resolveAsset, fetchOrderBook, normalizeLimitOrders, fetchPools, resolvePool, decodePool, selectPool };
 export type { ChainDbClient, ChainAsset, RawLimitOrder, RawPool };

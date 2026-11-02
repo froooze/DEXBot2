@@ -14,6 +14,7 @@ const {
     poolAskBaseDepth,
 } = require('../analysis/liquidity/liquidity_depth_model');
 const { decodePool, selectPool, normalizeLimitOrders, fetchOrderBook } = require('../analysis/liquidity/liquidity_chain');
+const { parseArgs: parseLiquidityArgs } = require('../analysis/analyze_liquidity');
 const { buildDepthView } = require('../analysis/liquidity/liquidity_view');
 const { generateLiquidityHTML } = require('../analysis/liquidity/liquidity_chart_generator');
 
@@ -510,6 +511,31 @@ check('html: embeds the shared 4-digit formatters', () => {
     assert.ok(html.includes('function buildDepthView'));
     // Sample pool price is 2 => formatCurrency(2) renders 4 active digits.
     assert.ok(html.includes('2.000 QUOTE per BASE'));
+});
+
+check('cli: a pool reference supplies both legs', () => {
+    const config = parseLiquidityArgs(['--pool', '133']);
+    assert.strictEqual(config.poolId, '133');
+    assert.strictEqual(config.base, '');
+    assert.strictEqual(config.quote, '');
+    // Pool token spelling is accepted too; base/quote stay optional with it.
+    const token = parseLiquidityArgs(['--pool', 'POOLTOK', '--range', '0.25']);
+    assert.strictEqual(token.poolId, 'POOLTOK');
+    assert.strictEqual(token.range, 0.25);
+    // Without a pool, both legs are still required.
+    assert.throws(() => parseLiquidityArgs([]), /Both base and quote assets are required/);
+    assert.throws(() => parseLiquidityArgs(['--base', 'A']), /Both base and quote assets are required/);
+    // Half a pair next to --pool is ambiguous, not silently ignored.
+    assert.throws(() => parseLiquidityArgs(['--pool', '133', '--base', 'A']), /Pass both --base and --quote, or neither/);
+    // --help must print usage even without a target.
+    assert.strictEqual(parseLiquidityArgs(['--help']).help, true);
+});
+
+check('cli: pool + explicit pair keeps both (membership is checked on chain)', () => {
+    const config = parseLiquidityArgs(['--pool', '1.19.7', '--pair', 'A/B']);
+    assert.strictEqual(config.poolId, '1.19.7');
+    assert.strictEqual(config.base, 'A');
+    assert.strictEqual(config.quote, 'B');
 });
 
 console.log(`\nLiquidity depth tests: ${passed} passed, ${failed} failed`);

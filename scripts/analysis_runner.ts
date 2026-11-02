@@ -9,13 +9,12 @@
  * crashed renderer reports the same way everywhere.
  */
 
-import fs from 'node:fs';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 import { PATHS } from '../modules/paths.js';
+import { runRuntimeScript } from '../modules/launcher/runtime_entry.js';
 
 /** Absolute path to an analysis script, e.g. ['tradingview','analyze_tradingview.js']. */
 function analysisScriptPath(segments: string[]): string {
@@ -28,16 +27,11 @@ function analysisScriptPath(segments: string[]): string {
  * renderer exits non-zero; child stdio is inherited.
  */
 function runAnalysisScript(segments: string[], args: string[], label: string): void {
-    const script = analysisScriptPath(segments);
-    if (!fs.existsSync(script)) {
-        throw new Error(`${label} not found at ${script} (run npm run build first)`);
-    }
-    const result = spawnSync(process.execPath, [script, ...args], {
+    runRuntimeScript(analysisScriptPath(segments), args, {
+        label,
         cwd: PATHS.PROJECT_ROOT,
-        stdio: 'inherit',
+        nonZero: 'throw',
     });
-    if (result.error) throw result.error;
-    if (result.status !== 0) throw new Error(`${label} exited with status ${result.status}`);
 }
 
 export { analysisScriptPath, runAnalysisScript };

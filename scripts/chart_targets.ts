@@ -8,6 +8,7 @@
  */
 
 import { isSameBotName } from '../modules/utils/sanitize_key.js';
+import { isPoolIdRef, isPoolRefLike } from '../modules/liquidity_pool_ref.js';
 import { loadBotMeta, loadBotSettings, computeBotKey } from '../analysis/bot_key_utils.js';
 import type { BotEntry } from '../modules/bot_settings.js';
 
@@ -16,9 +17,14 @@ interface BotTarget {
     meta: BotEntry;
 }
 
-/** Pool id targets accepted by chart commands: `133` or `1.19.x`. */
+/** Pool id targets (`133` / `1.19.x`) — delegates to the shared pool-ref rules. */
 function isPoolIdTarget(target: string): boolean {
-    return /^(1\.19\.\d+|\d+)$/.test(target.trim());
+    return isPoolIdRef(target);
+}
+
+/** True when a target could name a pool (numeric id or pool-token symbol). */
+function isPoolTarget(target: string): boolean {
+    return isPoolRefLike(target);
 }
 
 /** Find a bot by display name or by key (same rules as `dexbot tv`). */
@@ -50,9 +56,9 @@ function knownTargetsHint(includePool: boolean): string {
     const keys = knownBotKeys();
     const botHint = keys.length ? ` (${keys.slice(0, 8).join(', ')}${keys.length > 8 ? ', …' : ''})` : '';
     return includePool
-        ? `Use a bot name/key${botHint}, a pool id (e.g. 133), or AssetA/AssetB.`
+        ? `Use a bot name/key${botHint}, a pool id (133 / 1.19.133) or pool token, or AssetA/AssetB.`
         : `Use a bot name/key${botHint} or AssetA/AssetB.`;
 }
 
-export { isPoolIdTarget, findBotByTarget, knownBotKeys, knownTargetsHint };
+export { isPoolIdTarget, isPoolTarget, findBotByTarget, knownBotKeys, knownTargetsHint };
 export type { BotTarget };

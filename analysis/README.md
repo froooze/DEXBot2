@@ -348,9 +348,11 @@ identically offline.
 # Default example pair
 npm run analysis:liquidity -- --pair TOKENA/TOKENB
 
-# CLI wrapper: resolves a bot key or pair, then runs the same generator
+# CLI wrapper: resolves a bot key, a pool (id or pool token) or a pair
 dexbot liq TOKENA/TOKENB --range 0.25
 dexbot liq <bot-key>
+dexbot liq 1.19.123                 # pool by id
+dexbot liq <pool-token-symbol>      # pool by its LP share-asset symbol
 # Aliases: liqu, liquidity (canonical command: liquid)
 
 # Tighter window, deeper book, explicit pool
@@ -359,6 +361,10 @@ node dist/analysis/analyze_liquidity.js \
 
 # Any pair by symbol or asset id
 node dist/analysis/analyze_liquidity.js --base 1.3.123 --quote TOKENB --chart /tmp/lp.html
+
+# One pool by id or pool token (legs derived from the pool)
+node dist/analysis/analyze_liquidity.js --pool 1.19.123 --chart /tmp/pool.html
+node dist/analysis/analyze_liquidity.js --pool <pool-token-symbol> --json pool.json
 ```
 
 <details><summary><mark>Options (click to expand)</mark></summary>
@@ -367,7 +373,7 @@ node dist/analysis/analyze_liquidity.js --base 1.3.123 --quote TOKENB --chart /t
 |------|---------|-------------|
 | `--base` / `--quote` | — | Assets by symbol or `1.3.x` id (required via `--pair` or `--base` + `--quote`) |
 | `--pair <base>/<quote>` | — | Shorthand for `--base` + `--quote` (also accepts `:`) |
-| `--pool` | deepest pool | Restrict to one `1.19.x` liquidity pool |
+| `--pool` | deepest pool | One pool: id (`133` / `1.19.133`) or its pool token (LP share-asset symbol). With no `--base`/`--quote`, both legs come from the pool |
 | `--depth` | `300` | Order-book levels per side; fetched via `get_limit_orders` (commonly capped at 300) with a `get_order_book` fallback |
 | `--range` | `0.5` | Window half-width as a fraction of the center price |
 | `--steps` | `400` | Price samples across the window (exact book levels are always added) |
@@ -427,9 +433,10 @@ Generates a standalone TradingView-style HTML chart with candle OHLC, SMA, AMA, 
 
 # Recommended one-step: bot, pool, or pair (fetches candles + renders, default 3 months)
 dexbot tv <bot-key>
-dexbot tv 133
+dexbot tv 133                     # pool by id
+dexbot tv <pool-token-symbol>     # pool by its LP share-asset symbol
 dexbot tv TOKENA/TOKENB
-dexbot tv BTS/HONEST.USD --feed  # opt-in: MPA price-feed history instead of market candles
+dexbot tv BTS/HONEST.USD --feed   # opt-in: MPA price-feed history instead of market candles
 # Manual: bot-key (auto-resolves candle file and AMA settings)
 npm run analysis:tradingview -- --source market_adapter --bot-key <bot-key>
 
@@ -454,7 +461,8 @@ Interactive 4-panel chart for the asymmetric path: AMA slope plus Kalman confirm
 # Recommended one-step (advanced): bot, pool, or pair — fetches candles and renders,
 # same pipeline as `dexbot tv`, default 3 months
 dexbot dw <bot-key>
-dexbot dw 133 --month 6
+dexbot dw 133 --month 6           # pool by id
+dexbot dw <pool-token-symbol> --month 6
 dexbot dw TOKENA/TOKENB --month 1
 
 # Direct analyzer (own candle files, research knobs --alpha/--gain/--dw/--lb/--clip)

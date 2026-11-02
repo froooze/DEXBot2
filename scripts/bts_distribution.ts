@@ -71,6 +71,7 @@ import { pathToFileURL } from 'node:url';
 import { NODE_MANAGEMENT } from '../modules/constants.js';
 import { PATHS } from '../modules/paths.js';
 import { CLI_COLORS as colors } from '../modules/cli_colors.js';
+import { CLI_TAGS, clearProgressLine, savedLine, taggedProgress } from '../modules/cli_progress.js';
 import { toFileUrl } from '../analysis/chart_utils.js';
 
 // ---------------------------------------------------------------------------
@@ -91,7 +92,9 @@ const DEFAULT_HOLDERS = 100;
 const MAX_HOLDERS = 1000;
 // Console tag for status lines, matching the `[Liquidity]` / `[TradingView]`
 // style used by the other analysis entries.
-const LOG_TAG = '[Assets]';
+const LOG_TAG = CLI_TAGS.assets;
+const progress = taggedProgress(LOG_TAG);
+const clearProgress = clearProgressLine;
 
 // asset_api (get_asset_holders) is allowlisted on only a few public nodes; this
 // list mirrors the one in scripts/rich_list.ts, which solves the same problem.
@@ -1003,17 +1006,6 @@ async function sumCallOrderCollateral(
 // ---------------------------------------------------------------------------
 // Collection
 // ---------------------------------------------------------------------------
-
-function progress(enabled: boolean, message: string): void {
-    if (!enabled) return;
-    if (!process.stderr.isTTY) return;
-    process.stderr.write(`\r\x1b[2K${LOG_TAG} ${message}`);
-}
-
-function clearProgress(enabled: boolean): void {
-    if (!enabled || !process.stderr.isTTY) return;
-    process.stderr.write('\r\x1b[2K');
-}
 
 const COLORS = [
     '#5eb0ef', '#f0883e', '#3fb950', '#db61a2', '#a371f7', '#e3b341',
@@ -2596,7 +2588,7 @@ async function main(): Promise<void> {
             }, 2));
         } else {
             renderTerminal(report, opts);
-            if (opts.html) console.log(`\n${LOG_TAG} ✓ Report saved. Open report: (${toFileUrl(opts.html)})`);
+            if (opts.html) console.log(savedLine(LOG_TAG, 'Report', toFileUrl(opts.html)));
         }
     } finally {
         session.client.close();

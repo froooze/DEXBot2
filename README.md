@@ -339,11 +339,10 @@ dexbot enable {all|<bot>}  # Enable bot in config
 dexbot stat                # Runtime status (unlock or PM2)
 dexbot order [<bot>]       # Analyze order grids (--export → HTML to analysis/charts/)
 dexbot tv <bot|pool|A/B>   # TradingView 1h chart with AMA overlay (default: 3 months)
-dexbot liq <bot|A/B>       # Liquidity depth chart (canonical: liquid; aliases: liqu, liquidity)
+dexbot liq <bot|pool|A/B>  # Liquidity depth chart; pool = id or pool token (canonical: liquid)
 dexbot pnl <bot|account>   # HTML PnL report (--month N, optional --pair A/B)
 dexbot credit [<bot>]      # Live summed MPA + borrowed-credit positions
-dexbot asset bts           # BTS supply distribution + HTML report (shorthand: dexbot a bts)
-dexbot asset <sym>         # Per-token supply distribution; `dexbot a <sym>` is the shorthand
+dexbot asset <bts/token>   # Supply distribution + HTML report (short: dexbot a <bts/token>)
 dexbot export <bot>        # Export trades + settings (CSV/JSON) for analysis/
 
 dexbot update              # Update DEXBot2

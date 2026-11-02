@@ -2,25 +2,26 @@
 'use strict';
 /**
  * Usage:
- *   dexbot liquid <bot|AssetA/AssetB> [--range F] [--depth N] [--steps N]
- *                 [--pool 1.19.x] [--chart <path>] [--json <path>] [--quiet]
+ *   dexbot liquid <bot|pool|AssetA/AssetB> [--range F] [--depth N] [--steps N]
+ *                 [--pool <ref>] [--chart <path>] [--json <path>] [--quiet]
  *
  * Thin CLI wrapper behind the liquidity depth chart generator
- * (analysis/analyze_liquidity.js): resolve a bot name/key or a pair target to
- * its base/quote symbols, then render the live order-book + AMM pool chart.
+ * (analysis/analyze_liquidity.js): resolve a bot name/key, a pool (id or pool
+ * token) or a pair target, then render the live order-book + AMM pool chart.
  *
  * Supported targets:
  *   - bot name or key from profiles/bots.json (uses the bot's assetA/assetB)
+ *   - pool id (133 / 1.19.133) or pool token (LP share-asset symbol)
  *   - AssetA/AssetB symbols (case-insensitive; normalized to UPPERCASE)
  *
- * The analyzer owns the chain work, depth sampling and HTML rendering; this
- * entry only resolves the target and forwards the liquidity options.
+ * The analyzer owns the chain work, depth sampling, pool resolution and HTML
+ * rendering; this entry only routes the target and forwards the options.
  */
 
 import { pathToFileURL } from 'node:url';
 import { getErrorMessage } from '../modules/utils/errors.js';
 import { splitPairTarget, normalizeAssetSymbol } from '../modules/utils/asset_symbols.js';
-import { findBotByTarget, knownTargetsHint } from './chart_targets.js';
+import { findBotByTarget, isPoolTarget, knownTargetsHint } from './chart_targets.js';
 import { runAnalysisScript } from './analysis_runner.js';
 
 interface LiquidConfig {
@@ -36,20 +37,27 @@ interface ResolvedPair {
     botKey?: string;
 }
 
+/** Pool target: an id (`133` / `1.19.133`) or a pool token symbol. */
+interface ResolvedPoolRef {
+    pool: string;
+}
+
 const PASS_THROUGH_FLAGS = new Set(['--range', '--depth', '--steps', '--pool', '--chart', '--json']);
 
 function printUsage(): void {
-    console.log('Usage: dexbot liquid <bot|AssetA/AssetB> [options]');
+    console.log('Usage: dexbot liquid <bot|pool|AssetA/AssetB> [options]');
     console.log('Live cumulative-depth chart blending the limit-order book and the AMM pool (uPlot).');
     console.log('');
     console.log('  <bot>          Bot name or key from profiles/bots.json');
+    console.log('  <pool>         Pool id (133 / 1.19.133) or its pool token (LP share-asset symbol)');
     console.log('  AssetA/AssetB  Pair symbols, e.g. TOKENA/TOKENB (case-insensitive)');
     console.log('');
     console.log('Options:');
     console.log('  --range <f>      Price window half-width (default 0.5 => +/-50%)');
     console.log('  --depth <n>      Order-book levels per side (default 300; node cap commonly 300)');
     console.log('  --steps <n>      Price samples across the window (default 400)');
-    console.log('  --pool <1.19.x>  Restrict to a specific pool (default: deepest pool)');
+    console.log('  --pool <ref>     Restrict to one pool: id (133 / 1.19.133) or pool token');
+    console.log('                   (default: deepest pool of the resolved pair)');
     console.log('  --chart <path>   Override the output HTML path');
     console.log('  --json <path>    Optional JSON dump of the sampled depth series');
     console.log('  --quiet          Suppress the console summary');
@@ -87,7 +95,7 @@ function parseArgs(argv: string[]): LiquidConfig {
     return { target, analyzerArgs, help };
 }
 
-function resolveTarget(target: string): ResolvedPair {
+function resolveTarget(target: string): ResolvedPair | ResolvedPoolRef {
     if (target.includes('/')) {
         const parts = splitPairTarget(target);
         if (parts.length !== 2) {
@@ -97,11 +105,33 @@ function resolveTarget(target: string): ResolvedPair {
     }
 
     const hit = findBotByTarget(target);
-    if (!hit) throw new Error(`Unknown target "${target}". ${knownTargetsHint(false)}`);
-    const base = normalizeAssetSymbol(hit.meta.assetA);
-    const quote = normalizeAssetSymbol(hit.meta.assetB);
-    if (!base || !quote) throw new Error(`Bot '${target}' has no assetA/assetB pair in profiles/bots.json`);
-    return { base, quote, botName: hit.meta.name, botKey: hit.botKey };
+    if (hit) {
+        const base = normalizeAssetSymbol(hit.meta.assetA);
+        const quote = normalizeAssetSymbol(hit.meta.assetB);
+        if (!base || !quote) throw new Error(`Bot '${target}' has no assetA/assetB pair in profiles/bots.json`);
+        return { base, quote, botName: hit.meta.name, botKey: hit.botKey };
+    }
+
+    // Not a bot and not a pair: a pool reference. Ids and pool tokens are both
+    // accepted (the analyzer resolves them on chain), so only references that
+    // could not name a pool at all fail locally.
+    if (!isPoolTarget(target)) {
+        throw new Error(`Unknown target "${target}". ${knownTargetsHint(true)}`);
+    }
+    return { pool: target };
+}
+
+/** Analyzer arguments for a resolved target (`--pair` or `--pool`). */
+function analyzerArgsFor(target: ResolvedPair | ResolvedPoolRef, options: string[]): string[] {
+    if (!('pool' in target)) {
+        return ['--pair', `${target.base}/${target.quote}`, ...options];
+    }
+    // The target already names the pool; a second --pool would silently chart a
+    // different one (the analyzer keeps the last value), so reject it instead.
+    if (options.includes('--pool')) {
+        throw new Error('Target already names a pool; drop --pool (or use AssetA/AssetB with --pool)');
+    }
+    return ['--pool', target.pool, ...options];
 }
 
 async function run(): Promise<void> {
@@ -112,10 +142,10 @@ async function run(): Promise<void> {
         return;
     }
 
-    const pair = resolveTarget(target);
+    const resolved = resolveTarget(target);
     runAnalysisScript(
         ['analyze_liquidity.js'],
-        ['--pair', `${pair.base}/${pair.quote}`, ...analyzerArgs],
+        analyzerArgsFor(resolved, analyzerArgs),
         'Liquidity chart generator',
     );
 }
@@ -128,4 +158,4 @@ if (invoked) {
     });
 }
 
-export { parseArgs, resolveTarget, printUsage, run };
+export { parseArgs, resolveTarget, analyzerArgsFor, printUsage, run };

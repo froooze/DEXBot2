@@ -253,9 +253,9 @@ the canonical name is preferred in scripts and docs.
 | `dexbot order [<bot>]` | — | Analyze only the specified bot's order grid |
 | `dexbot credit` | — | Live summed MPA + borrowed-credit positions per asset per bot (`[<bot>]`) |
 | `dexbot rich <asset...>` | — | Top holder(s) per asset via the chain asset-holders API (`--top N`, `--json`/`--csv`) |
-| `dexbot tv <target>` | — | TradingView 1h chart for `<bot|pool-id|AssetA/AssetB>` over `--month N` (default 3) |
+| `dexbot tv <target>` | — | TradingView 1h chart for `<bot|pool|AssetA/AssetB>` over `--month N` (default 3); pool = id (133 / 1.19.133) or pool token (LP share-asset symbol) |
 | `dexbot dw <target>` | — | Dynamic-weight research chart: same targets/flags as `tv` |
-| `dexbot liquid <target>` | `liq` (default shorthand), `liqu`, `liquidity` | Blended order-book + AMM pool liquidity depth chart for `<bot|AssetA/AssetB>` (`--range`, `--depth`, `--steps`) |
+| `dexbot liquid <target>` | `liq` (default shorthand), `liqu`, `liquidity` | Blended order-book + AMM pool liquidity depth chart for `<bot|pool|AssetA/AssetB>` (`--range`, `--depth`, `--steps`); a pool target (id or pool token) derives both legs |
 | `dexbot pnl <account>` | — | HTML PnL report for a bot/account over `--month N`, optional `--pair BASE/QUOTE` filter |
 | `dexbot asset <bts\|symbol\|1.3.x>` | `a` | Supply distribution: `bts` for the core asset (collateral, pools, locks, residual), a bare symbol/id for an issued asset; `--json`, `--html`/`--no-html`, `--detail`, `--holders` |
 | `dexbot git` | — | Analyze repository git history and write an added/deleted-lines HTML chart (`repo-stats.html`; source checkouts only) |

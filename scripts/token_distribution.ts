@@ -51,6 +51,7 @@ import { pathToFileURL } from 'node:url';
 import { NODE_MANAGEMENT } from '../modules/constants.js';
 import { PATHS } from '../modules/paths.js';
 import { CLI_COLORS as colors } from '../modules/cli_colors.js';
+import { CLI_TAGS, clearProgressLine, savedLine, taggedProgress } from '../modules/cli_progress.js';
 import { toFileUrl } from '../analysis/chart_utils.js';
 
 // ---------------------------------------------------------------------------
@@ -69,7 +70,9 @@ const DEFAULT_CONCURRENCY = 12;
 const DEFAULT_HTML = path.join(PATHS.ANALYSIS.CHARTS_DIR, 'token-distribution.html');
 // Console tag for status lines, matching the `[Liquidity]` style used by the
 // other analysis entries.
-const LOG_TAG = '[Assets]';
+const LOG_TAG = CLI_TAGS.assets;
+const progress = taggedProgress(LOG_TAG);
+const clearProgress = clearProgressLine;
 
 // asset_api (get_asset_holders) is allowlisted on only a few public nodes; this
 // mirrors scripts/rich_list.ts and scripts/bts_distribution.ts.
@@ -863,16 +866,6 @@ function esc(text: string): string {
 // ---------------------------------------------------------------------------
 // Collection
 // ---------------------------------------------------------------------------
-
-function progress(enabled: boolean, message: string): void {
-    if (!enabled || !process.stderr.isTTY) return;
-    process.stderr.write(`\r\x1b[2K${LOG_TAG} ${message}`);
-}
-
-function clearProgress(enabled: boolean): void {
-    if (!enabled || !process.stderr.isTTY) return;
-    process.stderr.write('\r\x1b[2K');
-}
 
 interface PriceLevel {
     token: bigint;
@@ -2270,7 +2263,7 @@ async function main(): Promise<void> {
             }, 2));
         } else {
             renderTerminal(report, opts);
-            if (htmlPath) console.log(`\n${LOG_TAG} ✓ Report saved. Open report: (${toFileUrl(htmlPath)})`);
+            if (htmlPath) console.log(savedLine(LOG_TAG, 'Report', toFileUrl(htmlPath)));
         }
     } finally {
         session.client.close();

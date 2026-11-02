@@ -129,7 +129,7 @@ const {
     resolveRawBotEntries,
     saveSettingsFile,
 } = require('./modules/bot_settings');
-const { buildRuntimeScriptArgs } = require('./modules/launcher/runtime_entry');
+const { buildRuntimeScriptPath, runRuntimeScript } = require('./modules/launcher/runtime_entry');
 const { parseWorkerArgs, LAUNCHER_WORKER_COMMAND } = require('./modules/launcher/launch_modes');
 const { detectRuntimeMode, runtimeControlHelp, runtimeModeLabel, checkStatusTarget, resolveStatusRoute } = require('./modules/launcher/runtime_mode');
 const { PATHS, getHomeProfilesDir, getRecalculateTriggerFile, printRelocationNotices } = require('./modules/paths');
@@ -179,8 +179,8 @@ const CLI_EXAMPLES = [
     { title: 'Analyze order grids', command: 'dexbot order', notes: 'Spread, increment, and funds; --export for HTML.' },
     { title: 'Show live credit positions', command: 'dexbot credit', notes: 'Summed MPA + borrowed-credit positions per bot.' },
     { title: 'Asset rich list', command: 'dexbot rich <asset> [<asset...>]', notes: 'Top holder(s) per asset from the chain asset holders API.' },
-    { title: 'Chart a bot, pool, or pair', command: 'dexbot tv <bot|pool-id|AssetA/AssetB> --month 3', notes: 'OHLC chart; --feed charts MPA price-feed history.' },
-    { title: 'Liquidity depth chart', command: 'dexbot liq <bot|AssetA/AssetB>', notes: 'Order-book + AMM pool cumulative depth; --range/--depth/--steps. Canonical: liquid; aliases: liqu, liquidity.' },
+    { title: 'Chart a bot, pool, or pair', command: 'dexbot tv <bot|pool|AssetA/AssetB> --month 3', notes: 'OHLC chart; pool = id (133) or pool token (LP share asset); --feed charts MPA price-feed history.' },
+    { title: 'Liquidity depth chart', command: 'dexbot liq <bot|pool|AssetA/AssetB>', notes: 'Order-book + AMM pool cumulative depth; pool = id or pool token. Canonical: liquid; aliases: liqu, liquidity.' },
     { title: 'Asset supply distribution', command: 'dexbot a bts', notes: 'Where BTS sits (collateral, pools, locks, residual) + HTML report. A bare symbol (dexbot a <symbol>) covers an issued asset; canonical: asset.' },
     { title: 'PnL report', command: 'dexbot pnl <bot|account> --month 3 [--pair BASE/QUOTE]', notes: 'Self-contained HTML PnL report for the resolved bot or chain account.' }
 ];
@@ -240,9 +240,9 @@ function printCLIUsage() {
             ['export <bot>', 'Export bot trades/settings to CSV/JSON.'],
             ['credit [<bot>]', 'Show live MPA and borrowed-credit positions.'],
             ['rich <asset...>', 'Per-asset rich list / top holder; --top N, --json.'],
-            ['tv <target>', 'OHLC chart for <bot|pool-id|AssetA/AssetB>; --month N (default 3), --feed for MPA price-feed history.'],
+            ['tv <target>', 'OHLC chart for <bot|pool|AssetA/AssetB> (pool = id or pool token); --month N (default 3), --feed for MPA price-feed history.'],
             ['dw <target>', 'Dynamic-weight research chart; same targets and flags as tv.'],
-            ['liq <target>', 'Liquidity depth chart for <bot|AssetA/AssetB>; --range, --depth, --steps (canonical: liquid; aliases: liqu, liquidity).'],
+            ['liq <target>', 'Liquidity depth chart for <bot|pool|AssetA/AssetB> (pool = id or pool token); --range, --depth, --steps (canonical: liquid; aliases: liqu, liquidity).'],
             ['asset <bts|symbol>', 'Supply distribution: bts = core asset, bare symbol/id = issued asset; --json, --html (shorthand: a, e.g. dexbot a bts).'],
             ['pnl <account>', 'HTML PnL report for a bot or account; --month N, optional --pair BASE/QUOTE filter.'],
         ]],
@@ -908,6 +908,41 @@ async function exportBotTrades(botName: string | undefined) {
 }
 
 /**
+ * Script-backed commands: command name → entry-point segments under the code
+ * root. Every entry owns its own argument parsing and usage text (the
+ * HELP_OWNING_COMMANDS set forwards `--help` to it), so the CLI only spawns it
+ * and mirrors the exit code.
+ */
+const SCRIPT_COMMANDS: Record<string, string[]> = {
+    order: ['scripts', 'analyze-orders'],
+    credit: ['scripts', 'analyze-credit'],
+    rich: ['scripts', 'rich_list'],
+    git: ['scripts', 'analyze-git'],
+    tv: ['scripts', 'tv'],
+    dw: ['scripts', 'dw'],
+    liquid: ['scripts', 'liquid'],
+    pnl: ['scripts', 'pnl'],
+    asset: ['scripts', 'asset'],
+};
+
+/**
+ * Spawn a runtime entry point with inherited stdio and exit with its status.
+ * `rest` defaults to the CLI arguments after the command.
+ *
+ * Returns `true` after `process.exit` so a caller whose exit is intercepted
+ * (tests) still stops the command instead of falling through the switch.
+ */
+function exitWithRuntimeScript(segments: string[], label: string, rest: string[] = cliArgs.slice(1)): true {
+    const status = runRuntimeScript(
+        buildRuntimeScriptPath(__dirname, segments),
+        rest,
+        { label, cwd: PATHS.PROJECT_ROOT },
+    );
+    process.exit(status);
+    return true;
+}
+
+/**
  * Parse and execute CLI commands.
   * Supported commands: test, drystart, reset, default, disable, enable, key, bot, pm2, update, export, order, credit, tv, dw, liquid, pnl, asset, clear, status, unlock, help
  * @returns {Promise<boolean>} True if a command was handled, false otherwise
@@ -1006,32 +1041,12 @@ async function handleCLICommands() {
              }
              process.exit(0);
              return true;
-        case 'pm2': {
-            const { spawnSync } = require('child_process') as typeof import('node:child_process');
+        case 'pm2':
             // Forward the remaining CLI args to pm2.js so subcommands work
             // (`dexbot pm2 stop <bot>`, `dexbot pm2 restart all`, `dexbot pm2
-            // help`...). Previously the subcommand was silently dropped and the
-            // full-setup path ran, so `dexbot pm2 start X` started ALL bots and
-            // `dexbot pm2 stop X` no-oped into a full setup.
-            // buildRuntimeScriptArgs resolves the pm2 entry point under the
-            // dist-only runtime layout (dist/pm2.js); plain node executes
-            // compiled entries since the tsx removal.
-            const pm2Args = buildRuntimeScriptArgs({
-                codeRoot: __dirname,
-                scriptSegments: ['pm2'],
-                scriptArgs: cliArgs.slice(1),
-            });
-            const result = spawnSync(Config.EXEC_PATH, pm2Args, {
-                cwd: PATHS.PROJECT_ROOT,
-                stdio: 'inherit',
-            });
-            if (result.error) {
-                console.error(`pm2: ${result.error.message}`);
-                process.exit(1);
-            }
-            process.exit(result.status ?? 0);
-            return true;
-        }
+            // help`...). A dropped subcommand used to make `dexbot pm2 start X`
+            // start ALL bots and `dexbot pm2 stop X` no-op into a full setup.
+            return exitWithRuntimeScript(['pm2'], 'pm2');
         case 'update':
             setSuppressConnectionLog(true);
             require('./scripts/update');
@@ -1041,120 +1056,24 @@ async function handleCLICommands() {
             await exportBotTrades(target);
             process.exit(0);
             return true;
-        case 'order': {
-            const { spawnSync } = require('child_process') as typeof import('node:child_process');
-            const scriptArgs = buildRuntimeScriptArgs({
-                codeRoot: __dirname,
-                scriptSegments: ['scripts', 'analyze-orders'],
-                scriptArgs: cliArgs.slice(1),
-            });
-            const result = spawnSync(Config.EXEC_PATH, scriptArgs, {
-                cwd: PATHS.PROJECT_ROOT,
-                stdio: 'inherit',
-            });
-            if (result.error) {
-                console.error(`order: ${result.error.message}`);
-                process.exit(1);
-            }
-            process.exit(result.status ?? 0);
-            return true;
-        }
-        case 'credit': {
-            const { spawnSync } = require('child_process') as typeof import('node:child_process');
-            const scriptArgs = buildRuntimeScriptArgs({
-                codeRoot: __dirname,
-                scriptSegments: ['scripts', 'analyze-credit'],
-                scriptArgs: cliArgs.slice(1),
-            });
-            const result = spawnSync(Config.EXEC_PATH, scriptArgs, {
-                cwd: PATHS.PROJECT_ROOT,
-                stdio: 'inherit',
-            });
-            if (result.error) {
-                console.error(`credit: ${result.error.message}`);
-                process.exit(1);
-            }
-            process.exit(result.status ?? 0);
-            return true;
-        }
-        case 'rich': {
-            const { spawnSync } = require('child_process') as typeof import('node:child_process');
-            const scriptArgs = buildRuntimeScriptArgs({
-                codeRoot: __dirname,
-                scriptSegments: ['scripts', 'rich_list'],
-                scriptArgs: cliArgs.slice(1),
-            });
-            const result = spawnSync(Config.EXEC_PATH, scriptArgs, {
-                cwd: PATHS.PROJECT_ROOT,
-                stdio: 'inherit',
-            });
-            if (result.error) {
-                console.error(`rich: ${result.error.message}`);
-                process.exit(1);
-            }
-            process.exit(result.status ?? 0);
-            return true;
-        }
-        case 'git': {
-            // Repository statistics analyzer (scripts/analyze-git.ts): parses
-            // git history and writes analysis/charts/repo-stats.html. Git-only;
-            // it requires a source checkout (.git present).
-            const { spawnSync } = require('child_process') as typeof import('node:child_process');
-            const scriptArgs = buildRuntimeScriptArgs({
-                codeRoot: __dirname,
-                scriptSegments: ['scripts', 'analyze-git'],
-            });
-            const result = spawnSync(Config.EXEC_PATH, scriptArgs, {
-                cwd: PATHS.PROJECT_ROOT,
-                stdio: 'inherit',
-            });
-            if (result.error) {
-                console.error(`git: ${result.error.message}`);
-                process.exit(1);
-            }
-            process.exit(result.status ?? 0);
-            return true;
-        }
+        case 'order':
+        case 'credit':
+        case 'rich':
+        case 'git':
         case 'tv':
         case 'dw':
         case 'liquid':
         case 'pnl':
-        case 'asset': {
-            const { spawnSync } = require('child_process') as typeof import('node:child_process');
-            const scriptArgs = buildRuntimeScriptArgs({
-                codeRoot: __dirname,
-                scriptSegments: ['scripts', command],
-                scriptArgs: cliArgs.slice(1),
-            });
-            const result = spawnSync(Config.EXEC_PATH, scriptArgs, {
-                cwd: PATHS.PROJECT_ROOT,
-                stdio: 'inherit',
-            });
-            if (result.error) {
-                console.error(`${command}: ${result.error.message}`);
-                process.exit(1);
-            }
-            process.exit(result.status ?? 0);
-            return true;
-        }
-        case 'unlock': {
-            const { spawnSync } = require('child_process') as typeof import('node:child_process');
-            // buildRuntimeScriptArgs resolves the unlock entry point for the
-            // active runtime layout: dist/unlock.js when compiled, unlock.ts
-            // in source layouts. A hard-coded dist path silently no-ops
-            // (ENOENT -> exit 0), hiding the launcher.
-            const unlockArgs = buildRuntimeScriptArgs({
-                codeRoot: __dirname,
-                scriptSegments: ['unlock'],
-                scriptArgs: cliArgs.slice(1),
-            });
-            const result = spawnSync(Config.EXEC_PATH, unlockArgs, {
-                cwd: PATHS.PROJECT_ROOT,
-                stdio: 'inherit',
-            });
-            process.exit(result.status ?? 0);
-            return true;
-        }
+        case 'asset':
+            // Registered analysis/utility entry points; each one owns its
+            // argument parsing, usage text and `--help` (see
+            // HELP_OWNING_COMMANDS), so the CLI only forwards argv.
+            return exitWithRuntimeScript(SCRIPT_COMMANDS[command], command);
+        case 'unlock':
+            // Resolved through buildRuntimeScriptPath for the active runtime
+            // layout (dist/unlock.js when compiled). A hard-coded dist path used
+            // to no-op silently (ENOENT -> exit 0), hiding the launcher.
+            return exitWithRuntimeScript(['unlock'], 'unlock');
         case 'clear':
         case 'clear-orders':
         case 'clear-market-adapter':
@@ -1234,7 +1153,6 @@ async function handleCLICommands() {
                 process.exit(code);
                 return true;
             };
-            const { spawnSync } = require('child_process') as typeof import('node:child_process');
 
             // Centralized detection (modules/launcher/runtime_mode.ts), shared
             // with the mode-aware help output so the two cannot disagree.
@@ -1244,16 +1162,12 @@ async function handleCLICommands() {
             // so the report matches the help banner; otherwise a live unlock
             // runtime is shown by delegating to `unlock status`.
             if (resolveStatusRoute(runtimeInfo) === 'unlock') {
-                const unlockArgs = buildRuntimeScriptArgs({
-                    codeRoot: __dirname,
-                    scriptSegments: ['unlock'],
-                    scriptArgs: ['status', ...(target ? [target] : [])],
-                });
-                const result = spawnSync(Config.EXEC_PATH, unlockArgs, {
-                    cwd: PATHS.PROJECT_ROOT,
-                    stdio: 'inherit',
-                });
-                return finish(result.status ?? 0);
+                const status = runRuntimeScript(
+                    buildRuntimeScriptPath(__dirname, ['unlock']),
+                    ['status', ...(target ? [target] : [])],
+                    { label: 'unlock', cwd: PATHS.PROJECT_ROOT },
+                );
+                return finish(status);
             }
 
             // status is whole-runtime on every surface. With no unlock bot
@@ -1331,20 +1245,11 @@ async function handleCLICommands() {
         case 'delete':
         case 'stop':
         case 'restart':
-        case 'reload': {
-            const { spawnSync } = require('child_process') as typeof import('node:child_process');
-            const unlockArgs = buildRuntimeScriptArgs({
-                codeRoot: __dirname,
-                scriptSegments: ['unlock'],
-                scriptArgs: [command, ...cliArgs.slice(1)],
-            });
-            const result = spawnSync(Config.EXEC_PATH, unlockArgs, {
-                cwd: PATHS.PROJECT_ROOT,
-                stdio: 'inherit',
-            });
-            process.exit(result.status ?? 0);
-            return true;
-        }
+        case 'reload':
+            // The unlock runtime owns every lifecycle verb (stop/restart/
+            // reload/delete) for both modes, so the CLI forwards the verb plus
+            // the remaining arguments and mirrors the exit code.
+            return exitWithRuntimeScript(['unlock'], command, [command, ...cliArgs.slice(1)]);
         case 'help':
             printCLIUsage();
             process.exit(0);

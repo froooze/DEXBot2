@@ -38,6 +38,8 @@ modules/
 ├── cli_start_onboarding.ts        first-run setup routing for `dexbot start`
 ├── cli_start_output.ts            launcher notice formatting
 ├── cli_colors.ts                  shared CLI color helpers
+├── cli_progress.ts                shared `[Tag]` progress/saved status lines
+├── liquidity_pool_ref.ts          pool id / pool token resolution (shared by liq/tv/dw)
 ├── credential_runtime.ts          daemon socket/path helpers + private-path security
 ├── credential_policy.ts           signing policy validation
 ├── credential_session_cache.ts    encrypted session cache
