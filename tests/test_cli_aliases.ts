@@ -41,8 +41,10 @@ async function testLiquidSpellingsForwardHelp() {
 async function testHelpListsDefaultShorthand() {
     const res = await dexbot(['--help']);
     assert.strictEqual(res.status, 0, `dexbot --help should exit 0, got ${res.status}: ${res.stderr}`);
-    assert.match(res.stdout, /liq <target>\s+Liquidity depth chart/);
-    assert.match(res.stdout, /canonical: liquid; aliases: liqu, liquidity/);
+    // `liquid` is the command row and the shorthand lives in its description,
+    // so the canonical name and the aliases stay on one line.
+    assert.match(res.stdout, /liquid <target>\s+Liquidity depth chart/);
+    assert.match(res.stdout, /aliases: liq, liqu, liquidity/);
 }
 
 async function run() {
