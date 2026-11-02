@@ -225,6 +225,15 @@ Reconcile Phase 1 runs under `_gridLock` with no side effects on the frozen mast
 
 Three of the six guarded emission sites are reconcile sites (`RECONCILE-CREATE`, `RECONCILE-UPDATE`, `STARTUP-CREATE` in `grid_reconcile_internal.ts`): every op reconcile emits is checked against the slot's genesis level and an off-grid emission is skipped, not broadcast — see [`GRID_PRICE_INVARIANT.md`](GRID_PRICE_INVARIANT.md). The coupling is bidirectional: the invariant guard's persistent-rejection escalation and the deferred-hold escalation both exit through the same structural resync (debounced reload → full reset) described here, and a full reset's update-first reconcile emits the rail's genesis level, so the guard does not block its own resolution.
 
+### Fill Discipline (unsettled fills + last-fill placement)
+
+Reconcile derives its window from the **master grid**, which is only as fresh as the last applied fill. Two gates keep a top-up from being derived from geometry that has not absorbed the latest trades (both added after the 2026-11-02 buy-higher incident: 9 buy-lower violations, 23.5% of the window's BTS):
+
+- **Unsettled-fill gate** (`hasUnsettledFills`, `utils/system.ts`): while fills are queued (`_incomingFillQueue`), draining (`_deferredFillsPending`), in flight (`_fillBatchInFlight`) or owed a crawl (`_pendingFillCrawls`), `maybeRunTargetedDriftReconciliation` defers the targeted reconcile entirely and `_reconcileStartupSide` defers only the **window top-up** creates (1:1 repairs — cancelled-slot replacement, vacated-rail refill — still run). The master still counts filled slots as ACTIVE in that window, so a top-up would restore the expensive end of the rail.
+- **Last-fill placement guard** (`isLastFillPlacementBlocked`, `utils/system.ts`): every reconcile placement (create in `_createOrderFromGrid` and the batch create path, plus the re-pricing relocation in `_prepareStartupUpdatePlan`) is refused when it sits on the wrong side of the last fill **or on the same grid level** (within half an increment — a slot level and its execution price differ by rounding). A same-price relocation is an adoption, not a placement, and is exempt. `_pickVirtualSlotsToActivate` applies the same predicate so the pick budget rolls to the next level down/up instead of being spent on a level the create would refuse — the filled level is never re-stamped same-side (the "rotate to bottom BUY / counter SELL" behaviour).
+
+A fill whose order id no longer sits on an ACTIVE/PARTIAL slot (its slot was virtualised by a cleanup or a refused-commit adoption) is no longer dropped: `SyncEngine._absorbUnmatchedFill` attributes it to the slot that still owns the chain id and records the **pivot + owed crawl from the real execution price**. Without it the pivot stays on a stale, higher fill and the direction rule then permits re-buys above the market.
+
 ### Truncated-Read Ambiguity (since 1.4.8)
 
 Every chain read feeding an absence/surplus decision goes through `readOpenOrdersGuarded`. A truncated snapshot is always unreadable. An empty snapshot is also unreadable at callers that set `deferEmpty: true`; the Phase-2 cancellation pre-read intentionally accepts a complete empty result, executes no plan, and leaves all remaining state for the normal reconcile paths:
@@ -287,6 +296,8 @@ Commit `e64db685` replaced 6 single-value boolean state fields with refcounts/st
 | `tests/test_async_lock_force_release.ts` | Nested multi-lock re-entrancy |
 | `tests/test_targeted_drift_reconcile.ts` | Active-order shortfall triggers sync |
 | `tests/test_edge_orders.ts` | Reserve startup coverage: fully-placed matched-surplus cancels, orphan+matched ordering, at-target silence, plan/execute parity, shelf-order survival, reserve-deficit trigger (`buy reserves 0/2`) with filled/disabled/empty-budget silence, window-exclusion counting |
+| `tests/test_grid_fill_discipline.ts` | Placement predicate (direction + same grid level), picker fall-through on both sides, create refusal before broadcast, window top-up deferral while fills are unsettled |
+| `tests/test_fill_attribution_virtual_slot.ts` | Fill absorbed into a virtualised slot: pivot + owed crawl from the execution price, unknown-order/no-stacking/dryRun cases, incident ladder refusals, `hasUnsettledFills` states |
 | `tests/repro_phantom_orders.ts` | Phantom order prevention |
 
 ---

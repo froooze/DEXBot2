@@ -334,6 +334,23 @@ re-plan retries). Kept separate from the generic `refusedCommitCount`.
 
 ---
 
+## Fill discipline at the reconcile / placement sites
+
+Added with the buy-higher fix (2026-11-02: 9 buy-lower violations, 23.5% of the
+window's BTS). See `docs/GRID_RECONCILE.md#fill-discipline-unsettled-fills--last-fill-placement`.
+
+| Message | Meaning |
+|---------|---------|
+| `[SYNC] Fill for order <id> attributed to virtualised slot <slot> (<side> @ P): pivot + owed boundary crawl recorded, accounting already booked` | The fill's order id had no ACTIVE/PARTIAL slot any more (its slot was virtualised by a cleanup or a refused-commit adoption). The fill is still a real trade, so the LAST-FILL-GUARD pivot and the owed boundary crawl are recorded from the execution price. Previously this was a silent `ignored: order not found in active grid` at `debug` — the stale pivot it left behind is what let the reconciler re-buy above the market |
+| `[TARGETED-SYNC] Deferring <context> reconciliation: <reason> — the rail must absorb the fills before it is topped up` | A targeted reconcile was requested while fills are queued/draining/in flight/owed a crawl. No cooldown is stamped, so it retries as soon as they settle |
+| `Startup: Deferring N <side> window top-up create(s): <reason> — the rail must absorb the fills before it is refilled` | Same gate on the reconcile side. 1:1 repairs (cancelled-slot replacement, vacated-rail refill) are still planned; only the window top-up waits |
+| `Startup: <side> pick skipped N slot(s) on the wrong side of the last fill (pivot P); picked X/Y` | The activation picker refused candidates the placement guard would block, so the pick rolls to the next level down (BUY) / up (SELL). `picked X/Y` below target means the rail had no legal level left this cycle |
+| `[_createOrderFromGrid] SKIP (LAST-FILL-GUARD): Create for <slot> at P on the wrong side of the last fill F (<reason>); the rail must crawl before this level is refilled` | A reconcile create was refused before any broadcast. `reason` is `direction` (wrong side) or `same-level` (within half a grid step — a slot level and its execution price differ by rounding) |
+| `Startup: Skip create <label> (LAST-FILL-GUARD) - price P ...` | Same refusal in the batch create path |
+| `[STARTUP-LAST-FILL-GUARD] Skipping relocation update <orderId> -> <slot>: target ... is on the wrong side of the last fill F (<reason>); re-align on the next reconcile cycle` | A re-pricing relocation is a placement too. Same-price relocations are adoptions and are exempt |
+
+---
+
 ## Fill History Scan Profiling
 
 The `Subscriptions` logger emits `fetchFillHistoryEntries: maxPages (X) reached` at `debug` level when the fill-history scan reaches its configured page cap. On a busy account this is **normal** — the scan simply catches up over multiple polling cycles rather than in a single pass.

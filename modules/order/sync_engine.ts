@@ -1588,6 +1588,111 @@ class SyncEngine {
         return null;
     }
 
+    /**
+     * Resolve the slot that still OWNS a chain order id, in ANY state.
+     *
+     * Distinct from _findMatchingGridOrder on purpose: that one only accepts
+     * ACTIVE/PARTIAL slots (a fill must mutate a live order). A fill can also
+     * arrive for an order whose slot was already virtualised by an earlier
+     * cleanup/rotation (sync-cleanup-phantom, refused-commit adoption) while
+     * the order was still resting on chain — the chain id is then the only
+     * remaining identity.
+     */
+    _findAnyGridOrderByChainId(mgr: OrderManagerLike, orderId: string | null | undefined): ManagedOrder | null {
+        if (!orderId) return null;
+        for (const gridOrder of mgr.orders.values()) {
+            if (gridOrder && gridOrder.orderId === orderId) return gridOrder;
+        }
+        return null;
+    }
+
+    /**
+     * Absorb a fill whose order id has no ACTIVE/PARTIAL slot ("order not found
+     * in active grid").
+     *
+     * WHY THIS EXISTS — the incident this fixes: a 120s stale broadcast region
+     * deferred the fill queue; the post-fill targeted reconcile then ran against
+     * a master that still held the filled slots as ACTIVE and re-created 8 BUYs
+     * at the TOP of the un-crawled rail (1282.78 -> 1310.04), i.e. ABOVE the
+     * market, and they filled within seconds (9 buy-lower violations, 23.5% of
+     * the window's BTS). The cascade started here: those fills were dropped
+     * ("order not found in active grid") AFTER their accounting was booked, so
+     * neither the LAST-FILL-GUARD pivot nor the owed boundary crawl learned the
+     * real execution price. Every downstream geometry gate was then blind — the
+     * direction rule compared against a stale, HIGHER pivot and let the buys
+     * through.
+     *
+     * This method only records what the fill proves (pivot + owed crawl from the
+     * REAL execution price). It never mutates the slot or the accounting: the
+     * funds were already booked by processFillAccounting, and the slot is
+     * intentionally no longer live.
+     *
+     * @returns {boolean} true when the fill was attributed to a known slot.
+     */
+    _absorbUnmatchedFill(mgr: OrderManagerLike, params: {
+        orderId: string | null | undefined;
+        paysAssetId?: string | null;
+        paysAmountRaw?: unknown;
+        receivesAssetId?: string | null;
+        receivesAmountRaw?: unknown;
+        isPartial?: boolean;
+    }): boolean {
+        const { orderId, paysAssetId = null, paysAmountRaw = null, receivesAssetId = null, receivesAmountRaw = null } = params ?? {};
+        if (!orderId) return false;
+        const slot = this._findAnyGridOrderByChainId(mgr, orderId);
+        if (!slot || !slot.id) return false;
+
+        let ctx: ReturnType<SyncEngine['_computeFillContext']>;
+        try {
+            ctx = this._computeFillContext(mgr, slot, paysAssetId, Number(paysAmountRaw), receivesAssetId, Number(receivesAmountRaw));
+        } catch {
+            return false;
+        }
+        const type = ctx?.orderType;
+        if (type !== ORDER_TYPES.BUY && type !== ORDER_TYPES.SELL) return false;
+
+        const execPrice = Number(ctx.fillPrice);
+        const slotPrice = Number(slot.price);
+        const price = Number.isFinite(execPrice) && execPrice > 0
+            ? execPrice
+            : (Number.isFinite(slotPrice) && slotPrice > 0 ? slotPrice : NaN);
+        if (!Number.isFinite(price) || price <= 0) return false;
+
+        // 1. Pivot: the LAST-FILL-GUARD reference must track the real trade.
+        //    recordLastFilledPrices owns the scalar family + edge-pinned
+        //    exclusion (a wick on an edge order must not arm it).
+        try {
+            mgr.recordLastFilledPrices([{ id: slot.id, type, price, isPartial: params?.isPartial === true }]);
+        } catch (err) {
+            mgr.logger.log(`[SYNC] Fill-pivot record failed for absorbed fill ${orderId}: ${getErrorMessage(err)}`, 'warn');
+        }
+
+        // 2. Owed crawl: the same ledger the strategy maintains (identical
+        //    eligibility — the edge classification that decides whether a crawl
+        //    is APPLIED lives in the boundary derivation, so recording it here
+        //    matches strategy.processFillsOnly exactly). A re-delivered record
+        //    for the same slot replaces, never stacks. Dry runs never commit a
+        //    boundary, so they must not grow the ledger.
+        try {
+            if (mgr.config?.dryRun !== true && Array.isArray(mgr._pendingFillCrawls)) {
+                const pending = mgr._pendingFillCrawls;
+                const at = pending.findIndex((e) => e && e.slotId === slot.id);
+                if (at >= 0) pending.splice(at, 1);
+                pending.push({ slotId: slot.id, side: type, ts: Date.now() });
+                while (pending.length > 500) pending.shift();
+                if (typeof mgr._markGridDirty === 'function') mgr._markGridDirty();
+            }
+        } catch { /* best-effort: the pivot above is the fail-safe */ }
+
+        mgr.logger.log(
+            `[SYNC] Fill for order ${orderId} attributed to virtualised slot ${slot.id} ` +
+            `(${type} @ ${Format.formatPrice6(price)}): pivot + owed boundary crawl recorded, ` +
+            `accounting already booked`,
+            'warn'
+        );
+        return true;
+    }
+
     _computeFillContext(mgr: OrderManagerLike, matchedGridOrder: ManagedOrder, paysAssetId: string | null | undefined, paysAmountRaw: number, receivesAssetId: string | null | undefined = null, receivesAmountRaw: number | null = null) {
         const assets = mgr.assets;
         if (!assets?.assetA || !assets?.assetB) throw new Error('assets required for fill context');
@@ -1892,7 +1997,16 @@ class SyncEngine {
 
                     const matchedGridOrder = this._findMatchingGridOrder(mgr, orderId);
                     if (!matchedGridOrder) {
-                        mgr.logger.log(`[SYNC] Fill for order ${orderId} ignored: order not found in active grid.`, 'debug');
+                        // An order that filled while its slot was already virtualised
+                        // still proves a trade: absorb the pivot + owed crawl from the
+                        // real execution price instead of dropping it (see
+                        // _absorbUnmatchedFill). Only a truly unknown order is ignored.
+                        const absorbed = this._absorbUnmatchedFill(mgr, {
+                            orderId, paysAssetId, paysAmountRaw, receivesAssetId, receivesAmountRaw,
+                        });
+                        if (!absorbed) {
+                            mgr.logger.log(`[SYNC] Fill for order ${orderId} ignored: order not found in active grid.`, 'debug');
+                        }
                         return { filledOrders: [], updatedOrders: [], partialFill: false };
                     }
 
@@ -2116,7 +2230,16 @@ class SyncEngine {
 
                         const matchedGridOrder = this._findMatchingGridOrder(mgr, orderId);
                         if (!matchedGridOrder) {
-                            mgr.logger.log(`[SYNC] Fill for order ${orderId} ignored: order not found in active grid.`, 'debug');
+                            // Same absorption as the single-fill path: keep the
+                            // pivot/crawl ledger honest so the next derivation and the
+                            // LAST-FILL-GUARD see the price that actually traded.
+                            const absorbed = this._absorbUnmatchedFill(mgr, {
+                                orderId, paysAssetId, paysAmountRaw,
+                                receivesAssetId: entry.receivesAssetId, receivesAmountRaw: entry.receivesAmountRaw,
+                            });
+                            if (!absorbed) {
+                                mgr.logger.log(`[SYNC] Fill for order ${orderId} ignored: order not found in active grid.`, 'debug');
+                            }
                             anyRequiresSync = true;
                             continue;
                         }

@@ -1785,6 +1785,83 @@ export function isLastFillGuardBlocked(price: number, type: unknown, lastPrice: 
 }
 
 /**
+ * LAST-FILL PLACEMENT GUARD — the direction rule applied to a PLACEMENT.
+ *
+ * Wraps isLastFillGuardBlocked with the same pivot resolution the runtime uses
+ * (live fill pivot, then the bot-scoped market-fill row) and adds the
+ * SAME-LEVEL refusal: a placement within half a grid step of the pivot is a
+ * re-place at the level that just traded, which the raw `>=`/`<=` comparison
+ * lets through because a slot price and its execution price differ by
+ * rounding (live: slot 1310.046339 filled at 1310.060435).
+ *
+ * Unlike the COW-path guard this is meant for the reconcile/startup placement
+ * paths (create + relocation), which previously had no last-fill check at all:
+ * a startup-style top-up could therefore re-create a BUY at the price the bot
+ * had just bought at, or place a BUY above it (the "buying later at higher
+ * prices" incident). Fail-open on a cold pivot (no fill yet) so a fresh grid
+ * still builds.
+ *
+ * @param {Object} manager - OrderManager instance (pivot + config.incrementPercent)
+ * @param {number} price - Target placement price
+ * @param {string} type - ORDER_TYPES.BUY / ORDER_TYPES.SELL
+ * @returns {{blocked: boolean, pivot: number|null, reason?: 'direction'|'same-level'}}
+ */
+export function isLastFillPlacementBlocked(manager: OrderManagerLike | null | undefined, price: unknown, type: unknown): { blocked: boolean; pivot: number | null; reason?: 'direction' | 'same-level' } {
+    const numPrice = Number(price);
+    if (!Number.isFinite(numPrice) || numPrice <= 0) return { blocked: false, pivot: null };
+    let reference: { price: number | null; type: string | null } = { price: null, type: null };
+    try { reference = resolveLastFillGuardReference(manager as OrderManagerLike); } catch { reference = { price: null, type: null }; }
+    const pivot = reference.price;
+    const pivotType = reference.type;
+    if (pivot == null || pivotType == null) return { blocked: false, pivot: null };
+    if (type !== ORDER_TYPES.BUY && type !== ORDER_TYPES.SELL) return { blocked: false, pivot };
+    try {
+        if (MathUtils.pricesWithinHalfStep(numPrice, pivot, manager?.config?.incrementPercent)) {
+            return { blocked: true, pivot, reason: 'same-level' };
+        }
+    } catch { /* fall through to the direction rule */ }
+    const guard = isLastFillGuardBlocked(numPrice, type, pivot, pivotType);
+    if (guard.blocked) return { blocked: true, pivot, reason: 'direction' };
+    return { blocked: false, pivot };
+}
+
+/**
+ * Are fills still UNSETTLED (arrived but not yet absorbed by the grid)?
+ *
+ * While this returns true the master grid still holds filled slots as ACTIVE
+ * and the boundary has not crawled for them, so any geometry-derived plan
+ * (window top-up, startup-style reconcile) is built on the PREVIOUS book. The
+ * live incident: a 120s stale broadcast region deferred 12 fills, the
+ * post-fill reconcile saw "buy 12/20" on that stale master and re-created 8
+ * BUYs at the TOP of the un-crawled rail (1282.78 -> 1310.04), which filled
+ * within seconds (9 buy-lower violations, 23.5% of the window's BTS).
+ *
+ * Accepts a bot (its `manager` is inspected) or a bare manager.
+ *
+ * @param {Object} source - DEXBot-like or OrderManager-like instance
+ * @returns {{unsettled: boolean, reason: string|null}}
+ */
+export function hasUnsettledFills(source: unknown): { unsettled: boolean; reason: string | null } {
+    if (!source || typeof source !== 'object') return { unsettled: false, reason: null };
+    const outer = source as { manager?: unknown; _incomingFillQueue?: unknown; _deferredFillsPending?: unknown };
+    const mgr = (outer.manager && typeof outer.manager === 'object'
+        ? outer.manager
+        : outer) as { _pendingFillCrawls?: unknown; _fillBatchInFlight?: unknown };
+    try {
+        const queued = Array.isArray(outer._incomingFillQueue) ? outer._incomingFillQueue.length : 0;
+        if (queued > 0) return { unsettled: true, reason: `${queued} fill(s) queued for processing` };
+        if (outer._deferredFillsPending === true) return { unsettled: true, reason: 'deferred fill drain pending' };
+        const inFlight = Number(mgr._fillBatchInFlight);
+        if (Number.isFinite(inFlight) && inFlight > 0) return { unsettled: true, reason: 'fill batch in flight' };
+        const owed = Array.isArray(mgr._pendingFillCrawls) ? mgr._pendingFillCrawls.length : 0;
+        if (owed > 0) return { unsettled: true, reason: `${owed} owed boundary crawl(s)` };
+    } catch {
+        return { unsettled: false, reason: null };
+    }
+    return { unsettled: false, reason: null };
+}
+
+/**
  * Restore the persisted bot-scoped last-market-fill reference into the
  * manager. Deliberately independent of the boundary and the genesis: this is
  * the anchor spread correction uses to avoid trading through the last real

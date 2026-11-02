@@ -9,7 +9,7 @@ import { lazyShim } from './lazy_shim.js';
 
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
-import { nowIso, fireStructuralResync, resolveLastFillGuardReference } from './order/utils/system.js';
+import { nowIso, fireStructuralResync, resolveLastFillGuardReference, hasUnsettledFills } from './order/utils/system.js';
 import { path } from './path_api.js';
 import * as chainOrders from './chain_orders.js';
 import * as grid from './order/grid.js';
@@ -789,6 +789,25 @@ function getTargetedSyncReason(bot: BotLike) {
 async function maybeRunTargetedDriftReconciliation(bot: BotLike, context: string) {
     const trigger = getTargetedSyncReason(bot);
     if (!trigger) return false;
+
+    // UNSETTLED-FILL GATE: a startup-style reconcile derives its window from the
+    // master grid. While fills are still queued / draining / in flight / owed a
+    // crawl, that master still holds the filled slots as ACTIVE and the boundary
+    // has not crawled — the top-up would restore the EXPENSIVE end of the rail
+    // (live incident: 8 BUYs at 1282.78 -> 1310.04 re-created from a stale
+    // "buy 12/20" shortfall and filled within seconds). Defer to the next tick:
+    // the crawl commits in the same fill cycle, after which the same shortfall
+    // resolves against the crawled rail. No cooldown stamp, so the retry is
+    // immediate once the fills settle.
+    const unsettled = hasUnsettledFills(bot);
+    if (unsettled.unsettled) {
+        bot._log(
+            `[TARGETED-SYNC] Deferring ${context} reconciliation: ${unsettled.reason} — ` +
+            `the rail must absorb the fills before it is topped up`,
+            'debug'
+        );
+        return false;
+    }
 
     const now = Date.now();
     const cooldownMs = Number.isFinite(Number(bot._targetedDriftSyncCooldownMs))

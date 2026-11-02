@@ -2281,6 +2281,33 @@ function derivePriceLevels(
     return deduped;
 }
 
+/**
+ * True when two prices are the SAME grid step: within half an increment of
+ * each other. Used to judge a placement against the price that just traded —
+ * a fill's execution price and the slot level it filled at differ by rounding
+ * (live: slot 1310.046339 filled at 1310.060435, i.e. ~1e-5), so a raw
+ * `>=`/`<=` comparison lets a same-level re-place through.
+ *
+ * The half-step cap mirrors `pricesOnSameLevel`: it can never merge two
+ * legitimately adjacent levels (a full increment apart). A missing/invalid
+ * increment degrades to exact equality.
+ *
+ * @param {number} priceA - First price
+ * @param {number} priceB - Second price
+ * @param {number} incrementPercent - Grid step in percent (e.g. 0.3)
+ * @returns {boolean} True when both prices sit on the same grid step
+ */
+function pricesWithinHalfStep(priceA: number, priceB: number, incrementPercent: number | null | undefined): boolean {
+    const pa = Number(priceA);
+    const pb = Number(priceB);
+    if (!Number.isFinite(pa) || !Number.isFinite(pb)) return false;
+    const inc = Number(incrementPercent);
+    if (!Number.isFinite(inc) || inc <= 0) return pa === pb;
+    const level = Math.min(Math.abs(pa), Math.abs(pb));
+    if (!Number.isFinite(level)) return pa === pb;
+    return Math.abs(pa - pb) <= level * (inc / 100) * 0.5;
+}
+
 function buildGenesisFromPriceLevels(startPrice: number, incrementPercent: number, gapSlots: number, priceLevels: number[]): GridGenesis {
     const hash = hashPriceLevels(priceLevels);
     return {
@@ -2295,7 +2322,7 @@ function buildGenesisFromPriceLevels(startPrice: number, incrementPercent: numbe
 
 export type { FeeCacheEntry };
 
-export { getBtsSide, getSellStartIdx, resolveGapBand, countGapBandSpread, calculateGapSlots, isSlotInRail, isSlotIndexInGapBand, isEvacuationRotationAllowed, isEvacuationSizeStillValid, validateBoundaryCommit, validatePersistedBoundary, isTransientInBandRejection, BOUNDARY_REJECT_PLACED_IN_BAND, resolveGapSlots, isPercentageString, isPositiveNumber, isPositiveNumberOrPercent, isPositiveInt, parsePercentageString, toDecimal, resolveRelativePrice, parseRelativeMultiplier, validateGridPriceBounds, isExplicitZeroAllocation, getPrecision, computeChainFundTotals, calculateAvailableFundsValue, deriveChainTruthFundBudget, adjustBudgetForBtsFees, getGridBestPrices, calculateSpreadFromOrders, resolveConfigValue, resolveConfigValueWithRegistry, hasValidAccountTotals, blockchainToFloat, floatToBlockchainInt, floorToBlockchainInt, quantizeFloat, normalizeInt, getPrecisionByOrderType, getPrecisionsForManager, getPrecisionSlack, quantumForPrecision, calculatePriceTolerance, findCrossedOrder, pricesOnSameLevel, sameGridPrice, validateOrderAmountsWithinLimits, getMinOrderSize, getDustThresholdFactor, getSingleDustThreshold, getDoubleDustThreshold, validateOrderSize, getAssetFees, getAssetFeesSafe, allocateFundsByWeights, calculateOrderSizes, calculateRotationOrderSizes, calculateGridSideDivergenceMetric, calculateOrderCreationFees, calculateSwapInAmount, _setFeeCache, cloneWeightDistribution, clamp, roundTo, fixedTo, roundToDecimals, priceLevelsForGenesis, priceForSlot, slotIndexForPrice, slotIdForPrice, assertSlotPriceInvariant, priceSlotEqual, derivePriceLevels, sameGridLevel, buildGenesisFromPriceLevels, hashPriceLevels, isChainPriceOutOfGrid }
+export { getBtsSide, getSellStartIdx, resolveGapBand, countGapBandSpread, calculateGapSlots, isSlotInRail, isSlotIndexInGapBand, isEvacuationRotationAllowed, isEvacuationSizeStillValid, validateBoundaryCommit, validatePersistedBoundary, isTransientInBandRejection, BOUNDARY_REJECT_PLACED_IN_BAND, resolveGapSlots, isPercentageString, isPositiveNumber, isPositiveNumberOrPercent, isPositiveInt, parsePercentageString, toDecimal, resolveRelativePrice, parseRelativeMultiplier, validateGridPriceBounds, isExplicitZeroAllocation, getPrecision, computeChainFundTotals, calculateAvailableFundsValue, deriveChainTruthFundBudget, adjustBudgetForBtsFees, getGridBestPrices, calculateSpreadFromOrders, resolveConfigValue, resolveConfigValueWithRegistry, hasValidAccountTotals, blockchainToFloat, floatToBlockchainInt, floorToBlockchainInt, quantizeFloat, normalizeInt, getPrecisionByOrderType, getPrecisionsForManager, getPrecisionSlack, quantumForPrecision, calculatePriceTolerance, findCrossedOrder, pricesOnSameLevel, sameGridPrice, validateOrderAmountsWithinLimits, getMinOrderSize, getDustThresholdFactor, getSingleDustThreshold, getDoubleDustThreshold, validateOrderSize, getAssetFees, getAssetFeesSafe, allocateFundsByWeights, calculateOrderSizes, calculateRotationOrderSizes, calculateGridSideDivergenceMetric, calculateOrderCreationFees, calculateSwapInAmount, _setFeeCache, cloneWeightDistribution, clamp, roundTo, fixedTo, roundToDecimals, priceLevelsForGenesis, priceForSlot, slotIndexForPrice, slotIdForPrice, assertSlotPriceInvariant, priceSlotEqual, derivePriceLevels, sameGridLevel, pricesWithinHalfStep, buildGenesisFromPriceLevels, hashPriceLevels, isChainPriceOutOfGrid }
 
 /**
  * Round a value to a given factor.

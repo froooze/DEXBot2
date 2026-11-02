@@ -9,10 +9,10 @@
 
 import { ORDER_TYPES, ORDER_STATES, TIMING, BTS_PRECISION } from '../constants.js';
 import { readOpenOrdersGuarded } from '../chain_orders.js';
-import { getMinOrderSize, getAssetFees, getAssetFeesSafe, blockchainToFloat, findCrossedOrder, resolveGapBand, isSlotInRail, pricesOnSameLevel, sameGridLevel } from './utils/math.js';
+import { getMinOrderSize, getAssetFees, getAssetFeesSafe, blockchainToFloat, findCrossedOrder, resolveGapBand, isSlotInRail, pricesOnSameLevel, pricesWithinHalfStep, sameGridLevel } from './utils/math.js';
 import { isOrderPlaced, parseChainOrder, buildCreateOrderArgs, buildOutsideInPairGroups, extractBatchOperationResults, chainOrderMatchesSlotWithTolerance, buildCrossingCheckCandidates, isCrossingCheckCandidate, getSideBudget, calculateBudgetedSizes, getCoreOrdersTotal, convertToSpreadPlaceholder, isOrderGoneErrorMessage, clearDuplicateOrphanDetection, resolveEdgeCount, resolveLiveEdgeAnchorPrice, edgeOrderIdSet, compareEdge, reportGridPriceInvariant, liveWindowIdSet } from './utils/order.js';
 import { parseSlotIndex } from './utils/slot.js';
-import { resolveAccountRef } from './utils/system.js';
+import { resolveAccountRef, isLastFillPlacementBlocked, hasUnsettledFills } from './utils/system.js';
 import * as Format from './format.js';
 import { getErrorMessage, getErrorCode, getErrorName } from '../utils/errors.js';
 import type { OrderManagerLike, ManagedOrder, ChainOrder, ParsedChainEntry, ParsedChainOrder, ChainOrdersLike, AssetPair, LoggerLike, UnknownRecord, StartupCreatePlan, StartupUpdatePlan, StartupCancelPlan, OrderType } from '../types.js';
@@ -248,6 +248,15 @@ function _pickVirtualSlotsToActivate(manager: OrderManagerLike, type: OrderType,
     // Derived budgeted size per slot, built once (O(n)) so below-min lookups
     // don't recompute full-side sizing for every candidate (avoid O(n²)).
     const derivedSizes = _deriveBudgetedSideSizes(manager, type);
+    // LAST-FILL placement discipline at PICK time: a candidate on the wrong
+    // side of the last fill (or on its own level) must not consume activation
+    // budget — the create would be refused downstream anyway, and the pick
+    // budget is what decides which levels get restored. Skipping it lets the
+    // picker fall through to the NEXT level down (BUY) / up (SELL), which is
+    // the "rotate to the bottom BUY / counter SELL" behaviour: the level that
+    // just traded is never re-stamped same-side.
+    let lastFillSkipped = 0;
+    let lastFillPivot: number | null = null;
     for (const slot of slotsOfType) {
         if (valid.length >= count) break;
         if (!slot.orderId && slot.state === ORDER_STATES.VIRTUAL) {
@@ -269,6 +278,12 @@ function _pickVirtualSlotsToActivate(manager: OrderManagerLike, type: OrderType,
             }
 
             if (slot.id && effectiveSize >= effectiveMin) {
+                const fillGuard = isLastFillPlacementBlocked(manager, slot.price, type);
+                if (fillGuard.blocked) {
+                    lastFillSkipped++;
+                    if (lastFillPivot == null) lastFillPivot = fillGuard.pivot;
+                    continue;
+                }
                 // Re-type the picked slot to the activation side: empty slots are
                 // stored SPREAD (side-neutral), but an order being placed here must
                 // carry the concrete BUY/SELL rail type (SPREAD+ACTIVE is illegal,
@@ -280,6 +295,14 @@ function _pickVirtualSlotsToActivate(manager: OrderManagerLike, type: OrderType,
                 });
             }
         }
+    }
+
+    if (lastFillSkipped > 0) {
+        manager.logger?.log?.(
+            `Startup: ${type.toUpperCase()} pick skipped ${lastFillSkipped} slot(s) on the wrong side of the last fill ` +
+            `(pivot ${lastFillPivot == null ? 'n/a' : Format.formatPrice6(lastFillPivot)}); picked ${valid.length}/${count}`,
+            'debug'
+        );
     }
 
     return valid;
@@ -543,6 +566,25 @@ async function _createOrderFromGrid({ chainOrders, account, privateKey, manager,
             `${Format.formatPrice6(createPrice)} crosses live ${crossed.type || crossed.order?.type} ` +
             `${crossed.id || crossed.chainOrderId || crossed.slotId || 'chain'} (${crossed.orderId || crossed.chainOrderId || crossed.slotId}) ` +
             `@${Format.formatPrice6(crossed.price ?? crossed.order?.price ?? 0)}`,
+            'warn'
+        );
+        return null;
+    }
+
+    // LAST-FILL GUARD: never place a BUY on/above the price that just traded,
+    // nor a SELL on/below it (same level included — see
+    // isLastFillPlacementBlocked). The COW planner has this discipline; the
+    // reconcile/startup create path did not, so a top-up could re-create the
+    // level it had just bought at (live: 19 of 37 creates at an already-filled
+    // level, 9 of them above the previous fill). Refusing here fails closed to
+    // the next reconcile cycle, when the crawl has moved the rail.
+    const fillGuard = isLastFillPlacementBlocked(manager, createPrice, gridOrder.type);
+    if (fillGuard.blocked) {
+        manager.logger?.log?.(
+            `[_createOrderFromGrid] SKIP (LAST-FILL-GUARD): Create for ${gridOrder.id} at ` +
+            `${Format.formatPrice6(createPrice)} on the wrong side of the last fill ` +
+            `${Format.formatPrice6(Number(fillGuard.pivot))} (${fillGuard.reason}); ` +
+            `the rail must crawl before this level is refilled`,
             'warn'
         );
         return null;
@@ -874,11 +916,34 @@ function _prepareStartupUpdatePlan(plan: StartupUpdatePlan, manager: OrderManage
         return null;
     }
 
+    // LAST-FILL GUARD: a relocation re-prices a live order onto a different
+    // level, so it is a placement and obeys the same direction rule as a
+    // create (BUY lower, SELL higher; never the level that just traded). A
+    // same-price relocation is an ADOPTION (the chain order already rests at
+    // the target level), not a placement — it is left alone.
+    const parsedChainOrder = parseChainOrder(plan.chainOrderObj, manager.assets);
+    const chainPrice = Number(parsedChainOrder?.price);
+    const samePriceAdoption = Number.isFinite(chainPrice)
+        && pricesWithinHalfStep(chainPrice, Number(gridOrder.price), manager.config?.incrementPercent);
+    if (!samePriceAdoption) {
+        const fillGuard = isLastFillPlacementBlocked(manager, gridOrder.price, gridOrder.type);
+        if (fillGuard.blocked) {
+            logger?.log?.(
+                `[STARTUP-LAST-FILL-GUARD] Skipping relocation update ${chainOrderId} -> ${gridOrder.id}: ` +
+                `target ${gridOrder.type} @${Format.formatPrice6(gridOrder.price)} is on the wrong side of the ` +
+                `last fill ${Format.formatPrice6(Number(fillGuard.pivot))} (${fillGuard.reason}); ` +
+                `re-align on the next reconcile cycle.`,
+                'warn'
+            );
+            return null;
+        }
+    }
+
     return {
         plan,
         chainOrderId,
         gridOrder,
-        parsedChain: parseChainOrder(plan.chainOrderObj, manager.assets),
+        parsedChain: parsedChainOrder,
         updateParams: {
             newPrice: gridOrder.price,
             amountToSell,
@@ -1413,6 +1478,20 @@ async function _executeStartupCreateGroupBatch({
                 `${Format.formatPrice6(createPrice)} crosses live ${crossed.type || crossed.order?.type} ` +
                 `${crossed.id || crossed.chainOrderId || crossed.slotId || 'chain'} (${crossed.orderId || crossed.chainOrderId || crossed.slotId}) ` +
                 `@${Format.formatPrice6(crossed.price ?? crossed.order?.price ?? 0)}`,
+                'warn'
+            );
+            continue;
+        }
+
+        // LAST-FILL GUARD: creates only — never restore a level on the wrong
+        // side of the last fill (includes the level that just traded). See
+        // isLastFillPlacementBlocked.
+        const fillGuard = isLastFillPlacementBlocked(manager, createPrice, gridOrder.type);
+        if (fillGuard.blocked) {
+            logger?.log?.(
+                `Startup: Skip create ${plan.orderLabel} (LAST-FILL-GUARD) - price ` +
+                `${Format.formatPrice6(createPrice)} is on the wrong side of the last fill ` +
+                `${Format.formatPrice6(Number(fillGuard.pivot))} (${fillGuard.reason})`,
                 'warn'
             );
             continue;
@@ -2010,20 +2089,36 @@ async function _reconcileStartupSide({
     const createCount = Math.max(0, targetCount - chainCount);
     const remainingSlots = desiredSlots.slice(updateCount);
 
-    for (let i = 0; i < Math.min(createCount, remainingSlots.length); i++) {
-        const gridOrder = remainingSlots[i];
+    // UNSETTLED-FILL GATE: while fills are queued, draining, in flight, or
+    // owed a crawl, the master still treats filled slots as ACTIVE and the
+    // boundary has not crawled for them. Any window top-up derived from that
+    // geometry refills the EXPENSIVE end of the rail — the live incident
+    // (12s of buys at 1282.78 -> 1310.04 while the market was ~1280). Defer
+    // the top-up to the cycle after the fills (and their crawl) are committed;
+    // 1:1 repairs (cancelled-slot replacement, vacated-rail refill) still run.
+    const unsettled = hasUnsettledFills(manager);
+    if (unsettled.unsettled && createCount > 0) {
         logger?.log?.(
-            `Startup: Creating ${sideUpper} for grid ${gridOrder.id} (price=${Format.formatPrice6(gridOrder.price)}, size=${Format.formatSizeByOrderType(gridOrder.size, orderType, manager.assets)})`,
-            'info'
+            `Startup: Deferring ${Math.min(createCount, remainingSlots.length)} ${sideUpper} window top-up create(s): ` +
+            `${unsettled.reason} — the rail must absorb the fills before it is refilled`,
+            'warn'
         );
-        plannedCreates.push({
-            orderType,
-            gridOrder,
-            orderLabel: sideUpper,
-            // Intentionally no recovery metadata here.
-            // This preserves legacy behavior: regular virtual-slot creates only log failures,
-            // while cancelled-slot replacement creates trigger a startup recovery sync.
-        });
+    } else {
+        for (let i = 0; i < Math.min(createCount, remainingSlots.length); i++) {
+            const gridOrder = remainingSlots[i];
+            logger?.log?.(
+                `Startup: Creating ${sideUpper} for grid ${gridOrder.id} (price=${Format.formatPrice6(gridOrder.price)}, size=${Format.formatSizeByOrderType(gridOrder.size, orderType, manager.assets)})`,
+                'info'
+            );
+            plannedCreates.push({
+                orderType,
+                gridOrder,
+                orderLabel: sideUpper,
+                // Intentionally no recovery metadata here.
+                // This preserves legacy behavior: regular virtual-slot creates only log failures,
+                // while cancelled-slot replacement creates trigger a startup recovery sync.
+            });
+        }
     }
 
     // Guard: when the matcher found zero active grid orders (matchedOnGrid === 0)

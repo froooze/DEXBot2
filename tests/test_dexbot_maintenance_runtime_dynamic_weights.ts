@@ -51,6 +51,10 @@ const NAMES = {
         'setLastFillPivot', 'normalizeLastFillPivot',
         'rearmLastFillPivotFromMarketFill',
         'fireStructuralResync',
+        // Fill-discipline predicates (grid_reconcile_internal / maintenance
+        // runtime): stubbed settled here so the resync stages below exercise
+        // their own subject instead of the new deferral gates.
+        'hasUnsettledFills', 'isLastFillPlacementBlocked',
     ],
     format: ['formatCurrency', 'formatMetric2', 'isValidNumber', 'toFiniteNumber', 'toKnownNumber', 'formatPrice6', 'formatPercent'],
     orderUtils: [
@@ -209,6 +213,8 @@ function installCoreResyncMocks({ snapshotMode = 'live' } = {}) {
         nowIso: () => new Date().toISOString(),
         retryPersistenceIfNeeded: async () => {},
         applyGridDivergenceCorrections: async () => ({}),
+        hasUnsettledFills: () => ({ unsettled: false, reason: null }),
+        isLastFillPlacementBlocked: () => ({ blocked: false, pivot: null }),
         sleep: async () => {},
     });
 }
@@ -702,6 +708,8 @@ function installDivergenceMocks(opts) {
         loadAmaCenterSnapshot: () => null,
         parseJsonWithComments: (text) => JSON.parse(text),
         nowIso: () => new Date().toISOString(),
+        hasUnsettledFills: () => ({ unsettled: false, reason: null }),
+        isLastFillPlacementBlocked: () => ({ blocked: false, pivot: null }),
         sleep: async () => {},
     });
     defineEsmMockAbs(require.resolve('../modules/order/grid'), NAMES.grid, {
@@ -884,6 +892,8 @@ async function testDexbotClassPerformGridResyncForwardsOptions() {
         applyGridDivergenceCorrections: async () => ({}),
         parseJsonWithComments: (text) => JSON.parse(text),
         nowIso: () => new Date().toISOString(),
+        hasUnsettledFills: () => ({ unsettled: false, reason: null }),
+        isLastFillPlacementBlocked: () => ({ blocked: false, pivot: null }),
         sleep: async () => {},
     });
     defineEsmMockAbs(require.resolve('../modules/order/utils/validate'), NAMES.validate, {
