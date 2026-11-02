@@ -21,7 +21,8 @@ import { calculateAMA } from '../market_adapter/core/strategies/ama.js';
 import { computeAmaSlopeWeights, createAmaSlopeClipTracker } from '../market_adapter/core/strategies/ama_slope_model.js';
 import { MARKET_ADAPTER } from '../modules/constants.js';
 import { getCandleClose } from './math_utils.js';
-import { writeChartFile } from './chart_utils.js';
+import { writeChartFile, toFileUrl } from './chart_utils.js';
+import { CLI_TAGS, savedLine } from '../modules/cli_progress.js';
 import { PATHS } from '../modules/paths.js';
 import { resolveSource, listAvailableBots, type SourceConfig } from './resolve_source.js';
 import { baseAnalysisConfig, consumeCommonAnalysisArg } from './analyze_args.js';
@@ -141,7 +142,7 @@ async function main() {
         const html = generateHTML({ allResults, amaConfig, clipPct: MARKET_ADAPTER.DYNAMIC_WEIGHT_CLIP_PERCENTILE }, 'Kalman Trend Analysis');
         writeChartFile(config.chartFile, html);
 
-        if (!config.quiet) console.log(`[Kalman] ✓ Chart saved to ${config.chartFile}`);
+        if (!config.quiet) console.log(savedLine(CLI_TAGS.kalman, 'Chart', toFileUrl(config.chartFile)));
     } catch (err: unknown) {
         console.error(`[Kalman] Error: ${getErrorMessage(err)}`);
         process.exit(1);

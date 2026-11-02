@@ -11,7 +11,11 @@
  */
 
 const assert = require('assert');
-const { CLI_TAGS, progressLine, clearProgressLine, taggedProgress, savedLine } = require('../modules/cli_progress');
+const {
+    CLI_TAGS, progressLine, clearProgressLine, taggedProgress, savedLine,
+    loadingLine, section, warningLines, warningsBlock, summaryLine,
+} = require('../modules/cli_progress');
+const { CLI_COLORS, colorize } = require('../modules/cli_colors');
 
 console.log('Running cli progress tests');
 
@@ -39,6 +43,37 @@ function testTags() {
     assert.strictEqual(CLI_TAGS.liquidity, '[Liquidity]');
     assert.strictEqual(CLI_TAGS.tradingView, '[TradingView]');
     assert.strictEqual(CLI_TAGS.dynamicWeight, '[DynamicWeight]');
+    assert.strictEqual(CLI_TAGS.pnl, '[PnL]');
+    assert.strictEqual(CLI_TAGS.orders, '[Order]');
+}
+
+function testColorize() {
+    assert.strictEqual(colorize(CLI_COLORS.gray, 'x'), `${CLI_COLORS.gray}x${CLI_COLORS.reset}`);
+}
+
+function testPersistentLines() {
+    // Loading line: tag + message, no leading newline (callers print it first).
+    assert.strictEqual(loadingLine(CLI_TAGS.assets, 'Loading BTS supply distribution from chain...'),
+        '[Assets] Loading BTS supply distribution from chain...');
+
+    // Section block: one leading blank line, amber header, rule to `width`.
+    const rule = '─'.repeat(20 - 'Warnings'.length);
+    assert.strictEqual(section('Warnings', 20),
+        `\n${CLI_COLORS.bold}${CLI_COLORS.yellow}  ── Warnings ${rule}${CLI_COLORS.reset}`);
+    // Width smaller than the title: no negative rule.
+    assert.ok(section('A very long section title', 5).endsWith(`── A very long section title ${CLI_COLORS.reset}`));
+
+    // Warning bullets are red and indented; empty lists stay silent.
+    assert.deepStrictEqual(warningLines(['a', 'b']), [
+        `${CLI_COLORS.sell}  • a${CLI_COLORS.reset}`,
+        `${CLI_COLORS.sell}  • b${CLI_COLORS.reset}`,
+    ]);
+    assert.strictEqual(warningsBlock([]), '');
+    assert.ok(warningsBlock(['boom'], 20).startsWith(`\n${CLI_COLORS.bold}${CLI_COLORS.yellow}  ── Warnings ${rule}`));
+    assert.ok(warningsBlock(['boom'], 20).endsWith(`${CLI_COLORS.sell}  • boom${CLI_COLORS.reset}`));
+
+    // Trailing summary is muted and indented like the report notes.
+    assert.strictEqual(summaryLine('reconcile: …'), `${CLI_COLORS.gray}  reconcile: …${CLI_COLORS.reset}`);
 }
 
 function testProgressFormat() {
@@ -92,10 +127,21 @@ function testSavedLine() {
         savedLine(CLI_TAGS.liquidity, 'Chart', 'file:///tmp/liquidity_A_B.html'),
         '\n[Liquidity] ✓ Chart saved. Open chart: (file:///tmp/liquidity_A_B.html)',
     );
+    // `kind` keeps mixed-case labels readable in the "Open …" half.
+    assert.strictEqual(
+        savedLine(CLI_TAGS.pnl, 'PnL report', 'file:///tmp/pnl.html', 'report'),
+        '\n[PnL] ✓ PnL report saved. Open report: (file:///tmp/pnl.html)',
+    );
+    assert.strictEqual(
+        savedLine(CLI_TAGS.orders, 'Order Analysis', 'file:///tmp/orders.html', 'report'),
+        '\n[Order] ✓ Order Analysis saved. Open report: (file:///tmp/orders.html)',
+    );
 }
 
 function run() {
     testTags();
+    testColorize();
+    testPersistentLines();
     testProgressFormat();
     testProgressOverwritesAndClears();
     testDisabledAndNonTtyAreSilent();

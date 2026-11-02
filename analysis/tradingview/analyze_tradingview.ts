@@ -14,6 +14,7 @@ import { toIntervalLabel } from '../../market_adapter/interval_utils.js';
 import { loadBotMeta } from '../bot_key_utils.js';
 import { resolveSource, listAvailableBots } from '../resolve_source.js';
 import { writeChartFile, toFileUrl } from '../chart_utils.js';
+import { CLI_TAGS, savedLine } from '../../modules/cli_progress.js';
 import { PATHS } from '../../modules/paths.js';
 
 
@@ -316,7 +317,7 @@ async function main() {
 
         writeChartFile(config.chartFile, html);
 
-        if (!config.quiet) console.log(`\n[TradingView] ✓ Chart saved. Open chart: (${toFileUrl(config.chartFile)})`);
+        if (!config.quiet) console.log(savedLine(CLI_TAGS.tradingView, 'Chart', toFileUrl(config.chartFile)));
     } catch (err) {
         console.error(`[TradingView] Error: ${getErrorMessage(err)}`);
         process.exit(1);

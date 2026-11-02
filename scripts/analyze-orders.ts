@@ -29,6 +29,7 @@ import { getStorage } from '../modules/storage/index.js';
 const { readJSON } = getStorage();
 import { getErrorMessage } from '../modules/utils/errors.js';
 import { toFileUrl } from '../analysis/chart_utils.js';
+import { CLI_TAGS, savedLine } from '../modules/cli_progress.js';
 import { isSameBotName, sanitizeKey } from '../modules/utils/sanitize_key.js';
 import { CLI_COLORS as colors } from '../modules/cli_colors.js';
 import { pathToFileURL } from 'node:url';
@@ -1691,7 +1692,7 @@ function generateHtmlReport(analyses: JsonObj[]) {
   const outPath = path.join(PATHS.ANALYSIS.CHARTS_DIR, 'order-analysis.html');
   fs.mkdirSync(PATHS.ANALYSIS.CHARTS_DIR, { recursive: true });
   fs.writeFileSync(outPath, html, 'utf-8');
-  console.log(`\n📄 Order Analysis saved. Open report: (${toFileUrl(outPath)})`);
+  console.log(savedLine(CLI_TAGS.orders, 'Order Analysis', toFileUrl(outPath), 'report'));
 }
 
 function main() {

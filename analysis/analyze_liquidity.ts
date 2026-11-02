@@ -41,6 +41,7 @@ import type { ChainAsset, RawPool } from './liquidity/liquidity_chain.js';
 import { poolAssetIds } from '../modules/liquidity_pool_ref.js';
 import { generateLiquidityHTML } from './liquidity/liquidity_chart_generator.js';
 import { writeChartFile, toFileUrl } from './chart_utils.js';
+import { CLI_TAGS, savedLine } from '../modules/cli_progress.js';
 
 const DEFAULT_DEPTH = 300;
 const DEFAULT_RANGE = 0.5;
@@ -270,7 +271,7 @@ function printSummary(snapshot: Snapshot, seriesResult: ReturnType<typeof buildD
     const last = nearestIndex(seriesResult.prices, window.max);
     console.log(`  depth at window edges  book: bids=${fmtAmount(seriesResult.bookBid[first])} / asks=${fmtAmount(seriesResult.bookAsk[last])} ${quote.symbol}`);
     console.log(`                          pool: bids=${fmtAmount(seriesResult.poolBid[first])} / asks=${fmtAmount(seriesResult.poolAsk[last])} ${quote.symbol}`);
-    console.log(`\n[Liquidity] ✓ Chart saved. Open chart: (${toFileUrl(chartFile)})`);
+    console.log(savedLine(CLI_TAGS.liquidity, 'Chart', toFileUrl(chartFile)));
 }
 
 async function main(): Promise<void> {

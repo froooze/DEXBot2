@@ -18,6 +18,7 @@ import { writePnlReport } from './pnl_report.js';
 import { percentile } from './math_utils.js';
 import { fetchFillsCached } from './fills_cache.js';
 import { toFileUrl } from './chart_utils.js';
+import { CLI_TAGS, savedLine } from '../modules/cli_progress.js';
 import { PATHS } from '../modules/paths.js';
 import { sanitizeKey } from '../modules/utils/sanitize_key.js';
 import { monthsToHours } from '../modules/utils/time_range.js';
@@ -1372,7 +1373,7 @@ async function run(argv: string[] = process.argv.slice(2)) {
             assetFilter: opts.asset,
             pairs: analyses.map(pair => ({ pair, metrics: computeMetrics(pair, reportWindow) })),
         }, reportPath);
-        console.log(`\n📄 PnL report saved. Open report: (${toFileUrl(reportPath)})`);
+        console.log(savedLine(CLI_TAGS.pnl, 'PnL report', toFileUrl(reportPath), 'report'));
     } else {
         // Output: summaries → grand total → per-match detail
         printSummary(analyses);

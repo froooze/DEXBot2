@@ -28,7 +28,8 @@ import { PermutationEntropyAnalyzer }  from './trend_detection/permutation_entro
 import { generateRegimeHTML }          from './trend_detection/regime_chart_generator.js';
 import type { RegimeRow } from './trend_detection/regime_chart_generator.js';
 import { calculateAMA }                from '../market_adapter/core/strategies/ama.js';
-import { writeChartFile }              from './chart_utils.js';
+import { writeChartFile, toFileUrl } from './chart_utils.js';
+import { CLI_TAGS, savedLine } from '../modules/cli_progress.js';
 import { getCandleClose }              from './math_utils.js';
 import { resolveSource, listAvailableBots, type SourceConfig } from './resolve_source.js';
 import { baseAnalysisConfig, consumeCommonAnalysisArg } from './analyze_args.js';
@@ -141,7 +142,7 @@ async function main() {
 
         writeChartFile(config.chartFile, html);
 
-        if (!config.quiet) console.log(`[Regime] \u2713 Chart saved to ${config.chartFile}`);
+        if (!config.quiet) console.log(savedLine(CLI_TAGS.regime, 'Chart', toFileUrl(config.chartFile)));
 
     } catch (err: unknown) {
         console.error(`[Regime] Error: ${getErrorMessage(err)}`);

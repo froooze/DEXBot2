@@ -24,7 +24,8 @@ import { HurstAnalyzer, classifyHurst }  from './trend_detection/hurst_analyzer.
 import { PermutationEntropyAnalyzer } from './trend_detection/permutation_entropy_analyzer.js';
 import { MARKET_ADAPTER } from '../modules/constants.js';
 import { PATHS } from '../modules/paths.js';
-import { writeChartFile }            from './chart_utils.js';
+import { writeChartFile, toFileUrl } from './chart_utils.js';
+import { CLI_TAGS, savedLine } from '../modules/cli_progress.js';
 import { getCandleClose }            from './math_utils.js';
 import { roundTo } from '../modules/order/utils/math.js';
 import { resolveSource, listAvailableBots, type SourceConfig } from './resolve_source.js';
@@ -474,7 +475,7 @@ async function main() {
         const html = generateHeatmapHTML(results, HURST_WINDOWS, PE_WINDOWS);
         writeChartFile(config.chartFile, html);
 
-        if (!config.quiet) console.log(`[RegimeWindows] ✓ Chart saved to ${config.chartFile}`);
+        if (!config.quiet) console.log(savedLine(CLI_TAGS.regimeWindows, 'Chart', toFileUrl(config.chartFile)));
 
     } catch (err: unknown) {
         console.error(`[RegimeWindows] Error: ${getErrorMessage(err)}`);

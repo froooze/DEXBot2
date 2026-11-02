@@ -29,7 +29,8 @@ import { generateHTML } from './derivative_chart_generator.js';
 import type { DerivativeAnalyzer as DerivativeAnalyzerType } from './derivative_analyzer.js';
 
 type DerivativeRow = ReturnType<DerivativeAnalyzerType['update']>;
-import { writeChartFile } from '../chart_utils.js';
+import { writeChartFile, toFileUrl } from '../chart_utils.js';
+import { CLI_TAGS, savedLine } from '../../modules/cli_progress.js';
 import { PATHS } from '../../modules/paths.js';
 import { resolveSource, listAvailableBots, type SourceConfig } from '../resolve_source.js';
 import { baseAnalysisConfig, consumeCommonAnalysisArg } from '../analyze_args.js';
@@ -304,7 +305,7 @@ async function main(): Promise<void> {
         const html = generateHTML(report as unknown as Parameters<typeof generateHTML>[0], 'Derivative Trend Analysis');
         writeChartFile(config.chartFile, html);
 
-        if (!config.quiet) console.log(`[Derivatives] ✓ Chart saved to ${config.chartFile}`);
+        if (!config.quiet) console.log(savedLine(CLI_TAGS.derivatives, 'Chart', toFileUrl(config.chartFile)));
     } catch (err: unknown) {
         console.error(`[Derivatives] Error: ${getErrorMessage(err)}`);
         process.exit(1);

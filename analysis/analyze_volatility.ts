@@ -33,7 +33,8 @@ import type { VolatilityRow } from './trend_detection/volatility_chart_generator
 import { MARKET_ADAPTER } from '../modules/constants.js';
 import { PATHS } from '../modules/paths.js';
 import { getCandleClose } from './math_utils.js';
-import { writeChartFile } from './chart_utils.js';
+import { writeChartFile, toFileUrl } from './chart_utils.js';
+import { CLI_TAGS, savedLine } from '../modules/cli_progress.js';
 import { resolveSource, listAvailableBots, type SourceConfig } from './resolve_source.js';
 import { baseAnalysisConfig, consumeCommonAnalysisArg } from './analyze_args.js';
 
@@ -166,7 +167,7 @@ async function main() {
 
         writeChartFile(config.chartFile, html);
 
-        if (!config.quiet) console.log(`[Volatility] ✓ Chart saved to ${config.chartFile}`);
+        if (!config.quiet) console.log(savedLine(CLI_TAGS.volatility, 'Chart', toFileUrl(config.chartFile)));
     } catch (err: unknown) {
         console.error(`[Volatility] Error: ${getErrorMessage(err)}`);
         process.exit(1);

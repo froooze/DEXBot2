@@ -40,3 +40,11 @@ export const CLI_COLORS = {
   silver: '\x1b[38;5;250m', // light silver grey (bots editor)
   greenBold: '\x1b[1;32m', // bold green (bots editor)
 } as const;
+
+/**
+ * Wrap text in one of the {@link CLI_COLORS} codes and reset afterwards —
+ * the `c(colors.x, text)` helper each CLI used to declare locally.
+ */
+export function colorize(code: string, text: string): string {
+  return `${code}${text}${CLI_COLORS.reset}`;
+}

@@ -20,6 +20,7 @@
  */
 
 import { hasProcess } from './env.js';
+import { CLI_COLORS, colorize } from './cli_colors.js';
 
 /** Erase the current terminal line (progress updates overwrite in place). */
 const CLEAR_LINE = '\r\x1b[2K';
@@ -31,7 +32,16 @@ export const CLI_TAGS = {
     tradingView: '[TradingView]',
     dynamicWeight: '[DynamicWeight]',
     pnl: '[PnL]',
+    orders: '[Order]',
+    volatility: '[Volatility]',
+    regime: '[Regime]',
+    regimeWindows: '[RegimeWindows]',
+    kalman: '[Kalman]',
+    derivatives: '[Derivatives]',
 } as const;
+
+/** Width of the report section headers (`── Title ──…`). */
+const SECTION_WIDTH = 70;
 
 interface WriteStreamLike {
     write(chunk: string): unknown;
@@ -74,9 +84,43 @@ export function taggedProgress(tag: string): (enabled: boolean, message: string)
 /**
  * Trailer printed after a report is written, e.g.
  * `[Assets] ✓ Report saved. Open report: (file:///…/bts-distribution.html)`.
- * The caller supplies the file URL (analysis/chart_utils.toFileUrl).
+ * The caller supplies the file URL (analysis/chart_utils.toFileUrl); `kind`
+ * overrides the lowercased label in the "Open …" half (`'PnL report'` →
+ * `'report'`).
  */
-export function savedLine(tag: string, label: string, fileUrl: string): string {
-    const kind = label.toLowerCase();
-    return `\n${tag} ✓ ${label} saved. Open ${kind}: (${fileUrl})`;
+export function savedLine(tag: string, label: string, fileUrl: string, kind?: string): string {
+    return `\n${tag} ✓ ${label} saved. Open ${kind ?? label.toLowerCase()}: (${fileUrl})`;
+}
+
+/** Persistent `[Tag] message` line, e.g. `[Assets] Loading … from chain...`. */
+export function loadingLine(tag: string, message: string): string {
+    return `${tag} ${message}`;
+}
+
+/**
+ * Report section header block (leading blank line included):
+ * `\n  ── Title ─────────────────────────────…`, bold amber.
+ */
+export function section(title: string, width = SECTION_WIDTH): string {
+    const rule = '─'.repeat(Math.max(0, width - title.length));
+    return `\n${colorize(CLI_COLORS.bold + CLI_COLORS.yellow, `  ── ${title} ${rule}`)}`;
+}
+
+/** Warning bullets (`  • text`, red), one per entry. */
+export function warningLines(warnings: readonly string[]): string[] {
+    return warnings.map((text) => colorize(CLI_COLORS.sell, `  • ${text}`));
+}
+
+/**
+ * A section header plus its warning bullets, or '' when there is nothing to
+ * report. Every report command prints warnings the same way through this.
+ */
+export function warningsBlock(warnings: readonly string[], width = SECTION_WIDTH): string {
+    if (warnings.length === 0) return '';
+    return [section('Warnings', width), ...warningLines(warnings)].join('\n');
+}
+
+/** Muted trailing summary line, printed just above the saved-file link. */
+export function summaryLine(text: string): string {
+    return colorize(CLI_COLORS.gray, `  ${text}`);
 }
