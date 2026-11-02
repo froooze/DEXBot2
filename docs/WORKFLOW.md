@@ -255,7 +255,7 @@ the canonical name is preferred in scripts and docs.
 | `dexbot rich <asset...>` | — | Top holder(s) per asset via the chain asset-holders API (`--top N`, `--json`/`--csv`) |
 | `dexbot tv <target>` | — | TradingView 1h chart for `<bot|pool-id|AssetA/AssetB>` over `--month N` (default 3) |
 | `dexbot dw <target>` | — | Dynamic-weight research chart: same targets/flags as `tv` |
-| `dexbot liquid <target>` | `liquidity` | Blended order-book + AMM pool liquidity depth chart for `<bot|AssetA/AssetB>` (`--range`, `--depth`, `--steps`) |
+| `dexbot liquid <target>` | `liq` (default shorthand), `liqu`, `liquidity` | Blended order-book + AMM pool liquidity depth chart for `<bot|AssetA/AssetB>` (`--range`, `--depth`, `--steps`) |
 | `dexbot pnl <account>` | — | HTML PnL report for a bot/account over `--month N`, optional `--pair BASE/QUOTE` filter |
 | `dexbot git` | — | Analyze repository git history and write an added/deleted-lines HTML chart (`repo-stats.html`; source checkouts only) |
 | `dexbot status` | `stat`, `stats` | Unified runtime health — daemon, adapter, bots. Whole-runtime: an optional bot name is validated, then ignored |

@@ -349,8 +349,9 @@ identically offline.
 npm run analysis:liquidity -- --pair TOKENA/TOKENB
 
 # CLI wrapper: resolves a bot key or pair, then runs the same generator
-dexbot liquid TOKENA/TOKENB --range 0.25
-dexbot liquid <bot-key>
+dexbot liq TOKENA/TOKENB --range 0.25
+dexbot liq <bot-key>
+# Aliases: liqu, liquidity (canonical command: liquid)
 
 # Tighter window, deeper book, explicit pool
 node dist/analysis/analyze_liquidity.js \

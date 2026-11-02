@@ -163,7 +163,7 @@ const PROFILES_BOTS_FILE = PATHS.PROFILES.BOTS_JSON;
 const PROFILES_DIR = PATHS.PROFILES_DIR;
 
 const CLI_COMMANDS = ['start', 'test', 'reset', 'default', 'disable', 'enable', 'drystart', 'key', 'bot', 'pm2', 'update', 'export', 'order', 'credit', 'rich', 'tv', 'dw', 'liquid', 'pnl', 'git', 'clear', 'clear-orders', 'clear-market-adapter', 'clear-all', 'status', 'unlock', 'delete', 'stop', 'restart', 'reload', 'help'];
-const COMMAND_ALIASES: Record<string, string> = { orders: 'order', keys: 'key', bots: 'bot', stat: 'status', stats: 'status', start: 'unlock', defaults: 'default', stp: 'stop', stopall: 'stop', restartall: 'restart', reloadall: 'reload', liquidity: 'liquid' };
+const COMMAND_ALIASES: Record<string, string> = { orders: 'order', keys: 'key', bots: 'bot', stat: 'status', stats: 'status', start: 'unlock', defaults: 'default', stp: 'stop', stopall: 'stop', restartall: 'restart', reloadall: 'reload', liq: 'liquid', liqu: 'liquid', liquidity: 'liquid' };
 const CLI_HELP_FLAGS = ['-h', '--help'];
 const CLI_EXAMPLES_FLAG = '--cli-examples';
 const CLI_EXAMPLES = [
@@ -179,7 +179,7 @@ const CLI_EXAMPLES = [
     { title: 'Show live credit positions', command: 'dexbot credit', notes: 'Summed MPA + borrowed-credit positions per bot.' },
     { title: 'Asset rich list', command: 'dexbot rich <asset> [<asset...>]', notes: 'Top holder(s) per asset from the chain asset holders API.' },
     { title: 'Chart a bot, pool, or pair', command: 'dexbot tv <bot|pool-id|AssetA/AssetB> --month 3', notes: 'OHLC chart; --feed charts MPA price-feed history.' },
-    { title: 'Liquidity depth chart', command: 'dexbot liquid <bot|AssetA/AssetB>', notes: 'Order-book + AMM pool cumulative depth; --range/--depth/--steps.' },
+    { title: 'Liquidity depth chart', command: 'dexbot liq <bot|AssetA/AssetB>', notes: 'Order-book + AMM pool cumulative depth; --range/--depth/--steps. Canonical: liquid; aliases: liqu, liquidity.' },
     { title: 'PnL report', command: 'dexbot pnl <bot|account> --month 3 [--pair BASE/QUOTE]', notes: 'Self-contained HTML PnL report for the resolved bot or chain account.' }
 ];
 
@@ -240,7 +240,7 @@ function printCLIUsage() {
             ['rich <asset...>', 'Per-asset rich list / top holder; --top N, --json.'],
             ['tv <target>', 'OHLC chart for <bot|pool-id|AssetA/AssetB>; --month N (default 3), --feed for MPA price-feed history.'],
             ['dw <target>', 'Dynamic-weight research chart; same targets and flags as tv.'],
-            ['liquid <target>', 'Liquidity depth chart for <bot|AssetA/AssetB>; --range, --depth, --steps.'],
+            ['liq <target>', 'Liquidity depth chart for <bot|AssetA/AssetB>; --range, --depth, --steps (canonical: liquid; aliases: liqu, liquidity).'],
             ['pnl <account>', 'HTML PnL report for a bot or account; --month N, optional --pair BASE/QUOTE filter.'],
         ]],
         ['Files', [
