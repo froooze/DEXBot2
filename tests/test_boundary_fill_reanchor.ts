@@ -261,5 +261,37 @@ run('REANCHOR-19 an edge-pinned fill can never anchor (pivot is not armed by one
     assert.strictEqual(r.boundaryIdx, 5, 'the boundary must not move');
 });
 
+run('REANCHOR-20 batch extremum + PARTIAL residual: the residual is allow-listed at the ANCHOR slot', () => {
+    // The chunked-sweep shape: the pivot is the first chunk's fill (105) but the
+    // batch's furthest fill is 108 and that slot still holds its own PARTIAL
+    // residual. The allow-list exists for exactly this, so it must be keyed on
+    // the ANCHOR (108), not on the last-processed pivot (105) — keying it on
+    // the pivot made the list dead code and the re-anchor was refused as
+    // `unsafe: placed_order_in_band`.
+    const mgr = makeManager(105, ORDER_TYPES.SELL);
+    const r = reanchorBoundaryFromLastFill(mgr, 2, makeSlots([], [8]), 1, [
+        { id: 'slot-5', type: ORDER_TYPES.SELL, price: 105 },
+        { id: 'slot-8', type: ORDER_TYPES.SELL, price: 108, isPartial: true }
+    ]);
+    assert.strictEqual(r.reanchored, true, `the anchor's own residual must not block it, got ${JSON.stringify(r)}`);
+    assert.strictEqual(r.fillSlot, 8, 'the extremum fill anchors the geometry');
+    assert.strictEqual(r.boundaryIdx, 7, 'gap 1 => boundary 7 so sellStart is 9');
+});
+
+run('REANCHOR-21 the allow-list stays narrow: a FOREIGN in-band residual still refuses', () => {
+    // Same geometry, but the in-band order at the anchor slot is not the fill's
+    // own residual (wrong side). The anchor-aware allow-list must not become a
+    // blanket exemption for anything sitting at the anchor level.
+    const mgr = makeManager(105, ORDER_TYPES.SELL);
+    const slots = makeSlots([], [8]);
+    slots[8].type = ORDER_TYPES.BUY;
+    const r = reanchorBoundaryFromLastFill(mgr, 2, slots, 1, [
+        { id: 'slot-5', type: ORDER_TYPES.SELL, price: 105 },
+        { id: 'slot-8', type: ORDER_TYPES.SELL, price: 108, isPartial: true }
+    ]);
+    assert.strictEqual(r.reanchored, false, `a foreign in-band order must still refuse the re-anchor, got ${JSON.stringify(r)}`);
+    assert.ok(/unsafe/.test(String(r.reason)), `refusal must name the strand: ${JSON.stringify(r)}`);
+});
+
 console.log(`\nREANCHOR summary: ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

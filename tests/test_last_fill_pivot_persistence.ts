@@ -303,7 +303,8 @@ async function testLFP9_GuardFallsBackToMarketFillWhenPivotCold() {
         lastFillPivotSource: null,
         _lastMarketFillPrice: 100,
         _lastMarketFillType: ORDER_TYPES.BUY,
-        _lastMarketFillAt: FILLS_AT,
+        // Fresh, because the read path now expires a row past the TTL (LFP-10).
+        _lastMarketFillAt: Date.now() - 60_000,
     };
     assert.deepStrictEqual(
         resolveLastFillGuardReference(cold),
@@ -326,10 +327,11 @@ async function testLFP9_GuardFallsBackToMarketFillWhenPivotCold() {
     const armed: any = {
         _lastFilledPrice: 101,
         _lastFilledType: ORDER_TYPES.SELL,
+        _lastFilledAt: Date.now() - 60_000,
         lastFillPivotSource: 'fill',
         _lastMarketFillPrice: 100,
         _lastMarketFillType: ORDER_TYPES.BUY,
-        _lastMarketFillAt: FILLS_AT,
+        _lastMarketFillAt: Date.now() - 120_000,
     };
     assert.deepStrictEqual(resolveLastFillGuardReference(armed), { price: 101, type: ORDER_TYPES.SELL });
 
@@ -339,6 +341,43 @@ async function testLFP9_GuardFallsBackToMarketFillWhenPivotCold() {
         { price: null, type: null }
     );
     console.log('✓ LFP-9 passed');
+}
+
+async function testLFP10_ReadTimeTTL() {
+    console.log('\n[LFP-10] the pivot TTL is also enforced where the pivot is READ...');
+    // The geometry-bind watchdog re-centers at most ONCE per pivot and then
+    // reports that a fill or the pivot TTL restores the side. The TTL therefore
+    // has to bite in-process: a row that has aged past
+    // GRID_LIMITS.LAST_FILL_PIVOT_TTL_MS must stop arming the guard, not only be
+    // dropped on the next restart.
+    const { GRID_LIMITS } = require('../modules/constants');
+    const ttl = Number(GRID_LIMITS.LAST_FILL_PIVOT_TTL_MS);
+    assert.ok(ttl > 0, 'the pivot TTL must be configured');
+
+    const manager: any = {
+        _lastFilledPrice: 101,
+        _lastFilledType: ORDER_TYPES.SELL,
+        _lastFilledAt: Date.now() - ttl - 60_000,
+        lastFillPivotSource: 'fill',
+        _lastMarketFillPrice: null,
+        _lastMarketFillType: null,
+        _lastMarketFillAt: 0,
+        logger: { log: () => {} },
+    };
+    assert.deepStrictEqual(resolveLastFillGuardReference(manager), { price: null, type: null },
+        'an expired live pivot must not arm the guard');
+
+    // A missing timestamp is "unknown age", never an expiry: legacy managers
+    // carry no fill clock and unarming those silently would be worse.
+    const legacy: any = {
+        _lastFilledPrice: 101,
+        _lastFilledType: ORDER_TYPES.SELL,
+        lastFillPivotSource: 'fill',
+        logger: { log: () => {} },
+    };
+    assert.deepStrictEqual(resolveLastFillGuardReference(legacy), { price: 101, type: ORDER_TYPES.SELL },
+        'an unknown age must not expire the pivot');
+    console.log('✓ LFP-10 passed');
 }
 
 async function runAllTests() {
@@ -353,6 +392,7 @@ async function runAllTests() {
         await testLFP7_OffLadderPivotRefused();
         await testLFP8_ResetClearsWholeFamily();
         await testLFP9_GuardFallsBackToMarketFillWhenPivotCold();
+        await testLFP10_ReadTimeTTL();
         console.log('\nAll LAST-FILL-GUARD pivot persistence tests passed.');
     } catch (e: any) {
         console.error('Test failed:', e?.message ?? e);

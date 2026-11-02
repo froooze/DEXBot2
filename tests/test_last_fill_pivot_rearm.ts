@@ -14,11 +14,15 @@
  *      claim "the guard re-arms on the first fill of the new generation", which
  *      is not what the fallback did — the two must now agree.
  *
- * The decision is pinned deliberately: the pivot SURVIVES a rebuild (bounded by
- * the same 24h restore TTL as the row). If the market has moved away from that
- * price, the same-side rail reads `last-fill-blocked` and only a fill (or the
- * TTL) restores it — the geometry-bind watchdog is capped to one re-center per
- * pivot for exactly that reason (test_spread_last_fill_planning SLF-11).
+ * The decision is pinned deliberately: the pivot SURVIVES a rebuild, bounded by
+ * the same 24h TTL as the row — and that bound is enforced on BOTH sides: the
+ * restore path drops an expired persisted row, and the READ path
+ * (resolveLastFillGuardReference / resolveFillProvenancedRow) drops an expired
+ * in-memory row so a long-lived process cannot keep a stale fill vetoing a
+ * side forever. If the market has moved away from that price, the same-side
+ * rail reads `last-fill-blocked` and only a fill (or the TTL) restores it —
+ * the geometry-bind watchdog is capped to one re-center per pivot for exactly
+ * that reason (test_spread_last_fill_planning SLF-11).
  */
 
 const assert = require('assert');
@@ -29,7 +33,7 @@ const {
     resolveLastFillGuardReference,
     isLastFillGuardBlocked
 } = require('../modules/order/utils/system');
-const { ORDER_TYPES } = require('../modules/constants');
+const { ORDER_TYPES, GRID_LIMITS } = require('../modules/constants');
 
 let passed = 0;
 let failed = 0;
@@ -47,7 +51,10 @@ function run(name: string, fn: () => void) {
     }
 }
 
-const FILLS_AT = Date.parse('2026-10-31T10:00:00.000Z');
+// Relative, not a fixed date: the pivot now EXPIRES at read time, so a
+// hard-coded timestamp silently turns these fixtures into "expired pivot"
+// tests and they start failing a day after the date they were written.
+const FILLS_AT = Date.now() - 60_000;
 
 function makeManager(over: Record<string, unknown> = {}) {
     const logs: Array<{ msg: string; level?: string }> = [];
@@ -126,6 +133,75 @@ run('REARM-5 re-arm is idempotent (repeat rebuilds keep one value)', () => {
     const first = { price: mgr._lastFilledPrice, type: mgr._lastFilledType, at: mgr._lastFilledAt };
     assert.strictEqual(rearmLastFillPivotFromMarketFill(mgr), true);
     assert.deepStrictEqual({ price: mgr._lastFilledPrice, type: mgr._lastFilledType, at: mgr._lastFilledAt }, first);
+});
+
+run('REARM-6 the TTL is enforced where the pivot is READ, not only at restore', () => {
+    // The geometry-bind watchdog re-centers at most once per pivot and then
+    // reports that "a fill or the pivot TTL restores the side" — that promise
+    // only holds if an in-memory row past the TTL stops arming the guard.
+    const ttl = Number(GRID_LIMITS.LAST_FILL_PIVOT_TTL_MS);
+    assert.ok(ttl > 0, 'the pivot TTL must be configured');
+
+    const expired: any = makeManager({
+        _lastMarketFillPrice: 0.44764,
+        _lastMarketFillType: ORDER_TYPES.SELL,
+        _lastMarketFillAt: Date.now() - ttl - 1000
+    });
+    assert.deepStrictEqual(resolveLastFillGuardReference(expired), { price: null, type: null },
+        'an expired market row must not arm the guard');
+    assert.strictEqual(rearmLastFillPivotFromMarketFill(expired), false,
+        'an expired row must not be re-armed on a rebuild either');
+    assert.strictEqual(expired._lastFilledPrice, null, 'the refused re-arm leaves the pivot cold');
+
+    const fresh: any = makeManager({
+        _lastMarketFillPrice: 0.44764,
+        _lastMarketFillType: ORDER_TYPES.SELL,
+        _lastMarketFillAt: Date.now() - ttl + 60_000
+    });
+    assert.deepStrictEqual(resolveLastFillGuardReference(fresh), { price: 0.44764, type: ORDER_TYPES.SELL },
+        'a row just inside the TTL still arms the guard');
+    assert.strictEqual(rearmLastFillPivotFromMarketFill(fresh), true, 'and is still re-armed on a rebuild');
+});
+
+run('REARM-7 an expired LIVE pivot falls back only to a FRESH market row', () => {
+    const ttl = Number(GRID_LIMITS.LAST_FILL_PIVOT_TTL_MS);
+    const staleLive: any = makeManager({
+        _lastFilledPrice: 101,
+        _lastFilledType: ORDER_TYPES.BUY,
+        _lastFilledAt: Date.now() - ttl - 60_000,
+        lastFillPivotSource: 'fill',
+        _lastMarketFillPrice: 100,
+        _lastMarketFillType: ORDER_TYPES.SELL,
+        _lastMarketFillAt: Date.now() - 60_000
+    });
+    assert.deepStrictEqual(resolveLastFillGuardReference(staleLive), { price: 100, type: ORDER_TYPES.SELL },
+        'the stale live pivot must yield to the younger real fill');
+
+    staleLive._lastMarketFillAt = Date.now() - ttl - 60_000;
+    assert.deepStrictEqual(resolveLastFillGuardReference(staleLive), { price: null, type: null },
+        'two expired rows => cold (fail-open), never a stale veto');
+});
+
+run('REARM-8 the re-arm timestamp belongs to the row that supplied the PRICE', () => {
+    // A book seed writes _lastFilledAt but never the market row. The re-arm
+    // falls back to the market row's price, so it must also take that row's
+    // clock — otherwise setLastFillPivot(..., 'fill') re-stamps
+    // _lastMarketFillAt with the (fresh) seed time and the TTL never fires.
+    const seedAt = Date.now();
+    const rowAt = Date.now() - 3_600_000;
+    const mgr: any = makeManager({
+        _lastFilledPrice: 99,
+        _lastFilledType: ORDER_TYPES.BUY,
+        lastFillPivotSource: 'book',
+        _lastFilledAt: seedAt,
+        _lastMarketFillPrice: 100,
+        _lastMarketFillType: ORDER_TYPES.SELL,
+        _lastMarketFillAt: rowAt
+    });
+    assert.strictEqual(rearmLastFillPivotFromMarketFill(mgr), true);
+    assert.strictEqual(mgr._lastFilledPrice, 100, 'the market row supplies the price');
+    assert.strictEqual(mgr._lastFilledAt, rowAt, "the pivot must carry the market row's clock, not the seed's");
+    assert.strictEqual(mgr._lastMarketFillAt, rowAt, 'the market row keeps its own age (the re-arm must not refresh it)');
 });
 
 console.log(`\nPIVOT-REARM summary: ${passed} passed, ${failed} failed`);

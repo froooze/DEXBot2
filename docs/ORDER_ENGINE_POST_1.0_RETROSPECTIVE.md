@@ -695,7 +695,8 @@ required is no longer reachable at runtime.
 - **A rail clamp only cites its own evidence:** the batch's op destinations and the master
   orders on their own side of the planned boundary; strays are ignored and named (§9.10/P3).
 - **The pivot has a lifetime:** re-armed explicitly after a rebuild from the last real fill,
-  bounded by the same 24h TTL, and a re-center is requested at most once per pivot because a
+  bounded by the same 24h TTL (enforced at restore and at read time, so a stale row can neither
+  arm the guard nor be re-armed), and a re-center is requested at most once per pivot because a
   re-center cannot move it (§9.10/P2).
 
 #### 9.7 The guard was a band, not an economic rule (`c86b4b0e`)

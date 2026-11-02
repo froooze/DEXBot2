@@ -2109,8 +2109,12 @@ function logGridPriceInvariantSummary(bot: BotLike, stats: GridPriceInvariantSta
 function recordRestampBuyAboveAnchor(bot: BotLike, price: unknown, type: unknown): boolean {
     try {
         if (type !== ORDER_TYPES.BUY) return false;
-        if (bot?.manager?._lastFilledType !== ORDER_TYPES.BUY) return false;
-        const pivot = Number(bot?.manager?._lastFilledPrice);
+        // ONE reference, the same one the guard judges against: the raw live
+        // fields miss the market-row fallback (a rebuild) and would still count
+        // against an expired pivot that no longer gates anything.
+        const reference = resolveLastFillGuardReference(bot?.manager);
+        if (reference.type !== ORDER_TYPES.BUY) return false;
+        const pivot = Number(reference.price);
         const p = Number(price);
         if (!Number.isFinite(pivot) || pivot <= 0 || !Number.isFinite(p) || p <= 0) return false;
         // At or above the pivot is the re-stamp shape; a lower BUY is the

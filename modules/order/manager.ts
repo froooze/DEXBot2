@@ -622,6 +622,8 @@ class OrderManager implements OrderManagerLike {
     _lastFilledPrice: number | null;
     _lastFilledType: string | null;
     _lastFilledAt: number;
+    /** Timestamp of the fill reference whose read-time expiry was already logged (one line per expired value). */
+    _lastFillPivotExpiryLoggedAt: number;
     lastFillPivotSource: 'fill' | 'book' | null;
     // Bot-scoped "last market fill" reference. Unlike the genesis-bound
     // LAST-FILL-GUARD pivot (reset with the grid generation), this survives a
@@ -778,6 +780,7 @@ class OrderManager implements OrderManagerLike {
         this._lastFilledPrice = null;
         this._lastFilledType = null;
         this._lastFilledAt = 0;
+        this._lastFillPivotExpiryLoggedAt = 0;
         // Pivot provenance for the LAST-FILL-GUARD persist/restore contract:
         // 'fill' = armed by a real fill (persist-eligible), 'book' = armed by
         // the startup book seed (heuristic, in-memory only), null = unarmed.

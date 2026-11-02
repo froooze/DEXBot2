@@ -214,6 +214,56 @@ async function testPivotWithoutGenesisFallsBack() {
     console.log('  \u2713 PIVOT-003 passed');
 }
 
+/**
+ * PIVOT-004 - the COW lane's same-level refusal is the SNAP, not a band.
+ *
+ * The reconcile/startup placement path asks `isLastFillPlacementBlocked`, which
+ * refuses a target within half a grid step of the RAW pivot (a slot level and
+ * its execution price differ by rounding). The COW build loop instead snaps the
+ * pivot onto the ladder first (`resolveOnGridPivot`, tolerance = one
+ * increment) and then applies the direction rule — which blocks the same level
+ * because the target EQUALS the snapped pivot. Both lanes therefore refuse the
+ * live incident's shape; the COW lane needs no half-step predicate of its own.
+ *
+ * This is pinned so the "two lanes disagree" reading is not "fixed" by wiring
+ * the raw placement predicate into the COW lane: that would judge placements
+ * against an OFF-LADDER pivot, which is exactly what resolveOnGridPivot refuses
+ * to do (a corrupt pivot must not be rewritten onto the grid).
+ */
+async function testCowLaneSameLevelViaSnap() {
+    console.log('\n[PIVOT-004] the COW lane refuses the same-level shape through pivot snapping...');
+    // Live incident shape: slot level vs its own execution price.
+    const level = 1310.046339;
+    const fillPrice = 1310.060435;
+    const manager = { _genesis: { priceLevels: [level] }, config: { incrementPercent: 0.5 } };
+
+    const snapped = resolveOnGridPivot(manager, fillPrice);
+    assert.strictEqual(snapped.price, level, `the execution price must snap to its slot level, got ${snapped.price}`);
+    assert.strictEqual(snapped.snapped, true, 'the rounding drift is a snap');
+
+    // Raw pivot: the target is a hair BELOW it, so the direction rule alone
+    // would let the just-filled level be re-placed (the incident).
+    assert.strictEqual(
+        blocked(level, ORDER_TYPES.BUY, fillPrice, ORDER_TYPES.BUY),
+        false,
+        'the raw direction rule alone admits the same-level re-place — this is why the snap is load-bearing'
+    );
+    // Snapped pivot: target == pivot, so the direction rule blocks it.
+    assert.strictEqual(
+        blocked(level, ORDER_TYPES.BUY, snapped.price, ORDER_TYPES.BUY),
+        true,
+        'the COW lane must block a BUY on the level it just filled'
+    );
+
+    // The refusal is deliberately NOT extended to a far off-ladder pivot: an
+    // adopted orphan far outside the grid keeps its raw value (fail-open with a
+    // warn) instead of being dressed up as an edge fill.
+    const offGrid = resolveOnGridPivot(manager, 2000);
+    assert.strictEqual(offGrid.snapped, false, 'a far off-ladder pivot must not be snapped');
+    assert.strictEqual(offGrid.price, 2000, 'a far off-ladder pivot keeps its raw value');
+    console.log('  \u2713 PIVOT-004 passed');
+}
+
 async function main() {
     await testColdStartDisabled();
     await testBuyAndSellDirection();
@@ -225,6 +275,7 @@ async function main() {
     await testPivotSnapsToGridLevel();
     await testOffGridPivotIsNotRewritten();
     await testPivotWithoutGenesisFallsBack();
+    await testCowLaneSameLevelViaSnap();
     console.log('\nAll LAST-FILL-GUARD tests passed.');
 }
 

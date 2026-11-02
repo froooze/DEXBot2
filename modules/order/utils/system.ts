@@ -1578,6 +1578,13 @@ export function reanchorBoundaryFromLastFill(manager: OrderManagerLike, boundary
     // fill outside its window necessarily puts that slot inside the implied
     // band. Allow exactly that residual (PARTIAL, same side, same ladder
     // level); every other in-band order still refuses the re-anchor.
+    //
+    // ANCHOR-AWARE: the residual sits at the slot the re-anchor is derived
+    // from (`anchorIdx`), which is the batch EXTREMUM, not necessarily the
+    // last-processed pivot (`idx`). Comparing against `idx`/`price` made this
+    // allow-list dead code for every chunked sweep whose furthest fill is not
+    // the pivot — i.e. exactly the case the extremum resolution exists for —
+    // so the re-anchor was refused as 'unsafe: placed_order_in_band'.
     const allowedInBandSlotIds: string[] = [];
     const fillSlotOrder = Array.isArray(slots) ? slots[anchorIdx] : null;
     if (fillSlotOrder && fillSlotOrder.orderId
@@ -1586,8 +1593,8 @@ export function reanchorBoundaryFromLastFill(manager: OrderManagerLike, boundary
         let orderIdx: number | null = null;
         try { orderIdx = Number(MathUtils.slotIndexForPrice(Number(fillSlotOrder.price), genesis)); } catch { orderIdx = null; }
         const orderPrice = Number(fillSlotOrder.price);
-        if (orderIdx === idx && Number.isFinite(orderPrice) && orderPrice > 0
-            && Math.abs(orderPrice - price) / price <= maxDrift) {
+        if (orderIdx === anchorIdx && Number.isFinite(orderPrice) && orderPrice > 0
+            && Math.abs(orderPrice - anchorPrice) / anchorPrice <= maxDrift) {
             allowedInBandSlotIds.push(String(fillSlotOrder.id));
         }
     }
@@ -1689,23 +1696,132 @@ function resolveFillAnchorIndex(
  * live pivot only when `lastFillPivotSource === 'fill'`; otherwise fall back to
  * the bot-scoped last-market-fill row, which is written only by real fills and
  * survives grid regeneration.
+ *
+ * Read-time TTL applies here too (see resolveFillProvenancedRow): an absolute
+ * geometry move must not be derived from a fill older than the pivot lifetime.
+ *
  * @param {Object} manager - OrderManager instance
  * @returns {{price: number|null, type: string|null}}
  */
 function resolveFillProvenancedReference(manager: OrderManagerLike): { price: number | null; type: string | null } {
+    const row = resolveFillProvenancedRow(manager);
+    return { price: row?.price ?? null, type: row?.type ?? null };
+}
+
+/** A fill reference row: price, side, and the clock that belongs to THAT value (`null` = unknown age). */
+interface FillPivotRow {
+    price: number;
+    type: string;
+    fillsAt: number | null;
+}
+
+/**
+ * The pivot lifetime, in ms. 0 means "no lifetime configured" (never expire).
+ * ONE reader for GRID_LIMITS.LAST_FILL_PIVOT_TTL_MS: the persisted-row
+ * restores, the read-time guards and the re-arm all derive from it.
+ */
+function lastFillPivotTtlMs(): number {
+    const ttl = Number(GRID_LIMITS.LAST_FILL_PIVOT_TTL_MS);
+    return Number.isFinite(ttl) && ttl > 0 ? ttl : 0;
+}
+
+/**
+ * Is a fill reference older than the pivot lifetime?
+ *
+ * The same bound applies at every reading of a fill reference:
+ * `restoreLastFillPivot` / `restoreLastMarketFill` (persisted rows) and
+ * `resolveLastFillGuardReference` / `resolveFillProvenancedRow` (in-memory
+ * rows). Without the read-time half, a long-lived process keeps a fill older
+ * than 24h vetoing one side forever — and the geometry-bind watchdog
+ * re-centers at most ONCE per pivot and then reports that "a fill or the pivot
+ * TTL restores the side" (trackOutOfSpreadStaleness), a promise the code must
+ * keep without a restart.
+ *
+ * An unknown age (missing/0 timestamp) never expires: legacy managers and the
+ * ambiguous two-sided book seed carry no fill clock, and silently unarming
+ * those would be worse than a stale veto.
+ *
+ * @param {unknown} atMs - Row timestamp (ms epoch)
+ * @param {number} [now=Date.now()] - Injectable clock (tests)
+ * @returns {boolean} True when the row is older than the pivot TTL
+ */
+function isFillReferenceExpired(atMs: unknown, now: number = Date.now()): boolean {
+    const ttl = lastFillPivotTtlMs();
+    if (ttl <= 0) return false;
+    const at = Number(atMs);
+    if (!Number.isFinite(at) || at <= 0) return false;
+    return now - at > ttl;
+}
+
+/**
+ * Report a pivot expiry once per expired timestamp. The read-time readers run
+ * per probe and per guarded action, so an unguarded line would flood the log;
+ * the marker is the expired row's own clock, which also re-arms the report
+ * when a NEW fill later expires.
+ */
+function logExpiredFillReference(manager: OrderManagerLike | null | undefined, atMs: unknown, now: number): void {
+    const at = Number(atMs);
+    if (!manager || !Number.isFinite(at) || at <= 0) return;
+    if (Number(manager._lastFillPivotExpiryLoggedAt) === at) return;
+    manager._lastFillPivotExpiryLoggedAt = at;
+    try {
+        manager.logger?.log?.(
+            `[LAST-FILL-GUARD] Pivot expired (age ${Math.round((now - at) / 1000)}s > TTL ` +
+            `${Math.round(lastFillPivotTtlMs() / 1000)}s) — guard re-arms on the next fill`,
+            'info'
+        );
+    } catch { /* logging is best-effort */ }
+}
+
+/** Normalize one in-memory triple (price, side, clock) into a fill reference row. */
+function readFillRow(price: unknown, type: unknown, atMs: unknown): FillPivotRow | null {
+    const p = Number(price);
+    if (!Number.isFinite(p) || p <= 0) return null;
+    if (type !== ORDER_TYPES.BUY && type !== ORDER_TYPES.SELL) return null;
+    const at = Number(atMs);
+    return { price: p, type, fillsAt: Number.isFinite(at) && at > 0 ? at : null };
+}
+
+/** Keep a row only while it is inside the pivot lifetime (logging the expiry once). */
+function acceptFillRow(manager: OrderManagerLike | null | undefined, row: FillPivotRow | null, now: number): FillPivotRow | null {
+    if (!row) return null;
+    if (isFillReferenceExpired(row.fillsAt, now)) {
+        logExpiredFillReference(manager, row.fillsAt, now);
+        return null;
+    }
+    return row;
+}
+
+/** Live armed pivot as a row, or null when cold OR past the pivot lifetime. */
+function liveFillRow(manager: OrderManagerLike | null | undefined, now: number): FillPivotRow | null {
+    return acceptFillRow(manager, readFillRow(manager?._lastFilledPrice, manager?._lastFilledType, manager?._lastFilledAt), now);
+}
+
+/** Bot-scoped last-market-fill row, or null when absent OR past the pivot lifetime. */
+function marketFillRow(manager: OrderManagerLike | null | undefined, now: number): FillPivotRow | null {
+    return acceptFillRow(manager, readFillRow(manager?._lastMarketFillPrice, manager?._lastMarketFillType, manager?._lastMarketFillAt), now);
+}
+
+/**
+ * FILL-PROVENANCED row for absolute geometry repairs (boundary re-anchor,
+ * spread market reference): the live pivot only when its provenance is
+ * `'fill'`, else the bot-scoped market row.
+ *
+ * The row's OWN timestamp travels with the row. Pairing one value's price with
+ * another value's clock is what let `rearmLastFillPivotFromMarketFill` stamp a
+ * market-fill price with a BOOK seed's (fresh) timestamp — silently refreshing
+ * the 24h lifetime on every rebuild.
+ *
+ * @param {Object} manager - OrderManager instance
+ * @param {number} [now=Date.now()] - Injectable clock (tests)
+ * @returns {FillPivotRow|null} Row, or null when both sources are cold/expired
+ */
+function resolveFillProvenancedRow(manager: OrderManagerLike, now: number = Date.now()): FillPivotRow | null {
     if (manager?.lastFillPivotSource === 'fill') {
-        const livePrice = Number(manager?._lastFilledPrice);
-        const liveType = manager?._lastFilledType;
-        if (Number.isFinite(livePrice) && livePrice > 0 && (liveType === ORDER_TYPES.BUY || liveType === ORDER_TYPES.SELL)) {
-            return { price: livePrice, type: liveType };
-        }
+        const live = liveFillRow(manager, now);
+        if (live) return live;
     }
-    const marketPrice = Number(manager?._lastMarketFillPrice);
-    const marketType = manager?._lastMarketFillType;
-    if (Number.isFinite(marketPrice) && marketPrice > 0 && (marketType === ORDER_TYPES.BUY || marketType === ORDER_TYPES.SELL)) {
-        return { price: marketPrice, type: marketType };
-    }
-    return { price: null, type: null };
+    return marketFillRow(manager, now);
 }
 
 /**
@@ -1728,20 +1844,20 @@ function resolveFillProvenancedReference(manager: OrderManagerLike): { price: nu
  * so this fallback covers only the window before that write, not the whole
  * post-rebuild lifetime.
  *
+ * LIFETIME: a fill reference older than GRID_LIMITS.LAST_FILL_PIVOT_TTL_MS is
+ * ignored (read-time expiry, same bound the restore path applies), so a stale
+ * pivot cannot veto one side forever in a long-lived process. Unknown ages
+ * (missing timestamp) never expire.
+ *
  * @param {Object} manager - OrderManager instance
  * @returns {{price: number|null, type: string|null}} Effective pivot (both null when cold)
  */
-export function resolveLastFillGuardReference(manager: OrderManagerLike): { price: number | null; type: string | null } {
-    const livePrice = Number(manager?._lastFilledPrice);
-    const liveType = manager?._lastFilledType;
-    if (Number.isFinite(livePrice) && livePrice > 0 && (liveType === ORDER_TYPES.BUY || liveType === ORDER_TYPES.SELL)) {
-        return { price: livePrice, type: liveType };
-    }
-    const marketPrice = Number(manager?._lastMarketFillPrice);
-    const marketType = manager?._lastMarketFillType;
-    if (Number.isFinite(marketPrice) && marketPrice > 0 && (marketType === ORDER_TYPES.BUY || marketType === ORDER_TYPES.SELL)) {
-        return { price: marketPrice, type: marketType };
-    }
+export function resolveLastFillGuardReference(manager: OrderManagerLike | null | undefined): { price: number | null; type: string | null } {
+    const now = Date.now();
+    const live = liveFillRow(manager, now);
+    if (live) return { price: live.price, type: live.type };
+    const market = marketFillRow(manager, now);
+    if (market) return { price: market.price, type: market.type };
     return { price: null, type: null };
 }
 
@@ -1810,7 +1926,7 @@ export function isLastFillPlacementBlocked(manager: OrderManagerLike | null | un
     const numPrice = Number(price);
     if (!Number.isFinite(numPrice) || numPrice <= 0) return { blocked: false, pivot: null };
     let reference: { price: number | null; type: string | null } = { price: null, type: null };
-    try { reference = resolveLastFillGuardReference(manager as OrderManagerLike); } catch { reference = { price: null, type: null }; }
+    try { reference = resolveLastFillGuardReference(manager); } catch { reference = { price: null, type: null }; }
     const pivot = reference.price;
     const pivotType = reference.type;
     if (pivot == null || pivotType == null) return { blocked: false, pivot: null };
@@ -1890,10 +2006,9 @@ export function restoreLastMarketFill(manager: OrderManagerLike, persisted: unkn
         } catch { /* best-effort */ }
     };
     const now = Number.isFinite(options?.now) ? Number(options.now) : Date.now();
-    const ttl = Number(GRID_LIMITS.LAST_FILL_PIVOT_TTL_MS);
-    if (Number.isFinite(ttl) && ttl > 0 && now - row.fillsAt > ttl) {
+    if (isFillReferenceExpired(row.fillsAt, now)) {
         manager.logger?.log?.(
-            `[SPREAD-CORRECTION] Persisted last-market-fill expired (age ${Math.round((now - row.fillsAt) / 1000)}s > TTL ${Math.round(ttl / 1000)}s) — reference dropped`,
+            `[SPREAD-CORRECTION] Persisted last-market-fill expired (age ${Math.round((now - row.fillsAt) / 1000)}s > TTL ${Math.round(lastFillPivotTtlMs() / 1000)}s) — reference dropped`,
             'info'
         );
         dropPersistedRow();
@@ -1925,19 +2040,30 @@ export function restoreLastMarketFill(manager: OrderManagerLike, persisted: unkn
  * rewritten: an off-new-ladder value is handled by the same one-increment
  * `resolveOnGridPivot` rule every other probe uses.
  *
+ * The timestamp comes from the SAME row as the price (see
+ * resolveFillProvenancedRow). Reading `_lastFilledAt` unconditionally paired a
+ * market-row price with a book-seed clock: a book seed writes `_lastFilledAt`
+ * but never the market row, and `setLastFillPivot(..., 'fill')` then re-stamps
+ * `_lastMarketFillAt` with that newer time — refreshing the 24h lifetime on
+ * every rebuild until the row never expires.
+ *
+ * EXPIRED ROWS DO NOT RE-ARM (resolveFillProvenancedRow drops them), so the
+ * documented pivot lifetime holds with or without a restart.
+ *
  * @param {Object} manager - OrderManager instance
  * @returns {boolean} True when a pivot was re-armed
  */
 export function rearmLastFillPivotFromMarketFill(manager: OrderManagerLike): boolean {
     if (!manager) return false;
-    const ref = resolveFillProvenancedReference(manager);
-    const price = Number(ref?.price);
-    const type = ref?.type;
-    if (!Number.isFinite(price) || price <= 0 || (type !== ORDER_TYPES.BUY && type !== ORDER_TYPES.SELL)) return false;
-    const at = Number(manager?._lastFilledAt) || Number(manager?._lastMarketFillAt) || Date.now();
-    if (!setLastFillPivot(manager, type, price, 'fill', at)) return false;
+    const row = resolveFillProvenancedRow(manager);
+    if (!row) return false;
+    // A source with no clock cannot be aged; stamping `now` keeps the re-armed
+    // pivot inside the same lifetime from this rebuild on (production rows
+    // always carry the fill's own `fillsAt`).
+    const at = row.fillsAt != null ? row.fillsAt : Date.now();
+    if (!setLastFillPivot(manager, row.type, row.price, 'fill', at)) return false;
     manager.logger?.log?.(
-        `[LAST-FILL-GUARD] Re-armed on the new generation: ${price}(${type}) from the last real fill ` +
+        `[LAST-FILL-GUARD] Re-armed on the new generation: ${row.price}(${row.type}) from the last real fill ` +
         `(age ${Math.max(0, Math.round((Date.now() - at) / 1000))}s) — the guard survives a rebuild by design`,
         'info'
     );
@@ -2130,11 +2256,12 @@ export function restoreLastFillPivot(manager: OrderManagerLike, persisted: unkno
         } catch { /* best-effort */ }
     };
 
-    // TTL first: an expired pivot is dropped, not re-armed.
+    // TTL first: an expired pivot is dropped, not re-armed (one shared bound
+    // with the read-time readers and the market-row restore).
     const now = Number.isFinite(options?.now) ? Number(options.now) : Date.now();
-    if (now - row.fillsAt > Number(GRID_LIMITS.LAST_FILL_PIVOT_TTL_MS)) {
+    if (isFillReferenceExpired(row.fillsAt, now)) {
         manager.logger?.log?.(
-            `[LAST-FILL-GUARD] Persisted pivot expired (age ${Math.round((now - row.fillsAt) / 1000)}s > TTL ${Math.round(Number(GRID_LIMITS.LAST_FILL_PIVOT_TTL_MS) / 1000)}s) — guard re-arms on the next fill`,
+            `[LAST-FILL-GUARD] Persisted pivot expired (age ${Math.round((now - row.fillsAt) / 1000)}s > TTL ${Math.round(lastFillPivotTtlMs() / 1000)}s) — guard re-arms on the next fill`,
             'info'
         );
         dropPersistedRow();

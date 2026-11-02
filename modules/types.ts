@@ -1071,6 +1071,11 @@ export interface OrderManagerLike {
   _lastFilledPrice: number | null;
   _lastFilledType: string | null;
   _lastFilledAt: number | null;
+  /**
+   * Timestamp of the fill reference whose expiry was already logged, so the
+   * read-time pivot TTL reports once per expired value instead of per probe.
+   */
+  _lastFillPivotExpiryLoggedAt?: number | null;
   lastFillPivotSource: 'fill' | 'book' | null;
   // Bot-scoped last-market-fill reference (survives grid regeneration).
   _lastMarketFillPrice?: number | null;

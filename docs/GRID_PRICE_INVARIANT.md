@@ -202,7 +202,10 @@ Rules that keep the mirror honest:
   genesis-mismatch verdicts erase the row through one shared drop path
   (`AccountOrders.clearPersistedLastFillPivot`); an off-ladder row is a no-op
   that falls back to the book seed. The snapped ladder level is restored, never
-  the raw float.
+  the raw float. The same TTL bounds the in-memory reference at READ time
+  (`resolveLastFillGuardReference` / `resolveFillProvenancedRow`), so the
+  geometry-bind "a fill or the TTL restores the side" contract does not need a
+  restart; a reference with no timestamp has an unknown age and never expires.
 - **The generation wipes the pivot.** `initializeGrid` and
   `rejectCorruptedGridSnapshot` call `resetLastFillPivot`, which clears the
   full scalar family including the per-side mirrors (so the book seed's cold
