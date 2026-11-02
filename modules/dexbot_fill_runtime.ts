@@ -8,6 +8,7 @@ import { getErrorMessage, resolveSeamMsOrNull, getErrorField } from './utils/err
 import type { BotLike, ManagerLogger, IncomingFill, ManagedOrder } from './types.js';
 import { isOrderDoesNotExistError } from './dexbot_maintenance_runtime.js';
 import { slotIndexForPrice, isChainPriceOutOfGrid, isSlotInRail } from './order/utils/math.js';
+import { attributeUnmatchedFillToGrid } from './order/utils/order.js';
 
 /** A queued incoming fill annotated with its resolved grid order. */
 type QueuedFill = IncomingFill & { gridOrder: ManagedOrder | { orderId?: string } };
@@ -150,6 +151,25 @@ async function processSweepOrphanFill(bot: BotLike, fill: unknown, fillOp: FillO
         }
         return true;
     }
+
+    // GEOMETRY FIRST, then money. The order is unknown to the grid, but the
+    // fill still proves a trade at a price: attribute it (pivot + owed crawl)
+    // BEFORE crediting the proceeds, so a fill that never reaches the strategy
+    // cannot leave the LAST-FILL-GUARD pivot stale — the same split-brain the
+    // unmatched-fill path closes for a virtualised slot. Attribution refuses a
+    // price outside the frozen rail, so a shelf/manual order can never arm the
+    // pivot at a level this grid does not trade.
+    try {
+        const pays = fillOp?.pays as { asset_id?: string; amount?: number } | undefined;
+        const receives = fillOp?.receives as { asset_id?: string; amount?: number } | undefined;
+        attributeUnmatchedFillToGrid(bot.manager, {
+            orderId: fillOp?.order_id != null ? String(fillOp.order_id) : null,
+            paysAssetId: pays?.asset_id ?? null,
+            paysAmountRaw: pays?.amount ?? null,
+            receivesAssetId: receives?.asset_id ?? null,
+            receivesAmountRaw: receives?.amount ?? null,
+        });
+    } catch { /* attribution is best-effort: never block the credit */ }
 
     (opts.logger ?? bot.manager.logger).log?.(
         `[${opts.label}] Processing funds for unknown order ${fillOp.order_id} (not in grid but crediting proceeds)`,

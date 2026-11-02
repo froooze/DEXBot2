@@ -557,6 +557,15 @@ function reconcileGrid(masterGrid: Map<string, ManagedOrder>, targetGrid: Map<st
         const masterOrder = masterGrid.get(id);
 
         if (!masterOrder || masterOrder.state === ORDER_STATES.VIRTUAL) {
+            // A VIRTUAL slot that still OWNS a chain order id is not a hole: the
+            // level already holds a live order (the dark-level state owned by the
+            // sync/startup revive path). Planning a CREATE here would place a
+            // second order at the same price. A genuinely stale id is cleared by
+            // sync pass 1 (`sync-clear-stale-id`), which makes the slot a plain
+            // hole again on the next cycle.
+            if (masterOrder && masterOrder.state === ORDER_STATES.VIRTUAL && masterOrder.orderId) {
+                continue;
+            }
             // Slot is empty or virtual - check if we need to fill it
             if (targetOrder.size > 0 && targetOrder.state === ORDER_STATES.ACTIVE) {
                 // This is a hole that needs filling
@@ -911,14 +920,35 @@ function validateCreateTargetSlots(actions: CowAction[], orders: Map<string, Man
 
         const current = orderMap.get(targetId);
 
-        // isOrderOnChain already checks orderId is truthy
-        if (current && isOrderOnChain(current)) {
+        // OCCUPANCY = the slot still owns a chain order ID, in ANY state.
+        // isOrderOnChain() (ACTIVE/PARTIAL only) was too narrow: a slot
+        // virtualised while its order was still live (phantom cleanup on a
+        // truncated read, refused-commit adoption) kept its orderId but read as
+        // "empty", so a CREATE could be planned onto a level that already held a
+        // live order (duplicate price level). A genuinely STALE id is cleared by
+        // sync pass 1 (`sync-clear-stale-id`), which turns the slot back into a
+        // plain hole on the next cycle — so this gate cannot strand a level.
+        const currentOwnsChainId = Boolean(current?.orderId);
+        const currentCreateUncertain = (current as { createUncertain?: boolean } | null | undefined)?.createUncertain === true;
+        if (current && (isOrderOnChain(current) || currentOwnsChainId)) {
             violations.push({
                 targetId,
                 currentOrderId: current.orderId,
                 currentType: current.type,
                 currentState: current.state,
                 reason: 'slot_occupied'
+            });
+        } else if (current && currentCreateUncertain) {
+            // A CREATE whose broadcast outcome is unknown. Unlike slot_occupied
+            // this is NOT proof of a live order, so it must not abort the whole
+            // batch (runPreBroadcastGuards only hard-aborts on slot_occupied) —
+            // it only withholds this CREATE until the uncertainty resolves.
+            violations.push({
+                targetId,
+                currentOrderId: current.orderId,
+                currentType: current.type,
+                currentState: current.state,
+                reason: 'slot_create_uncertain'
             });
         }
 

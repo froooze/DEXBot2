@@ -2114,8 +2114,11 @@ function recordRestampBuyAboveAnchor(bot: BotLike, price: unknown, type: unknown
         const p = Number(price);
         if (!Number.isFinite(pivot) || pivot <= 0 || !Number.isFinite(p) || p <= 0) return false;
         // At or above the pivot is the re-stamp shape; a lower BUY is the
-        // legitimate rotation target (I3) and is not counted.
-        if (p < pivot) return false;
+        // legitimate rotation target (I3) and is not counted. SAME LEVEL counts
+        // too: a slot level and its execution price differ by rounding (slot
+        // 1310.046339 filled at 1310.060435), so a bare `p < pivot` misses
+        // exactly the shape this counter exists to expose.
+        if (p < pivot && !math.pricesWithinHalfStep(p, pivot, bot?.manager?.config?.incrementPercent)) return false;
         if (bot._metrics) bot._metrics.restampBuyAboveAnchorCount = (bot._metrics.restampBuyAboveAnchorCount || 0) + 1;
         // Warn at most once per batch. Stored as a single scalar (not a
         // per-cycle map key) so the flag cannot accumulate unbounded keys on
@@ -3507,6 +3510,9 @@ async function runPreBroadcastGuards(bot: BotLike, cowResult: CowResult): Promis
                     break;
                 case 'create_price_invalid':
                     reason = `broadcast price is not a finite number`;
+                    break;
+                case 'slot_create_uncertain':
+                    reason = `an earlier CREATE here has an unknown outcome (createUncertain)`;
                     break;
                 default:
                     reason = `existing orderId=${violation.currentOrderId}`;

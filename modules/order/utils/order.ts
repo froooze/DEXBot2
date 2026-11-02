@@ -336,6 +336,324 @@ function _stampCorrectionProvenance(entry: PendingPriceCorrection, source: strin
 }
 
 /**
+ * Resolve the EXECUTION price of a fill from its paid/received raw amounts
+ * (quote per base). This is the fill FACT the LAST-FILL-GUARD pivot and the
+ * boundary re-anchor need — the slot price is only a grid identity and may be
+ * stale after a refused-commit chain adoption or an off-ladder maker fill.
+ *
+ * Returns null when either side of the amounts is missing/unusable, so callers
+ * can fall back (a fill we cannot price must not move the pivot).
+ *
+ * @param {Object} assets - {assetA (base), assetB (quote)} with precisions
+ * @param {string|null} paysAssetId - Asset the account paid
+ * @param {number} paysAmountRaw - Raw (integer) amount paid
+ * @param {string|null} receivesAssetId - Asset the account received
+ * @param {number} receivesAmountRaw - Raw (integer) amount received
+ * @returns {number|null} Quote-per-base price, or null when unresolvable
+ */
+function resolveExecutionPrice(
+    assets: AssetPair | null | undefined,
+    paysAssetId: string | null | undefined,
+    paysAmountRaw: number | null | undefined,
+    receivesAssetId: string | null | undefined,
+    receivesAmountRaw: number | null | undefined
+): number | null {
+    if (!assets?.assetA || !assets?.assetB) return null;
+    const pays = Number(paysAmountRaw);
+    const receives = Number(receivesAmountRaw);
+    if (!Number.isFinite(pays) || pays <= 0) return null;
+    if (!Number.isFinite(receives) || receives <= 0) return null;
+    const A = assets.assetA;
+    const B = assets.assetB;
+    let baseRaw: number | null = null;
+    let quoteRaw: number | null = null;
+    if (paysAssetId === A.id && receivesAssetId === B.id) {
+        baseRaw = pays;
+        quoteRaw = receives;
+    } else if (paysAssetId === B.id && receivesAssetId === A.id) {
+        baseRaw = receives;
+        quoteRaw = pays;
+    }
+    if (baseRaw === null || quoteRaw === null) return null;
+    const base = MathUtils.blockchainToFloat(baseRaw, A.precision);
+    const quote = MathUtils.blockchainToFloat(quoteRaw, B.precision);
+    if (!(base > 0) || !(quote > 0)) return null;
+    const price = quote / base;
+    return Number.isFinite(price) && price > 0 ? price : null;
+}
+
+/**
+ * Resolve the grid SLOT a fill belongs to when its chain order id no longer
+ * identifies one.
+ *
+ * Every virtualisation path (`virtualizeOrder` -> `convertToSpreadPlaceholder`
+ * / `toRailHolePlaceholder`) NULLS `orderId`, so after a phantom cleanup or a
+ * refused-commit adoption the master holds no slot keyed by the filled order:
+ * the id lookup misses exactly when the fill matters most. The genesis ladder
+ * is the authority for "which slot does this price belong to" (same rule pass 2
+ * uses for adoption), so the fill's own execution price identifies the level.
+ *
+ * Returns null for a price outside the frozen rail: a shelf/manual order or an
+ * off-ladder wick must never be mapped onto an edge slot (that would arm the
+ * pivot with a price the grid never traded at).
+ *
+ * @param {Object} manager - OrderManager instance (genesis ladder + assets)
+ * @param {number} price - Fill execution price
+ * @param {Object} [hints] - Optional {size, type} of the fill for edge-dust tolerance
+ * @returns {string|null} `slot-N` id, or null when unresolvable/out-of-grid
+ */
+function resolveSlotIdForFillPrice(
+    manager: OrderManagerLike,
+    price: number,
+    hints: { size?: number | null; type?: string | null } = {}
+): string | null {
+    try {
+        const genesis = (manager as unknown as { _genesis?: GridGenesis })._genesis;
+        if (!hasGenesisLadder(genesis) || !Number.isFinite(price)) return null;
+        const ladder = genesis as GridGenesis;
+        if (MathUtils.isChainPriceOutOfGrid(
+            price,
+            ladder,
+            Number(hints.size) || 0,
+            hints.type === ORDER_TYPES.BUY || hints.type === ORDER_TYPES.SELL ? hints.type : null,
+            manager?.assets ?? null
+        )) return null;
+        const idx = MathUtils.slotIndexForPrice(price, ladder);
+        if (!Number.isFinite(idx) || idx < 0) return null;
+        const levels = ladder.priceLevels;
+        if (Array.isArray(levels) && levels.length > 0 && idx >= levels.length) return null;
+        return `slot-${idx}`;
+    } catch { return null; }
+}
+
+/**
+ * REVIVE a virtualised slot whose chain order is still LIVE on chain.
+ *
+ * The state hole this closes: a slot can be virtualised (phantom cleanup on a
+ * truncated read, refused-commit adoption, rotation cleanup) while its order
+ * still rests on the chain. In that state the slot is invisible to window
+ * accounting (`_countActiveOnGrid` needs ACTIVE/PARTIAL) but its order is still
+ * counted in `chainCount`, so the reconcile reads a shortfall it can never
+ * repair — and the planner sees a free level, which is how a second order can be
+ * created at a price that already holds one.
+ *
+ * The revive is broadcast-free (master-only): the order is already on chain, so
+ * this only re-materialises the slot at its chain size/state. It refuses when
+ * the chain order does NOT rest at this slot's level: the slot then merely
+ * aliases the id (a rotation source whose cancel has not landed, a re-slotted
+ * order) and reviving it would resurrect a level the planner emptied on purpose.
+ *
+ * @param {Object} manager - OrderManager instance
+ * @param {Object} slot - Master slot (must NOT be placed)
+ * @param {Object} chainOrder - Parsed chain order (price/size/type/orderId)
+ * @param {unknown} rawOnChain - Raw chain object for the slot snapshot
+ * @param {string} context - Update context tag for logging/accounting
+ * @param {Object} [options] - {skipAccounting}
+ * @returns {Promise<Object|null>} The revived slot when applied, else null
+ */
+async function reviveVirtualSlotFromChain(
+    manager: OrderManagerLike,
+    slot: ManagedOrder,
+    chainOrder: ParsedChainOrder | null | undefined,
+    rawOnChain: unknown,
+    context: string,
+    options: { skipAccounting?: boolean } = {}
+): Promise<ManagedOrder | null> {
+    try {
+        if (!manager || !slot || !slot.id || !chainOrder) return null;
+        // Only a NON-placed slot can be revived; a placed one is already live.
+        if (isOrderPlaced(slot)) return null;
+        const chainId = chainOrder.orderId ?? slot.orderId ?? null;
+        if (!chainId) return null;
+        if (slot.orderId && String(slot.orderId) !== String(chainId)) return null;
+        const type = chainOrder.type;
+        if (type !== ORDER_TYPES.BUY && type !== ORDER_TYPES.SELL) return null;
+        const chainPrice = Number(chainOrder.price);
+        const chainSize = Number(chainOrder.size);
+        if (!Number.isFinite(chainPrice) || chainPrice <= 0) return null;
+        if (!Number.isFinite(chainSize) || chainSize <= 0) return null;
+        if (!MathUtils.sameGridLevel(chainPrice, Number(slot.price), manager._genesis)) return null;
+
+        const booked = toFiniteNumber(slot.size, 0);
+        const state = booked > chainSize ? ORDER_STATES.PARTIAL : ORDER_STATES.ACTIVE;
+        const { createUncertain: _staleMarker, ...rest } = slot as ManagedOrder & { createUncertain?: boolean };
+        const revived: ManagedOrder = {
+            ...(rest as ManagedOrder),
+            type,
+            state,
+            size: chainSize,
+            orderId: String(chainId),
+            rawOnChain: (rawOnChain && typeof rawOnChain === 'object'
+                ? ({ ...(rawOnChain as Record<string, unknown>), fetchedAt: Date.now() } as ManagedOrder['rawOnChain'])
+                : (slot.rawOnChain ?? null)),
+        };
+        const applied = await manager._applyOrderUpdate(revived, context, {
+            skipAccounting: options.skipAccounting === true,
+            fee: 0
+        });
+        if (applied === false) {
+            manager.logger?.log?.(
+                `[SYNC] Revive of virtualised slot ${slot.id} rejected — slot keeps its VIRTUAL state`,
+                'warn'
+            );
+            return null;
+        }
+        manager.logger?.log?.(
+            `[SYNC] Revived virtualised slot ${slot.id}: its chain order ${chainId} is still live ` +
+            `(${type} @ ${Format.formatPrice6(chainPrice)}, size ${chainSize}) while the slot was ` +
+            `${ORDER_STATES.VIRTUAL} — re-materialised in place (no broadcast), so window accounting ` +
+            `counts it again`,
+            'warn'
+        );
+        return revived;
+    } catch { return null; }
+}
+
+/**
+ * ATTRIBUTE a fill to the grid when its chain order id identifies no live slot
+ * ("order not found in active grid").
+ *
+ * The failure this closes (live incident): a 120s stale broadcast region
+ * deferred the fill queue, a phantom cleanup then virtualised the filled slots
+ * (which NULLS their `orderId`), and the re-delivered fills were dropped AFTER
+ * their accounting had been booked. Neither the LAST-FILL-GUARD pivot nor the
+ * owed boundary crawl learned the execution price, so the pivot stayed on a
+ * stale, HIGHER value and the direction rule then allowed re-buys ABOVE the
+ * market (9 buy-lower violations, 23.5% of the window's BTS).
+ *
+ * Two identities, in order:
+ *   1. the slot that still owns the chain order id (any state — a virtualised
+ *      slot can keep its id), or
+ *   2. the genesis ladder level the fill's own execution price maps to (the
+ *      common case, because virtualisation clears the id).
+ *
+ * Only what the fill PROVES is recorded: the pivot, and — when the resolved
+ * slot is a hole — an owed boundary crawl. The slot and the already-booked
+ * accounting are never touched: the funds are the accountant's business, this
+ * only keeps the geometry honest. A price outside the frozen rail is refused,
+ * so a shelf/manual order can never arm the pivot at a level the grid does not
+ * trade.
+ *
+ * @param {Object} manager - OrderManager instance
+ * @param {Object} params - fill identity {orderId, pays/receives amount+asset, isPartial}
+ * @returns {boolean} true when the fill was attributed to the grid
+ */
+function attributeUnmatchedFillToGrid(
+    manager: OrderManagerLike,
+    params: {
+        orderId?: string | null;
+        paysAssetId?: string | null;
+        paysAmountRaw?: number | null;
+        receivesAssetId?: string | null;
+        receivesAmountRaw?: number | null;
+        isPartial?: boolean;
+    }
+): boolean {
+    const mgr = manager as OrderManagerLike & {
+        config?: { dryRun?: boolean };
+        _pendingFillCrawls?: Array<{ slotId?: string; side?: string; ts?: number }>;
+        _markGridDirty?: () => void;
+        recordLastFilledPrices?: (fills: Array<{ id?: string; type?: string; price?: number; isPartial?: boolean }>) => void;
+    };
+    if (!mgr || !(mgr.orders instanceof Map)) return false;
+    const input = params ?? {};
+    const assets = mgr.assets;
+    if (!assets?.assetA || !assets?.assetB) return false;
+
+    // Identity 1: the slot that still owns this chain order id, in ANY state.
+    const chainOrderId = input.orderId != null && String(input.orderId).length > 0 ? String(input.orderId) : null;
+    let slot: ManagedOrder | null = null;
+    if (chainOrderId) {
+        for (const candidate of mgr.orders.values()) {
+            if (candidate && String(candidate.orderId ?? '') === chainOrderId) { slot = candidate; break; }
+        }
+    }
+
+    // Side from the asset that was PAID: paying the quote (assetB) buys the
+    // base, paying the base sells it. Independent of any slot type. When the
+    // fill event carries no pays asset (malformed/degraded), fall back to the
+    // matched slot's rail type — the side must never be guessed from the price.
+    let type: string | null = null;
+    if (input.paysAssetId === assets.assetB.id) type = ORDER_TYPES.BUY;
+    else if (input.paysAssetId === assets.assetA.id) type = ORDER_TYPES.SELL;
+    if (type !== ORDER_TYPES.BUY && type !== ORDER_TYPES.SELL && slot
+        && (slot.type === ORDER_TYPES.BUY || slot.type === ORDER_TYPES.SELL)) {
+        type = slot.type;
+    }
+    if (type !== ORDER_TYPES.BUY && type !== ORDER_TYPES.SELL) return false;
+
+    const execPrice = resolveExecutionPrice(
+        assets, input.paysAssetId, input.paysAmountRaw, input.receivesAssetId, input.receivesAmountRaw
+    );
+    let identity: 'chain-id' | 'ladder' | null = slot && slot.id ? 'chain-id' : null;
+    let slotId: string | null = slot && slot.id ? String(slot.id) : null;
+    let price = execPrice;
+    if (identity === 'chain-id' && (price == null || !(price > 0))) {
+        // Unpriced fill on a known slot: its stored level is the best evidence.
+        const slotPrice = Number(slot?.price);
+        price = Number.isFinite(slotPrice) && slotPrice > 0 ? slotPrice : null;
+    }
+
+    // Identity 2: the ladder level the execution price maps to. Only for a
+    // price that is genuinely inside the frozen rail (never a shelf order).
+    if (identity == null) {
+        if (price == null || !(price > 0)) return false;
+        const derived = resolveSlotIdForFillPrice(mgr as OrderManagerLike, price, { type });
+        if (!derived) return false;
+        identity = 'ladder';
+        slotId = derived;
+        slot = mgr.orders.get(derived) ?? null;
+    }
+
+    if (price == null || !Number.isFinite(price) || price <= 0) return false;
+    if (!slotId) return false;
+
+    // 1. Pivot: the LAST-FILL-GUARD reference must track the real trade.
+    //    recordLastFilledPrices owns the scalar family + the edge-pinned
+    //    exclusion (a wick on an edge order must not arm it).
+    let pivotRecorded = false;
+    try {
+        mgr.recordLastFilledPrices?.([{ id: slotId, type, price, isPartial: input.isPartial === true }]);
+        // Honest reporting: the writer deliberately SKIPS edge-pinned fills (a
+        // wick on the static floor/ceiling must not arm the pivot), so "did the
+        // pivot move to this price" is the only truthful signal.
+        pivotRecorded = Number((mgr as unknown as { _lastFilledPrice?: number })._lastFilledPrice) === price;
+    } catch (err) {
+        mgr.logger?.log?.(`[SYNC] Fill-pivot record failed for unattributed fill ${chainOrderId ?? 'unknown'}: ${getErrorMessage(err)}`, 'warn');
+    }
+
+    // 2. Owed crawl: the same ledger the strategy maintains, and only for a
+    //    slot that is actually a HOLE the grid owns — a crawl is owed because
+    //    the level must be re-placed, which cannot happen while an order still
+    //    occupies it (and cannot be consumed for a slot that does not exist).
+    //    Same eligibility as strategy.processFillsOnly: the edge classification
+    //    that decides whether a crawl is APPLIED lives in the boundary
+    //    derivation. Re-delivery replaces, never stacks; dry runs never commit a
+    //    boundary, so they must not grow the ledger.
+    const slotIsHole = !!slot && !isOrderPlaced(slot);
+    try {
+        if (slotIsHole && mgr.config?.dryRun !== true && Array.isArray(mgr._pendingFillCrawls)) {
+            const pending = mgr._pendingFillCrawls;
+            const at = pending.findIndex((e) => e && e.slotId === slotId);
+            if (at >= 0) pending.splice(at, 1);
+            pending.push({ slotId, side: type, ts: Date.now() });
+            while (pending.length > 500) pending.shift();
+            if (typeof mgr._markGridDirty === 'function') mgr._markGridDirty();
+        }
+    } catch { /* best-effort: the pivot above is the fail-safe */ }
+
+    mgr.logger?.log?.(
+        `[SYNC] Fill for order ${chainOrderId ?? 'unknown'} attributed to ${slotId} via ${identity} ` +
+        `(${type} @ ${Format.formatPrice6(price)}): ` +
+        `${pivotRecorded ? 'pivot recorded' : 'pivot NOT armed (edge-pinned fill or no writer)'}` +
+        `${slotIsHole ? ' + owed boundary crawl' : ' (slot still holds a live order: no crawl)'}` +
+        `; accounting already booked`,
+        'warn'
+    );
+    return true;
+}
+
+/**
  * Find the live grid slot that currently owns a chain order.
  * When slotId is supplied, only that exact slot is considered; otherwise all
  * live slots are searched. This keeps stale-decision guards consistent without
@@ -3655,7 +3973,7 @@ function collectKnownOnChainOrderIds(mgr: OrderManagerLike, placedResults: unkno
     return { masterIds: [...masterIds], createIds: [...createIds], all: [...all] };
 }
 
-export { parseChainOrder, resolveLiveOrderLadderPosition, applyChainSizeToGridOrder,  buildFillKey, correctOrderPriceOnChain, correctAllPriceMismatches, _validatePriceCorrectionEntry, _stampCorrectionProvenance, findLiveOrderOwnerByChainId, buildCreateOrderArgs, getOrderTypeFromUpdatedFlags, resolveConfiguredPriceBound, virtualizeOrder, convertToSpreadPlaceholder, toRailHolePlaceholder, geometryTypeForSlotIndex, detectGapEvacuationCandidates, updateGapEvacuationStreaks, resolveSpreadOrderSide, chainOrderMatchesSlot, chainOrderMatchesSlotWithTolerance, crossingCandidateChainId, isCrossingCheckCandidate, buildCrossingCheckCandidates, filterOrdersByType, buildOutsideInPairGroups, extractBatchOperationResults, formatUnmatchedChainOrder, isNonBlockingUnmatchedOrder, isStrandedHoldOrder, isOrderOnChain, isOrderVirtual, hasOnChainId, isOrderPlaced, isPhantomOrder, isSlotAvailable, isEmptyGridSlot, isOrderHealthy, checkSizeThreshold, checkSizesBeforeMinimum, calculateIdealBoundary, assignGridRoles, resolveOnChainRetypeType, shouldFlagOutOfSpread, buildIndexes, validateIndexes, ordersEqual, buildDelta, deriveTargetBoundary, isShiftEligibleFill, resolveEdgeCount, resolveEdgeOrders, selectEdgeSlots, getCoreOrdersTotal, getSideBudget, calculateBudgetedSizes, buildCreateOpFingerprint, isOrderGoneErrorMessage, recordDuplicateOrphanDetection, clearDuplicateOrphanDetection, duplicateOrphanLogInfo, chainOrderUnchangedFromCache, detectCrossedBookPlan, collectKnownOnChainOrderIds, collectEdgePinnedFillIds, edgeOrderIdSet, liveWindowIdSet, checkGridPriceInvariant, reportGridPriceInvariant };
+export { parseChainOrder, resolveLiveOrderLadderPosition, applyChainSizeToGridOrder, resolveExecutionPrice, resolveSlotIdForFillPrice, reviveVirtualSlotFromChain, attributeUnmatchedFillToGrid,  buildFillKey, correctOrderPriceOnChain, correctAllPriceMismatches, _validatePriceCorrectionEntry, _stampCorrectionProvenance, findLiveOrderOwnerByChainId, buildCreateOrderArgs, getOrderTypeFromUpdatedFlags, resolveConfiguredPriceBound, virtualizeOrder, convertToSpreadPlaceholder, toRailHolePlaceholder, geometryTypeForSlotIndex, detectGapEvacuationCandidates, updateGapEvacuationStreaks, resolveSpreadOrderSide, chainOrderMatchesSlot, chainOrderMatchesSlotWithTolerance, crossingCandidateChainId, isCrossingCheckCandidate, buildCrossingCheckCandidates, filterOrdersByType, buildOutsideInPairGroups, extractBatchOperationResults, formatUnmatchedChainOrder, isNonBlockingUnmatchedOrder, isStrandedHoldOrder, isOrderOnChain, isOrderVirtual, hasOnChainId, isOrderPlaced, isPhantomOrder, isSlotAvailable, isEmptyGridSlot, isOrderHealthy, checkSizeThreshold, checkSizesBeforeMinimum, calculateIdealBoundary, assignGridRoles, resolveOnChainRetypeType, shouldFlagOutOfSpread, buildIndexes, validateIndexes, ordersEqual, buildDelta, deriveTargetBoundary, isShiftEligibleFill, resolveEdgeCount, resolveEdgeOrders, selectEdgeSlots, getCoreOrdersTotal, getSideBudget, calculateBudgetedSizes, buildCreateOpFingerprint, isOrderGoneErrorMessage, recordDuplicateOrphanDetection, clearDuplicateOrphanDetection, duplicateOrphanLogInfo, chainOrderUnchangedFromCache, detectCrossedBookPlan, collectKnownOnChainOrderIds, collectEdgePinnedFillIds, edgeOrderIdSet, liveWindowIdSet, checkGridPriceInvariant, reportGridPriceInvariant };
 export type { CrawlEntry }
 export { resolveEdgeAnchorPrice, resolveLiveEdgeAnchorPrice, compareEdge, collectRefillSlotIds, recordOrderPlacement, isFreshlyPlacedOrder, _filterUnmatchedChainOrders };
 

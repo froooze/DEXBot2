@@ -14,7 +14,12 @@ const { validateCreateTargetSlots } = require('../modules/order/utils/validate')
 
 // Helpers
 function makeOrder(id, type, price, size, state, orderId) {
-    return { id, type, price, size, state, orderId: orderId || `${id}-oid` };
+    // An EXPLICIT null means "this slot owns no chain order" (an empty/VIRTUAL
+    // slot). The old `orderId || fallback` turned that into a synthetic id,
+    // which is indistinguishable from a live order id — and occupancy is now
+    // decided by the id alone (a VIRTUAL slot that still owns an id may hold a
+    // live order on chain, so CREATE must not duplicate the level).
+    return { id, type, price, size, state, orderId: orderId === undefined ? `${id}-oid` : orderId };
 }
 
 function makeCreateAction(targetId, price, type, size = 100) {
@@ -280,8 +285,48 @@ async function runTests() {
         assert.strictEqual(bad.targetId, 'slot-n', 'violation targets the unpriceable CREATE slot');
     }
 
-    // ── 14. Chain-orphan price fallback honors the increment cap ────
-    console.log(' - 13. Chain-orphan fallback caps tolerance to the grid increment...');
+    // ── 14. A virtualised slot that still OWNS a chain id is occupied ──
+    // Live incident class: a slot virtualised while its order stayed on chain
+    // (phantom cleanup on a truncated read, refused-commit adoption) read as
+    // "empty" under isOrderOnChain (ACTIVE/PARTIAL only), so a CREATE was
+    // planned onto a level that already held a live order — a duplicate price
+    // level. Occupancy is the ID, not the state.
+    console.log(' - 14. Virtualised slot owning a chain id is occupied...');
+    {
+        const orders = mapToOrders([
+            makeOrder('slot-dark', ORDER_TYPES.BUY, 100, 50, ORDER_STATES.VIRTUAL, '1.7.424242')
+        ]);
+        const actions = [makeCreateAction('slot-dark', 100, ORDER_TYPES.BUY)];
+        const result = validateCreateTargetSlots(actions, orders, dummyAssets);
+        assert.strictEqual(result.isValid, false, 'a VIRTUAL slot owning a chain id must refuse the CREATE');
+        assert.strictEqual(result.violations[0].reason, 'slot_occupied');
+
+        // THE SAME SLOT with the id gone is a genuine hole: creatable again.
+        // (Sync pass 1 clears a stale id with `sync-clear-stale-id`, so a level
+        // whose order really disappeared is never stranded by this gate.)
+        const clearOrders = mapToOrders([
+            makeOrder('slot-dark', ORDER_TYPES.BUY, 100, 50, ORDER_STATES.VIRTUAL, null)
+        ]);
+        const cleared = validateCreateTargetSlots(actions, clearOrders, dummyAssets);
+        assert.strictEqual(cleared.isValid, true, `a cleared/stale-free hole must stay creatable, got ${JSON.stringify(cleared.violations)}`);
+
+        // A possibly-landed CREATE (createUncertain) is occupied too: its order
+        // may exist on chain under an id the master does not know yet.
+        const uncertainOrders = mapToOrders([
+            makeOrder('slot-uncertain', ORDER_TYPES.BUY, 100, 50, ORDER_STATES.VIRTUAL, null)
+        ]);
+        (uncertainOrders.get('slot-uncertain') as any).createUncertain = true;
+        const uncertain = validateCreateTargetSlots(
+            [makeCreateAction('slot-uncertain', 100, ORDER_TYPES.BUY)], uncertainOrders, dummyAssets
+        );
+        assert.strictEqual(uncertain.isValid, false, 'an uncertain CREATE must not be re-created');
+        // Distinct reason: an unknown outcome is NOT proof of a live order, so
+        // the batch is not hard-aborted — only this CREATE is withheld.
+        assert.strictEqual(uncertain.violations[0].reason, 'slot_create_uncertain');
+    }
+
+    // ── 15. Chain-orphan price fallback honors the increment cap ────
+    console.log(' - 15. Chain-orphan fallback caps tolerance to the grid increment...');
     {
         // A dust-sized order inflates calculatePriceTolerance above the grid
         // step, so without the cap the adjacent level 0.000319 collides with

@@ -13,6 +13,12 @@
  *        (fix 4: the filled level is never re-stamped same-side)
  *  GD-3  the reconcile create guard refuses the create outright
  *  GD-4  the window top-up is deferred while fills are unsettled (fix 1)
+ *  GD-5  a virtualised slot whose chain order is live is revived in place (F-2)
+ *  GD-6  the revive refuses aliases / placed slots / id mismatches / rejections
+ *  GD-7  a level that still owns a chain id is occupied (no duplicate CREATE) (F-3)
+ *  GD-8  the planner does not treat a dark level as a hole (F-3)
+ *  GD-9  the spread planner refuses the level that just filled (F-5)
+ *  GD-10 an orphan fill credits proceeds AND arms the pivot (F-4)
  */
 const assert = require('assert');
 const { OrderManager } = require('../modules/order/index').default;
@@ -22,7 +28,12 @@ const {
     _pickVirtualSlotsToActivate,
     _createOrderFromGrid,
 } = require('../modules/order/grid_reconcile_internal');
-const { isLastFillPlacementBlocked } = require('../modules/order/utils/system');
+const { isLastFillPlacementBlocked, isLastFillGuardBlocked } = require('../modules/order/utils/system');
+const { reviveVirtualSlotFromChain } = require('../modules/order/utils/order');
+const { validateCreateTargetSlots, reconcileGrid } = require('../modules/order/utils/validate');
+const { grid: Grid } = require('../modules/order').default;
+const { buildGenesisFromPriceLevels } = require('../modules/order/utils/math');
+
 
 // The incident ladder (slot-N prices), 0.3% per step.
 const SLOT_PRICE = (idx: number): number => 1310.046339 * Math.pow(1.003, idx - 145);
@@ -285,6 +296,331 @@ async function testTopUpDeferredWhileFillsUnsettled() {
     console.log('  ✓ deferral is state-driven and reversible');
 }
 
+// ---------------------------------------------------------------- F-2 revive
+const REVIVE_LADDER = Array.from({ length: 9 }, (_, i) => 1000 * Math.pow(1.003, i - 4));
+function reviveGenesis() {
+    return buildGenesisFromPriceLevels(REVIVE_LADDER[4], 0.3, 2, REVIVE_LADDER);
+}
+
+function makeReviveManager({ slot, applyResult = true }: { slot: any; applyResult?: boolean }) {
+    const applied: Array<{ order: any; context?: string }> = [];
+    const logs: Array<{ msg: string; level?: string }> = [];
+    const mgr: any = {
+        orders: new Map([[slot.id, slot]]),
+        assets: {
+            assetA: { id: '1.3.100', symbol: 'TEST', precision: 4 },
+            assetB: { id: '1.3.0', symbol: 'BTS', precision: 5 },
+        },
+        config: { incrementPercent: 0.3, startPrice: 1000 },
+        _genesis: reviveGenesis(),
+        logger: { log: (msg: string, level?: string) => logs.push({ msg, level }) },
+        _applied: applied,
+        _logs: logs,
+        _applyOrderUpdate: async (order: any, context?: string) => {
+            if (applyResult === false) return false;
+            applied.push({ order, context });
+            mgr.orders.set(order.id, order);
+            return true;
+        },
+    };
+    return mgr;
+}
+
+function virtualSlotAt(idx: number, orderId: string | null, size = 0) {
+    return {
+        id: `slot-${idx}`,
+        type: ORDER_TYPES.BUY,
+        state: ORDER_STATES.VIRTUAL,
+        price: REVIVE_LADDER[idx],
+        size,
+        orderId,
+    };
+}
+
+function chainOrderAt(idx: number, { size = 4, orderId = '1.7.900', type = ORDER_TYPES.BUY } = {}) {
+    return { orderId, price: REVIVE_LADDER[idx], size, type };
+}
+
+async function testReviveRevirtualisedSlot() {
+    console.log('\n[GD-5] a virtualised slot whose chain order is live is revived in place');
+    const slot = virtualSlotAt(4, '1.7.900');
+    const mgr = makeReviveManager({ slot });
+
+    const revived = await reviveVirtualSlotFromChain(mgr, slot, chainOrderAt(4), { id: '1.7.900' }, 'sync-pass1-revive', { skipAccounting: true });
+
+    assert(revived, 'the dark level must be revived');
+    assert.strictEqual(revived!.state, ORDER_STATES.ACTIVE, 'booked size 0 < chain size => ACTIVE');
+    assert.strictEqual(revived!.type, ORDER_TYPES.BUY, 'rail type comes from the chain order');
+    assert.strictEqual(revived!.size, 4, 'chain size is authoritative');
+    assert.strictEqual(revived!.orderId, '1.7.900');
+    assert.strictEqual(mgr._applied.length, 1, 'applied exactly once');
+    assert.strictEqual(mgr._applied[0].context, 'sync-pass1-revive');
+    assert(mgr._logs.some((l: any) => l.msg.includes('Revived virtualised slot')), 'the revive is logged');
+
+    // PARTIAL when the booked size exceeds the chain size (partial fill).
+    const partialSlot = virtualSlotAt(4, '1.7.901', 10);
+    const mgr2 = makeReviveManager({ slot: partialSlot });
+    const partial = await reviveVirtualSlotFromChain(mgr2, partialSlot, chainOrderAt(4, { orderId: '1.7.901', size: 6 }), null, 'sync-pass1-revive');
+    assert.strictEqual(partial!.state, ORDER_STATES.PARTIAL, 'chain smaller than booked => PARTIAL');
+    assert.strictEqual(partial!.size, 6);
+    console.log('  ✓ ACTIVE/PARTIAL materialisation, one apply, logged');
+}
+
+async function testReviveRefusals() {
+    console.log('\n[GD-6] revive refuses anything that is not this slot\'s own live order');
+    // A rotation source whose cancel has not landed: the chain order sits at a
+    // DIFFERENT level, so the slot only aliases the id.
+    const alias = virtualSlotAt(4, '1.7.900');
+    const aliasMgr = makeReviveManager({ slot: alias });
+    assert.strictEqual(
+        await reviveVirtualSlotFromChain(aliasMgr, alias, chainOrderAt(2, { orderId: '1.7.900' }), null, 'x'),
+        null,
+        'off-level alias must not be resurrected'
+    );
+    assert.strictEqual(aliasMgr._applied.length, 0);
+
+    // Already placed: nothing to revive.
+    const placed = { ...virtualSlotAt(4, '1.7.900'), state: ORDER_STATES.ACTIVE, size: 4 };
+    const placedMgr = makeReviveManager({ slot: placed });
+    assert.strictEqual(await reviveVirtualSlotFromChain(placedMgr, placed, chainOrderAt(4), null, 'x'), null);
+
+    // A different order id: the slot and the chain order disagree.
+    const otherMgr = makeReviveManager({ slot: virtualSlotAt(4, '1.7.111') });
+    assert.strictEqual(
+        await reviveVirtualSlotFromChain(otherMgr, otherMgr.orders.get('slot-4'), chainOrderAt(4, { orderId: '1.7.900' }), null, 'x'),
+        null,
+        'id mismatch must not revive'
+    );
+
+    // A rejected apply leaves the slot virtual (no silent state change).
+    const rejectMgr = makeReviveManager({ slot: virtualSlotAt(4, '1.7.900'), applyResult: false });
+    assert.strictEqual(
+        await reviveVirtualSlotFromChain(rejectMgr, rejectMgr.orders.get('slot-4'), chainOrderAt(4), null, 'x'),
+        null,
+        'rejected apply => null'
+    );
+    assert(rejectMgr._logs.some((l: any) => l.msg.includes('rejected')));
+    console.log('  ✓ alias / placed / id-mismatch / rejected all refuse');
+}
+
+// ------------------------------------------------------- F-3 duplicate CREATE
+function createTarget(id: string, price: number) {
+    return { type: 'create', id, order: { id, price, size: 4, type: ORDER_TYPES.BUY } };
+}
+
+async function testCreateTargetOccupancy() {
+    console.log('\n[GD-7] a level that still owns a chain id is occupied (no duplicate CREATE)');
+    const target = createTarget('slot-4', 1000);
+
+    // VIRTUAL + orderId = the dark-level state: the chain still holds an order
+    // here, so a CREATE would duplicate the price level.
+    const dark = new Map([['slot-4', { ...virtualSlotAt(4, '1.7.900') }]]);
+    const darkResult = validateCreateTargetSlots([target], dark, null, [], 0.3);
+    assert.strictEqual(darkResult.isValid, false, 'occupied level must refuse the CREATE');
+    assert.strictEqual(darkResult.violations[0].reason, 'slot_occupied');
+
+    // Same slot with NO chain id is a real hole: the CREATE is allowed.
+    const hole = new Map([['slot-4', { ...virtualSlotAt(4, null) }]]);
+    const holeResult = validateCreateTargetSlots([target], hole, null, [], 0.3);
+    assert.strictEqual(holeResult.isValid, true, `a clean hole must stay creatable, got ${JSON.stringify(holeResult.violations)}`);
+
+    // A possibly-landed CREATE (createUncertain) is occupied too.
+    const uncertain = new Map([['slot-4', { ...virtualSlotAt(4, null), createUncertain: true }]]);
+    const uncertainResult = validateCreateTargetSlots([target], uncertain, null, [], 0.3);
+    assert.strictEqual(uncertainResult.isValid, false, 'an uncertain CREATE must not be re-created');
+    console.log('  ✓ occupied / uncertain refuse, clean hole allowed');
+}
+
+async function testReconcileGridTreatsDarkLevelAsFilled() {
+    console.log('\n[GD-8] the planner does not treat a dark level as a hole');
+    const master = new Map([
+        ['slot-4', { ...virtualSlotAt(4, '1.7.900') }],   // dark: virtual + chain id
+        ['slot-5', { ...virtualSlotAt(5, null) }],        // true hole
+    ]);
+    const target = new Map([
+        ['slot-4', { ...virtualSlotAt(4, null), state: ORDER_STATES.ACTIVE, size: 4 }],
+        ['slot-5', { ...virtualSlotAt(5, null), state: ORDER_STATES.ACTIVE, size: 4 }],
+    ]);
+
+    const result = reconcileGrid(master, target, 5, {});
+    const createIds = result.actions.filter((a: any) => a.type === 'create').map((a: any) => a.id);
+    assert.deepStrictEqual(createIds, ['slot-5'],
+        `only the true hole may be CREATE'd, got ${JSON.stringify(createIds)}`);
+    console.log('  ✓ dark level skipped, hole created');
+}
+
+// ------------------------------------------------- F-5 planner/guard parity
+const SPREAD_INC = 0.3;
+const spreadPrice = (idx: number): number => 670.368 * Math.pow(1 + SPREAD_INC / 100, idx);
+
+async function buildSpreadGeometry(mgr: any) {
+    mgr.assets = {
+        assetA: { id: '1.3.100', symbol: 'TEST', precision: 5 },
+        assetB: { id: '1.3.0', symbol: 'BTS', precision: 5 },
+    };
+    mgr.config.weightDistribution = { buy: 0.5, sell: 0.5 };
+    mgr.btsBalance = { free: 1e9, total: 1e9, locked: 0 };
+    for (let i = 0; i <= 291; i++) {
+        const type = i <= 150 ? ORDER_TYPES.BUY : (i >= 156 ? ORDER_TYPES.SELL : ORDER_TYPES.SPREAD);
+        const live = (i >= 131 && i <= 145) || (i >= 156 && i <= 175);
+        await mgr._updateOrder({
+            id: `slot-${i}`,
+            price: spreadPrice(i),
+            type,
+            state: live ? ORDER_STATES.ACTIVE : ORDER_STATES.VIRTUAL,
+            size: live ? 2 : 1.5,
+            orderId: live ? `1.7.${500000 + i}` : '',
+        });
+    }
+    mgr.boundaryIdx = 150;
+    mgr._gapSlots = 5;
+    await mgr.setAccountTotals({ buy: 20000, sell: 0, buyFree: 20000, sellFree: 0 });
+    await mgr.recalculateFunds();
+}
+
+async function spreadManager() {
+    const mgr = new OrderManager({
+        assetA: 'TEST',
+        assetB: 'BTS',
+        startPrice: 1052.06,
+        botFunds: { buy: 20000, sell: 0 },
+        coreOrders: { buy: 20, sell: 20 },
+        incrementPercent: SPREAD_INC,
+        targetSpreadPercent: 1.5,
+    } as any);
+    await buildSpreadGeometry(mgr);
+    return mgr;
+}
+
+async function testSpreadPlannerExcludesSameLevel() {
+    console.log('\n[GD-9] the spread planner refuses the level that just filled (fix 5)');
+    const cold = await spreadManager();
+    const baseline = await Grid.prepareSpreadCorrectionOrders(cold, ORDER_TYPES.BUY, 1);
+    const baselineIds = baseline.ordersToPlace.map((o: any) => o.id);
+    assert.strictEqual(baselineIds.length, 1, `expected one BUY candidate, got ${JSON.stringify(baselineIds)}`);
+    const candidate = baselineIds[0];
+    const candidateIdx = Number(String(candidate).replace('slot-', ''));
+
+    // The fill EXECUTED a hair above the slot level (a maker fill always can:
+    // slot 1310.046339 traded at 1310.060435). That is the shape the raw
+    // direction rule cannot see — the slot reads as "below the pivot".
+    const slotPrice = spreadPrice(candidateIdx);
+    const fillPrice = slotPrice * (1 + (SPREAD_INC / 100) * 0.1);
+    assert.strictEqual(
+        isLastFillGuardBlocked(slotPrice, ORDER_TYPES.BUY, fillPrice, ORDER_TYPES.BUY).blocked,
+        false,
+        'the raw direction rule alone lets this same-level re-place through (the bug this pins)'
+    );
+
+    const filled = await spreadManager();
+    filled._lastFilledPrice = fillPrice;
+    filled._lastFilledType = ORDER_TYPES.BUY;
+    filled.lastFillPivotSource = 'fill';
+
+    const after = await Grid.prepareSpreadCorrectionOrders(filled, ORDER_TYPES.BUY, 1);
+    const afterIds = after.ordersToPlace.map((o: any) => o.id);
+    assert(!afterIds.includes(candidate),
+        `the filled level ${candidate} must not be planned again, got ${JSON.stringify(afterIds)}`);
+    for (const id of afterIds) {
+        const idxOfPicked = Number(String(id).replace('slot-', ''));
+        assert(spreadPrice(idxOfPicked) < fillPrice * (1 - (SPREAD_INC / 100) * 0.5),
+            `${id} @ ${spreadPrice(idxOfPicked)} is not strictly below the fill ${fillPrice}`);
+    }
+    console.log(`  ✓ ${candidate} (same level as the fill) excluded, planner picked ${JSON.stringify(afterIds)}`);
+}
+
+// --------------------------------------------- F-4 sweep-orphan attribution
+function makeSweepBot({ genesis }: { genesis: any }) {
+    const logs: Array<{ msg: string; level?: string }> = [];
+    const manager: any = {
+        orders: new Map(),
+        assets: {
+            assetA: { id: '1.3.100', symbol: 'TEST', precision: 4 },
+            assetB: { id: '1.3.0', symbol: 'BTS', precision: 5 },
+        },
+        config: { dryRun: false, incrementPercent: 0.3 },
+        _genesis: genesis,
+        _lastFilledPrice: null,
+        _lastFilledType: null,
+        _lastFilledBuyPrice: null,
+        _lastFilledSellPrice: null,
+        lastFillPivotSource: null,
+        _pendingFillCrawls: [],
+        _gridDirty: false,
+        logger: { log: (msg: string, level?: string) => logs.push({ msg, level }) },
+        _markGridDirty() { this._gridDirty = true; },
+        recordLastFilledPrices(fills: any[]) {
+            for (const f of fills) {
+                if (!f || (f.type !== ORDER_TYPES.BUY && f.type !== ORDER_TYPES.SELL)) continue;
+                const price = Number(f.price);
+                if (!Number.isFinite(price) || price <= 0) continue;
+                this._lastFilledPrice = price;
+                this._lastFilledType = f.type;
+                this.lastFillPivotSource = 'fill';
+            }
+        },
+    };
+    const credited: string[] = [];
+    const bot: any = {
+        manager,
+        _logs: logs,
+        _credited: credited,
+        // A degraded orphan key keeps the sweep off the network path
+        // (isUnknownFillOrderAdoptable() returns early when the op carries no
+        // order_id, which is precisely the degraded-key case).
+        _buildOrphanFillFallbackKey: () => 'orphan:degraded:test',
+        _isNewFillKey: () => true,
+        _recentlyQueuedFills: new Map(),
+        _applyReplaySafeOrphanFillAccounting: async () => { credited.push('credited'); return { status: 'applied' }; },
+    };
+    return bot;
+}
+
+async function testSweepOrphanFillAttributesBeforeCrediting() {
+    console.log('\n[GD-10] an orphan fill credits proceeds AND arms the pivot (fix 4)');
+    const { processSweepOrphanFill } = require('../modules/dexbot_fill_runtime');
+    const genesis = buildGenesisFromPriceLevels(REVIVE_LADDER[4], 0.3, 2, REVIVE_LADDER);
+
+    const inGridPrice = REVIVE_LADDER[3];
+    const bot = makeSweepBot({ genesis });
+    const fill = {
+        id: '1.11.1401134019',
+        block_num: 115762932,
+        op: [77, {
+            // No order id: the degraded-orphan-key case. Never touches the
+            // chain (adoption is impossible without an id), so this stays a
+            // pure unit test.
+            order_id: null,
+            pays: { amount: Math.round(inGridPrice * 2 * 1e5), asset_id: '1.3.0' },
+            receives: { amount: Math.round(2 * 1e4), asset_id: '1.3.100' },
+        }],
+    };
+    await processSweepOrphanFill(bot, fill, fill.op[1], new Set(), { context: 'TEST', label: 'TEST' });
+
+    assert(Math.abs(Number(bot.manager._lastFilledPrice) - inGridPrice) < 0.01,
+        `the pivot must track the credited fill's price, got ${bot.manager._lastFilledPrice}`);
+    assert.strictEqual(bot.manager._lastFilledType, ORDER_TYPES.BUY);
+    assert.strictEqual(bot._credited.length, 1, 'the credit still happens (attribution is additive)');
+
+    // Out-of-grid (shelf/manual) price: credited, but the pivot must NOT move —
+    // arming it below the rail would veto the whole BUY side.
+    const shelfBot = makeSweepBot({ genesis });
+    const shelfPrice = REVIVE_LADDER[0] * 0.5;
+    const shelfFill = {
+        id: '1.11.1401134020',
+        block_num: 115762933,
+        op: [77, {
+            order_id: null,
+            pays: { amount: Math.round(shelfPrice * 2 * 1e5), asset_id: '1.3.0' },
+            receives: { amount: Math.round(2 * 1e4), asset_id: '1.3.100' },
+        }],
+    };
+    await processSweepOrphanFill(shelfBot, shelfFill, shelfFill.op[1], new Set(), { context: 'TEST', label: 'TEST' });
+    assert.strictEqual(shelfBot.manager._lastFilledPrice, null, 'out-of-grid fill must not arm the pivot');
+    assert.strictEqual(shelfBot._credited.length, 1);
+    console.log('  ✓ in-grid arms the pivot, out-of-grid does not, credit unchanged');
+}
+
 async function main() {
     console.log('=== Grid fill discipline (buy lower / sell higher, no stale top-up) ===');
     await testPlacementPredicate();
@@ -292,6 +628,12 @@ async function main() {
     await testPickerFallsThroughOnSell();
     await testCreateGuardRefusesBlockedLevel();
     await testTopUpDeferredWhileFillsUnsettled();
+    await testReviveRevirtualisedSlot();
+    await testReviveRefusals();
+    await testCreateTargetOccupancy();
+    await testReconcileGridTreatsDarkLevelAsFilled();
+    await testSpreadPlannerExcludesSameLevel();
+    await testSweepOrphanFillAttributesBeforeCrediting();
     console.log('\nAll grid fill-discipline tests passed ✔');
 }
 

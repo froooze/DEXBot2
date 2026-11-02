@@ -15,6 +15,7 @@ import {
     isOrderPlaced, parseChainOrder, isOrderOnChain, findLiveOrderOwnerByChainId,
     chainOrderMatchesSlotWithTolerance,
     duplicateOrphanLogInfo, resolveEdgeCount,
+    reviveVirtualSlotFromChain,
 } from './utils/order.js';
 import * as Format from './format.js';
 import { getErrorMessage } from '../utils/errors.js';
@@ -278,6 +279,10 @@ export async function reconcileGridOrders({
         const applyUpdate = manager._applyOrderUpdate.bind(manager);
 
         const chainIds = new Set<string>((Array.isArray(chainOpenOrders) ? chainOpenOrders : []).map(o => o?.id).filter((id): id is string => Boolean(id)));
+        const chainOrderById = new Map<string, ChainOrder>();
+        for (const raw of (Array.isArray(chainOpenOrders) ? chainOpenOrders : [])) {
+            if (raw?.id) chainOrderById.set(String(raw.id), raw);
+        }
         for (const order of manager.orders.values()) {
             if (isOrderPlaced(order)) {
                 if (!order.orderId || !chainIds.has(order.orderId)) {
@@ -309,6 +314,28 @@ export async function reconcileGridOrders({
                         rawOnChain: null
                     }, 'startup-phantom', { skipAccounting: true });
                 }
+            } else if (order.orderId && chainIds.has(String(order.orderId))) {
+                // DARK LEVEL: the slot is not placed but its chain order is
+                // still live (a phantom cleanup on a truncated read, or a
+                // refused-commit adoption). Left as-is it is invisible to
+                // window accounting (_countActiveOnGrid counts only
+                // ACTIVE/PARTIAL) while its order still counts in chainCount —
+                // so this side reads a shortfall it can never repair, and the
+                // planner sees a free level that already holds an order (the
+                // duplicate-price precondition). Revive in place: no broadcast,
+                // and only when the order really rests at this slot's level.
+                const rawChain = chainOrderById.get(String(order.orderId)) ?? null;
+                const parsedChain = rawChain ? parseChainOrder(rawChain, manager.assets) : null;
+                // The helper logs the revive itself (one warn line, same text
+                // on both call sites) — no second log here.
+                await reviveVirtualSlotFromChain(
+                    manager,
+                    order,
+                    parsedChain,
+                    rawChain,
+                    'startup-revive',
+                    { skipAccounting: true }
+                );
             }
         }
 

@@ -163,7 +163,10 @@ import {
     resolveSpreadOrderSide,
     duplicateOrphanLogInfo,
     _stampCorrectionProvenance,
-    _filterUnmatchedChainOrders
+    _filterUnmatchedChainOrders,
+    attributeUnmatchedFillToGrid,
+    reviveVirtualSlotFromChain,
+    resolveExecutionPrice
 } from './utils/order.js';
 import { parseSlotIndex } from './utils/slot.js';
 import {
@@ -1141,6 +1144,30 @@ class SyncEngine {
                 if (!chainOrder) continue;
                 let updatedOrder = { ...gridOrder };
                 chainOrderIdsOnGrid.add(gridOrder.orderId);
+                // REVIVE BEFORE ANYTHING ELSE: this slot is not placed but its
+                // chain order is still live. Leaving it VIRTUAL is the "dark
+                // level" state — invisible to window accounting
+                // (_countActiveOnGrid needs ACTIVE/PARTIAL) while its order is
+                // still counted in chainCount, so the reconcile reads a
+                // shortfall it can never repair and the planner sees a free
+                // level that already holds an order. The revive is master-only
+                // (no broadcast) and refuses when the chain order does not rest
+                // at this slot's level, so a rotation source whose cancel has
+                // not landed is NOT resurrected.
+                if (!isOrderPlaced(gridOrder)) {
+                    const revived = await reviveVirtualSlotFromChain(
+                        mgr,
+                        gridOrder,
+                        chainOrder,
+                        rawChainOrders.get(gridOrder.orderId),
+                        'sync-pass1-revive',
+                        { skipAccounting }
+                    );
+                    if (revived) {
+                        updatedOrders.push(revived);
+                        continue;
+                    }
+                }
                 // Store raw blockchain data in grid slot for later update calculation.
                 // Tag the snapshot with `fetchedAt` so the drift check in
                 // syncFromFillHistory can distinguish a fresh chain read from a
@@ -1365,7 +1392,16 @@ class SyncEngine {
                         updatedOrders.push(spreadOrder);
                     }
                 }
-            } else if (gridOrder.state === ORDER_STATES.ACTIVE || gridOrder.state === ORDER_STATES.PARTIAL) {
+            } else if (gridOrder.state === ORDER_STATES.ACTIVE || gridOrder.state === ORDER_STATES.PARTIAL || hasOnChainId(gridOrder)) {
+                // Also entered for a NON-placed slot that still carries an
+                // orderId (virtualised while its order was live). Two outcomes
+                // below, decided by `wasPlaced`:
+                //   * placed + absent  -> a real fill/phantom (booked as before),
+                //   * virtual + absent -> the id is simply STALE: clear it so the
+                //     level becomes a normal hole again. Without this a stale id
+                //     would keep the slot looking occupied forever (blocking the
+                //     CREATE that the level needs) and would keep masking a
+                //     genuine fill on the other side.
                 // Don't virtualize orders placed by a successful COW commit.
                 // The chain snapshot may lag behind confirmed transactions,
                 // causing correctly-placed orders to appear missing. _committedOrderIds
@@ -1407,8 +1443,26 @@ class SyncEngine {
                 }
                 const currentGridOrder = mgr.orders.get(gridOrder.id) || gridOrder;
                 const hadOrderId = Boolean(currentGridOrder?.orderId);
+                const wasPlaced = isOrderPlaced(currentGridOrder);
+                // A freshly assigned id on a NON-placed slot is not trustworthy
+                // evidence of absence yet (an in-flight create/cancel whose
+                // broadcast has not landed, or a lagging read). Mirrors the
+                // reconcile's _orderIdAssignedAt deferral: keep the id, re-check
+                // next sync. A PLACED slot keeps the existing behaviour.
+                if (!wasPlaced && hadOrderId) {
+                    const assignedAt = Number((mgr as unknown as { _orderIdAssignedAt?: Map<string, number> })._orderIdAssignedAt?.get(String(currentGridOrder.orderId)) || 0);
+                    if (assignedAt > 0 && Date.now() - assignedAt < TIMING.SYNC_LOCK_TIMEOUT_MS) {
+                        mgr.logger?.log?.(
+                            `[SYNC] Stale-id check for ${gridOrder.id} deferred: chain id ${currentGridOrder.orderId} was ` +
+                            `assigned ${Date.now() - assignedAt}ms ago and is not in the snapshot — absence not yet trustworthy`,
+                            'debug'
+                        );
+                        continue;
+                    }
+                }
                 const spreadOrder = convertToSpreadPlaceholder(currentGridOrder);
-                const phantomApplied = await mgr._applyOrderUpdate(spreadOrder, 'sync-cleanup-phantom', { skipAccounting: skipAccounting, fee: 0 });
+                const cleanupContext = wasPlaced ? 'sync-cleanup-phantom' : 'sync-clear-stale-id';
+                const phantomApplied = await mgr._applyOrderUpdate(spreadOrder, cleanupContext, { skipAccounting: skipAccounting, fee: 0 });
                 if (phantomApplied === false) {
                     // Rejected virtualization books no phantom fill: the slot
                     // keeps its order and the disappearance re-detects next
@@ -1420,8 +1474,12 @@ class SyncEngine {
                     continue;
                 }
 
-                // Only genuine disappearances (had orderId) count as fills.
-                if (hadOrderId) {
+                // Only genuine disappearances of a PLACED order count as fills.
+                // A virtualised slot's stale id is cleared above without booking
+                // anything: the funds for that level were already settled when
+                // the slot was virtualised, and inventing a fill here would arm
+                // the pivot and crawl for a trade that never happened.
+                if (hadOrderId && wasPlaced) {
                     // A SPREAD slot can carry an on-chain order (spread-correction
                     // activation). Resolve the real side before pushing: the fill
                     // drives deriveTargetBoundary, which only shifts on BUY/SELL —
@@ -1448,6 +1506,14 @@ class SyncEngine {
                         type: resolvedType,
                         ...(liveChainPrice != null ? { price: liveChainPrice } : {})
                     });
+                } else if (hadOrderId) {
+                    updatedOrders.push(spreadOrder);
+                    mgr.logger?.log?.(
+                        `[SYNC] Cleared stale chain id ${currentGridOrder?.orderId ?? ''} on ${gridOrder.id} ` +
+                        `(slot was ${currentGridOrder?.state ?? ORDER_STATES.VIRTUAL}): the order is gone from the ` +
+                        `chain read, so the level is a normal hole again — no fill booked`,
+                        'debug'
+                    );
                 }
             }
         }
@@ -1589,45 +1655,16 @@ class SyncEngine {
     }
 
     /**
-     * Resolve the slot that still OWNS a chain order id, in ANY state.
-     *
-     * Distinct from _findMatchingGridOrder on purpose: that one only accepts
-     * ACTIVE/PARTIAL slots (a fill must mutate a live order). A fill can also
-     * arrive for an order whose slot was already virtualised by an earlier
-     * cleanup/rotation (sync-cleanup-phantom, refused-commit adoption) while
-     * the order was still resting on chain — the chain id is then the only
-     * remaining identity.
-     */
-    _findAnyGridOrderByChainId(mgr: OrderManagerLike, orderId: string | null | undefined): ManagedOrder | null {
-        if (!orderId) return null;
-        for (const gridOrder of mgr.orders.values()) {
-            if (gridOrder && gridOrder.orderId === orderId) return gridOrder;
-        }
-        return null;
-    }
-
-    /**
      * Absorb a fill whose order id has no ACTIVE/PARTIAL slot ("order not found
      * in active grid").
      *
-     * WHY THIS EXISTS — the incident this fixes: a 120s stale broadcast region
-     * deferred the fill queue; the post-fill targeted reconcile then ran against
-     * a master that still held the filled slots as ACTIVE and re-created 8 BUYs
-     * at the TOP of the un-crawled rail (1282.78 -> 1310.04), i.e. ABOVE the
-     * market, and they filled within seconds (9 buy-lower violations, 23.5% of
-     * the window's BTS). The cascade started here: those fills were dropped
-     * ("order not found in active grid") AFTER their accounting was booked, so
-     * neither the LAST-FILL-GUARD pivot nor the owed boundary crawl learned the
-     * real execution price. Every downstream geometry gate was then blind — the
-     * direction rule compared against a stale, HIGHER pivot and let the buys
-     * through.
+     * Thin wrapper over the shared `attributeUnmatchedFillToGrid` helper (see
+     * utils/order.ts for the two identities and the incident it closes). The
+     * work lives outside this class so the orphan-credit path in
+     * dexbot_fill_runtime.ts attributes fills with literally the same rule
+     * instead of keeping a second, weaker copy.
      *
-     * This method only records what the fill proves (pivot + owed crawl from the
-     * REAL execution price). It never mutates the slot or the accounting: the
-     * funds were already booked by processFillAccounting, and the slot is
-     * intentionally no longer live.
-     *
-     * @returns {boolean} true when the fill was attributed to a known slot.
+     * @returns {boolean} true when the fill was attributed to the grid.
      */
     _absorbUnmatchedFill(mgr: OrderManagerLike, params: {
         orderId: string | null | undefined;
@@ -1637,60 +1674,14 @@ class SyncEngine {
         receivesAmountRaw?: unknown;
         isPartial?: boolean;
     }): boolean {
-        const { orderId, paysAssetId = null, paysAmountRaw = null, receivesAssetId = null, receivesAmountRaw = null } = params ?? {};
-        if (!orderId) return false;
-        const slot = this._findAnyGridOrderByChainId(mgr, orderId);
-        if (!slot || !slot.id) return false;
-
-        let ctx: ReturnType<SyncEngine['_computeFillContext']>;
-        try {
-            ctx = this._computeFillContext(mgr, slot, paysAssetId, Number(paysAmountRaw), receivesAssetId, Number(receivesAmountRaw));
-        } catch {
-            return false;
-        }
-        const type = ctx?.orderType;
-        if (type !== ORDER_TYPES.BUY && type !== ORDER_TYPES.SELL) return false;
-
-        const execPrice = Number(ctx.fillPrice);
-        const slotPrice = Number(slot.price);
-        const price = Number.isFinite(execPrice) && execPrice > 0
-            ? execPrice
-            : (Number.isFinite(slotPrice) && slotPrice > 0 ? slotPrice : NaN);
-        if (!Number.isFinite(price) || price <= 0) return false;
-
-        // 1. Pivot: the LAST-FILL-GUARD reference must track the real trade.
-        //    recordLastFilledPrices owns the scalar family + edge-pinned
-        //    exclusion (a wick on an edge order must not arm it).
-        try {
-            mgr.recordLastFilledPrices([{ id: slot.id, type, price, isPartial: params?.isPartial === true }]);
-        } catch (err) {
-            mgr.logger.log(`[SYNC] Fill-pivot record failed for absorbed fill ${orderId}: ${getErrorMessage(err)}`, 'warn');
-        }
-
-        // 2. Owed crawl: the same ledger the strategy maintains (identical
-        //    eligibility — the edge classification that decides whether a crawl
-        //    is APPLIED lives in the boundary derivation, so recording it here
-        //    matches strategy.processFillsOnly exactly). A re-delivered record
-        //    for the same slot replaces, never stacks. Dry runs never commit a
-        //    boundary, so they must not grow the ledger.
-        try {
-            if (mgr.config?.dryRun !== true && Array.isArray(mgr._pendingFillCrawls)) {
-                const pending = mgr._pendingFillCrawls;
-                const at = pending.findIndex((e) => e && e.slotId === slot.id);
-                if (at >= 0) pending.splice(at, 1);
-                pending.push({ slotId: slot.id, side: type, ts: Date.now() });
-                while (pending.length > 500) pending.shift();
-                if (typeof mgr._markGridDirty === 'function') mgr._markGridDirty();
-            }
-        } catch { /* best-effort: the pivot above is the fail-safe */ }
-
-        mgr.logger.log(
-            `[SYNC] Fill for order ${orderId} attributed to virtualised slot ${slot.id} ` +
-            `(${type} @ ${Format.formatPrice6(price)}): pivot + owed boundary crawl recorded, ` +
-            `accounting already booked`,
-            'warn'
-        );
-        return true;
+        return attributeUnmatchedFillToGrid(mgr, {
+            orderId: params?.orderId ?? null,
+            paysAssetId: params?.paysAssetId ?? null,
+            paysAmountRaw: params?.paysAmountRaw == null ? null : Number(params.paysAmountRaw),
+            receivesAssetId: params?.receivesAssetId ?? null,
+            receivesAmountRaw: params?.receivesAmountRaw == null ? null : Number(params.receivesAmountRaw),
+            isPartial: params?.isPartial === true,
+        });
     }
 
     _computeFillContext(mgr: OrderManagerLike, matchedGridOrder: ManagedOrder, paysAssetId: string | null | undefined, paysAmountRaw: number, receivesAssetId: string | null | undefined = null, receivesAmountRaw: number | null = null) {
@@ -1727,30 +1718,9 @@ class SyncEngine {
         // Execution price from the actual paid/received amounts (quote per
         // base). This is the fill FACT the last-fill pivot and the re-anchor
         // need; the slot price is only a grid identity and may be stale after
-        // a refused-commit chain adoption.
-        let fillPrice: number | null = null;
-        if (Number.isFinite(Number(receivesAmountRaw)) && Number(receivesAmountRaw) > 0
-            && Number.isFinite(Number(paysAmountRaw)) && Number(paysAmountRaw) > 0) {
-            const A = assets.assetA;
-            const B = assets.assetB;
-            let baseRaw: number | null = null;
-            let quoteRaw: number | null = null;
-            if (paysAssetId === A.id && receivesAssetId === B.id) {
-                baseRaw = Number(paysAmountRaw);
-                quoteRaw = Number(receivesAmountRaw);
-            } else if (paysAssetId === B.id && receivesAssetId === A.id) {
-                baseRaw = Number(receivesAmountRaw);
-                quoteRaw = Number(paysAmountRaw);
-            }
-            if (baseRaw !== null && quoteRaw !== null) {
-                const base = blockchainToFloat(baseRaw, A.precision);
-                const quote = blockchainToFloat(quoteRaw, B.precision);
-                if (base > 0 && quote > 0) {
-                    const price = quote / base;
-                    if (Number.isFinite(price) && price > 0) fillPrice = price;
-                }
-            }
-        }
+        // a refused-commit chain adoption. Shared with the unmatched-fill
+        // attribution so both resolve a price identically.
+        const fillPrice = resolveExecutionPrice(assets, paysAssetId, paysAmountRaw, receivesAssetId, receivesAmountRaw);
 
         return { orderType, currentSize, precision, filledAmount, currentSizeIntFromGrid, rawForSaleInt, driftSignal, fillPrice };
     }

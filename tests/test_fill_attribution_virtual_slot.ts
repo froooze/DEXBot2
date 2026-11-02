@@ -21,6 +21,7 @@
  */
 const assert = require('assert');
 const SyncEngine = require('../modules/order/sync_engine').default;
+const { buildGenesisFromPriceLevels } = require('../modules/order/utils/math');
 const { ORDER_TYPES, ORDER_STATES } = require('../modules/constants');
 const { isLastFillPlacementBlocked, hasUnsettledFills } = require('../modules/order/utils/system');
 
@@ -40,7 +41,7 @@ function buyFill(price: number, baseSize: number) {
     };
 }
 
-function makeMgr({ slots = [], pivot = null, pivotType = null, dryRun = false } = {}) {
+function makeMgr({ slots = [], pivot = null, pivotType = null, dryRun = false, genesis = null } = {}) {
     const orders = new Map();
     for (const s of slots) orders.set(s.id, { ...s });
     const logs = [];
@@ -60,6 +61,7 @@ function makeMgr({ slots = [], pivot = null, pivotType = null, dryRun = false } 
         },
         logger: { log: (msg, level) => logs.push({ msg, level }) },
         _logs: logs,
+        _genesis: genesis,
         _pendingFillCrawls: [],
         _gridDirty: false,
         _markGridDirty() { this._gridDirty = true; },
@@ -127,7 +129,7 @@ async function testAttributionRecordsPivotAndCrawl() {
     assert.strictEqual(after.state, ORDER_STATES.VIRTUAL);
     assert.strictEqual(after.size, 0);
 
-    const log = mgr._logs.filter((l) => l.msg.includes('attributed to virtualised slot'));
+    const log = mgr._logs.filter((l) => l.msg.includes('attributed to slot-138 via chain-id'));
     assert.strictEqual(log.length, 1, 'the attribution is logged so it is visible in production');
     assert.strictEqual(log[0].level, 'warn');
     console.log('  ✓ pivot + owed crawl recorded, slot untouched');
@@ -216,6 +218,79 @@ async function testSameLevelRoundingIsCaught() {
     console.log('  ✓ same-level re-place refused, counter-side placement allowed');
 }
 
+/**
+ * The incident ladder: slot-130..140 spanned by a 0.3% step, indexed so that
+ * slot-138 carries the price the fill actually traded at.
+ */
+const LADDER = Array.from({ length: 14 }, (_, i) => 1282.781731 * Math.pow(1.003, i - 5));
+
+function ladderGenesis() {
+    return buildGenesisFromPriceLevels(LADDER[6], 0.3, 4, LADDER);
+}
+
+function slotAt(idx: number, { orderId = null, state = ORDER_STATES.VIRTUAL, size = 0 } = {}) {
+    return { id: `slot-${idx}`, type: ORDER_TYPES.BUY, state, price: LADDER[idx], size, orderId };
+}
+
+async function testLadderIdentityWhenOrderIdIsCleared() {
+    console.log('\n[FA-8] the PRODUCTION case: virtualisation cleared the orderId (ladder identity)');
+    // Every virtualisation path (virtualizeOrder -> convertToSpreadPlaceholder /
+    // toRailHolePlaceholder) NULLS orderId, so after a phantom cleanup the master
+    // holds no slot keyed by the filled order. The fill price is then the only
+    // identity left — this is the case the incident actually hit (15 dropped
+    // fills, all of them after sync-cleanup-phantom).
+    const hole = slotAt(5); // a clean hole: no orderId at all
+    const mgr = makeMgr({
+        slots: [slotAt(3), slotAt(4), hole, slotAt(6), slotAt(7)],
+        pivot: 1310.060435,
+        pivotType: ORDER_TYPES.BUY,
+        genesis: ladderGenesis(),
+    });
+
+    const absorbed = ENGINE._absorbUnmatchedFill(mgr, {
+        orderId: '1.7.576142590', // an order the grid no longer knows by id
+        ...buyFill(LADDER[5], 3.6),
+    });
+
+    assert.strictEqual(absorbed, true, 'a fill priced on the ladder must be attributed even without a chain-id match');
+    assert(Math.abs(mgr._lastFilledPrice - LADDER[5]) < 0.01,
+        `pivot must move to the execution price ${LADDER[5]}, got ${mgr._lastFilledPrice}`);
+    assert.strictEqual(mgr._pendingFillCrawls.length, 1, 'the level is a hole, so a crawl is owed');
+    assert.strictEqual(mgr._pendingFillCrawls[0].slotId, 'slot-5');
+
+    const log = mgr._logs.filter((l) => l.msg.includes('via ladder'));
+    assert.strictEqual(log.length, 1, 'the ladder identity is logged so it is visible in production');
+    console.log('  ✓ ladder identity attributes the fill and arms the pivot');
+}
+
+async function testLadderIdentityRefusesAnOccupiedLevel() {
+    console.log('\n[FA-9] a level that still holds a live order arms the pivot but owes no crawl');
+    const live = slotAt(5, { orderId: '1.7.700000001', state: ORDER_STATES.ACTIVE, size: 4 });
+    const mgr = makeMgr({ slots: [live], genesis: ladderGenesis() });
+
+    const absorbed = ENGINE._absorbUnmatchedFill(mgr, { orderId: '1.7.111', ...buyFill(LADDER[5], 1) });
+
+    assert.strictEqual(absorbed, true, 'the price is still evidence of a trade');
+    assert.strictEqual(mgr._pendingFillCrawls.length, 0, 'an occupied level cannot be re-placed, so nothing is owed');
+    assert(Math.abs(mgr._lastFilledPrice - LADDER[5]) < 0.01);
+    console.log('  ✓ pivot yes, crawl no');
+}
+
+async function testLadderIdentityRefusesOutOfGridPrices() {
+    console.log('\n[FA-10] a shelf/manual order far outside the rail never arms the pivot');
+    // Arming the pivot at a 0.5x-floor price would veto the entire BUY rail
+    // (every buy sits above it), so an out-of-grid fill must be ignored.
+    const mgr = makeMgr({ slots: [slotAt(5)], pivot: 1300, pivotType: ORDER_TYPES.BUY, genesis: ladderGenesis() });
+
+    const shelfPrice = LADDER[0] * 0.5;
+    const absorbed = ENGINE._absorbUnmatchedFill(mgr, { orderId: '1.7.999', ...buyFill(shelfPrice, 1) });
+
+    assert.strictEqual(absorbed, false, 'out-of-grid price is not this grid\'s trade');
+    assert.strictEqual(mgr._lastFilledPrice, 1300, 'pivot unchanged');
+    assert.strictEqual(mgr._pendingFillCrawls.length, 0, 'no crawl');
+    console.log('  ✓ out-of-grid refused');
+}
+
 async function testUnsettledFillsSignal() {
     console.log('\n[FA-7] hasUnsettledFills covers every deferral state');
     const base = () => ({ manager: { _pendingFillCrawls: [], _fillBatchInFlight: 0 }, _incomingFillQueue: [], _deferredFillsPending: false });
@@ -250,6 +325,9 @@ async function main() {
     await testDryRunRecordsNoCrawl();
     await testAbsorbedFillClosesTheBuyHigherLadder();
     await testSameLevelRoundingIsCaught();
+    await testLadderIdentityWhenOrderIdIsCleared();
+    await testLadderIdentityRefusesAnOccupiedLevel();
+    await testLadderIdentityRefusesOutOfGridPrices();
     await testUnsettledFillsSignal();
     console.log('\nAll fill-attribution tests passed ✔');
 }

@@ -83,6 +83,26 @@ function testRestampBuyAboveAnchorCountsOnlyTheLeakShape() {
         assert.strictEqual(bot._metrics.restampBuyAboveAnchorCount, 0);
     }
 
+    // SAME GRID LEVEL counts too. Live: slot 1310.046339 filled at
+    // 1310.060435, so the slot price is a rounding hair BELOW the pivot — the
+    // re-stamp shape the guard blocks (via its ladder-snapped pivot), which a
+    // bare `p < pivot` reads as a legitimate lower BUY and drops from the count.
+    {
+        const bot = makeBot({ lastPrice: 1310.060435 });
+        (bot.manager as any).config = { incrementPercent: 0.3 };
+        assert.strictEqual(
+            recordRestampBuyAboveAnchor(bot, 1310.046339, ORDER_TYPES.BUY), true,
+            'SAME-LEVEL BUY counted (rounding hair below the pivot)'
+        );
+        assert.strictEqual(bot._metrics.restampBuyAboveAnchorCount, 1);
+        // A genuine full step below is the legitimate rotation target.
+        assert.strictEqual(
+            recordRestampBuyAboveAnchor(bot, 1310.046339 / 1.003, ORDER_TYPES.BUY), false,
+            'a full step below the pivot is not the re-stamp shape'
+        );
+        assert.strictEqual(bot._metrics.restampBuyAboveAnchorCount, 1, 'still one');
+    }
+
     // Warn is once per batch (cycle), but every leak is still counted.
     {
         const bot = makeBot({ cycleId: 7 });

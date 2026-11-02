@@ -557,7 +557,7 @@ import {
     getOrderTypeFromUpdatedFlags
 } from './utils/order.js';
 import { parseSlotIndex } from './utils/slot.js';
-import { loadAmaCenterPrice, loadAmaCenterSnapshot, withBlockchainRetry, restoreLastFillPivot, resetLastFillPivot, rearmLastFillPivotFromMarketFill, evaluateSpreadCorrectionReadiness, maybeRefreshLiveMarketPrice, resolveLastFillGuardReference, isLastFillGuardBlocked } from './utils/system.js';
+import { loadAmaCenterPrice, loadAmaCenterSnapshot, withBlockchainRetry, restoreLastFillPivot, resetLastFillPivot, rearmLastFillPivotFromMarketFill, evaluateSpreadCorrectionReadiness, maybeRefreshLiveMarketPrice, resolveLastFillGuardReference, isLastFillPlacementBlocked } from './utils/system.js';
 import * as MathUtils from './utils/math.js';
 import { derivePriceWithPoolRef, resolveStartPriceMode } from './utils/withPoolRef.js';
 import { getWhitelistFlags } from '../market_adapter_whitelist.js';
@@ -3717,12 +3717,14 @@ export function determineOrderSideByFunds(manager: OrderManagerLike, currentMark
         const lastFillBlocks = (c: ManagedOrder): boolean => {
             if (lastFillPivot == null || lastFillSide == null) return false;
             if (c?.price == null || !Number.isFinite(Number(c.price))) return false;
-            return isLastFillGuardBlocked(
-                Number(c.price),
-                railType,
-                lastFillPivot,
-                lastFillSide
-            ).blocked === true;
+            // Judge candidates with the SAME predicate the placement guards use
+            // (direction rule + same grid level). The raw-pivot direction check
+            // this replaces was blind to the same-level shape — a slot level and
+            // its own execution price differ by rounding (slot 1310.046339
+            // filled at 1310.060435) — so it admitted candidates that the
+            // broadcast guard then refused, burning a correction cycle on a
+            // guaranteed refusal and under-reporting "Excluded N".
+            return isLastFillPlacementBlocked(manager, Number(c.price), railType).blocked === true;
         };
         let lastFillExcluded = 0;
         // A slot can legitimately appear in MORE than one candidate pool (an
