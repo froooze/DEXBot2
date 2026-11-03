@@ -7,9 +7,9 @@ import { readOpenOrdersGuarded } from './chain_orders.js';
 import { ORDER_TYPES, TIMING } from './constants.js';
 import * as Format from './order/format.js';
 import * as grid from './order/grid.js';
-import { convertToSpreadPlaceholder, parseChainOrder, isNonBlockingUnmatchedOrder } from './order/utils/order.js';
+import { convertToSpreadPlaceholder, parseChainOrder, isNonBlockingUnmatchedOrder, detectGapEvacuationCandidates, updateGapEvacuationStreaks } from './order/utils/order.js';
 import { restoreGapEvacStreaks, applyPersistedPendingCrawls, resetLastFillPivot, hasUnsettledFills } from './order/utils/system.js';
-import { blockchainToFloat, calculateGapSlots, validatePersistedBoundary, isTransientInBandRejection } from './order/utils/math.js';
+import { blockchainToFloat, calculateGapSlots, resolveGapSlots, validatePersistedBoundary, isTransientInBandRejection } from './order/utils/math.js';
 import { ON_MISSING_GENESIS, isMissingGenesisError } from './order/genesis_policy.js';
 import type { ManagedOrder, ChainOrder } from './types.js';
 import type { GridGenesis } from './order/utils/math.js';
@@ -577,6 +577,158 @@ async function recoverFromPersistedGrid(bot: BotLike) {
 }
 
 /**
+ * Rate limit for gap-evac repairs (one fill-less re-plan per bot per minute).
+ * The post-commit hook and the maintenance sweep can both observe the same
+ * stranding; without a floor a plan that fails to resolve it (guard, funds,
+ * crossing) would re-plan on every commit and burn broadcasts.
+ */
+const GAP_EVAC_REPAIR_COOLDOWN_MS = 60 * TIMING.MILLISECONDS_PER_SECOND;
+const _lastGapEvacRepairAt = new WeakMap<object, number>();
+
+/**
+ * Detect live orders resting INSIDE the committed gap band and schedule the
+ * repair (fill-less COW re-plan + cancel-only teeth as last resort).
+ *
+ * Why this exists: a boundary commit that moves the boundary away from a live
+ * order strands it inside the spread band. The plan normally evacuates it with
+ * a rotation in the SAME batch, but the LAST-FILL-GUARD re-proves an evacuation
+ * against the PRE-COMMIT geometry and refuses it as stale when the plan's own
+ * crawl is what created the stranding (fail-closed by design — see the
+ * 2026-10-30 bid-edge incident). The batch then commits the new boundary with
+ * the stranded order still live, and because plans are fill-driven the state
+ * never heals while the market is quiet: the 4-slot spread band keeps two live
+ * buys and the real spread collapses (observed: 1.21% against a 2.0% target).
+ *
+ * Re-planning AFTER the commit is safe where the in-batch rotation is not: the
+ * committed geometry is now the LIVE geometry, so the evacuation stamp passes
+ * `isEvacuationStampStillValid` and the rotation executes as one price update.
+ *
+ * Cheap when healthy: one `detectGapEvacuationCandidates` scan (O(grid)) and an
+ * early return. Callers run it on commit (writer of the stranding) and on the
+ * maintenance tick (covers restarts and commits from paths without a bot
+ * reference).
+ *
+ * @param {import('./dexbot_class.js').DEXBot} bot
+ * @param {string} context - Label for logging/telemetry
+ * @returns `{ stranded, scheduled }` — stranded slot ids found, whether a
+ *          re-plan was scheduled.
+ */
+function scheduleGapEvacRepair(bot: BotLike, context: string = 'gap-evac sweep'): { stranded: string[]; scheduled: boolean } {
+    const manager = bot.manager;
+    if (!manager || !(manager.orders instanceof Map) || manager.orders.size === 0) {
+        return { stranded: [], scheduled: false };
+    }
+    try {
+        // UNKNOWN GEOMETRY IS NOT HEALTH. Without a committed boundary (or a
+        // known band width) there is no band to judge, so this sweep must not
+        // conclude "clean" — clearing the ledger or scheduling against a guessed
+        // band would be the same "absent reads as 0" trap that hid the stranding
+        // in the first place. Same fail-closed contract as
+        // isEvacuationStampStillValid.
+        const boundaryKnown = Number.isFinite(Format.toKnownNumber(manager.boundaryIdx));
+        const gapKnown = Number.isFinite(Format.toKnownNumber(manager._gapSlots))
+            || Number.isFinite(Format.toKnownNumber(manager._genesis?.gapSlots));
+        if (!boundaryKnown || !gapKnown) return { stranded: [], scheduled: false };
+        const gapSlots = resolveGapSlots(manager);
+        const candidates = detectGapEvacuationCandidates(
+            manager.orders,
+            manager.boundaryIdx,
+            gapSlots,
+            { assets: manager.assets, genesis: manager._genesis }
+        );
+        const streaks = manager._gapEvacStreaks instanceof Map ? manager._gapEvacStreaks : null;
+        if (candidates.length === 0) {
+            // Healthy: drop resolved ledger entries so a future return to the
+            // band re-arms instead of inheriting a stale cycle count.
+            const resolved = streaks ? streaks.size : 0;
+            if (streaks && resolved > 0) {
+                updateGapEvacuationStreaks(streaks, []);
+                manager.logger?.log?.(
+                    `[GAP-EVAC] Spread band clean: cleared ${resolved} resolved in-band streak(s)`,
+                    'debug'
+                );
+            }
+            return { stranded: [], scheduled: false };
+        }
+        const stranded = candidates.map((c) => `${c.id}(${c.type})`);
+        // Re-derive the streak ledger against the COMMITTED geometry (drops
+        // resolved ids). The cancel-only teeth stay the LAST resort: they are
+        // only queued when the preferred repair (a fill-less re-plan, which
+        // evacuates by price update instead of cancel+recreate) cannot run —
+        // queueing both in the same tick would cancel the order the re-plan is
+        // about to rotate.
+        //
+        // NOTE: reconcileGrid also ticks this ledger at plan-build time. An
+        // order stranded across a plan AND its commit therefore advances two
+        // steps per cycle, reaching the cancel threshold one cycle earlier than
+        // the pure-plan cadence. That is the safe direction (the teeth re-verify
+        // live geometry and queue once), and it keeps the ledger anchored to
+        // the geometry that was actually committed rather than the plan's.
+        const tick = streaks
+            ? updateGapEvacuationStreaks(streaks, candidates)
+            : { streaks: {}, ready: [] as Array<{ id: string }> };
+        // `_processGapEvacuationTeeth` returns the number it actually queued
+        // (it re-verifies live geometry and honours queued-once), so report
+        // that — not the number of candidates it was offered.
+        const queueTeeth = (): number => {
+            const teeth = (manager as unknown as { _processGapEvacuationTeeth?: (ready: unknown) => unknown })._processGapEvacuationTeeth;
+            if (typeof teeth !== 'function' || tick.ready.length === 0) return 0;
+            const queued = Number(teeth.call(manager, tick.ready));
+            return Number.isFinite(queued) && queued > 0 ? queued : 0;
+        };
+
+        // The repair is a broadcast: only claim to schedule it when the bot can
+        // actually run a fill-less rebalance (same precondition the scheduler
+        // itself checks), so the log never promises a repair that cannot run.
+        if (typeof manager.performSafeRebalance !== 'function'
+            || typeof bot.updateOrdersOnChainBatch !== 'function') {
+            const queued = queueTeeth();
+            manager.logger?.log?.(
+                `[GAP-EVAC] ${stranded.length} live order(s) stranded inside the spread band ` +
+                `(boundary ${manager.boundaryIdx}, gap ${gapSlots}): ${stranded.join(', ')} — ` +
+                `no fill-less re-plan available on this path; teeth queued=${queued}`,
+                // Warn only when this tick actually did something; a bot shape
+                // without a re-plan path must not warn on every tick.
+                queued > 0 ? 'warn' : 'debug'
+            );
+            return { stranded, scheduled: false };
+        }
+
+        const now = Date.now();
+        const lastAt = _lastGapEvacRepairAt.get(bot as unknown as object) ?? 0;
+        const cooling = lastAt > 0 && (now - lastAt) < GAP_EVAC_REPAIR_COOLDOWN_MS;
+        if (cooling) {
+            // The previous re-plan either is still in flight or did not clear
+            // the stranding: fall back to the cancel-only teeth so a repeatedly
+            // unfixable slot cannot sit in the band forever.
+            const queued = queueTeeth();
+            manager.logger?.log?.(
+                `[GAP-EVAC] ${stranded.length} live order(s) inside the spread band (${stranded.join(', ')}) — ` +
+                `repair cooldown active (${Math.round((GAP_EVAC_REPAIR_COOLDOWN_MS - (now - lastAt)) / 1000)}s left); ` +
+                `teeth queued=${queued}`,
+                queued > 0 ? 'warn' : 'debug'
+            );
+            return { stranded, scheduled: false };
+        }
+        _lastGapEvacRepairAt.set(bot as unknown as object, now);
+        manager.logger?.log?.(
+            `[GAP-EVAC] ${stranded.length} live order(s) stranded inside the spread band ` +
+            `(boundary ${manager.boundaryIdx}, gap ${gapSlots}): ${stranded.join(', ')} — ` +
+            `scheduling a fill-less re-plan to evacuate (${context})`,
+            'warn'
+        );
+        _schedulePostRecoveryRebalance(bot, `gap-evac repair (${context})`);
+        return { stranded, scheduled: true };
+    } catch (err) {
+        bot.manager?.logger?.log?.(
+            `[GAP-EVAC] Stranding sweep failed (non-fatal): ${getErrorMessage(err)}`,
+            'debug'
+        );
+        return { stranded: [], scheduled: false };
+    }
+}
+
+/**
  * Best-effort target-grid rebalance after a snapshot reload.
  *
  * Runs a no-fill COW rebalance so slots the reconcile-only sync could not
@@ -833,5 +985,5 @@ async function targetedOrderRepair(bot: BotLike, orderIds: string[]) {
     }
 }
 
-export { persistAndRecoverIfNeeded, getRecentFillKeysSnapshot, triggerStateRecoverySync, abortFlowIfIllegalState, handleBatchHardAbort, applyRecoverableGridUpdates, recoverExplicitStaleOrders, recoverBatchSizeDrift, recoverFromPersistedGrid, rejectCorruptedGridSnapshot, targetedOrderRepair, _schedulePostRecoveryRebalance as schedulePostRecoveryRebalance }
+export { persistAndRecoverIfNeeded, getRecentFillKeysSnapshot, triggerStateRecoverySync, abortFlowIfIllegalState, handleBatchHardAbort, applyRecoverableGridUpdates, recoverExplicitStaleOrders, recoverBatchSizeDrift, recoverFromPersistedGrid, rejectCorruptedGridSnapshot, targetedOrderRepair, scheduleGapEvacRepair, _schedulePostRecoveryRebalance as schedulePostRecoveryRebalance }
 

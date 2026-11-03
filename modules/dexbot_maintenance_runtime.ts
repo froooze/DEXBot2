@@ -34,6 +34,15 @@ const { Config } = configModule;
 import { getErrorMessage } from './utils/errors.js';
 import type { BotLike, OrderManagerLike, ManagedOrder, OrderType, SpreadCorrectionStall, BotMetrics } from './types.js';
 
+/**
+ * Gap-evac stranding sweep (lazy import: the recovery module pulls the
+ * bitshares client into the graph, which this runtime loads on demand already).
+ */
+const scheduleGapEvacRepair = lazyShim('./dexbot_state_recovery', 'scheduleGapEvacRepair') as (
+    bot: BotLike,
+    context?: string
+) => { stranded: string[]; scheduled: boolean };
+
 /** Loose JSON-object view used across the maintenance runtime. */
 type JsonObj = Record<string, unknown>;
 
@@ -2698,6 +2707,22 @@ async function executeMaintenanceLogic(bot: BotLike, context: string) {
         } catch (e) {
             bot._log(`[LIGHTWEIGHT-SYNC] Check failed: ${getErrorMessage(e)}`, 'debug');
         }
+    }
+
+    // GAP-EVAC stranding sweep: a boundary commit that moved away from a live
+    // order strands it inside the spread band, and plans are fill-driven — so a
+    // quiet market never heals it (the band keeps live orders and the real
+    // spread stays collapsed). The sweep re-derives the streak ledger against
+    // the COMMITTED geometry, queues the cancel-only teeth for anything past
+    // the threshold, and schedules a fill-less re-plan (the preferred repair:
+    // one in-place price update). It early-returns on a healthy band, so it is
+    // cheap enough to run every tick, and it also covers commits made by paths
+    // that hold no bot reference (divergence/sync) plus a restart that loads an
+    // already-stranded snapshot.
+    try {
+        scheduleGapEvacRepair(bot, `maintenance ${context}`);
+    } catch (gapEvacErr) {
+        bot._log(`[GAP-EVAC] Stranding sweep failed (non-fatal): ${getErrorMessage(gapEvacErr)}`, 'debug');
     }
 
     // Process any price corrections queued by prior sync operations before

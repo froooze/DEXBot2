@@ -14,6 +14,7 @@ const { readOpenOrdersWithMetaSafe } = chainOrdersModule;
 import { BroadcastUncertainError as BroadcastUncertainErrorBinding } from './dexbot_credential_client.js';
 const BroadcastUncertainError = BroadcastUncertainErrorBinding;
 import * as orderUtils from './order/utils/order.js';
+import { lazyShim } from './lazy_shim.js';
 import { sleep, setLastFillPivot, fireStructuralResync, evaluateSpreadCorrectionReadiness, resolveLastFillGuardReference, resolveSpreadCrossingFloor, isLastFillGuardBlocked } from './order/utils/system.js';
 const {
     buildCreateOrderArgs,
@@ -67,6 +68,102 @@ export function isEvacuationStampStillValid(liveBoundary: unknown, liveGapSlots:
     const dstInRail = orderType === ORDER_TYPES.SELL ? Number(dstIdx) >= sellStartIdx : Number(dstIdx) <= b;
     return dstInRail;
 }
+/**
+ * Detect a live-rail conflict: the resting BUY/SELL rails cannot coexist with
+ * a `gapSlots`-wide spread band, i.e. no boundary value satisfies
+ * `maxBuy <= boundary` and `minSell >= boundary + gapSlots + 1` at once.
+ *
+ * Why this matters for gap evacuation: the stale-stamp check below refuses an
+ * evacuation whose source is no longer in-band under the LIVE (pre-commit)
+ * boundary. That is correct when the live geometry is itself consistent (the
+ * 2026-10-30 incident: plan boundary 124 wanted buys 125-128 evacuated, live
+ * 128 kept them on the rail, the bid edge survived). It is WRONG when the live
+ * rails already overlap: then the batch's boundary retreat is FORCED — some
+ * order has to move — and refusing the evacuation leaves the stranded order
+ * inside the band permanently (observed class: a buy fill inside the band
+ * crawls the boundary down, the retreat strands the two buys above it, the
+ * guard skips their rotation as stale, the rail clamp cannot move the boundary
+ * back because the sell rail caps it, and the 4-slot spread band keeps two
+ * live buys forever → real spread 1.2% against a 2.0% target).
+ *
+ * The test is boundary-independent (a crossing is a crossing at any boundary),
+ * so it cannot be satisfied by simply moving the boundary: only an evacuation
+ * resolves it. Ladder positions use the same live-price resolution as
+ * deriveRailBoundary, so a stale slot id cannot fake a rail member.
+ *
+ * @param manager - Manager exposing orders/assets/_genesis
+ * @param gapSlots - Gap-band width (slots)
+ * @returns `{ crossed, maxBuyIdx, minSellIdx, upper }`; `crossed` is false when
+ *          either rail is empty (one-sided book proves nothing) or geometry is
+ *          unknown (fail closed: keep the stale-stamp refusal).
+ */
+export function liveRailsConflictWithGap(
+    manager: unknown,
+    gapSlots: unknown
+): { crossed: boolean; maxBuyIdx: number | null; minSellIdx: number | null; upper: number | null } {
+    const result = { crossed: false, maxBuyIdx: null as number | null, minSellIdx: null as number | null, upper: null as number | null };
+    const rawGap = Format.toKnownNumber(gapSlots);
+    if (!Number.isFinite(rawGap) || rawGap < 0) return result;
+    const gap = Math.floor(rawGap);
+    const master = (manager as { orders?: unknown } | null | undefined)?.orders;
+    if (!(master instanceof Map)) return result;
+    const assets = (manager as { assets?: unknown } | null | undefined)?.assets;
+    const genesis = (manager as { _genesis?: unknown } | null | undefined)?._genesis;
+    let maxBuyIdx: number | null = null;
+    let minSellIdx: number | null = null;
+    for (const raw of master.values()) {
+        const o = raw as ManagedOrder | null | undefined;
+        if (!o || !o.id || !o.orderId) continue;
+        if (o.state !== ORDER_STATES.ACTIVE && o.state !== ORDER_STATES.PARTIAL) continue;
+        if (o.type !== ORDER_TYPES.BUY && o.type !== ORDER_TYPES.SELL) continue;
+        const live = orderUtils.resolveLiveOrderLadderPosition(o, assets as AssetPair | null | undefined, genesis);
+        const idx = live.idx !== null && Number.isFinite(Number(live.idx)) ? Number(live.idx) : null;
+        if (idx === null) continue;
+        if (o.type === ORDER_TYPES.BUY) maxBuyIdx = maxBuyIdx === null ? idx : Math.max(maxBuyIdx, idx);
+        else minSellIdx = minSellIdx === null ? idx : Math.min(minSellIdx, idx);
+    }
+    result.maxBuyIdx = maxBuyIdx;
+    result.minSellIdx = minSellIdx;
+    if (maxBuyIdx === null || minSellIdx === null) return result;
+    const upper = minSellIdx - gap - 1;
+    result.upper = upper;
+    result.crossed = maxBuyIdx > upper;
+    return result;
+}
+
+/**
+ * Decide whether a stale-stamp refusal of a gap-evacuation rotation must yield
+ * to the forced-retreat allowance. Single authority for the three call sites
+ * (stamped build branch, unstamped build branch, final pivot gate) so the
+ * conditions can never drift apart.
+ *
+ * Two conditions, both required:
+ * 1. The stamp could actually be EVALUATED: an unparseable source/dest id is
+ *    not a geometry disagreement — `isEvacuationStampStillValid` refuses those
+ *    too, and overriding that would ship a rotation whose geometry nobody
+ *    proved. Never override an unprovable stamp.
+ * 2. The live rails already conflict (see liveRailsConflictWithGap): some
+ *    order must move at ANY boundary, so the plan's retreat is the only
+ *    consistent geometry and the pre-commit "still on the rail" reading is not
+ *    authoritative.
+ *
+ * @param manager - Manager exposing orders/assets/_genesis
+ * @param gapSlots - LIVE gap-band width (slots)
+ * @param sourceId - Evacuation source slot id
+ * @param destId - Evacuation destination slot id
+ * @returns The conflict record when the allowance applies, otherwise null.
+ */
+export function forcedRetreatJustifiesEvacuation(
+    manager: unknown,
+    gapSlots: unknown,
+    sourceId: unknown,
+    destId: unknown
+): { crossed: boolean; maxBuyIdx: number | null; minSellIdx: number | null; upper: number | null } | null {
+    if (parseSlotIndex(sourceId) == null || parseSlotIndex(destId) == null) return null;
+    const conflict = liveRailsConflictWithGap(manager, gapSlots);
+    return conflict.crossed ? conflict : null;
+}
+
 function hasSlotPriceCollision(items: SlotLike[], targetPrice: number, genesis: unknown, excludeId: string | null, predicate?: (it: SlotLike) => boolean) {
     for (const it of items) {
         if (predicate && !predicate(it)) continue;
@@ -95,7 +192,20 @@ const Format = FormatModule;
 import * as workingGridModule from './order/working_grid.js';
 const { WorkingGrid } = workingGridModule;
 import { getErrorMessage, resolveSeamMs, resolveSeamMsOrNull, getErrorField } from './utils/errors.js';
-import type { BotLike, OrderManagerLike, ManagedOrder, ChainOrder, UnknownRecord, AssetInfo, CowAction } from './types.js';
+import type { BotLike, OrderManagerLike, ManagedOrder, ChainOrder, UnknownRecord, AssetInfo, AssetPair, CowAction } from './types.js';
+
+/**
+ * Post-commit gap-evacuation sweep (lazy: dexbot_state_recovery pulls the
+ * bitshares client into the graph, which this runtime deliberately avoids).
+ * Detects live orders left inside the committed band and schedules a fill-less
+ * re-plan to evacuate them — the in-batch rotation is refused as stale when the
+ * plan's own crawl created the stranding, and without this the spread collapse
+ * never heals on a quiet market.
+ */
+const scheduleGapEvacRepair = lazyShim('./dexbot_state_recovery', 'scheduleGapEvacRepair') as (
+    bot: BotLike,
+    context?: string
+) => { stranded: string[]; scheduled: boolean };
 
 /** Loose JSON-object view. */
 type JsonObj = UnknownRecord;
@@ -4764,12 +4874,34 @@ async function updateOrdersOnChainBatchCOWBody(
                                         action.id, action.newGridId, orderType
                                     );
                                     if (!stampValid) {
-                                        stampUsable = false;
-                                        bot.manager.logger.log(
-                                            `[LAST-FILL-GUARD] Stamped evacuation for ${action.id} -> ${action.newGridId} is stale under live ` +
-                                            `boundary ${bot.manager?.boundaryIdx}/gap ${bot.manager?._gapSlots} — refusing the stale plan`,
-                                            'warn'
+                                        // FORCED-RETREAT ALLOWANCE: the pre-commit
+                                        // geometry says the source is still a rail
+                                        // member, but if the live rails cannot host
+                                        // the gap band at ANY boundary then the
+                                        // batch's retreat is forced and refusing
+                                        // this evacuation is what permanently
+                                        // strands the order inside the band (the
+                                        // spread-collapse class this check is meant
+                                        // to protect against, inverted).
+                                        const conflict = forcedRetreatJustifiesEvacuation(
+                                            bot.manager, bot.manager?._gapSlots, action.id, action.newGridId
                                         );
+                                        if (conflict) {
+                                            bot.manager.logger.log(
+                                                `[LAST-FILL-GUARD] Stamped evacuation for ${action.id} -> ${action.newGridId} is stale under live ` +
+                                                `boundary ${bot.manager?.boundaryIdx}/gap ${bot.manager?._gapSlots}, but the live rails already conflict ` +
+                                                `(maxBuy=${conflict.maxBuyIdx} > minSell-gap-1=${conflict.upper}) — the retreat this batch commits is ` +
+                                                `forced, so the evacuation proceeds (plan-build authority kept)`,
+                                                'warn'
+                                            );
+                                        } else {
+                                            stampUsable = false;
+                                            bot.manager.logger.log(
+                                                `[LAST-FILL-GUARD] Stamped evacuation for ${action.id} -> ${action.newGridId} is stale under live ` +
+                                                `boundary ${bot.manager?.boundaryIdx}/gap ${bot.manager?._gapSlots} — refusing the stale plan`,
+                                                'warn'
+                                            );
+                                        }
                                     }
                                 }
                                 if (stampUsable) {
@@ -4838,9 +4970,30 @@ async function updateOrdersOnChainBatchCOWBody(
                                     // Non-finite live geometry keeps plan-build authority
                                     // (isEvacuationStampStillValid returns true there).
                                     let staleSkipReason: string | null = null;
-                                    if (!isEvacuationStampStillValid(bot.manager?.boundaryIdx, bot.manager?._gapSlots, action.id, action.newGridId, orderType)) {
-                                        staleSkipReason = `source/dest no longer evacuation geometry under live boundary ${bot.manager?.boundaryIdx}/gap ${bot.manager?._gapSlots}`;
-                                    } else {
+                                    const stampStillValid = isEvacuationStampStillValid(bot.manager?.boundaryIdx, bot.manager?._gapSlots, action.id, action.newGridId, orderType);
+                                    if (!stampStillValid) {
+                                        // Same forced-retreat allowance as the
+                                        // stamped branch: a live rail conflict means
+                                        // only an evacuation can resolve the
+                                        // geometry, so the pre-commit "still on the
+                                        // rail" reading is not authoritative. The
+                                        // live probe below still proves direction
+                                        // and size (this is not a blind bypass).
+                                        const conflict = forcedRetreatJustifiesEvacuation(
+                                            bot.manager, bot.manager?._gapSlots, action.id, action.newGridId
+                                        );
+                                        if (conflict) {
+                                            bot.manager.logger.log(
+                                                `[LAST-FILL-GUARD] ${action.id} -> ${action.newGridId} is stale under live boundary ` +
+                                                `${bot.manager?.boundaryIdx}/gap ${bot.manager?._gapSlots}, but the live rails already conflict ` +
+                                                `(maxBuy=${conflict.maxBuyIdx} > minSell-gap-1=${conflict.upper}) — re-proving the evacuation live`,
+                                                'warn'
+                                            );
+                                        } else {
+                                            staleSkipReason = `source/dest no longer evacuation geometry under live boundary ${bot.manager?.boundaryIdx}/gap ${bot.manager?._gapSlots}`;
+                                        }
+                                    }
+                                    if (staleSkipReason === null) {
                                         const evacCheck = isEvacuationRotationAllowed(oldPrice, oldSize, newPrice, newSize, orderType, sidePrecision);
                                         if (evacCheck.allowed) {
                                             bypassedEvacuation = true;
@@ -5686,6 +5839,17 @@ async function updateOrdersOnChainBatchCOWBody(
 
                 bot._metrics.batchesExecuted++;
                 clearPendingBroadcasts(bot.manager?._pendingBroadcasts);
+
+                // Post-commit stranding sweep: a boundary move that left a live
+                // order inside the band is a violation this batch created, and
+                // the in-batch evacuation was refused as stale (see
+                // forcedRetreatJustifiesEvacuation for the allowance).
+                // Re-plan now that the committed geometry IS the live geometry:
+                // the evacuation stamp validates and the rotation executes as a
+                // single price update. No-op when the band is clean.
+                try {
+                    scheduleGapEvacRepair(bot, 'post-commit');
+                } catch { /* heal path is best-effort; never fail a committed batch */ }
 
                 return { ...batchResult, executed: true, hadRotation: true };
             } else {
@@ -6554,6 +6718,29 @@ function runFinalPivotGate(bot: BotLike, operations: unknown[], opContexts: OpPh
                         );
                     if (evacStampLive) {
                         if (stats) stats.bypassed = (Number(stats.bypassed) || 0) + 1;
+                        continue;
+                    }
+                    // FORCED-RETREAT ALLOWANCE (mirrors the build loop): when the
+                    // live rails cannot host the gap band at ANY boundary, the
+                    // boundary move this batch commits is forced and only an
+                    // evacuation can resolve the geometry — keeping the op is the
+                    // violation-reducing choice, not a bypass of the guard's
+                    // intent. Without this the gate would drop exactly the
+                    // rotation the retreat needs and strand the order in the band.
+                    const gateConflict = forcedRetreatJustifiesEvacuation(
+                        bot.manager, bot.manager?._gapSlots, evacSrcId, evacDestId
+                    );
+                    if (gateConflict) {
+                        if (stats) stats.bypassed = (Number(stats.bypassed) || 0) + 1;
+                        try {
+                            bot.manager?.logger?.log?.(
+                                `[LAST-FILL-GUARD] Final gate keeping gap-evacuation ${ctx.kind} ${slotId ?? 'unknown'} ` +
+                                `despite live boundary ${bot.manager?.boundaryIdx}/gap ${bot.manager?._gapSlots}: the live rails ` +
+                                `already conflict (maxBuy=${gateConflict.maxBuyIdx} > minSell-gap-1=${gateConflict.upper}), so the ` +
+                                `retreat is forced`,
+                                'warn'
+                            );
+                        } catch { /* logging is best-effort */ }
                         continue;
                     }
                     // Geometry went stale after op-building (e.g. a boundary

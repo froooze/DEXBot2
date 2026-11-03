@@ -78,6 +78,9 @@ const NAMES = {
         'resolveSpreadOrderSide', 'selectEdgeSlots', 'shouldFlagOutOfSpread', 'virtualizeOrder',
         'formatUnmatchedChainOrder', 'correctAllPriceMismatches',
         'getOrderTypeFromUpdatedFlags',
+        // Gap-evac stranding sweep (dexbot_state_recovery.scheduleGapEvacRepair,
+        // reached from the maintenance tick).
+        'detectGapEvacuationCandidates', 'updateGapEvacuationStreaks',
     ],
     validate: [
         'buildAbortedResult', 'buildStateUpdates', 'buildSuccessResult',
