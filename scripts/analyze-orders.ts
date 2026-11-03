@@ -22,6 +22,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { formatCurrency, formatFundsValue } from '../modules/order/format.js';
 import { resolveConfiguredPriceBound } from '../modules/order/utils/order.js';
+import { calculateGapSlots } from '../modules/order/utils/math.js';
+import { parseSlotIndex } from '../modules/order/utils/slot.js';
 import { ORDER_TYPES, ORDER_STATES, MARKET_ADAPTER } from '../modules/constants.js';
 import { applyAsymmetricBounds } from '../market_adapter/core/asymmetric_bounds.js';
 import { PATHS } from '../modules/paths.js';
@@ -42,6 +44,7 @@ import { pathToFileURL } from 'node:url';
 type JsonObj = Record<string, unknown>;
 
 interface GridSlot {
+  id?: string;
   type?: string;
   state?: string;
   price: number;
@@ -112,6 +115,8 @@ interface SlotCounts {
   buy: number; sell: number; spread: number;
   activeBuy: number; virtualBuy: number; activeSell: number; virtualSell: number;
   partialBuy: number; partialSell: number;
+  /** Live rail orders resting INSIDE the gap band (spread-collapse signature). */
+  stranded: number;
   [key: string]: unknown;
 }
 interface FundSide { bts: number; xrp: number; [key: string]: unknown }
@@ -132,6 +137,17 @@ interface AnalysisResult {
   spread: SpreadAnalysis;
   increment: IncrementAnalysis;
   slots: SlotCounts;
+  /**
+   * Gap-band geometry + occupancy. `inBandPlaced` names live rail orders
+   * stranded inside the band — the spread-collapse signature that index-sliced
+   * bucketing used to hide.
+   */
+  gapBand?: {
+    /** Band width, or null when no frozen genesis gap and no live config exist. */
+    gapSlots: number | null;
+    sellStartIdx: number | null;
+    inBandPlaced: Array<{ id: string; type: string; price: number; idx: number }>;
+  };
   funds: FundsBreakdown;
   coreOrdersTarget: { buy: number; sell: number } | null;
   botFunds: { buy: string; sell: string } | null;
@@ -542,12 +558,23 @@ function analyzeOrder(botData: GridSnapshot, config: BotConfig, botKey: string):
   const hasBoundary = typeof botData.boundaryIdx === 'number' && Number.isFinite(botData.boundaryIdx);
   const boundaryIdx = hasBoundary ? (botData.boundaryIdx as number) : 0;
   const boundaryLess = !hasBoundary;
-  const buySlots = boundaryLess
-    ? grid.filter((s) => s.type === ORDER_TYPES.BUY)
-    : grid.filter((s, i) => i <= boundaryIdx && s.type === ORDER_TYPES.BUY);
-  const sellSlots = boundaryLess
-    ? grid.filter((s) => s.type === ORDER_TYPES.SELL)
-    : grid.filter((s, i) => i > boundaryIdx && s.type === ORDER_TYPES.SELL);
+  /** Slot identity: the parsed `slot-N` id wins over the array position (a re-sort invalidates position). */
+  const slotIndex = (s: GridSlot, i: number): number => {
+    const parsed = parseSlotIndex(s?.id);
+    return parsed === null ? i : parsed;
+  };
+  // CLASSIFY BY SLOT TYPE, NOT BY ARRAY SLICE.
+  // The persisted boundary says where the rails SHOULD be; a live order can be
+  // stranded inside the spread band (a boundary commit moved away from it and
+  // GAP-EVAC has not evacuated it yet) and it keeps its rail type. Slicing by
+  // index (`i <= boundaryIdx`) dropped exactly those orders from every bucket:
+  // the report then summed to fewer slots than the grid holds AND measured the
+  // "real" spread from the geometry edge instead of the actual top of book
+  // (observed live: 2.02% reported vs 1.21% on chain, with two live buys hidden
+  // inside the band). Type buckets keep every order visible; the geometry
+  // disagreement is reported explicitly via `gapBand.inBandPlaced`.
+  const buySlots = grid.filter((s) => s.type === ORDER_TYPES.BUY);
+  const sellSlots = grid.filter((s) => s.type === ORDER_TYPES.SELL);
   const spreadSlots = grid.filter((s) => s.type === ORDER_TYPES.SPREAD);
 
   const activeBuySlots = buySlots.filter((s) => s.state === ORDER_STATES.ACTIVE || s.state === ORDER_STATES.PARTIAL);
@@ -574,8 +601,11 @@ function analyzeOrder(botData: GridSnapshot, config: BotConfig, botKey: string):
   // design (a partially-placed grid IS partially masked); it is not a bug, but
   // the output should be read with that caveat in mind.
   const hasOrderId = (s: GridSlot) => !!(s && s.orderId);
-  const railBuys = boundaryLess ? grid.filter((s) => s.type === ORDER_TYPES.BUY) : grid.slice(0, boundaryIdx + 1);
-  const railSells = boundaryLess ? grid.filter((s) => s.type === ORDER_TYPES.SELL) : grid.slice(boundaryIdx + 1);
+  // Rail lists are type-based for the same reason as the buckets above: a
+  // stranded live order is still a live order on its side, and excluding it
+  // fabricates a tighter (geometry-edge) spread.
+  const railBuys = buySlots;
+  const railSells = sellSlots;
   const placedBuys = railBuys.filter((s) => s.type === ORDER_TYPES.BUY && hasOrderId(s));
   const placedSells = railSells.filter((s) => s.type === ORDER_TYPES.SELL && hasOrderId(s));
   const geoBuy = railBuys.filter((s) => s.type === ORDER_TYPES.BUY);
@@ -596,6 +626,45 @@ function analyzeOrder(botData: GridSnapshot, config: BotConfig, botKey: string):
   const realSpread = bestBuySlot && bestSellSlot
     ? ((bestSellSlot.price - bestBuySlot.price) / bestBuySlot.price)
     : 0;
+
+  /**
+   * Gap-band occupancy: live rail orders resting strictly inside the band.
+   * These are the spread-collapse signature — they hold band slots that should
+   * be empty, so the top-of-book spread is narrower than the configured gap.
+   * Detection is geometry-only (slot index vs boundary/gap), matching the
+   * runtime's `detectGapEvacuationCandidates`. The band width comes from the
+   * snapshot's frozen genesis (the geometry the slots were built with), then
+   * the live config, then the count of SPREAD-typed slots.
+   */
+  const snapshotGapSlots = Number((botData.genesis as { gapSlots?: unknown } | undefined)?.gapSlots);
+  // Unknown geometry stays unknown: without a frozen genesis gap or a live
+  // config there is no band to judge, and guessing one (e.g. from the
+  // SPREAD-typed slot count, which includes empty rail holes) would fabricate
+  // an "occupied band" warning. Same absent-aware rule as the runtime.
+  const gapSlots: number | null = Number.isFinite(snapshotGapSlots) && snapshotGapSlots >= 0
+    ? Math.floor(snapshotGapSlots)
+    : (config
+      ? calculateGapSlots(config.incrementPercent as number, config.targetSpreadPercent as number, config.gridLimits as Parameters<typeof calculateGapSlots>[2])
+      : null);
+  const sellStartIdx = hasBoundary && gapSlots !== null ? boundaryIdx + 1 + gapSlots : null;
+  const inBandPlaced: Array<{ id: string; type: string; price: number; idx: number }> = [];
+  if (hasBoundary && gapSlots !== null && sellStartIdx !== null) {
+    grid.forEach((s, i) => {
+      if (!hasOrderId(s)) return;
+      const idx = slotIndex(s, i);
+      if (idx > boundaryIdx && idx < sellStartIdx) {
+        inBandPlaced.push({
+          // Real snapshots always carry a slot id; fall back to the chain order
+          // id (then the array position) so the report always names something
+          // an operator can act on.
+          id: String(s.id ?? s.orderId ?? `#${i}`),
+          type: String(s.type ?? '?'),
+          price: Number(s.price),
+          idx,
+        });
+      }
+    });
+  }
 
   let spreadDiff, targetSpread, incrementCheck;
 
@@ -682,12 +751,18 @@ function analyzeOrder(botData: GridSnapshot, config: BotConfig, botKey: string):
       buy: buySlots.length,
       sell: sellSlots.length,
       spread: spreadSlots.length,
+      stranded: inBandPlaced.length,
       activeBuy: activeBuySlots.length,
       virtualBuy: virtualBuySlots.length,
       activeSell: activeSellSlots.length,
       virtualSell: virtualSellSlots.length,
       partialBuy: buySlots.filter((s) => s.state === ORDER_STATES.PARTIAL).length,
       partialSell: sellSlots.filter((s) => s.state === ORDER_STATES.PARTIAL).length
+    },
+    gapBand: {
+      gapSlots,
+      sellStartIdx,
+      inBandPlaced
     },
     // Slot data for weight visualization
     slotData: {
@@ -1346,6 +1421,22 @@ function formatAnalysis(analysisInput: JsonObj): string {
     );
   } else {
     lines.push(`   Spread:${formatPercent(analysis.spread.real).padStart(6)} | Incr.:${formatPercent(analysis.increment.avg).padStart(6)}`);
+  }
+
+  // Spread-collapse warning: live rail orders sitting inside the gap band eat
+  // the spread slots, so the reported spread is the REAL top-of-book gap (which
+  // is narrower than the configured one). Naming the slots is what makes the
+  // state actionable — they need a GAP-EVAC evacuation, not a config change.
+  const inBandPlaced = analysis.gapBand?.inBandPlaced ?? [];
+  if (inBandPlaced.length > 0) {
+    const names = inBandPlaced
+      .map((o) => `${o.id} ${o.type} @${formatCurrency(o.price)}`)
+      .join(', ');
+    lines.push(
+      `   ${colors.sell}⚠️  Spread band occupied:${colors.reset} ` +
+      `${inBandPlaced.length} live order(s) inside the ${analysis.gapBand?.gapSlots ?? '?'}-slot band ` +
+      `(${names}) — real spread is narrower than target; GAP-EVAC must evacuate them`
+    );
   }
 
   // Active orders comparison

@@ -843,14 +843,18 @@ function testAnalyzeOrderBoundaryLessClassifiesByType() {
   assert.ok(stripped.includes('boundary-less mode'), 'report should announce boundary-less mode');
 }
 
-function testAnalyzeOrderNumericBoundaryKeepsRailGeometry() {
-  const { analyzeOrder } = loadAnalyzer();
+function testAnalyzeOrderNumericBoundaryReportsStrandedOrders() {
+  const { analyzeOrder, formatAnalysis } = loadAnalyzer();
   const botKey = `boundary-numeric-${Date.now()}`;
   const botData = {
     meta: { assetA: 'BTS', assetB: 'XBTSX.USDT', updatedAt: new Date().toISOString() },
     boundaryIdx: 1,
-    // A buy placed after the numeric boundary is excluded by rail geometry
-    // (legacy behaviour); the fallback must not alter the numeric path.
+    // A live BUY above the numeric boundary is a STRANDED order (a boundary
+    // commit moved away from it; GAP-EVAC owns the evacuation). It keeps its
+    // rail type, so it must stay visible: index-slicing used to drop it from
+    // every bucket (buy+spread+sell summed to less than the grid) and to
+    // measure the spread from the geometry edge instead of the real top of
+    // book — the exact way a collapsed spread read as "on target".
     grid: [
       { type: 'buy', state: 'active', orderId: 'b1', price: 90, size: 1 },
       { type: 'sell', state: 'active', orderId: 's1', price: 105, size: 1 },
@@ -871,8 +875,30 @@ function testAnalyzeOrderNumericBoundaryKeepsRailGeometry() {
   };
   const analysis = analyzeOrder(botData, config, botKey);
   assert.strictEqual(analysis.boundaryLess, false, 'numeric boundary must not flag boundary-less mode');
-  assert.strictEqual(analysis.slots.buy, 1, 'numeric boundary keeps index rail (post-boundary buy excluded)');
-  assert.strictEqual(analysis.slots.sell, 1, 'numeric boundary keeps index rail');
+  assert.strictEqual(analysis.slots.buy, 2, 'every live buy stays visible regardless of its index');
+  assert.strictEqual(analysis.slots.sell, 2, 'every live sell stays visible regardless of its index');
+  assert.strictEqual(
+    analysis.slots.buy + analysis.slots.sell + analysis.slots.spread,
+    botData.grid.length,
+    'slot buckets must account for every grid slot (no hidden orders)'
+  );
+  // b2 (95) is the stranded in-band buy: it IS the real best bid, so the spread
+  // is measured from it, not from the boundary slot's 90.
+  assert.ok(
+    Math.abs(analysis.spread.real - (105 - 95) / 95) < 1e-9,
+    `spread must use the real top of book (got ${analysis.spread.real})`
+  );
+  // Both rails can strand: with gap 3 the band is 2..4, so the buy at index 2
+  // AND the sell at index 3 are inside it.
+  const stranded = (analysis.gapBand && analysis.gapBand.inBandPlaced) || [];
+  assert.strictEqual(stranded.length, 2, 'every in-band live order must be reported');
+  // No slot id in the fixture: the chain order id is the actionable label.
+  assert.deepStrictEqual(stranded.map((o) => o.id).sort(), ['b2', 's2'], 'the stranded orders are named');
+  const stripped = stripColorCodes(formatAnalysis(analysis));
+  assert.ok(
+    stripped.includes('Spread band occupied'),
+    'the report must surface the occupied band instead of a passing spread line'
+  );
 }
 
 async function main() {
@@ -904,7 +930,7 @@ async function main() {
   testAnalyzeOrderOmitsDynamicWeightForNonAma();
   testAnalyzeOrderFormatsNumericBotFunds();
   testAnalyzeOrderBoundaryLessClassifiesByType();
-  testAnalyzeOrderNumericBoundaryKeepsRailGeometry();
+  testAnalyzeOrderNumericBoundaryReportsStrandedOrders();
   console.log('analyze-orders dynamic weight tests passed');
   fs.rmSync(TEST_PROFILE_ROOT, { recursive: true, force: true });
 }
