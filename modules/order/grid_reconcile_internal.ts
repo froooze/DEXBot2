@@ -9,7 +9,7 @@
 
 import { ORDER_TYPES, ORDER_STATES, TIMING, BTS_PRECISION } from '../constants.js';
 import { readOpenOrdersGuarded } from '../chain_orders.js';
-import { getMinOrderSize, getAssetFees, getAssetFeesSafe, blockchainToFloat, findCrossedOrder, resolveGapBand, isSlotInRail, pricesOnSameLevel, pricesWithinHalfStep, sameGridLevel } from './utils/math.js';
+import { getMinOrderSize, getSingleDustThreshold, getAssetFees, getAssetFeesSafe, blockchainToFloat, findCrossedOrder, resolveGapBand, isSlotInRail, pricesOnSameLevel, pricesWithinHalfStep, sameGridLevel } from './utils/math.js';
 import { isOrderPlaced, parseChainOrder, buildCreateOrderArgs, buildOutsideInPairGroups, extractBatchOperationResults, chainOrderMatchesSlotWithTolerance, buildCrossingCheckCandidates, isCrossingCheckCandidate, getSideBudget, calculateBudgetedSizes, getCoreOrdersTotal, convertToSpreadPlaceholder, isOrderGoneErrorMessage, clearDuplicateOrphanDetection, resolveEdgeCount, resolveLiveEdgeAnchorPrice, edgeOrderIdSet, compareEdge, reportGridPriceInvariant, liveWindowIdSet } from './utils/order.js';
 import { parseSlotIndex } from './utils/slot.js';
 import { resolveAccountRef, isLastFillPlacementBlocked, hasUnsettledFills } from './utils/system.js';
@@ -1826,6 +1826,63 @@ async function _executePlannedStartupCreates({
     return createdOrderIds;
 }
 
+/**
+ * Partition the unmatched chain orders of one side into an UPDATE pool and a
+ * dust-surplus CANCEL pool.
+ *
+ * Policy (single implementation used by the startup reconcile):
+ * - dust = size below the per-slot single-dust threshold (same definition the
+ *   partial-dust health check uses);
+ * - when the NON-dust orders alone can cover every slot this side needs, dust
+ *   orders are surplus -> CANCEL only. They are never grown into a full slot
+ *   and no replacement is created for them (there are already enough real
+ *   orders to cover the target);
+ * - otherwise dust stays eligible to fill the remaining slots.
+ *
+ * Extracted so the policy is unit-testable and cannot drift between the
+ * startup reconcile and any future caller.
+ * @param {Object} input
+ * @param {Array} input.sortedUnmatched - Unmatched chain orders, pre-sorted by price
+ * @param {Array} input.desiredSlots - Target slots this side wants to activate
+ * @param {Object} input.assets - Asset metadata (precisions)
+ * @param {number} [input.dustThresholdPercent] - Dust threshold percentage
+ * @returns {Object} { updatePool, dustSurplus, nonDustCount, dustCount, referenceIdeal, dustThreshold, enoughNonDust }
+ */
+function _classifyStartupOrderReuse({
+    sortedUnmatched,
+    desiredSlots,
+    assets,
+    dustThresholdPercent,
+}: {
+    sortedUnmatched: ChainOrder[];
+    desiredSlots: ManagedOrder[];
+    assets: AssetPair;
+    dustThresholdPercent?: number;
+}) {
+    const referenceIdeal = desiredSlots.length > 0
+        ? desiredSlots.reduce((sum, slot) => sum + (Number(slot?.size) || 0), 0) / desiredSlots.length
+        : 0;
+    const dustThreshold = getSingleDustThreshold(referenceIdeal, dustThresholdPercent);
+    const isDustOrder = (chainOrder: ChainOrder): boolean => {
+        if (!(dustThreshold > 0)) return false;
+        const parsed = parseChainOrder(chainOrder, assets);
+        const size = Number(parsed?.size ?? 0);
+        return size > 0 && size < dustThreshold;
+    };
+    const nonDustUnmatched = sortedUnmatched.filter((chainOrder) => !isDustOrder(chainOrder));
+    const dustUnmatched = sortedUnmatched.filter((chainOrder) => isDustOrder(chainOrder));
+    const enoughNonDust = desiredSlots.length > 0 && nonDustUnmatched.length >= desiredSlots.length;
+    return {
+        updatePool: enoughNonDust ? nonDustUnmatched : sortedUnmatched,
+        dustSurplus: enoughNonDust ? dustUnmatched : [],
+        nonDustCount: nonDustUnmatched.length,
+        dustCount: dustUnmatched.length,
+        referenceIdeal,
+        dustThreshold,
+        enoughNonDust,
+    };
+}
+
 async function _reconcileStartupSide({
     orderType,
     targetCount,
@@ -1900,7 +1957,19 @@ async function _reconcileStartupSide({
     }
 
     const sortedUnmatched = unmatchedSideOrders.slice(0).sort(sortUpdateComparator);
-    const updateCount = Math.min(sortedUnmatched.length, desiredSlots.length);
+    const classifiedReuse = _classifyStartupOrderReuse({
+        sortedUnmatched,
+        desiredSlots,
+        assets: manager.assets,
+        dustThresholdPercent: manager.config?.gridLimits?.PARTIAL_DUST_THRESHOLD_PERCENTAGE,
+    });
+    // Only the Phase-1 (planOnly) caller can execute cancels. A non-planOnly
+    // caller must keep every order eligible for update rather than silently
+    // dropping dust from both the update pool and the cancel queue.
+    const updatePool = planOnly ? classifiedReuse.updatePool : sortedUnmatched;
+    const dustSurplus = planOnly ? classifiedReuse.dustSurplus : [];
+    const nonDustCount = classifiedReuse.nonDustCount;
+    const updateCount = Math.min(updatePool.length, desiredSlots.length);
     let cancelledIndex: number | null = null;
     let projectedSideBalance = Number(manager.accountTotals?.[balanceKey] || 0);
 
@@ -1969,7 +2038,7 @@ async function _reconcileStartupSide({
             account,
             privateKey,
             manager,
-            unmatchedOrders: sortedUnmatched,
+            unmatchedOrders: updatePool,
             updateCount,
             orderType,
             dryRun,
@@ -1993,7 +2062,7 @@ async function _reconcileStartupSide({
     for (let i = 0; i < updateCount; i++) {
         if (cancelledIndex !== null && i === cancelledIndex) continue;
 
-        const chainOrder = sortedUnmatched[i];
+        const chainOrder = updatePool[i];
         const gridOrder = desiredSlots[i];
         const gridSize = Number(gridOrder.size) || 0;
         const parsedChain = parseChainOrder(chainOrder, manager.assets);
@@ -2069,7 +2138,30 @@ async function _reconcileStartupSide({
         });
     }
 
-    const processedUnmatched = sortedUnmatched.slice(updateCount);
+    const processedUnmatched = updatePool.slice(updateCount);
+
+    // Queue the dust-surplus cancels after the update plans. Phase 2 always runs
+    // cancels before creates/updates, so these can never be paired into a slot.
+    // planOnly is the Phase-1 contract; the actual broadcast happens in Phase 2.
+    if (planOnly && dustSurplus.length > 0) {
+        const alreadyPlanned = new Set(plannedCancels.map((plan) => String(plan.chainOrderId)));
+        for (const dustOrder of dustSurplus) {
+            if (alreadyPlanned.has(String(dustOrder.id))) continue;
+            plannedCancels.push({
+                chainOrderId: dustOrder.id,
+                chainOrderObj: dustOrder,
+                releaseUntrackedFunds: true,
+                orderType,
+                boundaryIdx: manager?.boundaryIdx,
+                gapSlots: manager?._gapSlots,
+            });
+            logger?.log?.(
+                `Startup: Cancelling ${sideUpper} dust order ${dustOrder.id} ` +
+                `(${nonDustCount} non-dust order(s) already cover ${desiredSlots.length} needed slot(s); not pricing it into a full-size slot)`,
+                'info'
+            );
+        }
+    }
     // Slot-N gated chain count: fork-kept shelf/manual orders (non-slot-N
     // grid ids, e.g. deep-*) sit outside window accounting — same gate as
     // _countActiveOnGrid and matched-excess candidates (issue #27 follow-up).
@@ -2086,6 +2178,12 @@ async function _reconcileStartupSide({
             chainCount = chainSideOrders.filter((co) => co && !shelfOrderIds.has(String(co?.id))).length;
         }
     } catch { /* fail-open: keep unfiltered count */ }
+    // Dust-surplus cancels are already queued above, so the remaining chain
+    // count must exclude them. Without this adjustment `createCount` would
+    // over-count (no create for the freed level) and `cancelCount` would
+    // double-count the dust as excess, cancelling a healthy matched order from
+    // `matchedExcess` to satisfy a surplus that is already being removed.
+    chainCount = Math.max(0, chainCount - dustSurplus.length);
     const createCount = Math.max(0, targetCount - chainCount);
     const remainingSlots = desiredSlots.slice(updateCount);
 
@@ -2288,5 +2386,5 @@ async function _reconcileStartupSide({
     };
 }
 
-export { _countActiveOnGrid, _pickVirtualSlotsToActivate, _createOrderFromGrid, _prepareStartupUpdatePlan, _cancelChainOrder, _recoverStartupSyncFailure, _refreshStartupUpdatePlans, _executeStartupUpdateBatch, _executeStartupSequentialUpdateFallback, _executeStartupCreateGroupBatch, _createStartupOrderWithHandling, _executePlannedStartupCreates, _reconcileStartupSide }
+export { _countActiveOnGrid, _pickVirtualSlotsToActivate, _createOrderFromGrid, _prepareStartupUpdatePlan, _cancelChainOrder, _recoverStartupSyncFailure, _refreshStartupUpdatePlans, _executeStartupUpdateBatch, _executeStartupSequentialUpdateFallback, _executeStartupCreateGroupBatch, _createStartupOrderWithHandling, _executePlannedStartupCreates, _reconcileStartupSide, _classifyStartupOrderReuse }
 

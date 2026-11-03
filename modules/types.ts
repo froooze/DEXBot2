@@ -1117,6 +1117,10 @@ export interface OrderManagerLike {
   // --- lifecycle / rebalance state ---
   isRebalancing(): boolean;
   isBootstrapping(): boolean;
+  beginStructuralRebuild?(reason?: string): void;
+  endStructuralRebuild?(): void;
+  isStructuralRebuildInProgress?(): boolean;
+  structuralRebuildReason?(): string | null;
   isBroadcastingActive(): boolean;
   isPlanningActive(): boolean;
   setShuttingDown(value: boolean): void;
@@ -1124,6 +1128,13 @@ export interface OrderManagerLike {
   finishBootstrap(): void;
   startBroadcasting(): void;
   stopBroadcasting(): void;
+  /** Exclusive placement region shared by every chain-mutating path. */
+  acquirePlacement?: (kind: string, options?: { timeoutMs?: number; isShuttingDown?: () => boolean }) => Promise<{ kind: string; release(): void } | null>;
+  tryAcquirePlacement?: (kind: string) => { kind: string; release(): void } | null;
+  isPlacementActive?: () => boolean;
+  placementKind?: () => string | null;
+  placementHeldForMs?: () => number;
+  isStructuralRebuildStale?: (reason: unknown) => boolean;
   addBroadcastRegionEndListener(listener: () => void): void;
   _applySync(data: unknown, src: string): Promise<unknown>;
   synchronizeWithChain(data: unknown, src: string): Promise<SyncResult>;

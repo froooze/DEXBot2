@@ -168,6 +168,28 @@ function isOrderGoneErrorMessage(message: string | null | undefined, orderId?: s
     return false;
 }
 
+/**
+ * Classify a working-grid staleness reason as a STRUCTURAL rebuild.
+ *
+ * `_syncWorkingGridFromMasterMutation` stamps reasons such as
+ * `master mutation during broadcasting (grid-init)` (a full grid rebuild) or
+ * `(fill-place)` (a fill landing during the plan). The two are NOT
+ * interchangeable: after a rebuild the fresh master no longer carries the live
+ * chain order IDs, so re-planning from it emits CREATEs for price levels the
+ * startup reconcile is concurrently re-pricing via UPDATE — both generations
+ * land and the loser becomes a duplicate-price orphan backlog.
+ *
+ * Single source of truth for every planner/guard that must treat a rebuild
+ * differently from a fill. Keep the pattern anchored to the context tokens
+ * emitted by manager._syncWorkingGridFromMasterMutation / structural paths.
+ * @param {unknown} reason - evaluateCommit refusal reason or staleness label.
+ * @returns {boolean} True when the master was structurally rebuilt.
+ */
+function isStructuralRebuildStaleReason(reason: unknown) {
+    if (typeof reason !== 'string' || reason.length === 0) return false;
+    return /\bgrid-init\b|\brebuild\b|\bresync\b|\bregenerated grid\b/i.test(reason);
+}
+
 // ---------------------------------------------------------------------------
 // Persistent duplicate-orphan detection escalation. A duplicate-price-level
 // orphan is expected self-healing (fully filled order leaves a sub-dust
@@ -3973,7 +3995,7 @@ function collectKnownOnChainOrderIds(mgr: OrderManagerLike, placedResults: unkno
     return { masterIds: [...masterIds], createIds: [...createIds], all: [...all] };
 }
 
-export { parseChainOrder, resolveLiveOrderLadderPosition, applyChainSizeToGridOrder, resolveExecutionPrice, resolveSlotIdForFillPrice, reviveVirtualSlotFromChain, attributeUnmatchedFillToGrid,  buildFillKey, correctOrderPriceOnChain, correctAllPriceMismatches, _validatePriceCorrectionEntry, _stampCorrectionProvenance, findLiveOrderOwnerByChainId, buildCreateOrderArgs, getOrderTypeFromUpdatedFlags, resolveConfiguredPriceBound, virtualizeOrder, convertToSpreadPlaceholder, toRailHolePlaceholder, geometryTypeForSlotIndex, detectGapEvacuationCandidates, updateGapEvacuationStreaks, resolveSpreadOrderSide, chainOrderMatchesSlot, chainOrderMatchesSlotWithTolerance, crossingCandidateChainId, isCrossingCheckCandidate, buildCrossingCheckCandidates, filterOrdersByType, buildOutsideInPairGroups, extractBatchOperationResults, formatUnmatchedChainOrder, isNonBlockingUnmatchedOrder, isStrandedHoldOrder, isOrderOnChain, isOrderVirtual, hasOnChainId, isOrderPlaced, isPhantomOrder, isSlotAvailable, isEmptyGridSlot, isOrderHealthy, checkSizeThreshold, checkSizesBeforeMinimum, calculateIdealBoundary, assignGridRoles, resolveOnChainRetypeType, shouldFlagOutOfSpread, buildIndexes, validateIndexes, ordersEqual, buildDelta, deriveTargetBoundary, isShiftEligibleFill, resolveEdgeCount, resolveEdgeOrders, selectEdgeSlots, getCoreOrdersTotal, getSideBudget, calculateBudgetedSizes, buildCreateOpFingerprint, isOrderGoneErrorMessage, recordDuplicateOrphanDetection, clearDuplicateOrphanDetection, duplicateOrphanLogInfo, chainOrderUnchangedFromCache, detectCrossedBookPlan, collectKnownOnChainOrderIds, collectEdgePinnedFillIds, edgeOrderIdSet, liveWindowIdSet, checkGridPriceInvariant, reportGridPriceInvariant };
+export { parseChainOrder, resolveLiveOrderLadderPosition, applyChainSizeToGridOrder, resolveExecutionPrice, resolveSlotIdForFillPrice, reviveVirtualSlotFromChain, attributeUnmatchedFillToGrid,  buildFillKey, correctOrderPriceOnChain, correctAllPriceMismatches, _validatePriceCorrectionEntry, _stampCorrectionProvenance, findLiveOrderOwnerByChainId, buildCreateOrderArgs, getOrderTypeFromUpdatedFlags, resolveConfiguredPriceBound, virtualizeOrder, convertToSpreadPlaceholder, toRailHolePlaceholder, geometryTypeForSlotIndex, detectGapEvacuationCandidates, updateGapEvacuationStreaks, resolveSpreadOrderSide, chainOrderMatchesSlot, chainOrderMatchesSlotWithTolerance, crossingCandidateChainId, isCrossingCheckCandidate, buildCrossingCheckCandidates, filterOrdersByType, buildOutsideInPairGroups, extractBatchOperationResults, formatUnmatchedChainOrder, isNonBlockingUnmatchedOrder, isStrandedHoldOrder, isOrderOnChain, isOrderVirtual, hasOnChainId, isOrderPlaced, isPhantomOrder, isSlotAvailable, isEmptyGridSlot, isOrderHealthy, checkSizeThreshold, checkSizesBeforeMinimum, calculateIdealBoundary, assignGridRoles, resolveOnChainRetypeType, shouldFlagOutOfSpread, buildIndexes, validateIndexes, ordersEqual, buildDelta, deriveTargetBoundary, isShiftEligibleFill, resolveEdgeCount, resolveEdgeOrders, selectEdgeSlots, getCoreOrdersTotal, getSideBudget, calculateBudgetedSizes, buildCreateOpFingerprint, isOrderGoneErrorMessage, isStructuralRebuildStaleReason, recordDuplicateOrphanDetection, clearDuplicateOrphanDetection, duplicateOrphanLogInfo, chainOrderUnchangedFromCache, detectCrossedBookPlan, collectKnownOnChainOrderIds, collectEdgePinnedFillIds, edgeOrderIdSet, liveWindowIdSet, checkGridPriceInvariant, reportGridPriceInvariant };
 export type { CrawlEntry }
 export { resolveEdgeAnchorPrice, resolveLiveEdgeAnchorPrice, compareEdge, collectRefillSlotIds, recordOrderPlacement, isFreshlyPlacedOrder, _filterUnmatchedChainOrders };
 

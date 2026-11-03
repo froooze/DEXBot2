@@ -33,6 +33,7 @@ const { validateCreateTargetSlots, evaluateCommit, hasExecutableActions, stampGa
 import * as math from './order/utils/math.js';
 const { validateOrderSize, findCrossedOrder, sameGridLevel, isEvacuationRotationAllowed, isEvacuationSizeStillValid, getSellStartIdx, getPrecisionByOrderType, isSlotIndexInGapBand, getAssetFeesSafe, blockchainToFloat, floatToBlockchainInt, quantizeFloat } = math;
 import { parseSlotIndex } from './order/utils/slot.js';
+import type { PlacementLease } from './order/placement_lock.js';
 
 /**
  * Re-verify a B-stamped gap-evacuation rotation against the LIVE committed
@@ -3326,6 +3327,41 @@ function restoreSkippedUpdateSlotsInWorkingGrid(bot: BotLike, workingGrid: Insta
  *   with the original plan.
  */
 async function replanStaleBatch(bot: BotLike, cowResult: CowResult, replanDepth: number, preBroadcastGuard: JsonObj, seamPollIntervalMs?: number): Promise<{ handled: boolean; result?: JsonObj }> {
+    // STRUCTURAL REBUILD GUARD. A `grid-init`/resync staleness means the master
+    // was rebuilt while this plan was in flight. The fresh master has no live
+    // chain order IDs, so a re-plan would emit a create-only batch for levels
+    // that startup reconcile is concurrently re-pricing via UPDATE. Both
+    // generations land and the loser becomes a duplicate-price orphan backlog
+    // (2026-11-03: 25 duplicate orders). Abort instead and let the
+    // reconcile (update-first) complete — fills stay recorded and are drained
+    // by the bootstrap consumer / next reconcile.
+    const structuralRebuild = typeof bot.manager?.isStructuralRebuildStale === 'function'
+        ? bot.manager.isStructuralRebuildStale(preBroadcastGuard?.reason)
+        : orderUtils.isStructuralRebuildStaleReason(preBroadcastGuard?.reason);
+    if (structuralRebuild) {
+        bot.manager.logger.log(
+            `[COW] Plan stale after a structural grid rebuild (${preBroadcastGuard.reason}); ` +
+            `aborting this batch so the startup reconcile keeps update-first ownership (no create-only re-plan).`,
+            'warn'
+        );
+        popPushedWorkingGrid(bot, cowResult);
+        // The aborted plan's CREATE slots were recorded as pending broadcasts
+        // during op-building but will never be sent. Drop only THEIR entries:
+        // keeping them would make the reconcile's surplus sweep and the next
+        // batch's pending-broadcast guard treat a phantom create as in flight.
+        // Entries from an earlier unresolved batch are deliberately kept.
+        clearPendingBroadcastsForSlots(bot, cowResult.actions);
+        await requestStructuralResync(
+            bot,
+            'plan stale after structural rebuild (deferred to reconcile)',
+            { reason: preBroadcastGuard.reason }
+        );
+        return {
+            handled: true,
+            result: { executed: false, aborted: true, reason: 'STRUCTURAL_REBUILD_DEFERRED', hadRotation: false }
+        };
+    }
+
     const canReplan = replanDepth < STALE_PLAN_REPLAN_LIMIT
         && Array.isArray(cowResult.fills) && cowResult.fills.length > 0;
     if (!canReplan) {
@@ -4187,6 +4223,35 @@ async function updateOrdersOnChainBatchCOWBody(
     // would wipe a concurrent batch's in-flight flag and let a third batch
     // broadcast on top of it (the exact overlap this guard prevents).
     let heldBroadcastSlot = false;
+
+    // Exclusive placement region (shared with startup reconcile Phase 2 and
+    // correction drains). `heldBroadcastSlot` only serializes COW batches;
+    // this lease serializes EVERY chain-mutating placement path, so a
+    // reconcile cannot broadcast the same price levels while this batch is in
+    // flight. Claimed together with the COW slot and released on every exit.
+    let heldPlacementLease: PlacementLease | null = null;
+    const claimPlacement = async (stage: string): Promise<boolean> => {
+        if (typeof bot.manager?.acquirePlacement !== 'function') return true;
+        const lease = await bot.manager.acquirePlacement('cow-broadcast', {
+            timeoutMs: SINGLE_FLIGHT_MAX_WAIT_MS,
+            isShuttingDown: () => bot._shuttingDown === true,
+        });
+        if (!lease) {
+            bot.manager.logger.log(
+                `[COW] ${stage}: exclusive placement region unavailable (timeout/shutdown); aborting this batch instead of overlapping another placement path.`,
+                'warn'
+            );
+            return false;
+        }
+        heldPlacementLease = lease;
+        return true;
+    };
+    const releasePlacement = () => {
+        if (heldPlacementLease) {
+            heldPlacementLease.release();
+            heldPlacementLease = null;
+        }
+    };
 
     try {
         bot._batchInFlight++;
@@ -5259,6 +5324,10 @@ async function updateOrdersOnChainBatchCOWBody(
             popPushedWorkingGrid(bot, cowResult);
             return { executed: false, aborted: true, reason: 'SHUTDOWN_IN_PROGRESS', hadRotation: false };
         }
+        if (!(await claimPlacement('pre-broadcast'))) {
+            popPushedWorkingGrid(bot, cowResult);
+            return { executed: false, aborted: true, reason: 'PLACEMENT_REGION_UNAVAILABLE', hadRotation: false };
+        }
         bot._cowBroadcastInFlight = true;
         heldBroadcastSlot = true;
 
@@ -5286,6 +5355,7 @@ async function updateOrdersOnChainBatchCOWBody(
                 );
                 bot._cowBroadcastInFlight = false;
                 heldBroadcastSlot = false;
+                releasePlacement();
                 const replan = await replanStaleBatch(bot, cowResult, replanDepth, postWaitGuard, seamPollIntervalMs);
                 if (replan.handled) {
                     return replan.result ?? { executed: false, hadRotation: false };
@@ -5296,6 +5366,10 @@ async function updateOrdersOnChainBatchCOWBody(
                 if (await waitForCowBroadcastSingleFlight(bot, 'post-stale-replan')) {
                     popPushedWorkingGrid(bot, cowResult);
                     return { executed: false, aborted: true, reason: 'SHUTDOWN_IN_PROGRESS', hadRotation: false };
+                }
+                if (!(await claimPlacement('post-stale-replan'))) {
+                    popPushedWorkingGrid(bot, cowResult);
+                    return { executed: false, aborted: true, reason: 'PLACEMENT_REGION_UNAVAILABLE', hadRotation: false };
                 }
                 bot._cowBroadcastInFlight = true;
                 heldBroadcastSlot = true;
@@ -5650,6 +5724,7 @@ async function updateOrdersOnChainBatchCOWBody(
     } finally {
         bot._batchInFlight--;
         if (heldBroadcastSlot) bot._cowBroadcastInFlight = false;
+        releasePlacement();
         bot._markGridActivity('batch end');
         bot.manager.unlockOrders(idsToLock);
 

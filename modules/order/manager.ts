@@ -66,8 +66,10 @@ import {
     buildSuccessResult,
     evaluateCommit
 } from './utils/validate.js';
-import { resolveSpreadOrderSide, resolveLiveOrderLadderPosition, parseChainOrder, geometryTypeForSlotIndex, isOrderOnChain, resolveEdgeCount, resolveLiveEdgeAnchorPrice, compareEdge, collectRefillSlotIds, recordOrderPlacement, isFreshlyPlacedOrder, collectEdgePinnedFillIds } from './utils/order.js';
+import { resolveSpreadOrderSide, resolveLiveOrderLadderPosition, parseChainOrder, geometryTypeForSlotIndex, isOrderOnChain, resolveEdgeCount, resolveLiveEdgeAnchorPrice, compareEdge, collectRefillSlotIds, recordOrderPlacement, isFreshlyPlacedOrder, collectEdgePinnedFillIds, isStructuralRebuildStaleReason } from './utils/order.js';
 import { parseSlotIndex } from './utils/slot.js';
+import PlacementLock from './placement_lock.js';
+import type { PlacementLease } from './placement_lock.js';
 import { getErrorMessage, getErrorCode } from '../utils/errors.js';
 import type { GridGenesis } from './utils/math.js';
 import type {
@@ -506,6 +508,8 @@ class OrderManager implements OrderManagerLike {
     sync: SyncEngine;
     _rebalanceState: string;
     _bootstrapping: number;
+    _structuralRebuildDepth: number;
+    _structuralRebuildReason: string | null;
     _endOfBootstrapValidationDone: boolean;
     _broadcastingFlag: number;
     _broadcastingStartedAt: number;
@@ -585,6 +589,7 @@ class OrderManager implements OrderManagerLike {
     processedFillStore: ProcessedFillStoreLike | null;
     _syncLock: ManagerLock;
     _fillProcessingLock: ManagerLock;
+    _placementLock: PlacementLock;
     _divergenceLock: ManagerLock;
     _gridLock: ManagerLock;
     _fundLock: ManagerLock;
@@ -680,6 +685,8 @@ class OrderManager implements OrderManagerLike {
 
         this._rebalanceState = REBALANCE_STATES.NORMAL;
         this._bootstrapping = 0;
+        this._structuralRebuildDepth = 0;
+        this._structuralRebuildReason = null;
         this._endOfBootstrapValidationDone = false;
         this._broadcastingFlag = 0;
         this._broadcastingStartedAt = 0;
@@ -727,6 +734,11 @@ class OrderManager implements OrderManagerLike {
         //   Level 4: _fundLock         (fund operations — innermost)
         // Note: AsyncLock IS re-entrant (acquire detects nested calls via context).
         this._fillProcessingLock = new AsyncLock({ timeout: TIMING.SYNC_LOCK_TIMEOUT_MS });
+        // Level 0.5: exclusive placement region shared by EVERY chain-mutating
+        // path (COW batches, startup reconcile Phase 2, correction drains).
+        // The broadcast refcount below only defers fills; it does not stop two
+        // placement paths from broadcasting at once. See placement_lock.ts.
+        this._placementLock = new PlacementLock();
         this._divergenceLock = new AsyncLock();
         this._syncLock = new AsyncLock();
         this._gridLock = new AsyncLock({
@@ -915,6 +927,94 @@ class OrderManager implements OrderManagerLike {
     }
 
     /**
+     * Mark a structural grid rebuild (trigger-file resync, startup regenerate)
+     * as in progress. While active, fill-driven COW rebalances DEFER: they would
+     * otherwise re-plan against the freshly rebuilt, order-id-less master and
+     * emit a create-only batch while the reconcile re-prices the live orders
+     * onto the same levels (duplicate-price orphan incident 2026-11-03).
+     * This is deliberately narrower than isBootstrapping(): the constructor's
+     * initial bootstrap is not a rebuild and fills may still rebalance there.
+     * @param {string} reason - Diagnostic label (e.g. 'trigger-file resync')
+     */
+    beginStructuralRebuild(reason: string = 'structural rebuild') {
+        this._structuralRebuildDepth++;
+        this._structuralRebuildReason = reason;
+        this.logger?.log?.(`[REBUILD] Structural rebuild started (${reason}); fill-driven rebalances deferred`, 'debug');
+    }
+
+    /** End a structural rebuild region (balanced with beginStructuralRebuild). */
+    endStructuralRebuild() {
+        if (this._structuralRebuildDepth > 0) this._structuralRebuildDepth--;
+        if (this._structuralRebuildDepth === 0) {
+            this._structuralRebuildReason = null;
+            // Re-arm the deferred work that was parked while the rebuild owned
+            // placement. The broadcast-region-end listener schedules the
+            // post-recovery rebalance (and drains queued fills); without this
+            // wake-up a fill deferred by the rebuild would only retry on the
+            // next unrelated region end.
+            if (this._deferredRebalanceAt) this._fireBroadcastRegionEnd();
+        }
+    }
+
+    /** Whether a structural rebuild currently owns placement. */
+    isStructuralRebuildInProgress() {
+        return this._structuralRebuildDepth > 0;
+    }
+
+    /** Diagnostic label of the active structural rebuild, or null. */
+    structuralRebuildReason() {
+        return this._structuralRebuildReason;
+    }
+
+    /**
+     * Acquire the exclusive placement region (see placement_lock.ts).
+     * Callers MUST release the lease in a finally block before returning.
+     * @param {string} kind - Owner label for diagnostics (e.g. 'cow-broadcast')
+     * @param {Object} [options] - Wait bound + shutdown probe
+     * @returns {Promise<Object|null>} Lease, or null on timeout/shutdown
+     */
+    async acquirePlacement(kind: string, options: { timeoutMs?: number; isShuttingDown?: () => boolean } = {}): Promise<PlacementLease | null> {
+        return await this._placementLock.acquire(kind, {
+            ...options,
+            isShuttingDown: options.isShuttingDown || (() => this._shuttingDown),
+        });
+    }
+
+    /**
+     * Non-blocking placement acquire for paths that must defer rather than queue.
+     * @param {string} kind - Owner label
+     * @returns {Object|null} Lease when free, otherwise null
+     */
+    tryAcquirePlacement(kind: string): PlacementLease | null {
+        return this._placementLock.tryAcquire(kind);
+    }
+
+    /** Whether another placement path currently holds the exclusive region. */
+    isPlacementActive() {
+        return this._placementLock.isHeld();
+    }
+
+    /** Owner label of the active placement region, or null. */
+    placementKind() {
+        return this._placementLock.kind();
+    }
+
+    /** Milliseconds the current placement region has been held (0 when free). */
+    placementHeldForMs() {
+        return this._placementLock.heldForMs();
+    }
+
+    /**
+     * True when the given staleness reason means the master grid was
+     * structurally rebuilt while a plan was in flight. Such a plan must NOT be
+     * re-planned from the fresh (order-id-less) master: a create-only re-plan
+     * duplicates every live chain order the reconcile is about to update.
+     */
+    isStructuralRebuildStale(reason: unknown) {
+        return isStructuralRebuildStaleReason(reason);
+    }
+
+    /**
      * Whether a broadcast is currently active (no side-effects).
      * @returns {boolean}
      */
@@ -928,6 +1028,11 @@ class OrderManager implements OrderManagerLike {
      */
     setShuttingDown(value: boolean) {
         this._shuttingDown = value === true;
+        if (this._shuttingDown) {
+            // Never let a hung placement region block shutdown/exit, and force
+            // every waiter to abandon its batch instead of broadcasting.
+            this._placementLock.forceRelease();
+        }
     }
 
     /**
@@ -2644,6 +2749,33 @@ class OrderManager implements OrderManagerLike {
             // _fillProcessingLock (the lock's acquisition timeout is 20s; the
             // wait is 30s). A fill-driven rebalance defers instead, leaving
             // the crawls recorded by processFillsOnly for a later derivation.
+            //
+            // STRUCTURAL REBUILD DEFER (2026-11-03 live duplicate-order incident): a
+            // trigger-file rebuild rebuilds + reconciles the grid. A
+            // fill-driven COW that plans during that window re-plans against
+            // the freshly rebuilt (order-id-less) master and emits a
+            // create-only plan, while startup reconcile re-prices the live
+            // orders onto the same levels — both generations land as
+            // duplicate-price orphans. The reconcile owns placement until
+            // endStructuralRebuild(); fills stay queued and are drained by the
+            // bootstrap consumer. This check must run before
+            // deferIfBroadcasting because the fill path passes that flag.
+            if (this.isStructuralRebuildInProgress()) {
+                this.logger.log(
+                    `[SAFE-REBALANCE] Deferred: structural rebuild in progress (${this.structuralRebuildReason() || 'rebuild'}); startup reconcile owns placement`,
+                    'info'
+                );
+                this._deferredRebalanceAt = Date.now();
+                return { ...buildAbortedResult('structural-rebuild-deferred'), deferred: true };
+            }
+            if (this.isPlacementActive()) {
+                this.logger.log(
+                    `[SAFE-REBALANCE] Deferred: placement region held by ${this.placementKind() || 'another path'}; rebalance retries after it ends`,
+                    'info'
+                );
+                this._deferredRebalanceAt = Date.now();
+                return { ...buildAbortedResult('placement-active-deferred'), deferred: true };
+            }
             if (options?.deferIfBroadcasting && this.isBroadcastingActive()) {
                 this.logger.log(
                     '[SAFE-REBALANCE] Deferred: broadcast/placement activity active; rebalance retries after the region ends',

@@ -642,28 +642,36 @@ async function finishStartupSequence(bot: BotLike, startupState: Awaited<ReturnT
                 if (shouldRegenerate) {
                     if (!chainReadTruncated && Array.isArray(chainOpenOrders) && chainOpenOrders.length > 0) {
                         bot._log('Generating new grid and syncing with existing on-chain orders...');
-                        await botGridModule(bot).initializeGrid(bot.manager);
-                        await bot.manager.syncFromOpenOrders(chainOpenOrders, { skipAccounting: true });
-                        // Drain queued fills BEFORE re-placement (P3 ordering): fills
-                        // replayed from history reference the PRE-restart order ids.
-                        // Processing them now (freshly synced grid) keeps their slot
-                        // provenance; processing them after reconcile re-placement
-                        // finds no grid order and falls back to orphan proceeds
-                        // credits, which drift the fund bookkeeping.
-                        if (bot._incomingFillQueue.length > 0) {
-                            bot._log(`[STARTUP] Processing ${bot._incomingFillQueue.length} queued fill(s) before re-placement (order provenance intact)`, 'info');
-                            await bot._processFillsWithBootstrapMode(chainOrders);
-                        }
-                        const rebalanceResult = await reconcileMod.reconcileGridOrders({
-                            manager: bot.manager,
-                            config: bot.config,
-                            account: bot.account,
-                            privateKey: bot.privateKey,
-                            chainOrders,
-                            chainOpenOrders,
-                        });
+                        // Rebuild owns placement until reconcile finishes: a fill-driven
+                        // COW that starts inside this window must defer instead of
+                        // re-planning against the order-id-less master.
+                        bot.manager.beginStructuralRebuild?.('startup regenerate');
+                        try {
+                            await botGridModule(bot).initializeGrid(bot.manager);
+                            await bot.manager.syncFromOpenOrders(chainOpenOrders, { skipAccounting: true });
+                            // Drain queued fills BEFORE re-placement (P3 ordering): fills
+                            // replayed from history reference the PRE-restart order ids.
+                            // Processing them now (freshly synced grid) keeps their slot
+                            // provenance; processing them after reconcile re-placement
+                            // finds no grid order and falls back to orphan proceeds
+                            // credits, which drift the fund bookkeeping.
+                            if (bot._incomingFillQueue.length > 0) {
+                                bot._log(`[STARTUP] Processing ${bot._incomingFillQueue.length} queued fill(s) before re-placement (order provenance intact)`, 'info');
+                                await bot._processFillsWithBootstrapMode(chainOrders);
+                            }
+                            const rebalanceResult = await reconcileMod.reconcileGridOrders({
+                                manager: bot.manager,
+                                config: bot.config,
+                                account: bot.account,
+                                privateKey: bot.privateKey,
+                                chainOrders,
+                                chainOpenOrders,
+                            });
 
-                        await bot._executeBatchIfNeeded(rebalanceResult, 'startup reconcile (regenerated grid)');
+                            await bot._executeBatchIfNeeded(rebalanceResult, 'startup reconcile (regenerated grid)');
+                        } finally {
+                            bot.manager.endStructuralRebuild?.();
+                        }
                     } else if (!chainReadTruncated) {
                         bot._log('Generating new grid and placing initial orders on-chain...');
                         await bot.placeInitialOrders();

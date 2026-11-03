@@ -482,6 +482,22 @@ export async function reconcileGridOrders({
     // startBroadcasting() defers that rebalance —
     // manager.performSafeRebalance waits on the flag and the fill consumer gates
     // on it. The flag is refcounted and has a 120s stale-clear watchdog.
+    //
+    // The refcount alone is ADVISORY: a COW batch that already planned (or a
+    // correction drain) can still broadcast concurrently. The exclusive
+    // placement region is the authoritative mutual exclusion — hold it across
+    // the whole of Phase 2 so no other placement path can interleave a second
+    // order generation at these price levels.
+    const placementLease = typeof manager.acquirePlacement === 'function'
+        ? await manager.acquirePlacement('startup-reconcile', { timeoutMs: 120000 })
+        : null;
+    if (typeof manager.acquirePlacement === 'function' && !placementLease) {
+        logger?.log?.(
+            'Startup reconcile: exclusive placement region unavailable (timeout/shutdown); deferring Phase 2 to the next sync cycle.',
+            'warn'
+        );
+        return null;
+    }
     if (typeof manager.startBroadcasting === 'function') manager.startBroadcasting();
     try {
         const { plannedCreates, plannedUpdates, plannedCancels, chainSellCount, chainBuyCount } = phase1Result;
@@ -743,38 +759,70 @@ export async function reconcileGridOrders({
                             .filter((entry: PendingPriceCorrection) => entry?.chainOrderId && (entry?.cancelOnly === true || entry?.isSurplus === true))
                             .map((entry: PendingPriceCorrection) => String(entry.chainOrderId))
                     );
+                    // Absence/cancel decisions must never be taken on a snapshot
+                    // that is lagging or that still has unresolved in-flight
+                    // creates. Two independent guards:
+                    //   1. every Phase-2 created ID must be visible — a missing
+                    //      one means this node has not caught up with our own
+                    //      broadcast;
+                    //   2. no pending-broadcast entry may still be live — those
+                    //      are CREATEs from another (possibly concurrent) batch
+                    //      whose chain IDs are not known yet, so this pass cannot
+                    //      tell them apart from surplus and must not cancel.
+                    // Skipping is safe: the next full sync/duplicate drain
+                    // resolves the surplus with a caught-up view. Cancelling on
+                    // the stale view is not (2026-11-03: 15
+                    // legitimate fresh BUY orders this way).
+                    const freshChainIds = new Set(freshParsed.map((x) => String(x.chain.id)));
+                    const missingPhase2Ids = [...phase2CreatedOrderIds]
+                        .filter((id) => !freshChainIds.has(String(id)));
+                    const pendingBroadcastCount = manager._pendingBroadcasts instanceof Map
+                        ? manager._pendingBroadcasts.size
+                        : 0;
+                    let skipSurplusSweepReason = '';
+                    if (missingPhase2Ids.length > 0) {
+                        skipSurplusSweepReason =
+                            `post-Phase-2 chain read is lagging (${missingPhase2Ids.length} freshly created id(s) absent: ${missingPhase2Ids.slice(0, 5).join(', ')})`;
+                    } else if (pendingBroadcastCount > 0) {
+                        skipSurplusSweepReason =
+                            `${pendingBroadcastCount} pending-broadcast entr${pendingBroadcastCount === 1 ? 'y' : 'ies'} still protected (fresh CREATEs may be from another batch)`;
+                    }
+                    let cancelledSellCount = 0;
+                    let cancelledBuyCount = 0;
                     const staleSurplusCancels: Array<{ chainOrderObj: ChainOrder; sideLabel: string }> = [];
-                    for (const side of [ORDER_TYPES.SELL, ORDER_TYPES.BUY]) {
-                        const targetCount = side === ORDER_TYPES.SELL ? targetSell : targetBuy;
-                        let sideOrders = freshParsed.filter((x) => x.parsed.type === side);
-                        const sideLabel = side === ORDER_TYPES.SELL ? 'SELL' : 'BUY';
+                    if (skipSurplusSweepReason) {
+                        logger?.log?.(`Startup: skipping surplus sweep — ${skipSurplusSweepReason}`, 'warn');
+                    } else {
+                        for (const side of [ORDER_TYPES.SELL, ORDER_TYPES.BUY]) {
+                            const targetCount = side === ORDER_TYPES.SELL ? targetSell : targetBuy;
+                            let sideOrders = freshParsed.filter((x) => x.parsed.type === side);
+                            const sideLabel = side === ORDER_TYPES.SELL ? 'SELL' : 'BUY';
 
-                        if (sideOrders.length > targetCount) {
-                            // Sort by chain ID for deterministic cancellation order.
-                            sideOrders = sideOrders.sort((a, b) =>
-                                (a.chain.id || '').localeCompare(b.chain.id || '')
-                            );
-                            let cancelLimit = sideOrders.length - targetCount;
-                            // Protected candidates do not consume cancelLimit;
-                            // selection therefore moves to the next eligible
-                            // sorted order instead of the pre-guard candidate.
-                            for (const so of sideOrders) {
-                                if (cancelLimit <= 0) break;
-                                const recentlyCancelled = typeof chainOrders.wasRecentlyOwnCancelled === 'function'
-                                    && chainOrders.wasRecentlyOwnCancelled(so.chain.id);
-                                if (!gridOrderIds.has(so.chain.id)
-                                    && !queuedCancellationIds.has(String(so.chain.id))
-                                    && !phase2CancellationPlanIds.has(String(so.chain.id))
-                                    && !recentlyCancelled) {
-                                    staleSurplusCancels.push({ chainOrderObj: so.chain, sideLabel });
-                                    cancelLimit--;
+                            if (sideOrders.length > targetCount) {
+                                // Sort by chain ID for deterministic cancellation order.
+                                sideOrders = sideOrders.sort((a, b) =>
+                                    (a.chain.id || '').localeCompare(b.chain.id || '')
+                                );
+                                let cancelLimit = sideOrders.length - targetCount;
+                                // Protected candidates do not consume cancelLimit;
+                                // selection therefore moves to the next eligible
+                                // sorted order instead of the pre-guard candidate.
+                                for (const so of sideOrders) {
+                                    if (cancelLimit <= 0) break;
+                                    const recentlyCancelled = typeof chainOrders.wasRecentlyOwnCancelled === 'function'
+                                        && chainOrders.wasRecentlyOwnCancelled(so.chain.id);
+                                    if (!gridOrderIds.has(so.chain.id)
+                                        && !queuedCancellationIds.has(String(so.chain.id))
+                                        && !phase2CancellationPlanIds.has(String(so.chain.id))
+                                        && !recentlyCancelled) {
+                                        staleSurplusCancels.push({ chainOrderObj: so.chain, sideLabel });
+                                        cancelLimit--;
+                                    }
                                 }
                             }
                         }
                     }
 
-                    let cancelledSellCount = 0;
-                    let cancelledBuyCount = 0;
                     if (staleSurplusCancels.length > 0) {
                         for (const sc of staleSurplusCancels) {
                             try {
@@ -811,6 +859,7 @@ export async function reconcileGridOrders({
             'info'
         );
     } finally {
+        placementLease?.release();
         if (typeof manager.stopBroadcasting === 'function') manager.stopBroadcasting();
     }
 

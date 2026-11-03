@@ -1903,6 +1903,9 @@ export async function recalculateGrid(manager: OrderManagerLike, opts: { readOpe
 
         // Suppress invariant warnings during full resync
         manager.startBootstrap();
+        // A rebuild owns placement until the reconcile completes: fill-driven
+        // COW rebalances defer instead of re-planning against the fresh master.
+        manager.beginStructuralRebuild?.('recalculateGrid');
 
         // Total timeout across all steps — prevents indefinite hang even if
         // an individual withBlockchainRetry step pins the event loop.
@@ -1972,6 +1975,17 @@ export async function recalculateGrid(manager: OrderManagerLike, opts: { readOpe
                 if (_resyncAborted) return;
                 const { reconcileGridOrders } = require('./grid_reconcile');
 
+                // NOTE: do NOT re-adopt the chain snapshot by ladder index here.
+                // After a rebuild every slot price moved, so a price-agnostic
+                // ladder adoption would park each old order on a slot whose new
+                // price differs from the order's actual chain price. The
+                // reconcile marks that slot as matched and would leave the stale
+                // price in place for a later correction cycle. The rebuild is
+                // bracketed by beginStructuralRebuild(), so no concurrent COW
+                // can create against the fresh master; reconcileGridOrders owns
+                // update-first placement and re-prices the live orders onto the
+                // new slots from the chain snapshot directly.
+
                 // #5: Reconcile grid orders.
                 // No per-attempt wall-clock race around the whole reconcile.
                 // Phase 2 performs many sequential broadcasts (creates ~3s each)
@@ -2006,6 +2020,7 @@ export async function recalculateGrid(manager: OrderManagerLike, opts: { readOpe
                 manager.logger?.log?.('Full resync complete.', 'info');
             } finally {
                 manager.finishBootstrap();
+                manager.endStructuralRebuild?.();
             }
         })();
 

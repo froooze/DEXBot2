@@ -1462,6 +1462,10 @@ function performGridResync(bot: BotLike, options: {
     }
 
     self.manager.startBootstrap();
+    // Set BEFORE the async work so a fill-driven COW that starts while the
+    // resync reloads config/re-derives the centre already sees the rebuild and
+    // defers. recalculateGrid adds a second (balanced) level for its own body.
+    self.manager.beginStructuralRebuild?.('trigger-file resync');
     self._log('Grid regeneration triggered. Performing full grid resync...');
     return (async () => {
         try {
@@ -1589,6 +1593,7 @@ function performGridResync(bot: BotLike, options: {
             self._log(`Error during triggered resync: ${getErrorMessage(err)}`, 'error');
         } finally {
             self.manager.finishBootstrap();
+            self.manager.endStructuralRebuild?.();
         }
 
         return success;
@@ -2605,26 +2610,53 @@ async function executeMaintenanceLogic(bot: BotLike, context: string) {
     // during startup or periodic sync can stall the pipeline indefinitely.
     const pendingCorrections = bot.manager.ordersNeedingPriceCorrection?.length || 0;
     if (pendingCorrections > 0) {
-        const correctionResult = await correctAllPriceMismatches(
-            bot.manager, bot.account, bot.privateKey, chainOrders
-        );
-        if (correctionResult.failed > 0) {
-            const failedDetails = (correctionResult.results || [])
-                .filter((r: { result?: { success?: unknown } }) => !(r.result && r.result.success))
-                .slice(0, 3)
-                .map((r: { chainOrderId?: unknown; result?: { error?: unknown } }) => `${r.chainOrderId ?? '?'}: ${r.result?.error ?? 'unknown'}`)
-                .join(' | ');
-            bot._warn(
-                `[MAINT] ${correctionResult.failed}/${pendingCorrections} price correction(s) failed` +
-                (failedDetails ? ` — ${failedDetails}` : '') +
-                (correctionResult.staleDropped > 0 ? ` (${correctionResult.staleDropped} stale dropped)` : '')
-            );
-        } else if (correctionResult.staleDropped > 0) {
-            bot._log(
-                `[MAINT] ${correctionResult.corrected}/${pendingCorrections} price correction(s) resolved, ` +
-                `${correctionResult.staleDropped} stale dropped (resync moved the slot; re-queued by next sync if still off-target)`,
-                'info'
-            );
+        // The drain cancels/updates chain orders directly, so it must own the
+        // exclusive placement region. Without it a correction drain can run
+        // while a COW batch is broadcasting and cancel an order that batch
+        // just placed (or update one it is about to cancel). This is a
+        // background repair: take the region only if it is free and defer the
+        // drain to the next maintenance tick otherwise (never block maintenance
+        // behind a long broadcast).
+        let correctionLease: { release(): void } | null = null;
+        let placementAvailable = true;
+        if (typeof bot.manager.tryAcquirePlacement === 'function') {
+            correctionLease = bot.manager.tryAcquirePlacement('correction-drain');
+            placementAvailable = correctionLease !== null;
+        } else if (typeof bot.manager.acquirePlacement === 'function') {
+            correctionLease = await bot.manager.acquirePlacement('correction-drain', {
+                timeoutMs: 5000,
+                isShuttingDown: () => bot._shuttingDown === true,
+            });
+            placementAvailable = correctionLease !== null;
+        }
+        if (!placementAvailable) {
+            bot._log('[MAINT] Deferring price-correction drain: exclusive placement region busy or shutting down', 'info');
+        } else {
+            try {
+                const correctionResult = await correctAllPriceMismatches(
+                    bot.manager, bot.account, bot.privateKey, chainOrders
+                );
+                if (correctionResult.failed > 0) {
+                    const failedDetails = (correctionResult.results || [])
+                        .filter((r: { result?: { success?: unknown } }) => !(r.result && r.result.success))
+                        .slice(0, 3)
+                        .map((r: { chainOrderId?: unknown; result?: { error?: unknown } }) => `${r.chainOrderId ?? '?'}: ${r.result?.error ?? 'unknown'}`)
+                        .join(' | ');
+                    bot._warn(
+                        `[MAINT] ${correctionResult.failed}/${pendingCorrections} price correction(s) failed` +
+                        (failedDetails ? ` — ${failedDetails}` : '') +
+                        (correctionResult.staleDropped > 0 ? ` (${correctionResult.staleDropped} stale dropped)` : '')
+                    );
+                } else if (correctionResult.staleDropped > 0) {
+                    bot._log(
+                        `[MAINT] ${correctionResult.corrected}/${pendingCorrections} price correction(s) resolved, ` +
+                        `${correctionResult.staleDropped} stale dropped (resync moved the slot; re-queued by next sync if still off-target)`,
+                        'info'
+                    );
+                }
+            } finally {
+                correctionLease?.release();
+            }
         }
     }
 
