@@ -33,7 +33,7 @@
 
 const assert = require('assert');
 const { ORDER_TYPES, ORDER_STATES } = require('../modules/constants');
-const { liveRailsConflictWithGap, forcedRetreatJustifiesEvacuation } = require('../modules/dexbot_cow_runtime');
+const { liveRailsConflictWithGap, forcedRetreatJustifiesEvacuation, splitEvacuationCancelsSupersededByRotations } = require('../modules/dexbot_cow_runtime');
 const { scheduleGapEvacRepair } = require('../modules/dexbot_state_recovery');
 const { OrderManager } = require('../modules/order/manager');
 const { calculateGapSlots } = require('../modules/order/utils/math');
@@ -164,9 +164,14 @@ function testSweepSchedulesRepairForStrandedOrders() {
     );
     assert.strictEqual(result.scheduled, true, 'a fill-less re-plan must be scheduled');
     assert.ok(bot._postRecoveryRebalanceTimer, 'the deferred rebalance timer must be armed');
-    // Streak ledger re-derived against the committed geometry.
-    assert.strictEqual(manager._gapEvacStreaks.get('slot-72'), 1);
-    assert.strictEqual(manager._gapEvacStreaks.get('slot-73'), 1);
+    // The sweep re-derives the ledger WITHOUT counting an observation: the
+    // plan's reconcileGrid tick is the cycle's single increment. Counting both
+    // (observed live) took a restored streak of 1 to the cancel threshold in one
+    // cycle and armed the teeth against the plan's own rotation sources.
+    assert.strictEqual(manager._gapEvacStreaks.get('slot-72'), 0, 'the sweep must not increment the streak');
+    assert.strictEqual(manager._gapEvacStreaks.get('slot-73'), 0, 'the sweep must not increment the streak');
+    clearTimeout(bot._postRecoveryRebalanceTimer);
+    bot._postRecoveryRebalanceTimer = null;
     clearTimeout(bot._postRecoveryRebalanceTimer);
     bot._postRecoveryRebalanceTimer = null;
 }
@@ -258,9 +263,39 @@ function testSweepPrefersTheReplanAndFallsBackToTheTeeth() {
     clearTimeout(bot._postRecoveryRebalanceTimer);
     bot._postRecoveryRebalanceTimer = null;
 
+    const before = manager._gapEvacStreaks.get('slot-72');
     const second = scheduleGapEvacRepair(bot, 'test');
     assert.strictEqual(second.scheduled, false, 'cooldown blocks the second re-plan');
     assert.strictEqual(teethCalls.length, 1, 'the cooldown path falls back to the cancel-only teeth');
+    assert.strictEqual(manager._gapEvacStreaks.get('slot-72'), before,
+        'the cooldown path must not count a second observation (scheduled re-plans keep ticking the ledger)');
+}
+
+function testDrainHoldsCancelsTheBatchRotates() {
+    // The failure the live log showed: the teeth queued a cancel-only
+    // evacuation for the same chain orders the plan rotated, the pre-batch
+    // drain cancelled them, and the UPDATE batch was rejected with "target(s)
+    // missing on chain" → structural resync + full grid reload.
+    const actions = [
+        { type: 'update', id: 'slot-72', orderId: '1.7.111', newGridId: 'slot-52' },
+        { type: 'update', id: 'slot-73', orderId: '1.7.222', newGridId: 'slot-53' },
+        { type: 'create', id: 'slot-60', order: {} },
+    ];
+    const entries = [
+        { gridOrder: { id: 'slot-72' }, chainOrderId: '1.7.111', gapEvacuation: true, isSurplus: true },
+        { gridOrder: { id: 'slot-73' }, chainOrderId: '1.7.222', gapEvacuation: true, isSurplus: true },
+        { gridOrder: { id: 'slot-90' }, chainOrderId: '1.7.999', cancelOnly: true }, // duplicate-orphan cancel: unaffected
+    ];
+    const { kept, held } = splitEvacuationCancelsSupersededByRotations(entries, actions);
+    assert.deepStrictEqual(held.map((e) => e.chainOrderId), ['1.7.111', '1.7.222'],
+        'cancels for chain orders the batch rotates must be held out of the drain');
+    assert.deepStrictEqual(kept.map((e) => e.chainOrderId), ['1.7.999'],
+        'unrelated corrections still drain');
+
+    // Nothing is rotated => nothing is held (the drain keeps full authority).
+    const noRotations = splitEvacuationCancelsSupersededByRotations(entries, [{ type: 'create', id: 'slot-60' }]);
+    assert.strictEqual(noRotations.held.length, 0, 'no rotation => no hold');
+    assert.strictEqual(noRotations.kept.length, entries.length, 'all entries still drain');
 }
 
 function testForcedRetreatRequiresAnEvaluableStamp() {
@@ -386,6 +421,7 @@ const tests = [
     ['scheduleGapEvacRepair prefers the re-plan and falls back to the teeth', testSweepPrefersTheReplanAndFallsBackToTheTeeth],
     ['scheduleGapEvacRepair treats unknown geometry as unknown', testSweepTreatsUnknownGeometryAsUnknown],
     ['forcedRetreatJustifiesEvacuation requires an evaluable stamp', testForcedRetreatRequiresAnEvaluableStamp],
+    ['pre-batch drain holds cancels the batch rotates', testDrainHoldsCancelsTheBatchRotates],
     ['_logBoundaryDebug reports config gap and unmeasured spread count', testBoundaryDebugUsesConfigGapBeforeTheLoaderPublishesIt],
 ];
 

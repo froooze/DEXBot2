@@ -164,6 +164,51 @@ export function forcedRetreatJustifiesEvacuation(
     return conflict.crossed ? conflict : null;
 }
 
+/**
+ * Split pending price corrections into "drain now" and "held back because this
+ * batch supersedes them".
+ *
+ * A cancel-only gap-evacuation whose chain order the batch ROTATES is
+ * superseded by the plan: the rotation moves that order onto its rail in place,
+ * and cancelling it first destroys the batch's own source. Observed live on a
+ * stranded 4-slot band: the teeth queued cancels for the two rotation sources,
+ * the pre-batch drain executed them, and the UPDATE batch was rejected
+ * pre-broadcast ("2 target(s) missing on chain") → structural resync + full grid
+ * reload + two CREATEs, instead of two in-place price updates.
+ *
+ * Held entries are put back after the drain: if the rotation is dropped or the
+ * batch aborts they stay queued (their own staleness check drops them once the
+ * slot no longer owns the order).
+ *
+ * @param entries - `manager.ordersNeedingPriceCorrection`
+ * @param actions - The batch's planned actions
+ * @returns `{ kept, held }` (both empty-safe)
+ */
+export function splitEvacuationCancelsSupersededByRotations(
+    entries: unknown,
+    actions: unknown
+): { kept: Array<{ [key: string]: unknown }>; held: Array<{ [key: string]: unknown }> } {
+    const list = Array.isArray(entries) ? entries as Array<{ [key: string]: unknown }> : [];
+    const kept: Array<{ [key: string]: unknown }> = [];
+    const held: Array<{ [key: string]: unknown }> = [];
+    const rotatedOrderIds = new Set<string>();
+    if (Array.isArray(actions)) {
+        for (const action of actions as Array<{ type?: unknown; orderId?: unknown }>) {
+            if (action?.type !== COW_ACTIONS.UPDATE || !action?.orderId) continue;
+            rotatedOrderIds.add(String(action.orderId));
+        }
+    }
+    if (rotatedOrderIds.size === 0) return { kept: list, held };
+    for (const entry of list) {
+        const superseded = entry?.gapEvacuation === true
+            && entry?.chainOrderId != null
+            && rotatedOrderIds.has(String(entry.chainOrderId));
+        if (superseded) held.push(entry);
+        else kept.push(entry);
+    }
+    return { kept, held };
+}
+
 function hasSlotPriceCollision(items: SlotLike[], targetPrice: number, genesis: unknown, excludeId: string | null, predicate?: (it: SlotLike) => boolean) {
     for (const it of items) {
         if (predicate && !predicate(it)) continue;
@@ -192,7 +237,7 @@ const Format = FormatModule;
 import * as workingGridModule from './order/working_grid.js';
 const { WorkingGrid } = workingGridModule;
 import { getErrorMessage, resolveSeamMs, resolveSeamMsOrNull, getErrorField } from './utils/errors.js';
-import type { BotLike, OrderManagerLike, ManagedOrder, ChainOrder, UnknownRecord, AssetInfo, AssetPair, CowAction } from './types.js';
+import type { BotLike, OrderManagerLike, ManagedOrder, ChainOrder, UnknownRecord, AssetInfo, AssetPair, CowAction, PendingPriceCorrection } from './types.js';
 
 /**
  * Post-commit gap-evacuation sweep (lazy: dexbot_state_recovery pulls the
@@ -4366,6 +4411,29 @@ async function updateOrdersOnChainBatchCOWBody(
     // also keeps this batch's collision checks (chain_orphan_collision)
     // honest: orphaned chain orders already queued for cancellation are
     // resolved before the plan validates its CREATE targets against them.
+    //
+    // EXCEPTION — a cancel-only gap-evacuation whose chain order THIS batch
+    // rotates is superseded by the plan: the rotation moves the order onto its
+    // rail in place, and cancelling it first destroys the batch's own source
+    // (observed live: "2 target(s) missing on chain" → structural resync + full
+    // grid reload instead of two in-place price updates). Hold those entries out
+    // of the drain and put them back afterwards — if the rotation is dropped or
+    // the batch aborts, the entry stays queued for the next tick (its own
+    // staleness check drops it once the slot is evacuated).
+    let heldEvacuationCorrections: PendingPriceCorrection[] = [];
+    if (Array.isArray(bot.manager?.ordersNeedingPriceCorrection)) {
+        const split = splitEvacuationCancelsSupersededByRotations(bot.manager.ordersNeedingPriceCorrection, actions);
+        if (split.held.length > 0) {
+            heldEvacuationCorrections = split.held;
+            bot.manager.ordersNeedingPriceCorrection = split.kept as typeof bot.manager.ordersNeedingPriceCorrection;
+            bot.manager.logger.log(
+                `[COW] Holding ${split.held.length} gap-evacuation cancel(s) back from the pre-batch drain: ` +
+                `this batch rotates the same chain order (the rotation IS the evacuation)`,
+                'debug'
+            );
+        }
+    }
+
     const pendingCorrectionCount = Array.isArray(bot.manager?.ordersNeedingPriceCorrection)
         ? bot.manager.ordersNeedingPriceCorrection.length
         : 0;
@@ -4399,6 +4467,11 @@ async function updateOrdersOnChainBatchCOWBody(
                 'warn'
             );
         }
+    }
+    if (heldEvacuationCorrections.length > 0 && Array.isArray(bot.manager?.ordersNeedingPriceCorrection)) {
+        // Restore in queue order. Entries the drain already resolved are gone;
+        // these were never handed to it, so they are all still pending.
+        bot.manager.ordersNeedingPriceCorrection.push(...heldEvacuationCorrections);
     }
 
     // Pre-broadcast guard chain (create-slot validation, recovery-exhausted

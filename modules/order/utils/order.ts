@@ -1921,9 +1921,15 @@ function detectGapEvacuationCandidates(masterGrid: Map<string, ManagedOrder>, bo
  * @param {Map} streakMap - Mutable Map slotId -> consecutive-cycle count
  * @param {Array} candidates - detectGapEvacuationCandidates output
  * @param {number} [threshold] - GRID_LIMITS.GAP_EVACUATION_STREAK_THRESHOLD default
+ * @param {Object} [options] - `increment: false` re-derives the ledger (prune
+ *   resolved ids + report readiness) WITHOUT counting a new observation. The
+ *   committed-geometry sweep uses it because the plan ticks the same ledger in
+ *   the same cycle; counting twice would arm the cancel-only teeth in the very
+ *   cycle whose rotation is about to evacuate the order.
  * @returns {{streaks: Object, ready: Array}}
  */
-function updateGapEvacuationStreaks(streakMap: Map<string, number>, candidates: unknown, threshold: number | null = null): { streaks: Record<string, number>; ready: Array<{ id: string; [key: string]: unknown }> } {
+function updateGapEvacuationStreaks(streakMap: Map<string, number>, candidates: unknown, threshold: number | null = null, options: { increment?: boolean } = {}): { streaks: Record<string, number>; ready: Array<{ id: string; [key: string]: unknown }> } {
+    const increment = options?.increment !== false;
     const thrRaw = threshold !== null && threshold !== undefined ? Number(threshold) : Number(GRID_LIMITS?.GAP_EVACUATION_STREAK_THRESHOLD);
     const thr = Number.isFinite(thrRaw) && thrRaw > 0 ? Math.floor(thrRaw) : 2;
     const seen = new Set<string>();
@@ -1932,7 +1938,7 @@ function updateGapEvacuationStreaks(streakMap: Map<string, number>, candidates: 
         if (!c?.id || seen.has(c.id)) continue;
         seen.add(c.id);
         if (streakMap instanceof Map) {
-            streakMap.set(c.id, Number(streakMap.get(c.id) || 0) + 1);
+            streakMap.set(c.id, increment ? Number(streakMap.get(c.id) || 0) + 1 : Number(streakMap.get(c.id) || 0));
         }
     }
     if (streakMap instanceof Map) {

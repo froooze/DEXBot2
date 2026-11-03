@@ -3189,6 +3189,12 @@ class OrderManager implements OrderManagerLike {
         // delay the cancel-only evacuation queue. Queued-once per slot; the
         // corrections runner (correctAllPriceMismatches) executes the cancel
         // and settles the slot back to a spread placeholder.
+        //
+        // The COW pipeline holds a queued cancel back from its pre-batch drain
+        // when the same batch ROTATES that chain order (the rotation IS the
+        // evacuation) — see updateOrdersOnChainBatchCOWBody. Queueing both is
+        // therefore safe: the rotation runs, and the held entry is dropped as
+        // stale on the next drain because the slot no longer owns the order.
         try {
             this._processGapEvacuationTeeth(result?.evacReady);
         } catch (gapEvacError) {

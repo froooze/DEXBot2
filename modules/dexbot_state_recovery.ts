@@ -652,28 +652,26 @@ function scheduleGapEvacRepair(bot: BotLike, context: string = 'gap-evac sweep')
         }
         const stranded = candidates.map((c) => `${c.id}(${c.type})`);
         // Re-derive the streak ledger against the COMMITTED geometry (drops
-        // resolved ids). The cancel-only teeth stay the LAST resort: they are
-        // only queued when the preferred repair (a fill-less re-plan, which
-        // evacuates by price update instead of cancel+recreate) cannot run —
-        // queueing both in the same tick would cancel the order the re-plan is
-        // about to rotate.
-        //
-        // NOTE: reconcileGrid also ticks this ledger at plan-build time. An
-        // order stranded across a plan AND its commit therefore advances two
-        // steps per cycle, reaching the cancel threshold one cycle earlier than
-        // the pure-plan cadence. That is the safe direction (the teeth re-verify
-        // live geometry and queue once), and it keeps the ledger anchored to
-        // the geometry that was actually committed rather than the plan's.
+        // resolved ids) WITHOUT counting a new observation: reconcileGrid ticks
+        // this same ledger at plan-build time, and counting twice per cycle
+        // armed the cancel-only teeth in the very cycle whose rotation was about
+        // to evacuate the order. Observed live: the sweep's tick plus the plan's
+        // tick took a restored streak of 1 to 3 (cancel threshold), the teeth
+        // queued a cancel for both rotation sources, the pre-batch drain
+        // cancelled them, and the UPDATE batch was rejected pre-broadcast with
+        // "2 target(s) missing on chain" → structural resync + full grid reload
+        // instead of two in-place price updates.
         const tick = streaks
-            ? updateGapEvacuationStreaks(streaks, candidates)
+            ? updateGapEvacuationStreaks(streaks, candidates, null, { increment: false })
             : { streaks: {}, ready: [] as Array<{ id: string }> };
-        // `_processGapEvacuationTeeth` returns the number it actually queued
-        // (it re-verifies live geometry and honours queued-once), so report
-        // that — not the number of candidates it was offered.
-        const queueTeeth = (): number => {
+        // The cancel-only teeth stay the LAST resort. `_processGapEvacuationTeeth`
+        // returns the number it actually queued (it re-verifies live geometry and
+        // honours queued-once), so report that — not the number of candidates it
+        // was offered.
+        const queueTeeth = (ready: Array<{ id: string }>): number => {
             const teeth = (manager as unknown as { _processGapEvacuationTeeth?: (ready: unknown) => unknown })._processGapEvacuationTeeth;
-            if (typeof teeth !== 'function' || tick.ready.length === 0) return 0;
-            const queued = Number(teeth.call(manager, tick.ready));
+            if (typeof teeth !== 'function' || ready.length === 0) return 0;
+            const queued = Number(teeth.call(manager, ready));
             return Number.isFinite(queued) && queued > 0 ? queued : 0;
         };
 
@@ -682,7 +680,10 @@ function scheduleGapEvacRepair(bot: BotLike, context: string = 'gap-evac sweep')
         // itself checks), so the log never promises a repair that cannot run.
         if (typeof manager.performSafeRebalance !== 'function'
             || typeof bot.updateOrdersOnChainBatch !== 'function') {
-            const queued = queueTeeth();
+            // No plan cycle can run on this path, so this sweep is the ONLY
+            // ticker for the observation: advance the ledger before consulting it.
+            const ready = streaks ? updateGapEvacuationStreaks(streaks, candidates).ready : tick.ready;
+            const queued = queueTeeth(ready);
             manager.logger?.log?.(
                 `[GAP-EVAC] ${stranded.length} live order(s) stranded inside the spread band ` +
                 `(boundary ${manager.boundaryIdx}, gap ${gapSlots}): ${stranded.join(', ')} — ` +
@@ -700,8 +701,11 @@ function scheduleGapEvacRepair(bot: BotLike, context: string = 'gap-evac sweep')
         if (cooling) {
             // The previous re-plan either is still in flight or did not clear
             // the stranding: fall back to the cancel-only teeth so a repeatedly
-            // unfixable slot cannot sit in the band forever.
-            const queued = queueTeeth();
+            // unfixable slot cannot sit in the band forever. Readiness comes from
+            // the ledger as the PLAN cycles left it — scheduled re-plans keep
+            // running through the cooldown and each ticks it once, so the sweep
+            // must not count the same observation again.
+            const queued = queueTeeth(tick.ready);
             manager.logger?.log?.(
                 `[GAP-EVAC] ${stranded.length} live order(s) inside the spread band (${stranded.join(', ')}) — ` +
                 `repair cooldown active (${Math.round((GAP_EVAC_REPAIR_COOLDOWN_MS - (now - lastAt)) / 1000)}s left); ` +
