@@ -48,7 +48,7 @@ const __dirname = _esmDirname(__filename);
  * Runtime:   dexbot start [bot] | stop | reload | restart | delete | status | pm2
  * Trading:   dexbot test <bot> | drystart <bot> | reset {all|<bot>}
  * Config:    dexbot bot | key | enable {all|<bot>} | disable {all|<bot>} | default | update
- * Analysis:  dexbot order [<bot>] | export <bot> | credit [<bot>] | rich <asset...>
+ * Analysis:  dexbot order [<bot|account>] | export <bot> | credit [<bot|account>] | rich <asset...>
  *            dexbot tv <target> | dw <target> | liquid <target> | pnl <account>
  *            dexbot asset <bts|symbol> (shorthand: dexbot a <bts|symbol>)
  * Files:     dexbot clear | clear-orders | clear-market-adapter | clear-all
@@ -177,7 +177,7 @@ const CLI_EXAMPLES = [
     { title: 'Update DEXBot2', command: 'dexbot update', notes: 'Pull, install, and restart active bots.' },
     { title: 'Export bot trades', command: 'dexbot export <bot>', notes: 'Write trades and settings to CSV/JSON.' },
     { title: 'Analyze order grids', command: 'dexbot order', notes: 'Spread, increment, and funds; --export for HTML.' },
-    { title: 'Show live credit positions', command: 'dexbot credit', notes: 'Summed MPA + borrowed-credit positions per bot.' },
+    { title: 'Show live credit positions', command: 'dexbot credit [<bot|account>]', notes: 'Summed MPA + borrowed-credit positions per bot (all credit bots by default).' },
     { title: 'Asset rich list', command: 'dexbot rich <asset> [<asset...>]', notes: 'Top holder(s) per asset from the chain asset holders API.' },
     { title: 'Chart a bot, pool, or pair', command: 'dexbot tv <bot|pool|AssetA/AssetB> --month 3', notes: 'OHLC chart; pool = id (133) or pool token (LP share asset); --feed charts MPA price-feed history.' },
     { title: 'Liquidity depth chart', command: 'dexbot liquid <bot|pool|AssetA/AssetB>', notes: 'Order-book + AMM pool cumulative depth; pool = id or pool token (aliases: liq, liqu, liquidity).' },
@@ -239,13 +239,13 @@ function printCLIUsage() {
         // data export, then market research, then accounting/chain context. Keep the
         // README "Bot Management" block in the same order so the two cannot drift.
         ['Analysis', [
-            ['order [<bot>]', 'Analyze persisted order grids; --export for HTML.'],
+            ['order [<bot|account>]', 'Analyze persisted order grids for a bot, an account (name or 1.2.x id), or all bots; --export for HTML.'],
             ['export <bot>', 'Export bot trades/settings to CSV/JSON.'],
             ['tv <target>', 'OHLC chart for <bot|pool|AssetA/AssetB> (pool = id or pool token); --month N (default 3), --feed for MPA price-feed history.'],
             ['dw <target>', 'Dynamic-weight research chart; same targets and flags as tv.'],
             ['liquid <target>', 'Liquidity depth chart for <bot|pool|AssetA/AssetB> (pool = id or pool token); --range, --depth, --steps (aliases: liq, liqu, liquidity).'],
             ['pnl <account>', 'HTML PnL report for a bot or account; --month N, optional --pair BASE/QUOTE filter.'],
-            ['credit [<bot>]', 'Show live MPA and borrowed-credit positions.'],
+            ['credit [<bot|account>]', 'Show live MPA and borrowed-credit positions for a bot, an account (name or 1.2.x id), or every credit-enabled bot.'],
             ['asset <bts|symbol>', 'Supply distribution: bts = core asset, bare symbol/id = issued asset; --json, --html (shorthand: a, e.g. dexbot a bts).'],
             ['rich <asset...>', 'Per-asset rich list / top holder; --top N, --json.'],
         ]],

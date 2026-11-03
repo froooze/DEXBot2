@@ -8,7 +8,7 @@ const { readJSON, writeJSON } = getStorage();
 import { parseJsonWithComments } from '../modules/order/utils/system.js';
 import { MARKET_ADAPTER } from '../modules/constants.js';
 import { loadMarketProfiles } from './tradingview/tradingview_uplot_chart_generator.js';
-import { sanitizeKey } from '../modules/utils/sanitize_key.js';
+import { isSameBotName, sanitizeKey } from '../modules/utils/sanitize_key.js';
 import { isSameAssetSymbol, canonicalizeBotAssetSymbols } from '../modules/utils/asset_symbols.js';
 // Single source of truth for bot keys (named AND unnamed bots) so analysis
 // tools resolve the same files production writes.
@@ -284,7 +284,7 @@ function patchAccountIdInRaw(filePath: string, entryIndex: number, accountId: st
  * the file was updated.
  */
 function persistBotAccountId(botKey: unknown, accountId: string, filePath = PATHS.PROFILES.BOTS_JSON): boolean {
-    if (!botKey || !/^1\.2\.\d+$/.test(String(accountId))) return false;
+    if (!botKey || !isAccountIdRef(accountId)) return false;
     let settings: { bots?: BotEntry[] } | null = null;
     try {
         settings = loadBotSettings(filePath);
@@ -325,10 +325,19 @@ function getStoredBotAccountId(botKey: unknown, expectedRef?: string | null, fil
     }
     if (!meta) return null;
     const accountIdRaw = String(meta.accountId ?? '');
-    const stored = /^1\.2\.\d+$/.test(accountIdRaw) ? accountIdRaw : null;
+    const stored = isAccountIdRef(accountIdRaw) ? accountIdRaw : null;
     if (!stored) return null;
     if (expectedRef != null && String(meta.preferredAccount ?? '').toLowerCase() !== String(expectedRef).toLowerCase()) return null;
     return stored;
+}
+
+/**
+ * Chain account id (`1.2.x`) test — the single spelling rule for account ids.
+ * Analysis tools used to carry a private copy of this regex (`account_resolver`,
+ * `trade_profitability`, `fills_cache`, `resolve_bot_accounts`).
+ */
+function isAccountIdRef(ref: unknown): boolean {
+    return /^1\.2\.\d+$/.test(String(ref ?? '').trim());
 }
 
 /**
@@ -338,7 +347,7 @@ function getStoredBotAccountId(botKey: unknown, expectedRef?: string | null, fil
  * or when no bot claims the name.
  */
 function findBotKeyByAccountRef(ref: unknown, filePath = PATHS.PROFILES.BOTS_JSON): { botKey: string; meta: BotEntry } | null {
-    if (!ref || /^1\.2\.\d+$/.test(String(ref))) return null;
+    if (!ref || isAccountIdRef(ref)) return null;
     let settings: { bots?: BotEntry[] } | null = null;
     try {
         settings = loadBotSettings(filePath);
@@ -346,14 +355,85 @@ function findBotKeyByAccountRef(ref: unknown, filePath = PATHS.PROFILES.BOTS_JSO
         return null;
     }
     const entries = Array.isArray(settings?.bots) ? settings.bots : [];
-    const want = String(ref).toLowerCase();
     for (let i = 0; i < entries.length; i++) {
         const entry = entries[i];
-        if (entry && String(entry.preferredAccount ?? '').toLowerCase() === want) {
+        if (entry && matchBotAccountTarget(entry, ref)) {
             return { botKey: computeBotKey(entry, i), meta: entry };
         }
     }
     return null;
+}
+
+/**
+ * Which spelling of a `<bot|account>` CLI target matched a bot entry.
+ * `name`/`key` identify one bot; `account` identifies the chain account and
+ * therefore every entry that trades from it.
+ */
+type BotTargetKind = 'name' | 'key' | 'account';
+
+interface BotTargetMatch {
+    botKey: string;
+    meta: BotEntry;
+    matchedBy: BotTargetKind;
+}
+
+/** Trimmed target or '' — the positional is user input, so never assume a string. */
+function normalizeBotTarget(target: unknown): string {
+    return typeof target === 'string' ? target.trim() : '';
+}
+
+/**
+ * Match one bot entry against a `<bot>` target: display name (the same
+ * case/space-insensitive rule `resolveBotKey` uses) or bot key. `botKey` is a
+ * parameter because callers that key entries by a stored file name
+ * (`analyze-orders` reads `profiles/orders/<botKey>.json`) know the key without
+ * an entry, and a key must still match when the config entry is missing.
+ */
+function matchBotEntryTarget(entry: BotEntry | null | undefined, target: unknown, botKey?: unknown): BotTargetKind | null {
+    const raw = normalizeBotTarget(target);
+    if (!raw) return null;
+    if (entry && isSameBotName(entry.name, raw)) return 'name';
+    const key = String(botKey ?? '').trim();
+    if (!key) return null;
+    return key.toLowerCase() === raw.toLowerCase() || sanitizeKey(key) === sanitizeKey(raw) ? 'key' : null;
+}
+
+/**
+ * Does the target name the chain account behind this bot? Covers both stored
+ * spellings: `preferredAccount` (name or typed 1.2.x id) and the `accountId`
+ * `account_resolver.ts` stamps next to it. Matched case-insensitively — chain
+ * account names are lowercase, but operators type them any way they like.
+ */
+function matchBotAccountTarget(entry: BotEntry | null | undefined, target: unknown): boolean {
+    const raw = normalizeBotTarget(target).toLowerCase();
+    if (!entry || !raw) return false;
+    const account = String(entry.preferredAccount ?? '').trim().toLowerCase();
+    if (account && account === raw) return true;
+    const accountId = String(entry.accountId ?? '').trim().toLowerCase();
+    return Boolean(accountId) && accountId === raw;
+}
+
+/**
+ * Canonical `<bot|account>` target resolution: every entry matching the target
+ * as a bot name, a bot key, or the chain account it trades from. This is the
+ * one rule set behind `dexbot credit`, `dexbot order` and the chart commands —
+ * they previously each carried a slightly different copy (some name-only, some
+ * key-only, `credit` a third variant). Each caller picks the spellings it
+ * accepts from `matchedBy`: a chart command takes the first `name`/`key` match
+ * (an account is ambiguous there), while `credit` reports every match.
+ */
+function matchBotTargetIn(entries: Array<BotEntry | null | undefined> | null | undefined, target: unknown): BotTargetMatch[] {
+    const out: BotTargetMatch[] = [];
+    const list = Array.isArray(entries) ? entries : [];
+    for (let index = 0; index < list.length; index++) {
+        const entry = list[index];
+        if (!entry) continue;
+        const botKey = computeBotKey(entry, index);
+        const matchedBy = matchBotEntryTarget(entry, target, botKey)
+            ?? (matchBotAccountTarget(entry, target) ? 'account' : null);
+        if (matchedBy) out.push({ botKey, meta: entry, matchedBy });
+    }
+    return out;
 }
 
 function resolveAmaConfig(botKey: unknown): AmaConfig {
@@ -433,5 +513,6 @@ function resolveAmaKey(botKey: unknown): string {
     return 'AMA3';
 }
 
-export { loadBotSettings, sanitizeKey, computeBotKey, resolveBotKey, candleFileForBot, resolveCandleFile, loadBotMeta, getStoredBotAccountId, findBotKeyByAccountRef, persistBotAccountId, resolveAmaConfig, resolveAmaKey }
+export { loadBotSettings, sanitizeKey, computeBotKey, resolveBotKey, candleFileForBot, resolveCandleFile, loadBotMeta, getStoredBotAccountId, findBotKeyByAccountRef, persistBotAccountId, resolveAmaConfig, resolveAmaKey, isAccountIdRef, matchBotEntryTarget, matchBotAccountTarget, matchBotTargetIn }
+export type { BotTargetKind, BotTargetMatch };
 

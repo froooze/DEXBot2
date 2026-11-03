@@ -11,8 +11,9 @@
  * - Grid slot distribution (% near center) vs grid composition
  *
  * Usage:
- *   node dist/scripts/analyze-orders.js          # terminal output
- *   node dist/scripts/analyze-orders.js --export # standalone HTML report
+ *   node dist/scripts/analyze-orders.js                  # terminal output
+ *   node dist/scripts/analyze-orders.js <bot|account>    # one bot, or every bot on an account
+ *   node dist/scripts/analyze-orders.js --export         # standalone HTML report
  */
 
 
@@ -30,7 +31,10 @@ const { readJSON } = getStorage();
 import { getErrorMessage } from '../modules/utils/errors.js';
 import { toFileUrl } from '../analysis/chart_utils.js';
 import { CLI_TAGS, savedLine } from '../modules/cli_progress.js';
-import { isSameBotName, sanitizeKey } from '../modules/utils/sanitize_key.js';
+import { isSameBotName } from '../modules/utils/sanitize_key.js';
+// Bot keys and `<bot|account>` target matching are shared with the other
+// analysis tools (analysis/bot_key_utils) so the commands cannot drift.
+import { computeBotKey, matchBotAccountTarget, matchBotEntryTarget } from '../analysis/bot_key_utils.js';
 import { CLI_COLORS as colors } from '../modules/cli_colors.js';
 import { pathToFileURL } from 'node:url';
 
@@ -181,18 +185,6 @@ const HEADER_WIDTH = 11 + BAR_WIDTH;
  * Utility Functions
  * Helper functions for file I/O, formatting, and data retrieval
  */
-
-function createBotKey(bot: JsonObj | null | undefined, index: number): string {
-  if (bot && bot.name) {
-    return sanitizeKey(String(bot.name));
-  }
-  const identifier = bot && bot.assetA && bot.assetB
-    ? `${bot.assetA}/${bot.assetB}`
-    : bot && bot.assetAId && bot.assetBId
-      ? `${bot.assetAId}/${bot.assetBId}`
-      : `bot-${index}`;
-  return `${sanitizeKey(identifier)}-${index}`;
-}
 
 function hasOrderGrid(data: unknown): boolean {
   if (!data || typeof data !== 'object' || Array.isArray(data)) return false;
@@ -428,7 +420,9 @@ function getConfiguredBotConfig(botKey: string, botData: GridSnapshot): JsonObj 
   const meta = botData?.meta || {};
   return botsConfig.find((bot: JsonObj, index: number) => {
     if (!bot) return false;
-    return createBotKey(bot, index) === botKey || (meta.name && isSameBotName(bot.name, meta.name));
+    // Same key generator the runtime writes with (analysis/bot_key_utils →
+    // modules/account_orders), so a renamed pair can never drift.
+    return computeBotKey(bot, index) === botKey || (meta.name && isSameBotName(bot.name, meta.name));
   }) || null;
 }
 
@@ -1698,9 +1692,10 @@ function generateHtmlReport(analyses: JsonObj[]) {
 function main() {
   const rawArgs = process.argv.slice(2);
   const exportHtml = rawArgs.includes('--export');
-  // Positional (non-flag) args are treated as bot key filters. Example:
-  //   node dist/scripts/analyze-orders.js <bot>
-  //   node dist/scripts/analyze-orders.js <bot> --export
+  // Positional (non-flag) args select the analysed grids: a bot name/key, or a
+  // chain account (every bot trading it). Examples:
+  //   node dist/scripts/analyze-orders.js <bot|account>
+  //   node dist/scripts/analyze-orders.js <bot|account> --export
   const botKeyFilter = rawArgs.find((arg) => !arg.startsWith('-'))?.trim().toLowerCase() || null;
 
   if (!exportHtml) {
@@ -1712,22 +1707,29 @@ function main() {
   // Get all order files sorted by modification time (newest first)
   let { files, skippedCandidates } = getOrderFiles();
 
-  // Filter to a single bot when a bot key was requested. Also match the
-  // sanitized form of a bot name (e.g. "AAA-BBB" -> "aaa-bbb").
+  // Filter to the requested bot or account. Target matching is the shared
+  // `<bot|account>` rule set (analysis/bot_key_utils): bot key, bot name, or the
+  // chain account the bot trades from (`preferredAccount` name / 1.2.x id).
+  // The file's own key still matches when a snapshot has no bots.json entry.
   if (botKeyFilter) {
-    const sanitizedFilter = sanitizeKey(botKeyFilter);
-    const matched = files.filter((file) =>
-      String(file.botKey).toLowerCase() === botKeyFilter
-      || String(file.botKey).toLowerCase() === sanitizedFilter
-      || (file.config?.name && sanitizeKey(file.config.name) === sanitizedFilter)
-    );
+    const matched = files.filter((file) => {
+      const config = file.config ?? null;
+      return matchBotEntryTarget(config, botKeyFilter, file.botKey) !== null
+        || matchBotAccountTarget(config, botKeyFilter);
+    });
     if (matched.length === 0) {
       if (exportHtml) {
         generateHtmlReport([]);
       } else {
-        console.log(`${colors.sell}No order grid found for bot key '${botKeyFilter}'.${colors.reset}`);
+        console.log(`${colors.sell}No order grid found for '${botKeyFilter}'.${colors.reset}`);
         console.log('Available bots:');
-        files.forEach((file) => console.log(`  - ${file.botKey}`));
+        files.forEach((file) => {
+          const config = file.config ?? null;
+          const name = config?.name ? String(config.name) : '';
+          const nameSuffix = name && name.toLowerCase() !== String(file.botKey).toLowerCase() ? ` (${name})` : '';
+          const account = config?.preferredAccount ? ` (account: ${String(config.preferredAccount)})` : '';
+          console.log(`  - ${file.botKey}${nameSuffix}${account}`);
+        });
       }
       process.exit(0);
     }

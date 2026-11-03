@@ -22,7 +22,7 @@
  * long-running process holding a live connection.
  */
 
-import { loadBotSettings, computeBotKey, persistBotAccountId } from './bot_key_utils.js';
+import { loadBotSettings, computeBotKey, persistBotAccountId, matchBotEntryTarget, isAccountIdRef } from './bot_key_utils.js';
 import { setGlobalConsoleLevel, getGlobalConsoleLevel } from '../modules/order/logger.js';
 import { sleep } from '../modules/order/utils/system.js';
 import { getErrorMessage, getErrorCode } from '../modules/utils/errors.js';
@@ -100,7 +100,7 @@ async function resolveWithTimeout(chainOrders: typeof import('../modules/chain_o
             chainOrders.resolveAccountId(ref),
             sleep(timeoutMs).then(() => { throw timeoutErr; }),
         ]);
-        if (id && /^1\.2\.\d+$/.test(String(id))) return { id: String(id), reason: 'resolved' };
+        if (id && isAccountIdRef(id)) return { id: String(id), reason: 'resolved' };
         return { id: null, reason: 'not-found' };
     } catch (err) {
         return { id: null, reason: err && getErrorCode(err) === 'ACCOUNT_LOOKUP_TIMEOUT' ? 'timeout' : 'error' };
@@ -118,8 +118,9 @@ async function main() {
 
     let targets = entries.map((bot: BotEntry, index: number) => ({ bot, index, key: computeBotKey(bot, index) }));
     if (opts.botKey) {
-        const want = String(opts.botKey).toLowerCase();
-        targets = targets.filter((t) => t.key === want || String(t.bot?.name ?? '').toLowerCase() === want);
+        // Shared `<bot>` rule set (analysis/bot_key_utils): bot key or display
+        // name, case/separator-insensitive.
+        targets = targets.filter((t) => matchBotEntryTarget(t.bot, opts.botKey, t.key) !== null);
         if (!targets.length) {
             console.error(`Error: bot '${opts.botKey}' not found in profiles/bots.json.`);
             process.exit(1);
@@ -152,13 +153,13 @@ async function main() {
         for (const t of targets) {
             const name = t.bot?.name ?? t.key;
             const prefRaw = t.bot?.preferredAccount != null ? String(t.bot.preferredAccount) : '';
-            const stored = /^1\.2\.\d+$/.test(String(t.bot?.accountId ?? '')) ? String(t.bot.accountId) : null;
+            const stored = isAccountIdRef(t.bot?.accountId) ? String(t.bot.accountId) : null;
             if (!prefRaw) {
                 results.push({ key: t.key, name, status: 'skipped', detail: 'no preferredAccount' });
                 console.log(`- ${t.key}: skipped (no preferredAccount)`);
                 continue;
             }
-            if (/^1\.2\.\d+$/.test(prefRaw)) {
+            if (isAccountIdRef(prefRaw)) {
                 if (stored !== prefRaw) {
                     const wrote = opts.dryRun ? true : persistBotAccountId(t.key, prefRaw);
                     const status = !wrote ? 'failed' : (opts.dryRun ? 'would-update' : 'updated');

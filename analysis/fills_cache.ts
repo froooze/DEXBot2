@@ -28,6 +28,7 @@
 import path from 'node:path';
 import { getStorage } from '../modules/storage/index.js';
 import { PATHS } from '../modules/paths.js';
+import { isAccountIdRef } from './bot_key_utils.js';
 import { writeJsonAtomic } from '../market_adapter/utils/atomic_write.js';
 import {
     shardKeyForTimestamp,
@@ -70,7 +71,7 @@ interface FetchFillsOptions {
 
 function accountFileBase(accountId: string): string {
     const s = String(accountId ?? '').trim();
-    if (/^1\.2\.\d+$/.test(s)) return s;
+    if (isAccountIdRef(s)) return s;
     return s.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'account';
 }
 

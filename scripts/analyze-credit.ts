@@ -30,15 +30,21 @@ const require = createRequire(import.meta.url);
  *   debt_asset, debt_amount, collateral_asset, collateral_amount.
  *
  * Usage:
- *   node dist/scripts/analyze-credit.js            # credit-enabled bots only
- *   node dist/scripts/analyze-credit.js <bot>      # single bot (name or key)
+ *   node dist/scripts/analyze-credit.js                # credit-enabled bots only
+ *   node dist/scripts/analyze-credit.js <bot>          # single bot (name or key)
+ *   node dist/scripts/analyze-credit.js <account>      # every bot on that account
+ *
+ * The positional target matches a bot name/key, or the chain account the bot
+ * trades from (`preferredAccount` as a name or 1.2.x id, or the `accountId`
+ * stamped beside it by analysis/account_resolver.ts). Account matching is what
+ * makes `dexbot credit <account>` work on a shared account, where one account
+ * hosts several bot entries — the same target spelling `dexbot pnl` accepts.
  */
 
 const { BitShares, waitForConnected, disconnectClient, setSuppressConnectionLog } = require('../modules/bitshares_client');
 const { FEE_PARAMETERS } = require('../modules/constants');
 const { PATHS } = require('../modules/paths');
 const { getErrorMessage } = require('../modules/utils/errors');
-const { sanitizeKey } = require('../modules/utils/sanitize_key');
 const { normalizeAssetRef, normalizeAssetSymbol, isSameAssetSymbol } = require('../modules/utils/asset_symbols');
 const { loadSettingsFile, resolveRawBotEntries, normalizeBotEntries } = require('../modules/bot_settings');
 import type { BotEntry, BotLendingEntry } from '../modules/bot_settings.js';
@@ -46,6 +52,9 @@ import { pathToFileURL } from 'node:url';
 // Terminal colors: centralized palette (modules/cli_colors.ts), shared with
 // `dexbot order` so both analyzers stay visually in lockstep.
 import { CLI_COLORS as colors } from '../modules/cli_colors.js';
+// `<bot|account>` target matching lives in analysis/bot_key_utils so `credit`,
+// `order`, `pnl` and the chart commands share one rule set.
+import { matchBotTargetIn } from '../analysis/bot_key_utils.js';
 import { muteChainLogs } from '../modules/utils/chain_logs.js';
 import { setGlobalConsoleLevel } from '../modules/order/logger.js';
 import { deriveLiquidityPoolTokenValue } from '../modules/order/utils/system.js';
@@ -219,31 +228,59 @@ function mpaCollateralRaw(order: CallOrder | null | undefined): number {
 async function main() {
   const rawArgs = process.argv.slice(2);
   if (rawArgs.includes('-h') || rawArgs.includes('--help')) {
-    console.log('Usage: dexbot credit [<bot>]');
+    console.log('Usage: dexbot credit [<bot|account>]');
     console.log('  No args      Summed MPA + borrowed-credit positions for credit-enabled bots.');
-    console.log('  <bot>        Only the named bot (matches name or sanitized key).');
+    console.log('  <bot>        Only the named bot (matches name or bot key).');
+    console.log('  <account>    Only the bots trading that account (preferredAccount name or 1.2.x id);');
+    console.log('               a shared account lists every bot entry that uses it.');
     console.log('Live chain data via get_margin_positions + get_credit_deals_by_borrower per preferredAccount.');
     process.exit(0);
   }
   const botFilter = rawArgs.find((a) => !a.startsWith('-'))?.trim().toLowerCase() || null;
 
   const { config } = loadSettingsFile(BOTS_FILE);
-  let bots = normalizeBotEntries(resolveRawBotEntries(config))
-    .filter((b: BotEntry) => b && b.active !== false && hasLending(b));
-  if (botFilter) {
-    const sanitized = sanitizeKey(botFilter);
-    const matched = bots.filter((b: BotEntry) =>
-      String(b.name || '').toLowerCase() === botFilter ||
-      sanitizeKey(String(b.name || '')) === sanitized ||
-      String(b.botKey || '').toLowerCase() === botFilter);
-    if (matched.length === 0) {
-      console.log(`${colors.sell}No credit bot found for '${botFilter}'.${colors.reset}`);
+  // Keep every entry (with its file-order index, which unnamed bots' keys are
+  // derived from) so target matching cannot drift from what the runtime writes.
+  const allBots = normalizeBotEntries(resolveRawBotEntries(config)).filter((b: BotEntry) => Boolean(b));
+  const activeBots = allBots.filter((b: BotEntry) => b.active !== false);
+  // One account can back several bot entries, so a matched account selects all
+  // of them — the account-level view `dexbot credit <account>` promises.
+  const targets = botFilter ? matchBotTargetIn(allBots, botFilter) : [];
+  const targeted = botFilter ? new Set(targets.map((m) => m.meta)) : null;
+  let bots = activeBots.filter((b: BotEntry) => hasLending(b) && (!targeted || targeted.has(b)));
+  if (botFilter && bots.length === 0) {
+    const matchedEntries = targets.map((m) => m.meta as BotEntry);
+    const describe = (b: BotEntry) =>
+      `  - ${b.name || b.botKey || 'unnamed'}${b.preferredAccount ? ` (account: ${b.preferredAccount})` : ''}${hasLending(b) ? '' : ' (no debtPolicy)'}${b.active === false ? ' (inactive)' : ''}`;
+    // The `Available bots` hint keeps listing inactive entries so a disabled
+    // bot's name and account stay discoverable.
+    if (matchedEntries.length === 0) {
+      console.log(`${colors.sell}No credit bot or account found for '${botFilter}'.${colors.reset}`);
       console.log('Available bots:');
-      const all = normalizeBotEntries(resolveRawBotEntries(config));
-      all.forEach((b: BotEntry) => console.log(`  - ${b.name}${hasLending(b) ? '' : ' (no debtPolicy)'}`));
+      allBots.forEach((b: BotEntry) => console.log(describe(b)));
       process.exit(0);
     }
-    bots = matched;
+    const enabledMatches = matchedEntries.filter((b) => b.active !== false);
+    if (enabledMatches.length === 0) {
+      // Disabled bots are never reported, whatever their policy.
+      console.log(`${colors.yellow}Matched '${botFilter}' only on inactive entries:${colors.reset}`);
+      matchedEntries.forEach((b) => console.log(describe(b)));
+      console.log('Enable it with `dexbot enable <bot>`, or drop the filter to sum the active credit bots.');
+      process.exit(0);
+    }
+    // Enabled match(es) without a debtPolicy: that policy also supplies the
+    // per-bot asset filter, so without it a shared account's positions cannot
+    // be attributed. List every match — an inactive entry may still carry the
+    // policy and only need enabling.
+    console.log(`${colors.yellow}Matched '${botFilter}' but no enabled entry has debtPolicy.lending:${colors.reset}`);
+    matchedEntries.forEach((b) => console.log(describe(b)));
+    // Every enabled match lacks the policy here (a credit-enabled one would have
+    // been reported), so both remedies are always offered.
+    console.log('Add a debtPolicy via `dexbot bot` to include it in `dexbot credit`.');
+    if (matchedEntries.some((b) => b.active === false)) {
+      console.log('Disabled entries also need `dexbot enable <bot>` first.');
+    }
+    process.exit(0);
   }
   if (bots.length === 0) {
     console.log(`No credit-enabled bots found in ${BOTS_FILE} (debtPolicy.lending is empty everywhere).`);

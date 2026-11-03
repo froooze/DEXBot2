@@ -250,8 +250,8 @@ the canonical name is preferred in scripts and docs.
 | `dexbot update` | — | Update DEXBot2 from the repository and restart active bots |
 | `dexbot export <bot>` | — | Export bot trades/settings to CSV/JSON for local analysis/ |
 | `dexbot order` | `orders` | Analyze persisted order grids (spread, increment, funds); `--export` for HTML |
-| `dexbot order [<bot>]` | — | Analyze only the specified bot's order grid |
-| `dexbot credit` | — | Live summed MPA + borrowed-credit positions per asset per bot (`[<bot>]`) |
+| `dexbot order [<bot|account>]` | — | Analyze only the specified bot's order grid — or every grid on that account (`<bot|account>`) |
+| `dexbot credit` | — | Live summed MPA + borrowed-credit positions per asset per bot (`[<bot|account>]` — a bot name/key, or the account the bot trades from, name or `1.2.x` id) |
 | `dexbot rich <asset...>` | — | Top holder(s) per asset via the chain asset-holders API (`--top N`, `--json`/`--csv`) |
 | `dexbot tv <target>` | — | TradingView 1h chart for `<bot|pool|AssetA/AssetB>` over `--month N` (default 3); pool = id (133 / 1.19.133) or pool token (LP share-asset symbol) |
 | `dexbot dw <target>` | — | Dynamic-weight research chart: same targets/flags as `tv` |

@@ -7,9 +7,8 @@
  * hint is rendered.
  */
 
-import { isSameBotName } from '../modules/utils/sanitize_key.js';
 import { isPoolIdRef, isPoolRefLike } from '../modules/liquidity_pool_ref.js';
-import { loadBotMeta, loadBotSettings, computeBotKey } from '../analysis/bot_key_utils.js';
+import { computeBotKey, loadBotMeta, loadBotSettings, matchBotTargetIn } from '../analysis/bot_key_utils.js';
 import type { BotEntry } from '../modules/bot_settings.js';
 
 interface BotTarget {
@@ -31,17 +30,15 @@ function isPoolTarget(target: string): boolean {
 function findBotByTarget(target: string): BotTarget | null {
     const settings = loadBotSettings();
     const entries: BotEntry[] = Array.isArray(settings?.bots) ? settings.bots : [];
-    for (let i = 0; i < entries.length; i++) {
-        const entry = entries[i];
-        if (!entry) continue;
-        if (isSameBotName(entry.name, target)) return { botKey: computeBotKey(entry, i) ?? '', meta: entry };
-    }
-    const meta = loadBotMeta(target);
-    if (meta) {
-        const idx = entries.findIndex((entry) => isSameBotName(entry.name, meta.name));
-        return { botKey: computeBotKey(meta, idx >= 0 ? idx : 0) ?? '', meta };
-    }
-    return null;
+    // Name/key matching is the shared `<bot|account>` rule set
+    // (analysis/bot_key_utils); these commands take bot targets only — an
+    // account can back several bots, so an account spelling would silently
+    // chart whichever entry came first.
+    const match = matchBotTargetIn(entries, target).find((m) => m.matchedBy !== 'account');
+    if (!match) return null;
+    // loadBotMeta canonicalises the pair symbols (analysis-wide convention).
+    const meta = loadBotMeta(match.botKey) ?? (match.meta as unknown as BotEntry);
+    return { botKey: match.botKey, meta };
 }
 
 /** Bot keys used in the unknown-target hint (first 8 shown by callers). */

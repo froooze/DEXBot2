@@ -13,9 +13,10 @@ const chainOrders = require('../modules/chain_orders');
 const { PATHS } = require('../modules/paths');
 const { getErrorMessage, getErrorName } = require('../modules/utils/errors');
 const { loadSettingsFile, normalizeBotEntries, resolveRawBotEntries } = require('../modules/bot_settings');
-const { getStoredBotAccountId, persistBotAccountId } = require('../analysis/bot_key_utils');
-const { isSameBotName } = require('../modules/utils/sanitize_key');
 const { blockchainToFloat } = require('../modules/order/utils/math');
+// Typed ESM import (not `require`) so target matching and the accountId helpers
+// stay checked here instead of degrading to `any`.
+import { getStoredBotAccountId, matchBotTargetIn, persistBotAccountId } from '../analysis/bot_key_utils.js';
 import type { BotEntry } from '../modules/bot_settings.js';
 
 interface DealInput {
@@ -124,11 +125,14 @@ function loadBot(botName: string) {
   const botsPath = PATHS.PROFILES.BOTS_JSON;
   const { config } = loadSettingsFile(botsPath, { silent: false, exitOnError: false });
   const entries = normalizeBotEntries(resolveRawBotEntries(config));
-  const bot = entries.find((entry: BotEntry) => isSameBotName(entry.name, botName));
-  if (!bot) {
+  // Shared `<bot>` rule set (analysis/bot_key_utils): display name or bot key,
+  // case/separator-insensitive. Account spellings are rejected here — this
+  // flag selects a bot profile, not a chain account.
+  const match = matchBotTargetIn(entries, botName).find((m) => m.matchedBy !== 'account');
+  if (!match) {
     throw new Error(`Bot profile "${botName}" not found in ${botsPath}`);
   }
-  return bot;
+  return match.meta as BotEntry;
 }
 
 function amountToFloat(amount: number | string | undefined, asset: { precision?: unknown } | null | undefined): number | null {
@@ -239,7 +243,10 @@ async function main() {
           maxFeeRatePerDay: args.maxFeeRatePerDay,
           autoReborrow: true,
           autoRepay: args.autoRepay,
-        },
+          // Widened on purpose: the block below adds fields to this item
+          // (`maxCollateralAmount`, `allowedOfferIds`) that this literal does not
+          // declare — without the annotation the assignment trips TS2561.
+        } as Record<string, unknown>,
       ],
     },
   };

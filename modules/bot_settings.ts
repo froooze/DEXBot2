@@ -37,6 +37,8 @@ export interface BotEntry extends UnknownRecord {
     botKey?: string;
     botIndex?: number;
     preferredAccount?: string;
+    /** Chain account id (1.2.x) stamped next to `preferredAccount` (see analysis/account_resolver.ts). */
+    accountId?: string;
     coreOrders?: UnknownRecord;
     edgeOrders?: number | UnknownRecord;
     /** @deprecated legacy key, migrated to `coreOrders` at read time. */

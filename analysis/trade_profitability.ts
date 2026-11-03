@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { resolveAccountRef } from './account_resolver.js';
+import { isAccountIdRef } from './bot_key_utils.js';
 import {
     BTS_ID,
     assetPrec as getPrec,
@@ -1259,7 +1260,7 @@ async function run(argv: string[] = process.argv.slice(2)) {
     let accountId = opts.accountId;
     let resolvedBotName: string | null = null;
 
-    if (!/^1\.2\.\d+$/.test(String(accountId))) {
+    if (!isAccountIdRef(accountId)) {
         // The Kibana query below filters on the 1.2.x account_id field, so a
         // name must always resolve first (a raw name would silently return
         // zero fills). Shared resolver: a local bot profile is checked first

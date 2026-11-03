@@ -337,7 +337,7 @@ dexbot reset {all|<bot>}      # Regenerate grid
 dexbot disable {all|<bot>}    # Disable bot in config
 dexbot enable {all|<bot>}     # Enable bot in config
 
-dexbot order [<bot>]          # Grid state: spread, increment, funds (--export → HTML)
+dexbot order [<bot|account>]  # Grid state: spread, increment, funds (--export → HTML)
 dexbot export <bot>           # Trades + settings → CSV/JSON for analysis/
 
 dexbot tv <bot|pool|A/B>      # TradingView 1h chart with AMA overlay (default: 3 months)
@@ -345,14 +345,14 @@ dexbot dw <bot|pool|A/B>      # Dynamic-weight research chart (same targets/flag
 dexbot liquid <bot|pool|A/B>  # Liquidity depth: order book + AMM pool (aliases: liq, liqu)
 
 dexbot pnl <bot|account>      # HTML PnL report (--month N, optional --pair A/B)
-dexbot credit [<bot>]         # Live summed MPA + borrowed-credit positions
+dexbot credit [<bot|account>] # Live summed MPA + borrowed-credit positions
 dexbot asset <bts|symbol>     # Supply distribution + HTML report (short: dexbot a bts)
 dexbot rich <asset...>        # Top holders per asset
 
 dexbot update                 # Update DEXBot2
 dexbot clear                  # Delete log files in <profiles>/logs
 dexbot default                # Reset settings to defaults
-dexbot help                   # Grouped command reference (runtime, trading, config, analysis, files)
+dexbot help                   # Grouped command reference
 ```
 
 ## 🎯 PM2 Process Management

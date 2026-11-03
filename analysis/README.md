@@ -633,7 +633,7 @@ Details: [bot_fitting/README.md](bot_fitting/README.md)
 | `chart_css.ts` | Shared uPlot CSS fragments for generated charts |
 | `chart_ui.ts` | Shared browser-side uPlot helpers (cursor, hover, zoom-reset, sizing) |
 | `math_utils.ts` | Shared math utilities |
-| `bot_key_utils.ts` | Bot-key resolution, candle file lookup, `accountId` persistence (`persistBotAccountId`) |
+| `bot_key_utils.ts` | Bot-key resolution, `<bot|account>` target matching (`matchBotEntryTarget` / `matchBotAccountTarget` / `matchBotTargetIn` — shared by `credit`, `order`, `pnl` and the chart commands), candle file lookup, `accountId` persistence (`persistBotAccountId`) |
 | `account_resolver.ts` | Account resolution for all tools: `preferredAccount` / `--account` → `1.2.x`, stamping the result into `profiles/bots.json` |
 | `chain_pool.ts` | Ephemeral read-only chain client over the built-in node pool (account + asset lookups) |
 | `fills_source.ts` | Shared `fill_order` Kibana fetch/query and the static asset-precision table + on-chain cache |

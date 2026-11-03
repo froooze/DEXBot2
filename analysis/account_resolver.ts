@@ -13,10 +13,8 @@
  */
 
 import { getErrorMessage } from '../modules/utils/errors.js';
-import { findBotKeyByAccountRef, loadBotMeta, persistBotAccountId, resolveBotKey } from './bot_key_utils.js';
+import { findBotKeyByAccountRef, isAccountIdRef, loadBotMeta, persistBotAccountId, resolveBotKey } from './bot_key_utils.js';
 import { withReadOnlyClient } from './chain_pool.js';
-
-const ACCOUNT_ID_RE = /^1\.2\.\d+$/;
 
 /** Chain lookup seam: batch tools can reuse one connection across lookups. */
 type NameLookup = (name: string) => Promise<string | null>;
@@ -92,7 +90,7 @@ async function resolveBotAccount(botKey: string, options: ResolveOptions = {}): 
     // An explicit override always wins and is never persisted.
     const override = overrideAccount != null ? String(overrideAccount).trim() : '';
     if (override) {
-        if (ACCOUNT_ID_RE.test(override)) {
+        if (isAccountIdRef(override)) {
             return { accountId: override, botKey, botMeta, source: 'override-id', reason: null };
         }
         if (!quiet) console.log(`  Resolving account name '${override}'...`);
@@ -107,11 +105,11 @@ async function resolveBotAccount(botKey: string, options: ResolveOptions = {}): 
     const prefRaw = botMeta.preferredAccount != null ? String(botMeta.preferredAccount).trim() : '';
     if (!prefRaw) return { accountId: null, botKey, botMeta, source: null, reason: 'no-preferred-account' };
 
-    const stored = ACCOUNT_ID_RE.test(String(botMeta.accountId ?? '')) ? String(botMeta.accountId) : null;
+    const stored = isAccountIdRef(String(botMeta.accountId ?? '')) ? String(botMeta.accountId) : null;
 
     // A typed 1.2.x preferredAccount is authoritative — the stored accountId is
     // a derived cache and must never override it. Self-heal the cache.
-    if (ACCOUNT_ID_RE.test(prefRaw)) {
+    if (isAccountIdRef(prefRaw)) {
         if (stored !== prefRaw) persistResolvedAccountId(botKey, prefRaw, stored, quiet, botsFile);
         return { accountId: prefRaw, botKey, botMeta, source: 'preferred-id', reason: null };
     }
@@ -137,7 +135,7 @@ async function resolveBotAccount(botKey: string, options: ResolveOptions = {}): 
  */
 async function resolveAccountRef(accountRef: string, options: ResolveOptions = {}): Promise<ResolvedAccount> {
     const ref = String(accountRef ?? '').trim();
-    if (ACCOUNT_ID_RE.test(ref)) {
+    if (isAccountIdRef(ref)) {
         return { accountId: ref, botKey: null, botMeta: null, source: 'typed-id', reason: null };
     }
 

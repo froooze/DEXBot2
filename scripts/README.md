@@ -67,7 +67,13 @@ All are irreversible and prompt for confirmation.
 ```bash
 # Analyzes spread accuracy, geometric consistency, and fund distribution
 node dist/scripts/analyze-orders.js
+
+# One bot (name or key), or every grid on one account (name or 1.2.x id)
+node dist/scripts/analyze-orders.js <bot|account>
 ```
+
+Bot/account targets share one rule set with `dexbot credit`, `dexbot pnl` and
+the chart commands (`analysis/bot_key_utils.ts`).
 
 For AMA bots (`gridPrice: ama`) the analyzer reads `<botKey>.dynamicgrid.json`
 and, when fresh (`2 × MARKET_ADAPTER.RUNTIME_DEFAULTS.pollSeconds`, default 2h),
@@ -84,6 +90,9 @@ node dist/scripts/analyze-credit.js
 
 # Single bot (name or key)
 node dist/scripts/analyze-credit.js <bot>
+
+# Every bot trading one account (preferredAccount name or 1.2.x id)
+node dist/scripts/analyze-credit.js <account>
 ```
 Credit deals report per-pair and average CR, but only for pairs whitelisted in `bots.json` (`debtPolicy.lending`) and listed on the current credit offer; everything else is shown as ignored/unpriced and excluded from the average. A borrow-now preview per configured pair shows today's rate.
 

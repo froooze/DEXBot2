@@ -12,6 +12,9 @@ const {
     resolveBotKey,
     candleFileForBot,
     resolveCandleFile,
+    matchBotEntryTarget,
+    matchBotAccountTarget,
+    matchBotTargetIn,
 } = require('../analysis/bot_key_utils');
 const { getErrorMessage } = require('../modules/utils/errors');
 
@@ -156,6 +159,66 @@ try {
         fs.mkdirSync(isolatedDir, { recursive: true });
         const p = resolveCandleFile('whatever', '1h', isolatedDir, botsFile);
         assert.strictEqual(p, null);
+    });
+
+    // `<bot|account>` target matching — the one rule set shared by `dexbot
+    // credit`, `dexbot order` and the chart commands.
+    const targetEntries = [
+        { name: 'AAA-BBB', preferredAccount: 'acct-one', accountId: '1.2.11', active: true },
+        { name: 'MY BOT', preferredAccount: 'acct-one', active: true },
+        { preferredAccount: 'acct-two', assetA: 'CCC', assetB: 'DDD' },
+        null,
+    ];
+
+    check('matchBotEntryTarget: display name is case/separator-insensitive', () => {
+        assert.strictEqual(matchBotEntryTarget(targetEntries[0], 'aaa-bbb', 'aaa-bbb'), 'name');
+        assert.strictEqual(matchBotEntryTarget(targetEntries[1], 'my-bot', 'my-bot'), 'name');
+    });
+
+    check('matchBotEntryTarget: bot key matches exactly and sanitized', () => {
+        assert.strictEqual(matchBotEntryTarget(targetEntries[0], 'aaa-bbb', 'aaa-bbb'), 'name');
+        // No entry (a persisted grid with no bots.json match) still matches by key.
+        assert.strictEqual(matchBotEntryTarget(null, 'bot-2-2', 'bot-2-2'), 'key');
+        assert.strictEqual(matchBotEntryTarget(null, 'BOT 2 2', 'bot-2-2'), 'key');
+    });
+
+    check('matchBotEntryTarget: account spellings never match', () => {
+        assert.strictEqual(matchBotEntryTarget(targetEntries[0], 'acct-one', 'aaa-bbb'), null);
+        assert.strictEqual(matchBotEntryTarget(targetEntries[0], '1.2.11', 'aaa-bbb'), null);
+    });
+
+    check('matchBotAccountTarget: preferredAccount name or stamped 1.2.x id', () => {
+        assert.strictEqual(matchBotAccountTarget(targetEntries[0], 'acct-one'), true);
+        assert.strictEqual(matchBotAccountTarget(targetEntries[0], 'ACCT-ONE'), true);
+        assert.strictEqual(matchBotAccountTarget(targetEntries[0], '1.2.11'), true);
+        assert.strictEqual(matchBotAccountTarget(targetEntries[0], 'acct-two'), false);
+        assert.strictEqual(matchBotAccountTarget(targetEntries[0], ''), false);
+        assert.strictEqual(matchBotAccountTarget(null, 'acct-one'), false);
+    });
+
+    check('matchBotTargetIn: an account selects every bot on it', () => {
+        const matches = matchBotTargetIn(targetEntries, 'acct-one');
+        assert.deepStrictEqual(matches.map((m) => m.botKey), ['aaa-bbb', 'my-bot']);
+        assert.deepStrictEqual(matches.map((m) => m.matchedBy), ['account', 'account']);
+    });
+
+    check('matchBotTargetIn: an account id selects the same bots', () => {
+        assert.deepStrictEqual(matchBotTargetIn(targetEntries, '1.2.11').map((m) => m.botKey), ['aaa-bbb']);
+    });
+
+    check('matchBotTargetIn: name/key targets identify one entry', () => {
+        const byName = matchBotTargetIn(targetEntries, 'my bot');
+        assert.deepStrictEqual(byName.map((m) => [m.botKey, m.matchedBy]), [['my-bot', 'name']]);
+        // Unnamed bot: the key is the sanitized pair + file index.
+        const byKey = matchBotTargetIn(targetEntries, 'ccc-ddd-2');
+        assert.deepStrictEqual(byKey.map((m) => [m.botKey, m.matchedBy]), [['ccc-ddd-2', 'key']]);
+    });
+
+    check('matchBotTargetIn: blanks and unknown targets match nothing', () => {
+        assert.deepStrictEqual(matchBotTargetIn(targetEntries, ''), []);
+        assert.deepStrictEqual(matchBotTargetIn(targetEntries, '   '), []);
+        assert.deepStrictEqual(matchBotTargetIn(targetEntries, 'nope'), []);
+        assert.deepStrictEqual(matchBotTargetIn(null, 'acct-one'), []);
     });
 
 } finally {
