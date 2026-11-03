@@ -1019,6 +1019,8 @@ export interface OrderManagerLike {
   targetGrid?: unknown;
   initialSpreadCount: number;
   currentSpreadCount: number;
+  /** True once the spread metric has been measured (load/create); both counters are 0 before that. */
+  _spreadCountKnown?: boolean;
   outOfSpread: number;
   btsBalance?: { free: number; total: number; locked: number };
   ordersNeedingPriceCorrection: PendingPriceCorrection[];

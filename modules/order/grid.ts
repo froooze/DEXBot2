@@ -1142,6 +1142,14 @@ export async function loadGrid(manager: OrderManagerLike, grid: ManagedOrder[], 
                 manager.config?.targetSpreadPercent,
                 manager.config?.gridLimits
             );
+            // Publish the geometry BEFORE restoring the boundary.  The restore
+            // path (and anything it calls: last-fill pivot snapping, the
+            // [BOUNDARY] restore debug line) reads manager._gapSlots, and
+            // leaving it unset until the re-type pass below made every restart
+            // report `gapSlots=0 sellStart=boundary+1` — i.e. "the spread band
+            // is gone" on a perfectly healthy 4-slot band.  Same value as the
+            // assignment in the re-type block, which now only reads it.
+            manager._gapSlots = loadGapSlots;
             let restoredBoundary = typeof boundaryIdx === 'number' ? boundaryIdx : null;
             if (restoredBoundary !== null) {
                 const check = validatePersistedBoundary(restoredBoundary, grid, loadGapSlots);
@@ -1250,7 +1258,6 @@ export async function loadGrid(manager: OrderManagerLike, grid: ManagedOrder[], 
             // slot-N is the canonical identity.
             if (restoredBoundary !== null) {
                 const gapSlots = loadGapSlots;
-                manager._gapSlots = gapSlots;
                 const buyEndIdx = restoredBoundary;
                 const sellStartIdx = getSellStartIdx(restoredBoundary, gapSlots);
                 let reassignCount = 0;
@@ -1420,6 +1427,7 @@ export async function loadGrid(manager: OrderManagerLike, grid: ManagedOrder[], 
                  });
                  manager.initialSpreadCount = spreadCount;
                  manager.currentSpreadCount = spreadCount;
+                 manager._spreadCountKnown = true;
 
              } finally {
                  await manager.resumeFundRecalc();
@@ -1899,6 +1907,7 @@ export async function initializeGrid(manager: OrderManagerLike): Promise<void> {
             // should not assume the two paths agree.
             manager.initialSpreadCount = initialSpreadCount.buy + initialSpreadCount.sell;
             manager.currentSpreadCount = manager.initialSpreadCount;
+            manager._spreadCountKnown = true;
         });
         // FIX: Use consistent optional chaining pattern for all logger calls
         manager.logger?.log?.(`Initialized grid with ${orders.length} orders.`, 'info');

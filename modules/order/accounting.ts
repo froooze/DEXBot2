@@ -93,7 +93,7 @@ import { ORDER_TYPES, ORDER_STATES, PIPELINE_TIMING, TIMING, FEE_PARAMETERS, GRI
 import { resolveAccountRef } from './utils/system.js';
 import { resolveSpreadOrderSide, parseChainOrder, applyChainSizeToGridOrder, convertToSpreadPlaceholder, resolveEdgeCount } from './utils/order.js';
 import { parseSlotIndex } from './utils/slot.js';
-import { isSlotInRail, floatToBlockchainInt } from './utils/math.js';
+import { isSlotInRail, resolveGapSlots, floatToBlockchainInt } from './utils/math.js';
 import * as Format from './format.js';
 import * as fundRegistry from '../fund_registry.js';
 import * as chainOrders from '../chain_orders.js';
@@ -425,7 +425,11 @@ class Accountant {
              //   * price >= startPrice → SELL side (higher prices are asks)
               const genesis = mgr._genesis;
               const boundaryIdx = mgr.boundaryIdx;
-              const gapSlots = genesis?.gapSlots ?? mgr._gapSlots ?? 0;
+              // Never fall back to gap 0: a 0-wide band classifies the slot just
+              // above the boundary as a SELL rail slot and would book a SPREAD
+              // placeholder's size on the wrong side. resolveGapSlots keeps the
+              // config-derived geometry as the fallback.
+              const gapSlots = genesis?.gapSlots ?? resolveGapSlots(mgr);
               let spreadSide: string | null = null;
               if (order.type === ORDER_TYPES.SPREAD && genesis && boundaryIdx != null && Number.isFinite(Number(boundaryIdx))) {
                   if (isSlotInRail(boundaryIdx, gapSlots, ORDER_TYPES.BUY, order)) spreadSide = ORDER_TYPES.BUY;

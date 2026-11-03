@@ -576,6 +576,13 @@ class OrderManager implements OrderManagerLike {
     }
     initialSpreadCount: number;
     currentSpreadCount: number;
+    /**
+     * True once a grid has been loaded/created and the spread metric measured.
+     * Before that both counters are 0, which is indistinguishable from a
+     * genuinely empty band — telemetry must print "unknown" instead of "0"
+     * (the restore line otherwise claims the spread band is gone).
+     */
+    _spreadCountKnown: boolean;
     outOfSpread: number;
     assets!: AssetPair;
     accountId!: string | null;
@@ -724,6 +731,7 @@ class OrderManager implements OrderManagerLike {
         this.btsBalance = { free: 0, total: 0, locked: 0 };
         this.initialSpreadCount = 0;
         this.currentSpreadCount = 0;
+        this._spreadCountKnown = false;
         this.outOfSpread = 0;
         this.assets = null as unknown as AssetPair;
         this._accountTotalsPromise = null;
@@ -2533,8 +2541,23 @@ class OrderManager implements OrderManagerLike {
         try {
             const boundary = newIdx == null ? this.boundaryIdx : newIdx;
             if (boundary == null) return;
-            const gapSlots = typeof this._gapSlots === 'number' ? this._gapSlots : 0;
+            // Geometry: resolveGapSlots is the single source of truth
+            // (_gapSlots ?? config-derived).  Reading the raw field with a `0`
+            // fallback printed `gapSlots=0 sellStart=boundary+1` for every
+            // restore that happens before the loader publishes _gapSlots —
+            // indistinguishable in the log from a genuinely collapsed spread
+            // band (field report: "bot lost its fixed spread, only one slot is
+            // used").  A config-derived gap is always a valid geometry; an
+            // absent one is unknown, never zero.
+            const gapSlots = resolveGapSlots(this);
             const sellStart = boundary + 1 + gapSlots;
+            // The spread metric only exists once a grid has been loaded or
+            // created (both counters are 0 on a fresh manager, which is
+            // indistinguishable from a genuinely empty band).  Printing 0
+            // before the measurement claims an empty band we have not measured.
+            const spreadCount = this._spreadCountKnown
+                ? (this.currentSpreadCount ?? this.initialSpreadCount)
+                : '?';
             const countActive = (type: OrderType) => {
                 let n = 0;
                 for (const o of this.orders.values()) {
@@ -2544,7 +2567,7 @@ class OrderManager implements OrderManagerLike {
             };
             this.logger?.log?.(
                 `[BOUNDARY] ${source} boundary=${boundary} sellStart=${sellStart} gapSlots=${gapSlots} ` +
-                `spreadCount=${this.currentSpreadCount ?? this.initialSpreadCount ?? '?'} ` +
+                `spreadCount=${spreadCount} ` +
                 `activeBuy=${countActive(ORDER_TYPES.BUY)} activeSell=${countActive(ORDER_TYPES.SELL)}`,
                 'debug'
             );

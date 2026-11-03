@@ -260,12 +260,21 @@ async function testLoadGridFallsBackToNullBoundary() {
     // startPrice not numeric ("pool"/"book" modes) -> cannot re-derive.
     const manager = buildFakeManager({ incrementPercent: 1, targetSpreadPercent: 1, startPrice: 'pool' });
     manager.boundaryIdx = 42;      // sentinel: must NOT be overwritten by poison
-    manager._gapSlots = 'unset';   // sentinel: null path must not touch it
+    manager._gapSlots = 'unset';   // sentinel: no boundary is restored here
 
     await loadGrid(manager, grid, 3, gridLadder());
 
     assert.strictEqual(manager.boundaryIdx, 42, 'poison discarded, previous value kept');
-    assert.strictEqual(manager._gapSlots, 'unset', 'null-boundary path leaves _gapSlots untouched');
+    // The band width is pure config geometry (not boundary state): loadGrid now
+    // publishes it BEFORE the boundary gate so every geometry reader between the
+    // gate and the re-type pass sees the real band instead of an absent one
+    // (the restore debug line used to print gapSlots=0 / sellStart=boundary+1
+    // from that window, which reads as a collapsed spread band).
+    assert.strictEqual(
+        manager._gapSlots,
+        calculateGapSlots(1, 1),
+        'the config-derived gap is published even when the boundary is rejected'
+    );
     assert.strictEqual(manager.orders.size, 10, 'grid still loads without a boundary');
     assert.ok(manager.logs.some(l => l.msg.includes('Could not re-derive a safe boundary') && l.level === 'error'),
         'fallback logged at error level');

@@ -7,7 +7,7 @@ import { NATIVE_CLIENT, FILL_PROCESSING, TIMING, MAINTENANCE, ORDER_TYPES } from
 import { getErrorMessage, resolveSeamMsOrNull, getErrorField } from './utils/errors.js';
 import type { BotLike, ManagerLogger, IncomingFill, ManagedOrder } from './types.js';
 import { isOrderDoesNotExistError } from './dexbot_maintenance_runtime.js';
-import { slotIndexForPrice, isChainPriceOutOfGrid, isSlotInRail } from './order/utils/math.js';
+import { slotIndexForPrice, isChainPriceOutOfGrid, isSlotInRail, resolveGapSlots } from './order/utils/math.js';
 import { attributeUnmatchedFillToGrid } from './order/utils/order.js';
 
 /** A queued incoming fill annotated with its resolved grid order. */
@@ -90,7 +90,10 @@ async function isUnknownFillOrderAdoptable(bot: BotLike, fillOp: FillOpLike): Pr
                 const slot = bot.manager.orders.get(slotId);
                 if (!slot) return false;
                 const boundaryIdx = bot.manager.boundaryIdx;
-                const gapSlots = genesis.gapSlots ?? bot.manager._gapSlots ?? 0;
+                // Gap 0 is not a valid geometry (it makes the slot above the
+                // boundary a SELL rail member); resolveGapSlots supplies the
+                // config-derived band width when neither source has one.
+                const gapSlots = genesis.gapSlots ?? resolveGapSlots(bot.manager);
                 if (boundaryIdx != null && !isSlotInRail(boundaryIdx, gapSlots, parsed.type, { id: slotId })) return false;
                 return slot.state === ORDER_STATES.VIRTUAL || !slot.orderId;
             } catch { return false; }

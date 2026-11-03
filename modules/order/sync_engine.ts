@@ -146,6 +146,7 @@ import {
     slotIndexForPrice,
     isChainPriceOutOfGrid,
     isSlotInRail,
+    resolveGapSlots,
     priceForSlot,
     priceSlotEqual,
     pricesOnSameLevel
@@ -1602,7 +1603,11 @@ class SyncEngine {
                     continue;
                 }
             }
-            const gapSlots = genesis?.gapSlots ?? mgr._gapSlots ?? 0;
+            // Unknown geometry must NOT read as gap 0 (a 0-wide band turns the
+            // slot just above the boundary into a SELL rail slot, so an in-band
+            // orphan could be adopted onto the wrong rail). resolveGapSlots is
+            // the single source of truth (_gapSlots ?? config-derived).
+            const gapSlots = genesis?.gapSlots ?? resolveGapSlots(mgr);
             const boundaryIdx = mgr.boundaryIdx;
             // Pre-boundary sync: gap geometry is unknown, so adoption is
             // deferred entirely — touch nothing (no adopt, no cancelOnly).
