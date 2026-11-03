@@ -321,28 +321,48 @@ to the book mid, and how far the two diverge.
   also swaps bid/ask roles and flips the depth asset to the new quote, so the
   chart stays a valid book view rather than a mirrored picture with the wrong sides
 - **Bids**: order-book bids (`quote` of every bid at price >= p) drawn next to
-  the pool's `quoteReserve * (1 - sqrt(p / p0))` curve
+  the pool's fee-adjusted bid curve, which starts at `(1 - f) * p0` and nets
+  `(1 - f) * quoteReserve * (1 - sqrt(p / ((1 - f) * p0)))`
 - **Asks**: order-book asks (`quote` of every ask at price <= p) drawn next to
-  the pool's `quoteReserve * (sqrt(p / p0) - 1)` curve
+  the pool's fee-adjusted ask curve, which starts at `p0 / (1 - f)` and is
+  `quoteReserve * (sqrt(p * (1 - f) / p0) - 1)`
+- **Spread bands**: the order-book spread (best bid .. best ask, amber) and the
+  pool fee band (violet, between the fee-adjusted edges) are both shaded, so the
+  two spreads a taker could cross are directly comparable. The overlay lists
+  each percentage with its absolute edges and tags the tighter one; clicking the
+  x-axis to invert flips both bands with the rest of the view
 
 The window is symmetric around the pool price (book mid when there is no pool),
 so the whole `0.5x .. 1.5x` range is visible by default. The chain's
 `get_order_book` side convention is handled by the tool. Pool depth is the exact
-constant-product solution (verified against the `x*y = k` swap invariant); the
-AMM taker fee is **not** applied to the curve — matching PoolTool — and is shown
-in the header as metadata only. PoolTool's `depthchart.py` plots the same curves
-with the reciprocal price convention (`amount_y * (sqrt(p_pool/p) - 1)` for buys
-and `amount_y * (1 - sqrt(p_pool/p))` for sells).
+constant-product solution (verified against the `x*y = k` swap invariant) and is
+**net of the AMM taker fee** `f` (`taker_fee_percent / 100`): the chain charges
+it on the output side and keeps it in the pool, so a swap's effective price is
+`(1 - f) * p` when selling into the pool and `p / (1 - f)` when buying. The
+curve is parameterized by that effective price, so the two pool curves no
+longer meet at the pool price — they stop at their own edges, `(1 - f) * p0` and
+`p0 / (1 - f)`, and the shaded band between them (`~2f` wide) is the AMM spread
+a taker has to cross. That band is drawn in the chart next to the book spread,
+reported in the readout (`BOOK` / `POOL` rows, with the tighter one tagged) and
+in the header (`BOOK SPREAD`, `FEE … · POOL SPREAD …`), and mirrored in the
+console summary (`pool edge bid/ask`). With `f = 0` the two sides collapse onto
+the pool price and the curves match PoolTool's depth chart exactly. PoolTool's
+`depthchart.py` plots the same fee-free curves with the reciprocal price
+convention (`amount_y * (sqrt(p_pool/p) - 1)` for buys and
+`amount_y * (1 - sqrt(p_pool/p))` for sells).
 
 Order-book depth prefers `get_limit_orders` (up to ~300 levels per side) over
 `get_order_book`, which many nodes cap at 50 — otherwise thin far levels are
 silently missing from the curves. If the wider call is unavailable the tool
 falls back to the classic 50-level endpoint.
 
-All displayed numbers use DEXBot's existing 4-active-digit formatters —
-`formatCurrency` for prices/percentages and `formatFundsValue` for amounts
-(`modules/order/format.ts`) — embedded into the generated page so it renders
-identically offline.
+All displayed numbers use DEXBot's shared formatters (`modules/order/format.ts`)
+embedded into the generated page so it renders identically offline:
+`formatCurrency` for prices (4 active digits), `formatFundsValue` for amounts,
+and `formatPercentLabel` for every percentage — 2 decimals below 100%
+(`2.27%`, `0.40%`, `18.18%`), 1 from 100% (`100.0%`) and none from 1000%
+(`1235%`), fixed-point so a small percentage never picks up the SI suffixes
+`formatCurrency` produces.
 
 ```bash
 # Default example pair

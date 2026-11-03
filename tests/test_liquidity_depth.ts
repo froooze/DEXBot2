@@ -8,6 +8,9 @@ const {
     computeBookStats,
     resolvePriceWindow,
     buildDepthSeries,
+    poolFeeFraction,
+    poolBidPrice,
+    poolAskPrice,
     poolBidDepth,
     poolAskDepth,
     poolBidBaseDepth,
@@ -17,6 +20,7 @@ const { decodePool, selectPool, normalizeLimitOrders, fetchOrderBook } = require
 const { parseArgs: parseLiquidityArgs } = require('../analysis/analyze_liquidity');
 const { buildDepthView } = require('../analysis/liquidity/liquidity_view');
 const { generateLiquidityHTML } = require('../analysis/liquidity/liquidity_chart_generator');
+const { formatPercentLabel } = require('../modules/order/format');
 
 let passed = 0;
 let failed = 0;
@@ -117,6 +121,98 @@ check('pool: closed-form depth satisfies the x*y = k swap invariant', () => {
     }
 });
 
+// A taker fee is charged on the output side and stays in the pool (the
+// on-chain liquidity_pool_exchange evaluator), so a swap's effective price is
+// (1 - f) * p when selling base into the pool and p / (1 - f) when buying. The
+// curve is parameterized by that effective price, which opens the AMM spread.
+check('pool: taker fee opens a fee band and nets the curve output', () => {
+    const baseReserve = 100;
+    const quoteReserve = 200;
+    const p0 = 2;
+    const fee = 0.005;
+    const bidEdge = poolBidPrice(p0, fee);
+    const askEdge = poolAskPrice(p0, fee);
+    close(bidEdge, 1.99);
+    close(askEdge, 2 / 0.995);
+
+    // Nothing executes inside the band: each side starts at its own edge.
+    assert.strictEqual(poolBidDepth(bidEdge, p0, quoteReserve, fee), 0);
+    assert.strictEqual(poolAskDepth(askEdge, p0, quoteReserve, fee), 0);
+    assert.strictEqual(poolBidBaseDepth(bidEdge, p0, baseReserve, fee), 0);
+    assert.strictEqual(poolAskBaseDepth(askEdge, p0, baseReserve, fee), 0);
+    for (const inside of [bidEdge, (bidEdge + askEdge) / 2, askEdge]) {
+        assert.strictEqual(poolBidDepth(inside, p0, quoteReserve, fee), 0);
+        assert.strictEqual(poolAskDepth(inside, p0, quoteReserve, fee), 0);
+        assert.strictEqual(poolBidBaseDepth(inside, p0, baseReserve, fee), 0);
+        assert.strictEqual(poolAskBaseDepth(inside, p0, baseReserve, fee), 0);
+    }
+
+    // Selling base down to an effective price nets (1 - f) of the gross quote
+    // the reserve move produces.
+    const sellTo = 1.5;
+    const internalSell = sellTo / (1 - fee);
+    close(
+        poolBidDepth(sellTo, p0, quoteReserve, fee),
+        (1 - fee) * quoteReserve * (1 - Math.sqrt(internalSell / p0)),
+    );
+    // Buying base up to an effective price pays the gross quote and leaves the
+    // fee with the pool, so the taker receives (1 - f) of the base moved.
+    const buyTo = 2.5;
+    const internalBuy = buyTo * (1 - fee);
+    close(
+        poolAskDepth(buyTo, p0, quoteReserve, fee),
+        quoteReserve * (Math.sqrt(internalBuy / p0) - 1),
+    );
+    close(
+        poolAskBaseDepth(buyTo, p0, baseReserve, fee),
+        (1 - fee) * baseReserve * (1 - Math.sqrt(p0 / internalBuy)),
+    );
+
+    // A zero/unknown fee reproduces the fee-free PoolTool curve.
+    close(poolBidDepth(1.5, p0, quoteReserve, 0), 200 * (1 - Math.sqrt(0.75)));
+    close(poolBidDepth(1.5, p0, quoteReserve), poolBidDepth(1.5, p0, quoteReserve, 0));
+});
+
+check('pool: fee-adjusted depth satisfies x*y = k with the fee staying in the pool', () => {
+    const baseReserve = 2727.9005;
+    const quoteReserve = 3658504.96369;
+    const k = baseReserve * quoteReserve;
+    const p0 = quoteReserve / baseReserve;
+    const fee = 0.002;
+    const bidEdge = poolBidPrice(p0, fee);
+    for (const factor of [0.5, 0.8, 0.95, 1.05, 1.2, 1.5]) {
+        const price = p0 * factor;
+        let newX = baseReserve;
+        let newY = quoteReserve;
+        let internal: number;
+        if (price < bidEdge) {
+            // Sell base into the pool; the gross quote out includes the fee
+            // the pool keeps, so only the net leaves the reserves.
+            newX += poolBidBaseDepth(price, p0, baseReserve, fee);
+            newY -= poolBidDepth(price, p0, quoteReserve, fee) / (1 - fee);
+            internal = price / (1 - fee);
+        } else {
+            newX -= poolAskBaseDepth(price, p0, baseReserve, fee) / (1 - fee);
+            newY += poolAskDepth(price, p0, quoteReserve, fee);
+            internal = price * (1 - fee);
+        }
+        close(newX * newY, k, Math.abs(k) * 1e-12);
+        close(newY / newX, internal, internal * 1e-12);
+    }
+});
+
+check('pool: fee percent decoding, clamping and unknown fallback', () => {
+    const pool = (feePercent: unknown) => ({ baseReserve: 1, quoteReserve: 2, feePercent: feePercent as number | null });
+    assert.strictEqual(poolFeeFraction(null), 0);
+    assert.strictEqual(poolFeeFraction(pool(undefined)), 0);
+    assert.strictEqual(poolFeeFraction(pool(0)), 0);
+    assert.strictEqual(poolFeeFraction(pool(-1)), 0);
+    assert.strictEqual(poolFeeFraction(pool(Number.NaN)), 0);
+    close(poolFeeFraction(pool(0.2)), 0.002);
+    // A nonsensical >=100% fee cannot make the ask edge infinite.
+    assert.ok(Number.isFinite(poolAskPrice(2, poolFeeFraction(pool(500)))));
+});
+
 // PoolTool (1.0.0 depthchart.py) prices in A per B and measures depth in B:
 //   get_pool_buys:  amount_y * (sqrt(p_pool / p) - 1), p < p_pool
 //   get_pool_sells: amount_y * (1 - sqrt(p_pool / p)), p > p_pool
@@ -208,11 +304,32 @@ check('series: all arrays align with the price axis', () => {
     }
     assert.strictEqual(s.priceCount, n);
     assert.strictEqual(s.poolPrice, 2);
+    // sampleSeries carries a 0.5% pool fee, so the pool curves are net of it
+    // and stop at the fee-adjusted edges instead of meeting at the pool price.
+    const fee = 0.005;
+    close(s.poolBidPrice as number, 2 * (1 - fee));
+    close(s.poolAskPrice as number, 2 / (1 - fee));
     // Base-unit series are sampled on the same axis and wired correctly.
     close(s.bookBidBase[0], 100 / 1.8 + 50 / 1.5);
-    close(s.poolBidBase[0], 100 * (Math.sqrt(2) - 1));
+    close(s.poolBidBase[0], 100 * (Math.sqrt((2 * (1 - fee)) / 1) - 1));
     close(s.bookAskBase[n - 1], 60 / 2.2 + 40 / 2.5);
-    close(s.poolAskBase[n - 1], 100 * (1 - Math.sqrt(2 / 3)));
+    close(s.poolAskBase[n - 1], (1 - fee) * 100 * (1 - Math.sqrt(2 / (3 * (1 - fee)))));
+});
+
+check('series: the fee band is sampled and empty at the pool price', () => {
+    const s = sampleSeries();
+    const bidEdge = s.poolBidPrice as number;
+    const askEdge = s.poolAskPrice as number;
+    assert.ok(s.prices.some((p: number) => Math.abs(p - bidEdge) < 1e-9), 'bid edge sampled');
+    assert.ok(s.prices.some((p: number) => Math.abs(p - askEdge) < 1e-9), 'ask edge sampled');
+    // The reserve-implied price sits inside the band, where neither side has
+    // depth: the fee is exactly the spread the curves no longer cover.
+    const inside = s.prices.indexOf(2);
+    assert.ok(inside >= 0, 'pool price sampled');
+    assert.strictEqual(s.poolBid[inside], 0);
+    assert.strictEqual(s.poolAsk[inside], 0);
+    assert.strictEqual(s.poolBidBase[inside], 0);
+    assert.strictEqual(s.poolAskBase[inside], 0);
 });
 
 check('series: each source is monotonic toward its window edge', () => {
@@ -304,6 +421,8 @@ check('view: normal orientation passes the sampled series through', () => {
     assert.strictEqual(v.poolAsk, s.poolAsk);
     assert.strictEqual(v.min, 1);
     assert.strictEqual(v.max, 3);
+    assert.strictEqual(v.poolBidPrice, s.poolBidPrice);
+    assert.strictEqual(v.poolAskPrice, s.poolAskPrice);
 });
 
 check('view: inverted price is 1/p ascending and centered on the reciprocal centre', () => {
@@ -319,6 +438,9 @@ check('view: inverted price is 1/p ascending and centered on the reciprocal cent
     close(v.max, 0.75);
     close(v.poolPrice as number, 0.5);
     close(v.mid as number, 1 / 1.9);
+    // Inversion swaps the sides, so the pool's fee-band edges swap with them.
+    close(v.poolBidPrice as number, 1 / (s.poolAskPrice as number));
+    close(v.poolAskPrice as number, 1 / (s.poolBidPrice as number));
 });
 
 check('view: inversion swaps bid/ask roles and picks the right depth asset', () => {
@@ -335,6 +457,40 @@ check('view: inversion swaps bid/ask roles and picks the right depth asset', () 
     assert.deepStrictEqual(baseView.bookAsk, [...s.bookBid].reverse());
     assert.deepStrictEqual(baseView.bookBid, [...s.bookAsk].reverse());
     assert.strictEqual(baseView.prices.length, n);
+});
+
+check('view: book spread band follows the orientation', () => {
+    const s = sampleSeries();
+    const normal = buildDepthView(s, {
+        orientation: 'normal', depthMode: 'quote', poolPrice: 2, mid: 1.9, window: { min: 1, max: 3 },
+        bookBestBid: 1.8, bookBestAsk: 2.2,
+    });
+    assert.strictEqual(normal.bookBidPrice, 1.8);
+    assert.strictEqual(normal.bookAskPrice, 2.2);
+
+    const inverted = buildDepthView(s, {
+        orientation: 'inverted', depthMode: 'quote', poolPrice: 2, mid: 1.9, window: { min: 1, max: 3 },
+        bookBestBid: 1.8, bookBestAsk: 2.2,
+    });
+    close(inverted.bookBidPrice as number, 1 / 2.2);
+    close(inverted.bookAskPrice as number, 1 / 1.8);
+
+    // A one-sided book (or a missing book) has no band, but the present edge
+    // still follows the same rules.
+    const oneSided = buildDepthView(s, {
+        orientation: 'normal', depthMode: 'quote', poolPrice: 2, mid: 1.8, window: { min: 1, max: 3 },
+        bookBestBid: 1.8, bookBestAsk: null,
+    });
+    assert.strictEqual(oneSided.bookBidPrice, 1.8);
+    assert.strictEqual(oneSided.bookAskPrice, null);
+    assert.strictEqual(buildDepthView(s, { orientation: 'normal', depthMode: 'quote', poolPrice: 2, mid: 2, window: { min: 1, max: 3 } }).bookBidPrice, null);
+    // Non-positive levels are not prices: they must never reach the band math.
+    const invalid = buildDepthView(s, {
+        orientation: 'normal', depthMode: 'quote', poolPrice: 2, mid: 2, window: { min: 1, max: 3 },
+        bookBestBid: 0, bookBestAsk: -1,
+    });
+    assert.strictEqual(invalid.bookBidPrice, null);
+    assert.strictEqual(invalid.bookAskPrice, null);
 });
 
 // ── chain decoding ────────────────────────────────────────────────
@@ -484,9 +640,53 @@ check('html: payload carries aligned series arrays and summary data', () => {
     assert.strictEqual(payload.series.totalBid ?? null, null);
     assert.strictEqual(payload.book.bestAsk, 2.2);
     assert.strictEqual(payload.pool.price, 2);
+    assert.strictEqual(payload.pool.feePercent, 0.5);
+    close(payload.series.poolBidPrice, 2 * (1 - 0.005));
+    close(payload.series.poolAskPrice, 2 / (1 - 0.005));
     assert.strictEqual(payload.priceLabel, 'QUOTE per BASE');
     assert.strictEqual(payload.depthLabel, 'QUOTE');
     assert.ok(payload.series.prices.every((v: number) => Number.isFinite(v)));
+});
+
+check('html: header reports the taker fee and the spread band it opens', () => {
+    const html = buildChartHtml();
+    // sampleSeries: 0.5% fee => ~1% fee-band spread.
+    assert.ok(html.includes('POOL SPREAD'));
+    assert.ok(html.includes('FEE 0.50%'));
+    // The book spread is highlighted next to it, in its own colour.
+    assert.ok(html.includes('BOOK SPREAD'));
+    assert.ok(html.includes('spread-block'));
+    assert.ok(html.includes('r-book-spread'));
+    assert.ok(html.includes('r-pool-spread'));
+    assert.ok(html.includes('is-tighter'));
+    // Band shading is drawn from the orientation-aware view edges.
+    assert.ok(html.includes('view.poolBidPrice'));
+    assert.ok(html.includes('view.bookBidPrice'));
+    assert.ok(html.includes('fillRect'));
+    // Both band colours reach the payload so the page script can paint them.
+    const match = html.match(/<script id="payload" type="application\/json">([\s\S]*?)<\/script>/);
+    const payload = JSON.parse(match![1]);
+    assert.ok(String(payload.colors.bookSpreadEdge).startsWith('rgba(227,179,65'));
+    assert.ok(String(payload.colors.poolSpreadEdge).startsWith('rgba(210,168,255'));
+    assert.ok(String(payload.colors.bookSpreadFillTop).startsWith('rgba(210,153,34'));
+    assert.ok(String(payload.colors.poolSpreadFillTop).startsWith('rgba(210,168,255'));
+    // The book best levels ride in the payload so the page can size its band.
+    assert.strictEqual(payload.book.bestBid, 1.8);
+    assert.strictEqual(payload.book.bestAsk, 2.2);
+});
+
+check('percent formatting: charts reuse the central percentage formatter', () => {
+    // 2 decimals below 100%, 1 from 100%: easy to reason about, never SI-suffixed
+    // (the old path rendered 0.05 as "50m").
+    assert.strictEqual(formatPercentLabel(2.2664), '2.27%');
+    assert.strictEqual(formatPercentLabel(18.18), '18.18%');
+    assert.strictEqual(formatPercentLabel(0.4), '0.40%');
+    assert.strictEqual(formatPercentLabel(100), '100.0%');
+    // The generated header text goes through the same formatter...
+    assert.ok(buildChartHtml().includes('FEE 0.50%'));
+    // ...and the page embeds it rather than a chart-local copy.
+    assert.ok(buildChartHtml().includes('function formatPercentLabel'));
+    assert.ok(!buildChartHtml().includes('formatPercentCompact'));
 });
 
 check('html: asset symbols are HTML-escaped', () => {

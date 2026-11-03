@@ -10,12 +10,12 @@
  *
  * Asset Amounts:                8 decimals  - blockchain native precision
  * Prices:                       6-8 decimals - price precision varies by pair
- * Percentages:                  1-4 decimals - display precision
+ * Percentages:                  0-2 decimals - display precision (formatPercentLabel)
  * Ratios/Metrics:               2-5 decimals - context dependent
  * Time/Performance (ms, %):     1-2 decimals - readable metrics
  *
  * ===============================================================================
- * TABLE OF CONTENTS (17 exported functions)
+ * TABLE OF CONTENTS (18 exported functions)
  * ===============================================================================
  *
  * SECTION 1: ASSET FORMATTING (4 functions)
@@ -31,20 +31,22 @@
  *   8. formatCurrency(value, digits) - Grouped thousands with SI micro-suffixes
  *   9. formatFundsValue(value) - Compact K/M, 4 significant figures (keeps trailing zeros)
  *
- * SECTION 3: PERCENTAGE FORMATTING (2 functions)
+ * SECTION 3: PERCENTAGE FORMATTING (3 functions)
  *   10. formatPercent2(value) - Format to 2 decimals (spread %, ratios)
  *   11. formatPercent(value, decimals) - Format with custom decimal places
+ *   12. formatPercentLabel(value) - Percentage with unit: 2 decimals below 100%,
+ *       1 from 100%, 0 from 1000% (fixed-point, never SI-suffixed)
  *
  * SECTION 4: RATIO/METRIC FORMATTING (1 function)
- *   12. formatMetric2(value) - Format to 2 decimals (timing, performance)
+ *   13. formatMetric2(value) - Format to 2 decimals (timing, performance)
  *
  * SECTION 5: HELPER UTILITIES (5 functions)
- *   13. isValidNumber(value) - Check if value is defined and finite
- *   14. toFiniteNumber(value, defaultValue) - Convert to finite number with fallback
- *   15. toKnownNumber(value, absentValue) - Convert to finite number, treating an
+ *   14. isValidNumber(value) - Check if value is defined and finite
+ *   15. toFiniteNumber(value, defaultValue) - Convert to finite number with fallback
+ *   16. toKnownNumber(value, absentValue) - Convert to finite number, treating an
  *       explicitly absent value (null/undefined/empty) as the absent sentinel
- *   16. positiveOrNull(value) - Convert to a strictly-positive number, else null
- *   17. safeFormat(value, decimals, fallback) - Safely format with fallback
+ *   17. positiveOrNull(value) - Convert to a strictly-positive number, else null
+ *   18. safeFormat(value, decimals, fallback) - Safely format with fallback
  *
  * ===============================================================================
  */
@@ -227,6 +229,24 @@ function formatPercent(value: number, decimals: number = 2): string {
 	return safeFormat(value, decimals);
 }
 
+/**
+ * Percentage including its unit, at display precision.
+ *
+ * 2 decimals below 100% ("2.27%", "0.40%", "18.18%"), 1 from 100% ("100.0%")
+ * and none from 1000% ("1235%"), so a percentage never carries more than four
+ * significant digits or a noisy trailing digit on a spread. Fixed-point, so the
+ * milli/micro suffixes `formatCurrency` produces for small values ("0.05" ->
+ * "50m") can never leak into a percentage.
+ *
+ * Dependency-free (Math/Number only) so chart exporters can embed it verbatim.
+ */
+function formatPercentLabel(value: number | null | undefined): string {
+	if (typeof value !== 'number' || !Number.isFinite(value)) return 'N/A';
+	const abs = Math.abs(value);
+	const decimals = abs >= 1000 ? 0 : abs >= 100 ? 1 : 2;
+	return `${value.toFixed(decimals)}%`;
+}
+
 // ===============================================================================
 // SECTION 4: RATIO/METRIC FORMATTING
 // ===============================================================================
@@ -320,5 +340,5 @@ function safeFormat(value: unknown, decimals: number, fallback: string = 'N/A'):
 // EXPORTS
 // ===============================================================================
 
-export { formatAmount8, formatAmount, formatAmountByPrecision, formatSizeByOrderType, formatPrice, formatPrice6, formatPrice4, formatCurrency, formatFundsValue, formatPercent2, formatPercent, formatMetric2, isValidNumber, toFiniteNumber, toKnownNumber, positiveOrNull, safeFormat }
+export { formatAmount8, formatAmount, formatAmountByPrecision, formatSizeByOrderType, formatPrice, formatPrice6, formatPrice4, formatCurrency, formatFundsValue, formatPercent2, formatPercent, formatPercentLabel, formatMetric2, isValidNumber, toFiniteNumber, toKnownNumber, positiveOrNull, safeFormat }
 

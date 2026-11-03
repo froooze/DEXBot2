@@ -27,17 +27,29 @@
  * `normalizeOrderBook` performs that side flip, so the rest of this module
  * (and the chart) speaks plain real bid/ask.
  *
- * Pool depth is the exact constant-product solution for moving the pool price
- * from p0 to p:
- *   - below p0 (selling base into the pool):
- *       quote received = quoteReserve * (1 - sqrt(p / p0))
- *   - above p0 (buying base from the pool):
- *       quote paid     = quoteReserve * (sqrt(p / p0) - 1)
- * which is the same curve PoolTool plots as `amount_y * (1 - sqrt(p_pool/p))`
- * and `amount_y * (sqrt(p_pool/p) - 1)` (there p_pool/p is inverted because
- * PoolTool's price is base-per-quote). The closed forms preserve x*y = k and
- * move the implied pool price to exactly p; the taker fee is not applied,
- * matching PoolTool's depth chart.
+ * Pool depth is the exact constant-product solution, net of the AMM taker fee
+ * f (`taker_fee_percent / 100`). The fee comes off the output side and stays in
+ * the pool (the on-chain liquidity_pool_exchange evaluator), so a swap that
+ * moves the reserve price p0 -> p pays:
+ *   - selling base into the pool (p < p0):
+ *       gross quote out = quoteReserve * (1 - sqrt(p / p0))
+ *       taker gets      = (1 - f) * gross
+ *   - buying base from the pool (p > p0):
+ *       gross quote in  = quoteReserve * (sqrt(p / p0) - 1)
+ *       taker gets      = (1 - f) * gross base
+ * The marginal price of such a trade is p * (1 - f) when selling and
+ * p / (1 - f) when buying, so the curve is parameterized by that EFFECTIVE
+ * price P instead of the reserve price. That keeps the local slope of the
+ * cumulative curve equal to P at every sample (the same property the fee-free
+ * closed forms have), and it opens a fee band between the two sides:
+ *   bid (P <  (1 - f) * p0) = (1 - f) * quoteReserve * (1 - sqrt(P / ((1 - f) * p0)))
+ *   ask (P >  p0 / (1 - f)) = quoteReserve * (sqrt(P * (1 - f) / p0) - 1)
+ * i.e. the AMM's own spread `[(1 - f) * p0, p0 / (1 - f)]` (~2f wide) that a
+ * taker has to cross. With f = 0 both sides collapse onto p0 and reduce to the
+ * curve PoolTool plots (`amount_y * (1 - sqrt(p_pool/p))` and
+ * `amount_y * (sqrt(p_pool/p) - 1)`; its price is base-per-quote, so the same
+ * curves appear with the reciprocal price). The closed forms preserve
+ * x * y = k and move the implied pool price to exactly p.
  */
 
 interface RawBookOrder {
@@ -80,6 +92,10 @@ interface PoolState {
 
 interface DepthSeries {
     prices: number[];
+    /** Effective pool bid edge (fee-adjusted); null without a pool. */
+    poolBidPrice: number | null;
+    /** Effective pool ask edge (fee-adjusted); null without a pool. */
+    poolAskPrice: number | null;
     /** Cumulative quote (B) depth. */
     bookBid: number[];
     poolBid: number[];
@@ -221,7 +237,7 @@ function upperBound(values: number[], target: number): number {
     return lo;
 }
 
-function buildPriceGrid(input: DepthBuildInput, poolPrice: number | null): number[] {
+function buildPriceGrid(input: DepthBuildInput, poolPrice: number | null, poolFee: number): number[] {
     const { window } = input;
     const steps = Math.max(2, Math.floor(input.steps ?? DEFAULT_STEPS));
     const span = window.max - window.min;
@@ -241,7 +257,11 @@ function buildPriceGrid(input: DepthBuildInput, poolPrice: number | null): numbe
     for (const order of input.asks) {
         values.push(order.price, order.price - eps);
     }
-    if (poolPrice != null) values.push(poolPrice);
+    if (poolPrice != null) {
+        // Reserve price plus both fee-adjusted edges, so the band corners are
+        // sampled sharply instead of being smeared across a step interval.
+        values.push(poolPrice, poolBidPrice(poolPrice, poolFee), poolAskPrice(poolPrice, poolFee));
+    }
 
     const inWindow = values.filter((v) => Number.isFinite(v) && v > 0 && v >= window.min && v <= window.max);
     inWindow.sort((a, b) => a - b);
@@ -284,24 +304,48 @@ function buildBookLookups(sides: BookSides): {
     return { bidPrices, bidSuffix, bidSuffixBase, askPrices, askPrefix, askPrefixBase };
 }
 
-function poolBidDepth(price: number, poolPrice: number, quoteReserve: number): number {
-    if (!(price < poolPrice)) return 0;
-    return quoteReserve * (1 - Math.sqrt(price / poolPrice));
+/**
+ * AMM taker fee as a fraction (0.2% => 0.002). Unknown/negative fees are 0 and
+ * the value is capped below 1 so the effective ask edge stays finite.
+ */
+function poolFeeFraction(pool: PoolState | null | undefined): number {
+    const percent = pool?.feePercent;
+    if (typeof percent !== 'number' || !Number.isFinite(percent) || percent <= 0) return 0;
+    return Math.min(percent, 99) / 100;
 }
 
-function poolAskDepth(price: number, poolPrice: number, quoteReserve: number): number {
-    if (!(price > poolPrice)) return 0;
-    return quoteReserve * (Math.sqrt(price / poolPrice) - 1);
+/** Effective pool bid edge: the highest price a pool seller can realize. */
+function poolBidPrice(poolPrice: number, fee = 0): number {
+    return poolPrice * (1 - fee);
 }
 
-function poolBidBaseDepth(price: number, poolPrice: number, baseReserve: number): number {
-    if (!(price < poolPrice)) return 0;
-    return baseReserve * (Math.sqrt(poolPrice / price) - 1);
+/** Effective pool ask edge: the lowest price a pool buyer can realize. */
+function poolAskPrice(poolPrice: number, fee = 0): number {
+    return poolPrice / (1 - fee);
 }
 
-function poolAskBaseDepth(price: number, poolPrice: number, baseReserve: number): number {
-    if (!(price > poolPrice)) return 0;
-    return baseReserve * (1 - Math.sqrt(poolPrice / price));
+function poolBidDepth(price: number, poolPrice: number, quoteReserve: number, fee = 0): number {
+    const edge = poolBidPrice(poolPrice, fee);
+    if (!(price < edge)) return 0;
+    return (1 - fee) * quoteReserve * (1 - Math.sqrt(price / edge));
+}
+
+function poolAskDepth(price: number, poolPrice: number, quoteReserve: number, fee = 0): number {
+    const edge = poolAskPrice(poolPrice, fee);
+    if (!(price > edge)) return 0;
+    return quoteReserve * (Math.sqrt((price * (1 - fee)) / poolPrice) - 1);
+}
+
+function poolBidBaseDepth(price: number, poolPrice: number, baseReserve: number, fee = 0): number {
+    const edge = poolBidPrice(poolPrice, fee);
+    if (!(price < edge)) return 0;
+    return baseReserve * (Math.sqrt(((1 - fee) * poolPrice) / price) - 1);
+}
+
+function poolAskBaseDepth(price: number, poolPrice: number, baseReserve: number, fee = 0): number {
+    const edge = poolAskPrice(poolPrice, fee);
+    if (!(price > edge)) return 0;
+    return (1 - fee) * baseReserve * (1 - Math.sqrt(poolPrice / (price * (1 - fee))));
 }
 
 /**
@@ -318,8 +362,9 @@ function buildDepthSeries(input: DepthBuildInput): DepthBuildResult {
         throw new Error('buildDepthSeries: window must be positive with max > min');
     }
     const poolPrice = computePoolPrice(input.pool);
+    const fee = poolFeeFraction(input.pool);
     const quoteReserve = poolPrice != null && input.pool ? input.pool.quoteReserve : 0;
-    const prices = buildPriceGrid(input, poolPrice);
+    const prices = buildPriceGrid(input, poolPrice, fee);
     if (prices.length === 0) throw new Error('buildDepthSeries: empty price grid');
 
     const { bidPrices, bidSuffix, bidSuffixBase, askPrices, askPrefix, askPrefixBase } = buildBookLookups({
@@ -330,6 +375,8 @@ function buildDepthSeries(input: DepthBuildInput): DepthBuildResult {
 
     const series: DepthBuildResult = {
         prices,
+        poolBidPrice: poolPrice != null ? poolBidPrice(poolPrice, fee) : null,
+        poolAskPrice: poolPrice != null ? poolAskPrice(poolPrice, fee) : null,
         bookBid: [],
         poolBid: [],
         bookAsk: [],
@@ -347,10 +394,10 @@ function buildDepthSeries(input: DepthBuildInput): DepthBuildResult {
         const bookAsk = askPrefix[upperBound(askPrices, price)] ?? 0;
         const bookBidBase = bidSuffixBase[lowerBound(bidPrices, price)] ?? 0;
         const bookAskBase = askPrefixBase[upperBound(askPrices, price)] ?? 0;
-        const poolBid = poolPrice != null ? poolBidDepth(price, poolPrice, quoteReserve) : 0;
-        const poolAsk = poolPrice != null ? poolAskDepth(price, poolPrice, quoteReserve) : 0;
-        const poolBidBase = poolPrice != null ? poolBidBaseDepth(price, poolPrice, baseReserve) : 0;
-        const poolAskBase = poolPrice != null ? poolAskBaseDepth(price, poolPrice, baseReserve) : 0;
+        const poolBid = poolPrice != null ? poolBidDepth(price, poolPrice, quoteReserve, fee) : 0;
+        const poolAsk = poolPrice != null ? poolAskDepth(price, poolPrice, quoteReserve, fee) : 0;
+        const poolBidBase = poolPrice != null ? poolBidBaseDepth(price, poolPrice, baseReserve, fee) : 0;
+        const poolAskBase = poolPrice != null ? poolAskBaseDepth(price, poolPrice, baseReserve, fee) : 0;
 
         series.bookBid.push(bookBid);
         series.poolBid.push(poolBid);
@@ -372,6 +419,9 @@ export {
     computeBookStats,
     resolvePriceWindow,
     buildDepthSeries,
+    poolFeeFraction,
+    poolBidPrice,
+    poolAskPrice,
     poolBidDepth,
     poolAskDepth,
     poolBidBaseDepth,

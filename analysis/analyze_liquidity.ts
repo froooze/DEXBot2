@@ -25,7 +25,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { PATHS } from '../modules/paths.js';
 import { getErrorMessage } from '../modules/utils/errors.js';
-import { formatCurrency, formatFundsValue } from '../modules/order/format.js';
+import { formatCurrency, formatFundsValue, formatPercentLabel } from '../modules/order/format.js';
 import { muteChainLogs } from '../modules/utils/chain_logs.js';
 import { withReadOnlyClient } from './chain_pool.js';
 import {
@@ -80,7 +80,9 @@ function usage(): string {
         '  --help                show this help',
         '',
         'Conventions: price is quote per base (e.g. QUOTE per BASE); depth is',
-        'cumulative quote liquidity (QUOTE) at or better than that price.',
+        'cumulative quote liquidity (QUOTE) at or better than that price. Pool',
+        'depth is net of the AMM taker fee, so the pool bid/ask curves are',
+        'separated by the fee-band spread a taker has to cross.',
     ].join('\n');
 }
 
@@ -259,11 +261,20 @@ function printSummary(snapshot: Snapshot, seriesResult: ReturnType<typeof buildD
 
     console.log(`[Liquidity] ${base.symbol}/${quote.symbol}  (price: ${priceLabel}, depth: ${quote.symbol})`);
     if (pool) {
-        console.log(`  pool      ${pool.id ?? 'unknown'}  price=${fmtPrice(poolPrice)}  reserves=${fmtAmount(pool.baseReserve)} ${base.symbol} / ${fmtAmount(pool.quoteReserve)} ${quote.symbol}${pool.feePercent != null ? `  fee=${fmtPrice(pool.feePercent)}%` : ''}`);
+        const feeText = pool.feePercent != null ? `  fee=${formatPercentLabel(pool.feePercent)}` : '';
+        console.log(`  pool      ${pool.id ?? 'unknown'}  price=${fmtPrice(poolPrice)}${feeText}  reserves=${fmtAmount(pool.baseReserve)} ${base.symbol} / ${fmtAmount(pool.quoteReserve)} ${quote.symbol}`);
+        // Fee-adjusted edges: the pool curves stop there, so the gap between
+        // them is the AMM spread a taker has to cross before the curve starts.
+        const bidEdge = seriesResult.poolBidPrice;
+        const askEdge = seriesResult.poolAskPrice;
+        if (bidEdge != null && askEdge != null) {
+            const feeSpread = ((askEdge - bidEdge) / askEdge) * 100;
+            console.log(`  pool edge bid=${fmtPrice(bidEdge)}  ask=${fmtPrice(askEdge)}  spread=${formatPercentLabel(feeSpread)}  (fee-adjusted, net of taker fee)`);
+        }
     } else {
         console.log('  pool      none');
     }
-    console.log(`  book      ${stats.bidOrders} bids / ${stats.askOrders} asks  best bid=${fmtPrice(stats.bestBid)}  best ask=${fmtPrice(stats.bestAsk)}  mid=${fmtPrice(stats.mid)}  spread=${fmtPrice(stats.spreadPercent)}%`);
+    console.log(`  book      ${stats.bidOrders} bids / ${stats.askOrders} asks  best bid=${fmtPrice(stats.bestBid)}  best ask=${fmtPrice(stats.bestAsk)}  mid=${fmtPrice(stats.mid)}  spread=${stats.spreadPercent != null ? formatPercentLabel(stats.spreadPercent) : '-'}`);
     console.log(`  window    ${fmtPrice(window.min)} .. ${fmtPrice(window.max)}  (${seriesResult.priceCount} samples, range=${config.range})`);
     // The sampled series is wider than the displayed window so the inverted
     // (1/p) view can stay centered; report depth at the actual window edges.

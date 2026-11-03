@@ -14,6 +14,10 @@
  * Inversion swaps bid/ask roles: a bid for the old base is an ask for the new
  * base. `depthMode` selects the asset the cumulative depth is measured in,
  * relative to the current orientation ('quote' or 'base').
+ *
+ * The same transform carries the two spread bands the chart shades: the pool's
+ * fee-adjusted edges and the book's best bid/ask. Inversion flips both, so the
+ * bands stay on the correct sides instead of mirroring the wrong way round.
  */
 
 import type { DepthSeries, PriceWindow } from './liquidity_depth_model.js';
@@ -25,6 +29,14 @@ interface DepthView {
     bookAsk: number[];
     poolAsk: number[];
     poolPrice: number | null;
+    /** Fee-adjusted pool bid edge in the current price orientation. */
+    poolBidPrice: number | null;
+    /** Fee-adjusted pool ask edge in the current price orientation. */
+    poolAskPrice: number | null;
+    /** Best book bid (the low edge of the order-book spread band). */
+    bookBidPrice: number | null;
+    /** Best book ask (the high edge of the order-book spread band). */
+    bookAskPrice: number | null;
     mid: number | null;
     min: number;
     max: number;
@@ -36,6 +48,9 @@ interface DepthViewOptions {
     poolPrice: number | null;
     mid: number | null;
     window: PriceWindow;
+    /** Best book bid/ask, so the book spread band follows the orientation. */
+    bookBestBid?: number | null;
+    bookBestAsk?: number | null;
 }
 
 function buildDepthView(series: DepthSeries, options: DepthViewOptions): DepthView {
@@ -48,6 +63,10 @@ function buildDepthView(series: DepthSeries, options: DepthViewOptions): DepthVi
             bookAsk: useQuote ? series.bookAsk : series.bookAskBase,
             poolAsk: useQuote ? series.poolAsk : series.poolAskBase,
             poolPrice: options.poolPrice,
+            poolBidPrice: series.poolBidPrice,
+            poolAskPrice: series.poolAskPrice,
+            bookBidPrice: options.bookBestBid != null && options.bookBestBid > 0 ? options.bookBestBid : null,
+            bookAskPrice: options.bookBestAsk != null && options.bookBestAsk > 0 ? options.bookBestAsk : null,
             mid: options.mid,
             min: options.window.min,
             max: options.window.max,
@@ -89,6 +108,13 @@ function buildDepthView(series: DepthSeries, options: DepthViewOptions): DepthVi
         bookAsk,
         poolAsk,
         poolPrice: options.poolPrice != null ? 1 / options.poolPrice : null,
+        // Inversion swaps the sides, so the pool's bid edge becomes 1/askEdge.
+        poolBidPrice: series.poolAskPrice != null ? 1 / series.poolAskPrice : null,
+        poolAskPrice: series.poolBidPrice != null ? 1 / series.poolBidPrice : null,
+        // The best book bid becomes the inverted market's best ask, and vice
+        // versa, so the spread band survives an orientation flip intact.
+        bookBidPrice: options.bookBestAsk != null && options.bookBestAsk > 0 ? 1 / options.bookBestAsk : null,
+        bookAskPrice: options.bookBestBid != null && options.bookBestBid > 0 ? 1 / options.bookBestBid : null,
         mid: options.mid != null ? 1 / options.mid : null,
         min: validRange ? qCenter * (1 - range) : 1 / options.window.max,
         max: validRange ? qCenter * (1 + range) : 1 / options.window.min,
