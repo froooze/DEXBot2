@@ -50,6 +50,11 @@ function testStaleReasonClassifier() {
         true,
         'resync/rebuild labels must classify as structural'
     );
+    assert.strictEqual(
+        isStructuralRebuildStaleReason('master mutation during structural rebuild (sync-pass1-partial)'),
+        true,
+        'a mutation stamped during a rebuild is structural regardless of the sync context'
+    );
     assert.strictEqual(isStructuralRebuildStaleReason(null), false);
     assert.strictEqual(isStructuralRebuildStaleReason(undefined), false);
     console.log('  PASS');

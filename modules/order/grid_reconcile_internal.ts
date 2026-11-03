@@ -2143,6 +2143,7 @@ async function _reconcileStartupSide({
     // Queue the dust-surplus cancels after the update plans. Phase 2 always runs
     // cancels before creates/updates, so these can never be paired into a slot.
     // planOnly is the Phase-1 contract; the actual broadcast happens in Phase 2.
+    let dustCancelledCount = 0;
     if (planOnly && dustSurplus.length > 0) {
         const alreadyPlanned = new Set(plannedCancels.map((plan) => String(plan.chainOrderId)));
         for (const dustOrder of dustSurplus) {
@@ -2155,6 +2156,7 @@ async function _reconcileStartupSide({
                 boundaryIdx: manager?.boundaryIdx,
                 gapSlots: manager?._gapSlots,
             });
+            dustCancelledCount++;
             logger?.log?.(
                 `Startup: Cancelling ${sideUpper} dust order ${dustOrder.id} ` +
                 `(${nonDustCount} non-dust order(s) already cover ${desiredSlots.length} needed slot(s); not pricing it into a full-size slot)`,
@@ -2179,11 +2181,13 @@ async function _reconcileStartupSide({
         }
     } catch { /* fail-open: keep unfiltered count */ }
     // Dust-surplus cancels are already queued above, so the remaining chain
-    // count must exclude them. Without this adjustment `createCount` would
-    // over-count (no create for the freed level) and `cancelCount` would
-    // double-count the dust as excess, cancelling a healthy matched order from
-    // `matchedExcess` to satisfy a surplus that is already being removed.
-    chainCount = Math.max(0, chainCount - dustSurplus.length);
+    // count must exclude them. Use the ACTUALLY queued count, not
+    // dustSurplus.length: the alreadyPlanned guard can skip a dust order that
+    // is already in plannedCancels, and subtracting it twice would fabricate
+    // a shortfall (or over-cancel a healthy matched order). Without this
+    // adjustment `createCount` would over-count (no create for the freed level)
+    // and `cancelCount` would double-count the dust as excess.
+    chainCount = Math.max(0, chainCount - dustCancelledCount);
     const createCount = Math.max(0, targetCount - chainCount);
     const remainingSlots = desiredSlots.slice(updateCount);
 

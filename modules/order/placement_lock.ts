@@ -30,6 +30,56 @@ export interface PlacementAcquireOptions {
     isShuttingDown?: () => boolean;
 }
 
+/**
+ * Minimal manager surface needed by {@link withPlacement}. Kept structural so
+ * callers in utils/ can use it without importing OrderManager (cycle safety).
+ */
+export interface PlacementCapableManager {
+    acquirePlacement?(kind: string, options?: PlacementAcquireOptions): Promise<PlacementLease | null>;
+    tryAcquirePlacement?(kind: string): PlacementLease | null;
+    isPlacementActive?(): boolean;
+    placementKind?(): string | null;
+}
+
+/** Used when the caller has no lock (dry-run mocks / browser shims). */
+const NOOP_PLACEMENT_LEASE: PlacementLease = { kind: 'noop', release: () => { /* no lock */ } };
+
+/**
+ * Run `fn` inside the exclusive placement region.
+ *
+ * This is the single entry point every chain-mutating placement path should
+ * use (COW broadcast, startup reconcile Phase 2, correction drains, dust /
+ * residual cancels, pool swaps). It centralizes the acquire/release contract
+ * so a path cannot forget to release, and it accepts an existing lease for
+ * nested calls (a COW batch holds the region across its pre-batch correction
+ * drain, so the drain must reuse that lease instead of deadlocking).
+ *
+ * @returns `null` when the region could not be acquired (timeout/shutdown);
+ *   callers must abort/defer their broadcast in that case.
+ */
+export async function withPlacement<T>(
+    manager: PlacementCapableManager | null | undefined,
+    kind: string,
+    fn: (lease: PlacementLease) => Promise<T>,
+    options: PlacementAcquireOptions & { lease?: PlacementLease | null } = {}
+): Promise<T | null> {
+    if (options.lease) return await fn(options.lease);
+    if (!manager || typeof manager.acquirePlacement !== 'function') {
+        return await fn(NOOP_PLACEMENT_LEASE);
+    }
+    const acquireOptions: PlacementAcquireOptions = {
+        ...(options.timeoutMs != null ? { timeoutMs: options.timeoutMs } : {}),
+        ...(options.isShuttingDown ? { isShuttingDown: options.isShuttingDown } : {}),
+    };
+    const lease = await manager.acquirePlacement(kind, acquireOptions);
+    if (!lease) return null;
+    try {
+        return await fn(lease);
+    } finally {
+        lease.release();
+    }
+}
+
 interface PlacementWaiter {
     kind: string;
     resolve: (lease: PlacementLease | null) => void;
@@ -41,12 +91,21 @@ class PlacementLock {
     _since: number;
     _waiters: PlacementWaiter[];
     _token: number;
+    _onRegionEnd: (() => void) | null;
 
-    constructor() {
+    constructor(onRegionEnd?: () => void) {
         this._holder = null;
         this._since = 0;
         this._waiters = [];
         this._token = 0;
+        this._onRegionEnd = typeof onRegionEnd === 'function' ? onRegionEnd : null;
+    }
+
+    _notifyRegionEnd(): void {
+        if (!this._onRegionEnd) return;
+        try {
+            this._onRegionEnd();
+        } catch { /* listener errors must never escape a release */ }
     }
 
     isHeld(): boolean {
@@ -108,7 +167,10 @@ class PlacementLock {
      * @returns a lease when the region was free, otherwise null.
      */
     tryAcquire(kind: string): PlacementLease | null {
-        if (this._holder !== null) return null;
+        // Fairness: never barge ahead of waiters queued behind the holder.
+        // Otherwise a rapid try-acquire loop can starve a bounded waiter until
+        // its timeout even though the region is momentarily free.
+        if (this._holder !== null || this._waiters.length > 0) return null;
         this._holder = kind;
         this._since = Date.now();
         this._token += 1;
@@ -129,6 +191,7 @@ class PlacementLock {
         this._holder = null;
         this._since = 0;
         this._token += 1;
+        this._notifyRegionEnd();
     }
 
     _makeLease(kind: string, token: number): PlacementLease {
@@ -153,6 +216,10 @@ class PlacementLock {
             this._holder = null;
             this._since = 0;
             this._token += 1;
+            // The region is fully free: wake any fill/rebalance that deferred
+            // on isPlacementActive(). A handoff keeps the region contiguous and
+            // must NOT wake intermediate work.
+            this._notifyRegionEnd();
             return;
         }
         if (next.timer) clearTimeout(next.timer);

@@ -8,7 +8,7 @@ import { ORDER_TYPES, TIMING } from './constants.js';
 import * as Format from './order/format.js';
 import * as grid from './order/grid.js';
 import { convertToSpreadPlaceholder, parseChainOrder, isNonBlockingUnmatchedOrder } from './order/utils/order.js';
-import { restoreGapEvacStreaks, applyPersistedPendingCrawls, resetLastFillPivot } from './order/utils/system.js';
+import { restoreGapEvacStreaks, applyPersistedPendingCrawls, resetLastFillPivot, hasUnsettledFills } from './order/utils/system.js';
 import { blockchainToFloat, calculateGapSlots, validatePersistedBoundary, isTransientInBandRejection } from './order/utils/math.js';
 import { ON_MISSING_GENESIS, isMissingGenesisError } from './order/genesis_policy.js';
 import type { ManagedOrder, ChainOrder } from './types.js';
@@ -75,6 +75,7 @@ async function triggerStateRecoverySync(bot: BotLike, reason: string = 'state re
     }
 
     bot._recoverySyncInFlight++;
+    (bot as unknown as { _recoverySyncInFlightStartedAt?: number })._recoverySyncInFlightStartedAt = Date.now();
     try {
         bot.manager.logger.log(`Triggering state recovery sync (${reason})...`, 'info');
         await bot.manager.fetchAccountTotals(bot.accountId);
@@ -103,7 +104,10 @@ async function triggerStateRecoverySync(bot: BotLike, reason: string = 'state re
             'error'
         );
     } finally {
-        bot._recoverySyncInFlight--;
+        bot._recoverySyncInFlight = Math.max(0, bot._recoverySyncInFlight - 1);
+        if (bot._recoverySyncInFlight === 0) {
+            (bot as unknown as { _recoverySyncInFlightStartedAt?: number })._recoverySyncInFlightStartedAt = 0;
+        }
     }
 }
 
@@ -685,6 +689,24 @@ function _schedulePostRecoveryRebalance(bot: BotLike, context: string) {
  */
 async function rejectCorruptedGridSnapshot(bot: BotLike, context: string) {
     if (!bot.manager?.checkFundDriftAfterFills) return false;
+    // A drift measured while fills are queued/draining/deferred (or while a
+    // COW/recovery batch is in flight) is NOT snapshot corruption: the queued
+    // fills still have to move the grid/books. Deleting the snapshot here
+    // destroys a valid grid and the following recovery does nothing
+    // (2026-11-03: drift 6234.93639 == the two queued fills; another snapshot
+    // rejected as corrupted while deferred fills were pending). Gate the
+    // destructive decision on a settled pipeline.
+    const pipeline = hasUnsettledFills(bot);
+    const batchInFlight = Number((bot as unknown as { _batchInFlight?: unknown })._batchInFlight) || 0;
+    const deferredRebalance = Number((bot.manager as unknown as { _deferredRebalanceAt?: unknown })._deferredRebalanceAt) || 0;
+    if (pipeline.unsettled || batchInFlight > 0 || deferredRebalance > 0) {
+        bot._warn?.(
+            `[SNAPSHOT-REJECT] Skipping corruption check (${context}): pipeline not settled — ` +
+            `${pipeline.reason || (batchInFlight > 0 ? 'batch in flight' : 'deferred rebalance pending')}; ` +
+            `the snapshot is preserved and re-checked once fills settle`
+        );
+        return false;
+    }
     const driftCheck = bot.manager.checkFundDriftAfterFills();
     if (driftCheck.isValid) return false;
 

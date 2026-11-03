@@ -1209,6 +1209,12 @@ class DEXBot implements BotLike {
         if (typeof this.manager?.pauseFundRecalc === 'function') {
             this.manager.pauseFundRecalc();
         }
+        // One absolute boundary re-anchor per drained fill batch: each fill
+        // event re-anchoring + a fresh COW plan amplified churn (6 re-anchors
+        // in ~1 min). The crawl still runs per chunk; the absolute anchor is
+        // the expensive geometry jump and only the first plan in the batch
+        // needs it.
+        (this.manager as unknown as { _boundaryReanchorAllowed?: boolean })._boundaryReanchorAllowed = true;
         let anyDeferred = false;
         try {
             const activeSell = this.manager?.config?.coreOrders?.sell ?? 1;
@@ -1286,6 +1292,7 @@ class DEXBot implements BotLike {
             if (this.manager) {
                 delete this.manager._boundaryShiftBudget;
                 delete this.manager._boundaryShiftBudgetBase;
+                (this.manager as unknown as { _boundaryReanchorAllowed?: boolean })._boundaryReanchorAllowed = undefined;
             }
             if (typeof this.manager?.resumeFundRecalc === 'function') {
                 await this.manager.resumeFundRecalc();

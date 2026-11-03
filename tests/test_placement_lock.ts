@@ -102,6 +102,23 @@ async function testForceReleaseAba() {
     console.log('  PASS');
 }
 
+async function testRegionEndCallback() {
+    console.log('\n - region-end callback fires on full release, not handoff...');
+    let ended = 0;
+    const lock = new PlacementLock(() => { ended++; });
+    const first = await lock.acquire('first');
+    assert.ok(first);
+    const waiterP = lock.acquire('waiter');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    first.release(); // handoff to waiter: region stays contiguous, no wake
+    const waiter = await waiterP;
+    assert.ok(waiter);
+    assert.strictEqual(ended, 0, 'a handoff must not fire the region-end callback');
+    waiter.release();
+    assert.strictEqual(ended, 1, 'the final release must fire the region-end callback exactly once');
+    console.log('  PASS');
+}
+
 async function testShutdownProbe() {
     console.log('\n - shutdown probe rejects acquisition...');
     const lock = new PlacementLock();
@@ -117,6 +134,7 @@ async function testShutdownProbe() {
     await testFifoHandoff();
     await testTimeout();
     await testForceReleaseAba();
+    await testRegionEndCallback();
     await testShutdownProbe();
     console.log('\n✓ All placement lock tests passed');
 })().catch((err) => {

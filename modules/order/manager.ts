@@ -68,7 +68,7 @@ import {
 } from './utils/validate.js';
 import { resolveSpreadOrderSide, resolveLiveOrderLadderPosition, parseChainOrder, geometryTypeForSlotIndex, isOrderOnChain, resolveEdgeCount, resolveLiveEdgeAnchorPrice, compareEdge, collectRefillSlotIds, recordOrderPlacement, isFreshlyPlacedOrder, collectEdgePinnedFillIds, isStructuralRebuildStaleReason } from './utils/order.js';
 import { parseSlotIndex } from './utils/slot.js';
-import PlacementLock from './placement_lock.js';
+import PlacementLock, { withPlacement as runWithPlacement } from './placement_lock.js';
 import type { PlacementLease } from './placement_lock.js';
 import { getErrorMessage, getErrorCode } from '../utils/errors.js';
 import type { GridGenesis } from './utils/math.js';
@@ -509,6 +509,8 @@ class OrderManager implements OrderManagerLike {
     _rebalanceState: string;
     _bootstrapping: number;
     _structuralRebuildDepth: number;
+    _structuralRebuildStartedAt: number;
+    _structuralRebuildDeferWarnAt: number;
     _structuralRebuildReason: string | null;
     _endOfBootstrapValidationDone: boolean;
     _broadcastingFlag: number;
@@ -621,6 +623,13 @@ class OrderManager implements OrderManagerLike {
     _fundDriftLedger: { side: string; direction: string; count: number; firstAt: number; lastAt: number } | null;
     _pendingRecovery: Promise<void> | null;
     _pendingFillCrawls: { slotId: string; side: string; ts: number }[];
+    /**
+     * Chain-size resizes already absorbed by sync pass 1 (partial fill seen in
+     * an open-orders snapshot). The fill-history batch that follows the same
+     * fill must not subtract / credit the same amount a second time.
+     * key = chain orderId, value = base filled int + observation time.
+     */
+    _chainSizeAppliedFills: Map<string, { filledInt: number; at: number }>;
     _recentFillKeysSnapshot: Record<string, number> | null;
     _lastFilledBuyPrice: number | null;
     _lastFilledSellPrice: number | null;
@@ -686,6 +695,8 @@ class OrderManager implements OrderManagerLike {
         this._rebalanceState = REBALANCE_STATES.NORMAL;
         this._bootstrapping = 0;
         this._structuralRebuildDepth = 0;
+        this._structuralRebuildStartedAt = 0;
+        this._structuralRebuildDeferWarnAt = 0;
         this._structuralRebuildReason = null;
         this._endOfBootstrapValidationDone = false;
         this._broadcastingFlag = 0;
@@ -735,10 +746,18 @@ class OrderManager implements OrderManagerLike {
         // Note: AsyncLock IS re-entrant (acquire detects nested calls via context).
         this._fillProcessingLock = new AsyncLock({ timeout: TIMING.SYNC_LOCK_TIMEOUT_MS });
         // Level 0.5: exclusive placement region shared by EVERY chain-mutating
-        // path (COW batches, startup reconcile Phase 2, correction drains).
-        // The broadcast refcount below only defers fills; it does not stop two
-        // placement paths from broadcasting at once. See placement_lock.ts.
-        this._placementLock = new PlacementLock();
+        // path (COW batches, startup reconcile Phase 1+2, correction drains,
+        // dust/residual cancels, pool swaps). The broadcast refcount below only
+        // defers fills; it does not stop two placement paths from broadcasting
+        // at once. See placement_lock.ts.
+        //
+        // Lock hierarchy: fillProcessingLock -> syncLock -> placement (0.5) ->
+        // gridLock -> fundLock is NOT the order — placement is acquired BEFORE
+        // _gridLock and never while holding it. The canonical order is:
+        // startBroadcasting -> placement -> gridLock -> fundLock -> release
+        // placement -> stopBroadcasting. The region-end callback wakes work
+        // that deferred on isPlacementActive().
+        this._placementLock = new PlacementLock(() => this._handlePlacementRegionEnd());
         this._divergenceLock = new AsyncLock();
         this._syncLock = new AsyncLock();
         this._gridLock = new AsyncLock({
@@ -785,6 +804,7 @@ class OrderManager implements OrderManagerLike {
         this._fundDriftLedger = null;
         this._pendingRecovery = null;
         this._pendingFillCrawls = [];
+        this._chainSizeAppliedFills = new Map();
         this._recentFillKeysSnapshot = null;
         this._lastStaleTotalsWarnAt = {};
         this._lastFilledBuyPrice = null;
@@ -937,6 +957,7 @@ class OrderManager implements OrderManagerLike {
      * @param {string} reason - Diagnostic label (e.g. 'trigger-file resync')
      */
     beginStructuralRebuild(reason: string = 'structural rebuild') {
+        if (this._structuralRebuildDepth === 0) this._structuralRebuildStartedAt = Date.now();
         this._structuralRebuildDepth++;
         this._structuralRebuildReason = reason;
         this.logger?.log?.(`[REBUILD] Structural rebuild started (${reason}); fill-driven rebalances deferred`, 'debug');
@@ -947,6 +968,7 @@ class OrderManager implements OrderManagerLike {
         if (this._structuralRebuildDepth > 0) this._structuralRebuildDepth--;
         if (this._structuralRebuildDepth === 0) {
             this._structuralRebuildReason = null;
+            this._structuralRebuildStartedAt = 0;
             // Re-arm the deferred work that was parked while the rebuild owned
             // placement. The broadcast-region-end listener schedules the
             // post-recovery rebalance (and drains queued fills); without this
@@ -964,6 +986,28 @@ class OrderManager implements OrderManagerLike {
     /** Diagnostic label of the active structural rebuild, or null. */
     structuralRebuildReason() {
         return this._structuralRebuildReason;
+    }
+
+    /**
+     * Run a chain-mutating placement path inside the exclusive region.
+     *
+     * SINGLE SOURCE OF TRUTH: every caller that can broadcast (COW, startup
+     * reconcile Phase 2, correction drain, dust/residual cancels, pool swaps)
+     * must go through this helper. Pass an existing `lease` when nesting (a
+     * COW batch holds the region across its pre-batch drain).
+     *
+     * Lock hierarchy: acquire placement BEFORE `_gridLock`; never acquire it
+     * while holding `_gridLock` (Level 0.5 — see `manageLocks`).
+     *
+     * @returns `null` when the region could not be acquired; the caller must
+     *   defer/abort its broadcast.
+     */
+    async withPlacement<T>(
+        kind: string,
+        fn: (lease: PlacementLease) => Promise<T>,
+        options: { timeoutMs?: number; isShuttingDown?: () => boolean; lease?: PlacementLease | null } = {}
+    ): Promise<T | null> {
+        return await runWithPlacement(this, kind, fn, options);
     }
 
     /**
@@ -1023,6 +1067,63 @@ class OrderManager implements OrderManagerLike {
     }
 
     /**
+     * Record that sync pass 1 already applied a chain-size reduction (a
+     * partial fill) for this order. The following fill-history batch checks it
+     * to stay idempotent: subtracting/crediting the same fill again shrinks the
+     * order twice and over-credits free balance (2026-11-03 log: 3.6604 ->
+     * 3.3046 by pass 1, then 3.3046 -> 2.9488 by the fill batch).
+     * @param {string} orderId - Chain order id
+     * @param {number} filledInt - Base-amount delta in chain integer units
+     * @returns {void}
+     */
+    noteChainSizeAppliedFill(orderId: string, filledInt: number) {
+        const id = String(orderId || '');
+        const amount = Math.round(Number(filledInt));
+        if (!id || !Number.isFinite(amount) || amount <= 0) return;
+        if (!(this._chainSizeAppliedFills instanceof Map)) this._chainSizeAppliedFills = new Map();
+        this._chainSizeAppliedFills.set(id, { filledInt: amount, at: Date.now() });
+    }
+
+    /**
+     * Consume a pass-1 chain-size marker when it matches this fill's base
+     * amount (within one chain unit, for rounding). Returns true when the
+     * fill's fund/size impact is already reflected in the books.
+     * A stale marker (fill history never arrived) expires instead of
+     * suppressing a later unrelated fill.
+     * @param {string} orderId - Chain order id
+     * @param {number} filledInt - Base-amount delta in chain integer units
+     * @param {number} [maxAgeMs] - Marker freshness bound
+     * @returns {boolean}
+     */
+    consumeChainSizeAppliedFill(orderId: string, filledInt: number, maxAgeMs: number = 5 * 60 * 1000): boolean {
+        const id = String(orderId || '');
+        const amount = Math.round(Number(filledInt));
+        const marker = this._chainSizeAppliedFills?.get(id);
+        if (!marker) return false;
+        if (Date.now() - Number(marker.at) > maxAgeMs) {
+            this._chainSizeAppliedFills.delete(id);
+            return false;
+        }
+        if (!Number.isFinite(amount) || Math.abs(Number(marker.filledInt) - amount) > 1) return false;
+        this._chainSizeAppliedFills.delete(id);
+        return true;
+    }
+
+    /**
+     * Wake the tasks that deferred on isPlacementActive() when the region ends.
+     * The broadcast-region-end listener reschedules a deferred rebalance and
+     * drains queued fills; without this a fill deferred because a correction
+     * drain/COW held placement would only retry on the next unrelated event.
+     * Skipped while a broadcast region is still active (stopBroadcasting will
+     * fire the same listeners when it ends).
+     * @returns {void}
+     */
+    _handlePlacementRegionEnd() {
+        if (this._broadcastingFlag > 0) return;
+        this._fireBroadcastRegionEnd();
+    }
+
+    /**
      * @param {boolean} value
      * @returns {void}
      */
@@ -1047,6 +1148,17 @@ class OrderManager implements OrderManagerLike {
         if (this._broadcastingFlag > 0 && this._broadcastingStartedAt > 0) {
             const elapsed = Date.now() - this._broadcastingStartedAt;
             if (elapsed > TIMING.BROADCAST_STALE_CLEAR_MS) {
+                // A legitimately long reconcile/COW can hold placement well past
+                // the watchdog while its refcount is still valid. Never cut the
+                // region out from under a live placement holder: the refcount
+                // is the leak signal only when nobody owns the region.
+                if (this.isPlacementActive()) {
+                    this.logger?.log?.(
+                        `[BROADCAST] Stale-flag watchdog skipped: placement region still held by ${this.placementKind() || 'unknown'} for ${Math.round(this.placementHeldForMs() / 1000)}s`,
+                        'debug'
+                    );
+                    return;
+                }
                 this.logger?.log?.(`[BROADCAST] Auto-clearing stale broadcast flag after ${Math.round(TIMING.BROADCAST_STALE_CLEAR_MS / 1000)}s`, 'warn');
                 // Hard-reset to 0 (not decrement) — this is a safety valve for
                 // a hung broadcast where stopBroadcasting() was never called.
@@ -1795,9 +1907,16 @@ class OrderManager implements OrderManagerLike {
         }
 
         try {
-            wg.markStale(
-                `master mutation during ${(this._rebalanceState || '').toLowerCase()} (${context})`
-            );
+            // A mutation during a structural rebuild is ALWAYS structural, even
+            // when its own context (`sync-pass1-partial`, `sync-pass2-orphan`,
+            // `fill-place`) looks like a fill. The rebuild's fresh master has no
+            // live chain ids, so a create-only re-plan at these levels duplicates
+            // the reconcile's update-first placement. Stamping the reason here
+            // makes the classifier independent of the individual sync context.
+            const reason = this.isStructuralRebuildInProgress()
+                ? `master mutation during structural rebuild (${context})`
+                : `master mutation during ${(this._rebalanceState || '').toLowerCase()} (${context})`;
+            wg.markStale(reason);
             wg.syncFromMaster(this.orders, orderId, this._gridVersion);
         } catch (syncErr) {
             wg.markStale(`working-grid sync failure: ${getErrorMessage(syncErr)}`);
@@ -2761,9 +2880,22 @@ class OrderManager implements OrderManagerLike {
             // bootstrap consumer. This check must run before
             // deferIfBroadcasting because the fill path passes that flag.
             if (this.isStructuralRebuildInProgress()) {
+                const rebuildAgeMs = this._structuralRebuildStartedAt > 0
+                    ? Date.now() - this._structuralRebuildStartedAt
+                    : 0;
+                const deferBoundMs = Number(TIMING.STRUCTURAL_REBUILD_DEFER_MAX_MS) > 0
+                    ? Number(TIMING.STRUCTURAL_REBUILD_DEFER_MAX_MS)
+                    : 3 * 60 * 1000;
+                const overBound = rebuildAgeMs > deferBoundMs;
+                const lastWarnAt = Number(this._structuralRebuildDeferWarnAt) || 0;
+                const shouldWarn = overBound && Date.now() - lastWarnAt > 60000;
+                if (shouldWarn) {
+                    this._structuralRebuildDeferWarnAt = Date.now();
+                }
                 this.logger.log(
-                    `[SAFE-REBALANCE] Deferred: structural rebuild in progress (${this.structuralRebuildReason() || 'rebuild'}); startup reconcile owns placement`,
-                    'info'
+                    `[SAFE-REBALANCE] Deferred: structural rebuild in progress (${this.structuralRebuildReason() || 'rebuild'}, ` +
+                    `${Math.round(rebuildAgeMs / 1000)}s); startup reconcile owns placement`,
+                    shouldWarn ? 'warn' : (overBound ? 'debug' : 'info')
                 );
                 this._deferredRebalanceAt = Date.now();
                 return { ...buildAbortedResult('structural-rebuild-deferred'), deferred: true };

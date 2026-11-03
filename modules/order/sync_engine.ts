@@ -242,6 +242,12 @@ interface FillTransitionParams {
      * (GRID-PRICE-INVARIANT).
      */
     fillPrice?: number | null;
+    /**
+     * True when sync pass 1 already applied this fill's chain-size delta. The
+     * transition must then use the observed chain size directly instead of
+     * subtracting the fill again (double shrink + double credit incident).
+     */
+    alreadyAppliedChainSize?: boolean;
 }
 
 interface SyncChainData {
@@ -1369,6 +1375,12 @@ class SyncEngine {
                                 `[SYNC] Partial-size update for ${gridOrder.id} rejected — slot keeps booked size ${gridOrder.size}`,
                                 'warn'
                             );
+                        } else if (chainSizeInt < currentSizeInt && gridOrder.orderId) {
+                            // Mark the fill's size/fund delta as already absorbed:
+                            // the fill-history batch that follows must not shrink
+                            // (or credit) it a second time.
+                            (mgr as unknown as { noteChainSizeAppliedFill?: (id: string, filledInt: number) => void })
+                                .noteChainSizeAppliedFill?.(String(gridOrder.orderId), currentSizeInt - chainSizeInt);
                         }
                     } else {
                         const spreadOrder = convertToSpreadPlaceholder(gridOrder);
@@ -1741,7 +1753,14 @@ class SyncEngine {
         const currentSizeInt = Number.isFinite(effectiveRawForSale)
             ? Math.max(0, Math.round(effectiveRawForSale))
             : currentSizeIntFromGrid;
-        const newSizeInt = Math.max(0, currentSizeInt - filledAmountInt);
+        const newSizeInt = params.alreadyAppliedChainSize
+            // Pass 1 already resized the slot from this chain snapshot. The
+            // snapshot is post-fill, so the observed for_sale IS the remaining
+            // size; subtracting filledAmount again would remove the fill twice.
+            ? (Number.isFinite(effectiveRawForSale)
+                ? Math.max(0, Math.min(currentSizeInt, Math.round(effectiveRawForSale)))
+                : currentSizeIntFromGrid)
+            : Math.max(0, currentSizeInt - filledAmountInt);
         const newSize = blockchainToFloat(newSizeInt, precision);
 
         if (Number.isFinite(effectiveRawForSale) && currentSizeInt !== currentSizeIntFromGrid) {
@@ -1865,7 +1884,11 @@ class SyncEngine {
                 const baselineForSale = (chainRefetched && Number.isFinite(effectiveRawForSale))
                     ? effectiveRawForSale
                     : toFiniteNumber(updatedOrder.rawOnChain.for_sale);
-                const nextForSaleInt = Math.max(0, Math.round(baselineForSale) - filledAmountInt);
+                // When pass 1 already applied this fill, the snapshot's for_sale
+                // is post-fill; do NOT subtract the fill from it a second time.
+                const nextForSaleInt = params.alreadyAppliedChainSize
+                    ? newSizeInt
+                    : Math.max(0, Math.round(baselineForSale) - filledAmountInt);
                 updatedOrder.rawOnChain = {
                     ...updatedOrder.rawOnChain,
                     for_sale: String(nextForSaleInt),
@@ -2024,7 +2047,8 @@ class SyncEngine {
                         blockNum,
                         historyId,
                         isMaker,
-                        fillPrice: ctx.fillPrice
+                        fillPrice: ctx.fillPrice,
+                        alreadyAppliedChainSize: Boolean((fillOp as unknown as { __chainSizeAlreadyApplied?: boolean }).__chainSizeAlreadyApplied)
                     });
 
                     const filledOrders: ManagedOrder[] = [];
@@ -2339,7 +2363,8 @@ class SyncEngine {
                             blockNum: lastCtx.entry.blockNum,
                             historyId: lastCtx.entry.historyId,
                             isMaker: lastCtx.entry.isMaker,
-                            fillPrice: lastCtx.fillPrice
+                            fillPrice: lastCtx.fillPrice,
+                            alreadyAppliedChainSize: Boolean((lastCtx.entry.fillOp as unknown as { __chainSizeAlreadyApplied?: boolean }).__chainSizeAlreadyApplied)
                         });
 
                         if (result.isFull) {

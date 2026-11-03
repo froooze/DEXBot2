@@ -2476,6 +2476,56 @@ function scheduleDeferredGridResync(ctx: MaintenanceCtx, options: JsonObj = {}) 
 }
 
 /**
+ * Leak watchdog for the bot-level pipeline counters. A missed decrement parks
+ * the fill queue indefinitely; there is no stale-clear equivalent for
+ * _batchInFlight / _recoverySyncInFlight. Surface the age every tick, and only
+ * force-clear when nothing actually holds the placement region (a live batch
+ * owns it, so resetting there would allow a second concurrent broadcast).
+ * @param {import('./dexbot_class.js').DEXBot} bot
+ */
+function checkPipelineInFlightWatchdogs(bot: BotLike) {
+    const now = Date.now();
+    const placementHeld = typeof bot.manager?.isPlacementActive === 'function'
+        && bot.manager.isPlacementActive() === true;
+    const checks: Array<{ countKey: string; startedKey: string; label: string; staleMs: number }> = [
+        {
+            countKey: '_batchInFlight',
+            startedKey: '_batchInFlightStartedAt',
+            label: 'batch',
+            staleMs: Number(TIMING.BATCH_INFLIGHT_STALE_MS) > 0 ? Number(TIMING.BATCH_INFLIGHT_STALE_MS) : 10 * 60 * 1000,
+        },
+        {
+            countKey: '_recoverySyncInFlight',
+            startedKey: '_recoverySyncInFlightStartedAt',
+            label: 'recovery sync',
+            staleMs: Number(TIMING.RECOVERY_INFLIGHT_STALE_MS) > 0 ? Number(TIMING.RECOVERY_INFLIGHT_STALE_MS) : 10 * 60 * 1000,
+        },
+    ];
+    const botAny = bot as unknown as Record<string, unknown>;
+    for (const check of checks) {
+        const count = Number(botAny[check.countKey]) || 0;
+        if (count <= 0) continue;
+        const startedAt = Number(botAny[check.startedKey]) || 0;
+        if (!startedAt) continue;
+        const ageMs = now - startedAt;
+        if (ageMs < check.staleMs) continue;
+        if (placementHeld) {
+            bot._warn(
+                `[WATCHDOG] ${check.label} counter (${count}) has been in flight for ${Math.round(ageMs / 1000)}s ` +
+                `but the placement region is still held by ${bot.manager.placementKind?.() || 'unknown'}; not force-clearing`
+            );
+            continue;
+        }
+        bot._warn(
+            `[WATCHDOG] Force-clearing leaked ${check.label} counter (${count}) after ${Math.round(ageMs / 1000)}s ` +
+            `with no placement holder; the pipeline must not stay parked`
+        );
+        botAny[check.countKey] = 0;
+        botAny[check.startedKey] = 0;
+    }
+}
+
+/**
  * Execute the core maintenance logic: recalculate funds, check pipeline,
  * refresh dynamic weights, check grid health, cancel dust orders,
  * apply divergence corrections, and fix spread conditions.
@@ -2491,6 +2541,7 @@ async function executeMaintenanceLogic(bot: BotLike, context: string) {
     // isBroadcastingActive() (e.g. recalculateFunds, BTS balance check)
     // sees the freshest state rather than a hung flag.
     bot.manager._clearStaleBroadcastFlag();
+    checkPipelineInFlightWatchdogs(bot);
 
     await bot.manager.recalculateFunds();
     await checkBtsBalanceAndAcquire(bot);
@@ -2611,52 +2662,37 @@ async function executeMaintenanceLogic(bot: BotLike, context: string) {
     const pendingCorrections = bot.manager.ordersNeedingPriceCorrection?.length || 0;
     if (pendingCorrections > 0) {
         // The drain cancels/updates chain orders directly, so it must own the
-        // exclusive placement region. Without it a correction drain can run
-        // while a COW batch is broadcasting and cancel an order that batch
-        // just placed (or update one it is about to cancel). This is a
-        // background repair: take the region only if it is free and defer the
-        // drain to the next maintenance tick otherwise (never block maintenance
-        // behind a long broadcast).
-        let correctionLease: { release(): void } | null = null;
-        let placementAvailable = true;
-        if (typeof bot.manager.tryAcquirePlacement === 'function') {
-            correctionLease = bot.manager.tryAcquirePlacement('correction-drain');
-            placementAvailable = correctionLease !== null;
-        } else if (typeof bot.manager.acquirePlacement === 'function') {
-            correctionLease = await bot.manager.acquirePlacement('correction-drain', {
-                timeoutMs: 5000,
-                isShuttingDown: () => bot._shuttingDown === true,
-            });
-            placementAvailable = correctionLease !== null;
-        }
-        if (!placementAvailable) {
-            bot._log('[MAINT] Deferring price-correction drain: exclusive placement region busy or shutting down', 'info');
-        } else {
-            try {
-                const correctionResult = await correctAllPriceMismatches(
-                    bot.manager, bot.account, bot.privateKey, chainOrders
+        // exclusive placement region. `correctAllPriceMismatches` acquires it
+        // internally (single entry point); this call uses a short bound because
+        // this is a background repair and must not block the maintenance tick
+        // behind a long broadcast. A busy region leaves the queue for the next
+        // tick (or the region-end wake-up).
+        try {
+            const correctionResult = await correctAllPriceMismatches(
+                bot.manager, bot.account, bot.privateKey, chainOrders, { timeoutMs: 250 }
+            );
+            if (correctionResult?.deferred === true) {
+                bot._log('[MAINT] Deferring price-correction drain: exclusive placement region busy or shutting down', 'info');
+            } else if (correctionResult.failed > 0) {
+                const failedDetails = (correctionResult.results || [])
+                    .filter((r: { result?: { success?: unknown } }) => !(r.result && r.result.success))
+                    .slice(0, 3)
+                    .map((r: { chainOrderId?: unknown; result?: { error?: unknown } }) => `${r.chainOrderId ?? '?'}: ${r.result?.error ?? 'unknown'}`)
+                    .join(' | ');
+                bot._warn(
+                    `[MAINT] ${correctionResult.failed}/${pendingCorrections} price correction(s) failed` +
+                    (failedDetails ? ` — ${failedDetails}` : '') +
+                    (correctionResult.staleDropped > 0 ? ` (${correctionResult.staleDropped} stale dropped)` : '')
                 );
-                if (correctionResult.failed > 0) {
-                    const failedDetails = (correctionResult.results || [])
-                        .filter((r: { result?: { success?: unknown } }) => !(r.result && r.result.success))
-                        .slice(0, 3)
-                        .map((r: { chainOrderId?: unknown; result?: { error?: unknown } }) => `${r.chainOrderId ?? '?'}: ${r.result?.error ?? 'unknown'}`)
-                        .join(' | ');
-                    bot._warn(
-                        `[MAINT] ${correctionResult.failed}/${pendingCorrections} price correction(s) failed` +
-                        (failedDetails ? ` — ${failedDetails}` : '') +
-                        (correctionResult.staleDropped > 0 ? ` (${correctionResult.staleDropped} stale dropped)` : '')
-                    );
-                } else if (correctionResult.staleDropped > 0) {
-                    bot._log(
-                        `[MAINT] ${correctionResult.corrected}/${pendingCorrections} price correction(s) resolved, ` +
-                        `${correctionResult.staleDropped} stale dropped (resync moved the slot; re-queued by next sync if still off-target)`,
-                        'info'
-                    );
-                }
-            } finally {
-                correctionLease?.release();
+            } else if (correctionResult.staleDropped > 0) {
+                bot._log(
+                    `[MAINT] ${correctionResult.corrected}/${pendingCorrections} price correction(s) resolved, ` +
+                    `${correctionResult.staleDropped} stale dropped (resync moved the slot; re-queued by next sync if still off-target)`,
+                    'info'
+                );
             }
+        } catch (correctionErr) {
+            bot._warn(`[MAINT] Price-correction drain failed: ${getErrorMessage(correctionErr)}`);
         }
     }
 
@@ -3047,6 +3083,18 @@ async function cancelOrderDeferredOnUncertain(bot: BotLike, order: { orderId?: s
     }
 }
 
+async function runWithPlacement<T>(
+    bot: BotLike,
+    kind: string,
+    fn: (lease: { kind: string; release(): void }) => Promise<T>,
+    options: { timeoutMs?: number; isShuttingDown?: () => boolean } = {}
+): Promise<T | null> {
+    if (typeof bot.manager.withPlacement === 'function') {
+        return await bot.manager.withPlacement(kind, fn, options);
+    }
+    return await fn({ kind, release: () => { /* no lock (mock/no manager) */ } });
+}
+
 /**
  * Cancel dust orders immediately — no delay, no timer, no maps.
  * Each dust order is cancelled on chain and its slot is rotated through
@@ -3063,6 +3111,11 @@ async function cancelDustOrders(bot: BotLike, { buy: buyDust = [], sell: sellDus
     if (allDust.length === 0) return { cancelledCount: 0, batchResult: null };
 
     const syntheticFills: unknown[] = [];
+    // Hold the exclusive placement region across the whole cancel pass: each
+    // cancel mutates the chain and the following synchronizeWithChain mutates
+    // the master. A COW batch / reconcile must not interleave between them.
+    // The rotation batch below runs after release (it acquires its own lease).
+    const placementOk = await runWithPlacement(bot, 'dust-cancel', async () => {
     for (const order of allDust) {
         if (!order.orderId) continue;
         try {
@@ -3104,6 +3157,12 @@ async function cancelDustOrders(bot: BotLike, { buy: buyDust = [], sell: sellDus
                 bot._warn(`[DUST] Failed to cancel ${order.id} (${order.orderId}): ${errMsg}`);
             }
         }
+    }
+    return true;
+    }, { timeoutMs: 10000, isShuttingDown: () => bot._shuttingDown === true });
+    if (placementOk !== true) {
+        bot._log('[DUST] Deferring dust cancels: exclusive placement region busy or shutting down', 'info');
+        return { cancelledCount: 0, batchResult: null };
     }
 
     if (syntheticFills.length === 0) return { cancelledCount: 0, batchResult: null };
@@ -3292,17 +3351,20 @@ async function acquireBts(bot: BotLike, deficit: number) {
     const minReceiveInt = floatToBlockchainInt(minReceive, BTS_PRECISION);
     const op = chainOrders.buildLiquidityPoolExchangeOp(bot.accountId, best.poolId as string, sellInt, best.asset.id as string, minReceiveInt, coreAssetId);
 
-    try {
-        if (bot.privateKey) {
+    const swapOk = await runWithPlacement(bot, 'bts-acquisition-swap', async () => {
+        try {
+            if (!bot.privateKey) {
+                bot._log('[BTS-ACQ] CRITICAL: No signing method available', 'error');
+                return false;
+            }
             await chainOrders.executeBatch(bot.account, bot.privateKey, [op]);
-        } else {
-            bot._log('[BTS-ACQ] CRITICAL: No signing method available', 'error');
-            return;
+            return true;
+        } catch (err) {
+            bot._log(`[BTS-ACQ] Swap broadcast failed: ${getErrorMessage(err)}`, 'error');
+            return false;
         }
-    } catch (err) {
-        bot._log(`[BTS-ACQ] Swap broadcast failed: ${getErrorMessage(err)}`, 'error');
-        return;
-    }
+    }, { timeoutMs: 10000, isShuttingDown: () => bot._shuttingDown === true });
+    if (swapOk !== true) return;
 
     const orderType = (best.asset.id === bot.assets?.assetA?.id) ? 'sell' : 'buy';
     if (bot.manager.accountant) {

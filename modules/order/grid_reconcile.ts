@@ -20,6 +20,7 @@ import {
 import * as Format from './format.js';
 import { getErrorMessage } from '../utils/errors.js';
 import type { OrderManagerLike, ChainOrder, ChainOrdersLike, ManagedOrder, ParsedChainEntry, PendingPriceCorrection, GridConfig, LoggerLike, StartupCancelPlan, StartupUpdatePlan, StartupCreatePlan } from '../types.js';
+import type { PlacementLease } from '../order/placement_lock.js';
 
 function _startupChainSnapshotSignature(orders: ChainOrder[], manager: OrderManagerLike): Map<string, string> {
     const signature = new Map<string, string>();
@@ -223,6 +224,7 @@ export async function reconcileGridOrders({
     privateKey,
     chainOrders,
     chainOpenOrders,
+    options = {},
 }: {
     manager: OrderManagerLike;
     config: GridConfig;
@@ -230,6 +232,12 @@ export async function reconcileGridOrders({
     privateKey: string;
     chainOrders: ChainOrdersLike;
     chainOpenOrders: ChainOrder[];
+    options?: {
+        /** Rebuild callers own the rebuild and must be allowed to reconcile. */
+        allowDuringRebuild?: boolean;
+        /** Reuse an already-held placement lease instead of acquiring one. */
+        placementLease?: PlacementLease | null;
+    };
 }) {
     // Parameter validation
     if (!manager || typeof manager.synchronizeWithChain !== 'function') {
@@ -256,6 +264,20 @@ export async function reconcileGridOrders({
     const logger = manager && manager.logger;
     const dryRun = !!(config && config.dryRun);
 
+    // A maintenance/targeted reconcile must NOT broadcast while a structural
+    // rebuild owns placement: Phase 1 mutates the master and Phase 2 places
+    // orders, so running it inside the rebuild re-creates the duplicate class
+    // the rebuild's own reconcile is designed to avoid. Rebuild callers pass
+    // allowDuringRebuild (they ARE the rebuild and run update-first).
+    const rebuildInProgress = manager.isStructuralRebuildInProgress?.() === true;
+    if (rebuildInProgress && options.allowDuringRebuild !== true) {
+        logger?.log?.(
+            'Reconcile deferred: structural grid rebuild in progress; the rebuild owns placement and update-first repair',
+            'info'
+        );
+        return null;
+    }
+
     const parsedChain: ParsedChainEntry[] = (chainOpenOrders || [])
         .map((co) => ({ chain: co, parsed: parseChainOrder(co, manager.assets) }))
         .filter((x): x is ParsedChainEntry => x.parsed !== null);
@@ -272,7 +294,38 @@ export async function reconcileGridOrders({
     // PHASE 1: In-memory reconciliation under lock — pure planning, no blockchain I/O.
     // All cancellations are collected into plannedCancels and executed in Phase 2.
     // This keeps the lock hierarchy clean (no _gridLock held across sync calls).
-    const phase1Result = await manager._gridLock.acquire(async () => {
+    // Acquire the exclusive placement region BEFORE Phase 1: Phase 1 is not
+    // read-only (phantom cleanup, revive, adoption) and its decisions must not
+    // interleave with a COW/drain that mutates the same chain levels. Held
+    // across Phase 1 + Phase 2 and released after stopBroadcasting in the
+    // finally below (canonical order: start region -> placement -> work ->
+    // stop region -> release placement).
+    let placementLease: PlacementLease | null = options.placementLease ?? null;
+    const ownsPlacementLease = !placementLease;
+    if (!placementLease && typeof manager.acquirePlacement === 'function') {
+        placementLease = await manager.acquirePlacement('startup-reconcile', { timeoutMs: 120000 });
+        if (!placementLease) {
+            logger?.log?.(
+                'Startup reconcile: exclusive placement region unavailable (timeout/shutdown); deferring to the next sync cycle.',
+                'warn'
+            );
+            return null;
+        }
+    }
+    const regionStarted = typeof manager.startBroadcasting === 'function';
+    const releaseRegion = () => {
+        if (regionStarted) manager.stopBroadcasting?.();
+        if (ownsPlacementLease) placementLease?.release();
+        placementLease = null;
+    };
+
+    let phase1Result;
+    try {
+        // Start the broadcast region INSIDE the try: if it throws, the catch
+        // below releases the placement lease (finding: acquire outside try
+        // leaked the lease when startBroadcasting failed).
+        if (regionStarted) manager.startBroadcasting?.();
+        phase1Result = await manager._gridLock.acquire(async () => {
         if (typeof manager._applyOrderUpdate !== 'function') {
             throw new Error('manager._applyOrderUpdate is required for startup reconciliation');
         }
@@ -468,37 +521,23 @@ export async function reconcileGridOrders({
 
         return { plannedCreates, plannedUpdates, plannedCancels, chainSellCount: sellResult.chainCount, chainBuyCount: buyResult.chainCount };
     });
+    } catch (phase1Err) {
+        releaseRegion();
+        throw phase1Err;
+    }
 
     // PHASE 2: Blockchain operations outside lock (batch updates, creates, cancels, read)
     // These are the heavy operations that would block all other grid operations
     // if held under _gridLock. All lock acquisitions here follow the canonical
     // hierarchy (fillProcessingLock → syncLock → gridLock → fundLock).
-    // P0 placement mutex: the whole of Phase 2 is broadcast I/O plus master-grid
-    // mutations, and it is NOT under _gridLock. Without the broadcasting gate a
-    // fill-driven COW rebalance can plan and broadcast the SAME slots in parallel
-    // with this loop: the commit is then refused ("master mutation during
-    // broadcasting"), both order generations land on chain, and the loser becomes
-    // a duplicate-price orphan backlog that blocks placements until drained.
-    // startBroadcasting() defers that rebalance —
-    // manager.performSafeRebalance waits on the flag and the fill consumer gates
-    // on it. The flag is refcounted and has a 120s stale-clear watchdog.
     //
-    // The refcount alone is ADVISORY: a COW batch that already planned (or a
-    // correction drain) can still broadcast concurrently. The exclusive
-    // placement region is the authoritative mutual exclusion — hold it across
-    // the whole of Phase 2 so no other placement path can interleave a second
-    // order generation at these price levels.
-    const placementLease = typeof manager.acquirePlacement === 'function'
-        ? await manager.acquirePlacement('startup-reconcile', { timeoutMs: 120000 })
-        : null;
-    if (typeof manager.acquirePlacement === 'function' && !placementLease) {
-        logger?.log?.(
-            'Startup reconcile: exclusive placement region unavailable (timeout/shutdown); deferring Phase 2 to the next sync cycle.',
-            'warn'
-        );
-        return null;
-    }
-    if (typeof manager.startBroadcasting === 'function') manager.startBroadcasting();
+    // Placement was acquired before Phase 1, and the broadcast region was
+    // started there too, so a fill-driven COW rebalance cannot plan/broadcast
+    // the SAME slots in parallel with this loop. The refcount alone is
+    // ADVISORY (it only defers fills); the exclusive placement lease is the
+    // authoritative mutual exclusion and covers Phase 1's master mutations as
+    // well as Phase 2's I/O.
+
     try {
         const { plannedCreates, plannedUpdates, plannedCancels, chainSellCount, chainBuyCount } = phase1Result;
 
@@ -859,8 +898,7 @@ export async function reconcileGridOrders({
             'info'
         );
     } finally {
-        placementLease?.release();
-        if (typeof manager.stopBroadcasting === 'function') manager.stopBroadcasting();
+        releaseRegion();
     }
 
     return null;

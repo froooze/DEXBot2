@@ -1999,7 +1999,7 @@ export async function recalculateGrid(manager: OrderManagerLike, opts: { readOpe
                 // failover standard via withBlockchainRetry, and the 10-min
                 // totalTimeoutMs safety net below bounds the whole resync.
                 try {
-                    await reconcileGridOrders({ manager, config: manager.config, account, privateKey, chainOrders, chainOpenOrders });
+                    await reconcileGridOrders({ manager, config: manager.config, account, privateKey, chainOrders, chainOpenOrders, options: { allowDuringRebuild: true } });
                 } catch (err) {
                     manager.logger?.log?.(`Error during startup order reconciliation: ${getErrorMessage(err)}`, 'error');
                     throw new Error(`Grid recalculation failed during order reconciliation: ${getErrorMessage(err)}`);

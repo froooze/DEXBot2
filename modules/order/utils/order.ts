@@ -123,6 +123,7 @@ import { sleep } from './system.js';
 import { getErrorMessage, getErrorCode, getErrorName } from '../../utils/errors.js';
 import { hasGenesisLadder } from '../genesis_policy.js';
 import { parseSlotIndex } from './slot.js';
+import type { PlacementLease } from '../placement_lock.js';
 import type { OrderManagerLike, PendingPriceCorrection, ChainOrder, ParsedChainOrder, AssetPair, AssetInfo, OrderType, ManagedOrder, UnmatchedChainOrder, CowAction, ProjectedFunds } from '../../types.js';
 import type { GridGenesis } from './math.js';
 const { isValidNumber, toFiniteNumber } = Format;
@@ -187,7 +188,7 @@ function isOrderGoneErrorMessage(message: string | null | undefined, orderId?: s
  */
 function isStructuralRebuildStaleReason(reason: unknown) {
     if (typeof reason !== 'string' || reason.length === 0) return false;
-    return /\bgrid-init\b|\brebuild\b|\bresync\b|\bregenerated grid\b/i.test(reason);
+    return /\bgrid-init\b|\brebuild\b|\bresync\b|\bregenerated grid\b|\bstructural rebuild\b/i.test(reason);
 }
 
 // ---------------------------------------------------------------------------
@@ -1367,14 +1368,44 @@ function resolveCorrectionWarnRateLimitMs(manager: OrderManagerLike): number {
  * Correct all pending price mismatches atomically.
  * Cancel-type corrections (duplicate orphans, surplus) are batched into
  * chunked multi-op transactions; price updates run sequentially.
- * 
+ *
+ * Runs inside the exclusive placement region: every correction broadcasts a
+ * chain mutation, so it must never interleave with a COW batch, startup
+ * reconcile Phase 2 or a dust/residual cancel. A caller already holding the
+ * region (COW pre-batch drain) passes its lease so the nested call does not
+ * deadlock.
+ *
  * @param {Object} manager - OrderManager instance
  * @param {string} accountName - Account name for blockchain transactions
  * @param {string} privateKey - Private key for signing
  * @param {Object} accountOrders - AccountOrders accessor for blockchain ops
+ * @param {Object} [options] - placementLease (reuse) + timeoutMs (bounded wait)
  * @returns {Promise<Object>} Summary {corrected, failed, results}
  */
-async function correctAllPriceMismatches(manager: OrderManagerLike, accountName: string, privateKey: string, accountOrders: CorrectionAccountOrdersLike) {
+async function correctAllPriceMismatches(
+    manager: OrderManagerLike,
+    accountName: string,
+    privateKey: string,
+    accountOrders: CorrectionAccountOrdersLike,
+    options: { placementLease?: PlacementLease | null; timeoutMs?: number } = {}
+) {
+    if (!manager || !manager._gridLock) return { corrected: 0, failed: 0, results: [] };
+    const run = () => _correctAllPriceMismatchesLocked(manager, accountName, privateKey, accountOrders);
+    if (options.placementLease) return await run();
+    if (typeof manager.acquirePlacement !== 'function') return await run();
+    const timeoutMs = Number.isFinite(Number(options.timeoutMs)) ? Number(options.timeoutMs) : 5000;
+    const lease = await manager.acquirePlacement('correction-drain', { timeoutMs: Math.max(1, timeoutMs) });
+    if (!lease) {
+        return { corrected: 0, failed: 0, results: [], staleDropped: 0, deferred: true, reason: 'placement-active' };
+    }
+    try {
+        return await run();
+    } finally {
+        lease.release();
+    }
+}
+
+async function _correctAllPriceMismatchesLocked(manager: OrderManagerLike, accountName: string, privateKey: string, accountOrders: CorrectionAccountOrdersLike) {
     if (!manager || !manager._gridLock) return { corrected: 0, failed: 0, results: [] };
 
     // 6b: backlog alarm (rate-limited). Emitted even when the drain defers

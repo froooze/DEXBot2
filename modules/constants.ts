@@ -326,6 +326,32 @@ let TIMING = {
     // terms of it, so they cannot be tuned out of agreement.
     BROADCAST_STALE_CLEAR_MS: 120000,  // 120 seconds
 
+    // PENDING_BROADCAST_TTL_MS: a CREATE recorded as pending (uncertain
+    // broadcast) protects its slot/price from a duplicate CREATE. The entry is
+    // normally cleared when the batch resolves; if that resolution is lost
+    // (crash, hung poll) a stale entry must not block creates forever. After
+    // this TTL it is dropped and the next caught-up read re-verifies the level
+    // against the chain instead.
+    PENDING_BROADCAST_TTL_MS: 30 * 60 * 1000,  // 30 minutes
+
+    // BATCH_INFLIGHT_STALE_MS / RECOVERY_INFLIGHT_STALE_MS: leak watchdogs for
+    // the bot-level pipeline counters. A parked fill queue for minutes with no
+    // progress (2026-11-03: _batchInFlight stuck ~2.5 min, queue depth 10) must
+    // be surfaced and, when nothing actually holds placement, cleared so the
+    // pipeline can recover. Generous: a legitimate create-group reconcile can
+    // take minutes. Never force-clear while placement is still held (a live
+    // batch owns it).
+    BATCH_INFLIGHT_STALE_MS: 10 * 60 * 1000,
+    RECOVERY_INFLIGHT_STALE_MS: 10 * 60 * 1000,
+
+    // STRUCTURAL_REBUILD_DEFER_MAX_MS: fill-driven rebalances defer while a
+    // structural rebuild runs. A hung rebuild (e.g. a 10-minute reconcile) must
+    // not defer them silently for its whole duration: after this bound, log at
+    // warn every tick so the stall is visible to operators. The deferral
+    // itself is kept (correctness beats availability: planning mid-rebuild is
+    // exactly the duplicate class), but it is no longer silent.
+    STRUCTURAL_REBUILD_DEFER_MAX_MS: 3 * 60 * 1000,
+
     // BROADCAST_DEFER_SAFETY_MARGIN_MS: headroom added to
     // BROADCAST_STALE_CLEAR_MS when deriving FILL_BROADCAST_DEFER_MAX_MS, so a
     // region that is still considered live by the stale-clear watchdog cannot

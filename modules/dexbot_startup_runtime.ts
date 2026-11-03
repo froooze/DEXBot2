@@ -666,6 +666,9 @@ async function finishStartupSequence(bot: BotLike, startupState: Awaited<ReturnT
                                 privateKey: bot.privateKey,
                                 chainOrders,
                                 chainOpenOrders,
+                                // This path IS the rebuild: it owns update-first
+                                // placement and must not defer on its own flag.
+                                options: { allowDuringRebuild: true },
                             });
 
                             await bot._executeBatchIfNeeded(rebalanceResult, 'startup reconcile (regenerated grid)');

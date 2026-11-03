@@ -218,28 +218,46 @@ function wireProcessedFillTracking(bot: BotLike) {
  */
 async function cancelResidualOrders(bot: BotLike, residualCancels: Array<{ orderId?: string; id?: string }>) {
     if (!residualCancels || residualCancels.length === 0) return;
-    for (const rc of residualCancels) {
-        if (!rc || !rc.orderId) continue;
-        try {
-            await chainOrders.cancelOrder(bot.account, bot.privateKey, rc.orderId);
-            bot.manager.logger.log(
-                `[RESIDUAL] Cancelled residual order ${rc.orderId}${rc.id ? ` (slot ${rc.id})` : ''} left on chain after sub-dust fill`,
-                'warn'
-            );
-        } catch (err) {
-            const errMsg = getErrorMessage(err) || '';
-            if (isOrderDoesNotExistError(errMsg, rc.orderId)) {
+    const run = async () => {
+        for (const rc of residualCancels) {
+            if (!rc || !rc.orderId) continue;
+            try {
+                await chainOrders.cancelOrder(bot.account, bot.privateKey, rc.orderId);
                 bot.manager.logger.log(
-                    `[RESIDUAL] Residual order ${rc.orderId} already gone from chain; nothing to cancel`,
-                    'debug'
-                );
-            } else {
-                bot.manager.logger.log(
-                    `[RESIDUAL] Failed to cancel residual order ${rc.orderId}: ${errMsg}`,
+                    `[RESIDUAL] Cancelled residual order ${rc.orderId}${rc.id ? ` (slot ${rc.id})` : ''} left on chain after sub-dust fill`,
                     'warn'
                 );
+            } catch (err) {
+                const errMsg = getErrorMessage(err) || '';
+                if (isOrderDoesNotExistError(errMsg, rc.orderId)) {
+                    bot.manager.logger.log(
+                        `[RESIDUAL] Residual order ${rc.orderId} already gone from chain; nothing to cancel`,
+                        'debug'
+                    );
+                } else {
+                    bot.manager.logger.log(
+                        `[RESIDUAL] Failed to cancel residual order ${rc.orderId}: ${errMsg}`,
+                        'warn'
+                    );
+                }
             }
         }
+        return true;
+    };
+    // Residual cancels are chain mutations: serialize them with every other
+    // placement path. On a busy/shutting-down region leave the residuals for
+    // the next sync/reconcile rather than racing a live batch.
+    const placementOk = typeof bot.manager.withPlacement === 'function'
+        ? await bot.manager.withPlacement('fill-residual-cancel', run, {
+            timeoutMs: 10000,
+            isShuttingDown: () => bot._shuttingDown === true,
+        })
+        : await run();
+    if (placementOk !== true) {
+        bot.manager.logger.log(
+            `[RESIDUAL] Deferring ${residualCancels.length} residual cancel(s): exclusive placement region busy or shutting down`,
+            'warn'
+        );
     }
 }
 
@@ -577,8 +595,24 @@ export function consumeDeferredDrainMarker(bot: BotLike): boolean {
 function shouldDeferFillForBroadcast(bot: BotLike, nowMs?: number): { defer: boolean; stuckFallback: boolean } {
     const now = Number.isFinite(Number(nowMs)) ? Number(nowMs) : Date.now();
     let active = false;
+    let regionStartedAt = 0;
     try {
         active = bot?.manager?.isBroadcastingActive?.() === true;
+        if (active) {
+            regionStartedAt = Number(bot?.manager?._broadcastingStartedAt) || 0;
+        } else if (bot?.manager?.isPlacementActive?.() === true) {
+            // Placement is the authoritative mutex; the broadcast refcount is
+            // only advisory. A correction drain / reconcile Phase 2 / dust
+            // cancel holds placement WITHOUT startBroadcasting(), so gating on
+            // the refcount alone lets fills book accounting while that path
+            // broadcasts. Treat the placement hold as a live region.
+            active = true;
+            const heldMs = Number(bot?.manager?.placementHeldForMs?.()) || 0;
+            // Round to a second: placementHeldForMs() grows between calls, and
+            // raw millisecond jitter would look like an advancing region and
+            // re-arm the deferral bound forever (defeating its purpose).
+            regionStartedAt = heldMs > 0 ? Math.round((now - heldMs) / 1000) * 1000 : now;
+        }
     } catch { active = false; }
     if (!active) {
         if (bot) {
@@ -590,8 +624,8 @@ function shouldDeferFillForBroadcast(bot: BotLike, nowMs?: number): { defer: boo
     // Region-change detection: startBroadcasting() refreshes
     // _broadcastingStartedAt on every increment, so an advancing timestamp
     // proves the region is live and re-arms the bound. A frozen flag does
-    // not advance it and still falls through at the bound.
-    const regionStartedAt = Number(bot?.manager?._broadcastingStartedAt) || 0;
+    // not advance it and still falls through at the bound. A placement hold
+    // derives its start from placementHeldForMs() for the same reason.
     const lastRegionAt = Number(bot?._fillBroadcastDeferRegionAt) || 0;
     if (regionStartedAt && regionStartedAt !== lastRegionAt) {
         bot._fillBroadcastDeferRegionAt = regionStartedAt;

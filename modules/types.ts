@@ -1132,6 +1132,11 @@ export interface OrderManagerLike {
   acquirePlacement?: (kind: string, options?: { timeoutMs?: number; isShuttingDown?: () => boolean }) => Promise<{ kind: string; release(): void } | null>;
   tryAcquirePlacement?: (kind: string) => { kind: string; release(): void } | null;
   isPlacementActive?: () => boolean;
+  withPlacement?<T>(
+    kind: string,
+    fn: (lease: { kind: string; release(): void }) => Promise<T>,
+    options?: { timeoutMs?: number; isShuttingDown?: () => boolean; lease?: { kind: string; release(): void } | null }
+  ): Promise<T | null>;
   placementKind?: () => string | null;
   placementHeldForMs?: () => number;
   isStructuralRebuildStale?: (reason: unknown) => boolean;

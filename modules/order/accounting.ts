@@ -1831,6 +1831,29 @@ class Accountant {
 
          if (assetAPrecision === undefined || assetBPrecision === undefined) return false;
 
+         // Idempotency with sync pass 1: an open-orders pass may already have
+         // resized the slot from the same post-fill chain snapshot and
+         // recalculated free funds from it. Crediting/shrinking again here is
+         // the double-apply regression (3.6604 -> 3.3046 -> 2.9488 and an
+         // over-credited free balance). Consume the marker only when the fill's
+         // base amount matches the pass-1 delta; otherwise account normally.
+         // A limit-order fill always PAYS the order's base asset (assetA for a
+         // SELL, assetB for a BUY); the order's `size` and pass-1 delta are in
+         // that same base unit. `receives` is the quote side and must not be
+         // used here.
+         const filledBaseInt = Number(pays.amount);
+         const chainSizeAlreadyApplied = Number.isFinite(filledBaseInt)
+             && typeof (mgr as unknown as { consumeChainSizeAppliedFill?: (id: string, filledInt: number) => boolean }).consumeChainSizeAppliedFill === 'function'
+             && (mgr as unknown as { consumeChainSizeAppliedFill: (id: string, filledInt: number) => boolean })
+                 .consumeChainSizeAppliedFill(String(fillOp.order_id), filledBaseInt);
+         if (chainSizeAlreadyApplied) {
+             (fillOp as unknown as { __chainSizeAlreadyApplied?: boolean }).__chainSizeAlreadyApplied = true;
+             mgr?.logger?.log?.(
+                 `[FILL-DEDUP] Fill ${fillKey || fillOp.order_id} already absorbed by sync pass 1 (base delta ${filledBaseInt}); skipping duplicate fund adjustment`,
+                 'debug'
+             );
+         }
+
          // Derive all numeric effects before recording the fill key.
          // This keeps retries safe if a later computation unexpectedly fails.
          const balanceAdjustments: Array<{ orderType: string | null | undefined; delta: number; operation: string }> = [];
@@ -1858,6 +1881,12 @@ class Accountant {
          const btsRefundAdjustment = this._buildBtsDeferredRefundAdjustment(fillOp.order_id, isMaker);
          if (btsRefundAdjustment) {
              balanceAdjustments.push(btsRefundAdjustment);
+         }
+         if (chainSizeAlreadyApplied) {
+             // Pass 1's recalculation already reflected both the reduced
+             // commitment and the chain-total proceeds; applying these again
+             // would over-credit. Keep the dedupe-key bookkeeping below.
+             balanceAdjustments.length = 0;
          }
 
          let processedAt: number | null = null;

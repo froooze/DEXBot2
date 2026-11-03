@@ -888,7 +888,14 @@ function hasExecutableActions(rebalanceResult: unknown) {
  *   with {chainOrderId, price, size, type} to check beyond the grid
  * @returns {{isValid: boolean, violations: Array<Object>, violatingTargetIds: Set<string>}} Validation result
  */
-function validateCreateTargetSlots(actions: CowAction[], orders: Map<string, ManagedOrder>, _assets: AssetPair | null = null, chainOrderCandidates: UnmatchedChainOrder[] = [], incrementPercent: number | null = null) {
+function validateCreateTargetSlots(
+    actions: CowAction[],
+    orders: Map<string, ManagedOrder>,
+    _assets: AssetPair | null = null,
+    chainOrderCandidates: UnmatchedChainOrder[] = [],
+    incrementPercent: number | null = null,
+    pendingBroadcasts: Array<{ slotId?: unknown; price?: unknown; size?: unknown; type?: unknown; fingerprint?: unknown }> = []
+) {
     const safeActions = Array.isArray(actions) ? actions : [];
     const orderMap: Map<string, ManagedOrder> = orders instanceof Map ? orders : new Map();
     const releasedSlotIds = new Set<string>();
@@ -1008,6 +1015,49 @@ function validateCreateTargetSlots(actions: CowAction[], orders: Map<string, Man
                             violations.push({ targetId: entry.targetId, currentOrderId: u.chainOrderId, currentType: entry.type, currentState: 'CHAIN_ORPHAN', reason: 'chain_orphan_collision' });
                             break;
                         }
+                    }
+                }
+            }
+        }
+        // Pending-broadcast collisions: an uncertain CREATE from an earlier
+        // batch already targets this slot/price. Its orderId is not visible yet
+        // (the broadcast outcome is unknown), so the chain-orphan layers above
+        // cannot see it. Landing a second CREATE at the same level duplicates
+        // the order. Check BOTH the exact slot id and the price level, because
+        // a rebuilt grid can re-map a price onto a different slot id.
+        if (pendingBroadcasts.length > 0) {
+            const pendingSlotIds = new Set<string>();
+            for (const p of pendingBroadcasts) {
+                if (p?.slotId != null && String(p.slotId).length > 0) pendingSlotIds.add(String(p.slotId));
+            }
+            for (const entry of createEntries) {
+                if (pendingSlotIds.has(entry.targetId)) {
+                    violations.push({
+                        targetId: entry.targetId,
+                        currentOrderId: `pending:${entry.targetId}`,
+                        currentType: entry.type,
+                        currentState: 'PENDING_BROADCAST',
+                        reason: 'pending_broadcast_collision'
+                    });
+                    continue;
+                }
+                if (!_assets) continue;
+                for (const p of pendingBroadcasts) {
+                    if (p?.price == null) continue;
+                    if (p.type && entry.type && p.type !== entry.type) continue;
+                    if (pricesOnSameLevel(
+                        Number(p.price), Number(p.size) || 0, p.type as string | undefined,
+                        Number(entry.price), Number(entry.size) || 0, entry.type as string | undefined,
+                        _assets, incrementPercent
+                    )) {
+                        violations.push({
+                            targetId: entry.targetId,
+                            currentOrderId: `pending:${String(p.fingerprint ?? p.slotId ?? 'unknown')}`,
+                            currentType: entry.type,
+                            currentState: 'PENDING_BROADCAST',
+                            reason: 'pending_broadcast_collision'
+                        });
+                        break;
                     }
                 }
             }

@@ -357,6 +357,31 @@ async function runTests() {
         );
     }
 
+    // ── 16. Pending-broadcast collision ────────────────────────────────
+    console.log(' - 16. Pending uncertain CREATE blocks duplicate slot/price...');
+    {
+        const emptySlot = mapToOrders([
+            makeOrder('slot-10', ORDER_TYPES.BUY, 100, 0, ORDER_STATES.VIRTUAL, null)
+        ]);
+        const pending = [{ slotId: 'slot-10', price: 100, size: 100, type: ORDER_TYPES.BUY, fingerprint: 'fp-10' }];
+        const sameSlot = validateCreateTargetSlots(
+            [makeCreateAction('slot-10', 100, ORDER_TYPES.BUY)], emptySlot, dummyAssets, [], null, pending
+        );
+        assert.strictEqual(sameSlot.isValid, false, 'a pending CREATE on the same slot must block the new CREATE');
+        assert.strictEqual(sameSlot.violations[0].reason, 'pending_broadcast_collision');
+
+        const samePrice = validateCreateTargetSlots(
+            [makeCreateAction('slot-11', 100, ORDER_TYPES.BUY)], emptySlot, dummyAssets, [], null, pending
+        );
+        assert.strictEqual(samePrice.isValid, false, 'a pending CREATE at the same price on another slot must block the new CREATE');
+        assert.strictEqual(samePrice.violations[0].reason, 'pending_broadcast_collision');
+
+        const otherSide = validateCreateTargetSlots(
+            [makeCreateAction('slot-11', 100, ORDER_TYPES.SELL)], emptySlot, dummyAssets, [], null, pending
+        );
+        assert.strictEqual(otherSide.isValid, true, 'the opposite side at the same price is not a collision');
+    }
+
     console.log('\n✓ validateCreateTargetSlots tests PASSED!');
 }
 

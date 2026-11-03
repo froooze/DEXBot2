@@ -88,6 +88,7 @@ const {
     ORDER_STATES,
     ORDER_TYPES,
     REBALANCE_STATES,
+    TIMING,
 } = constantsModule;
 import { acquireIfNotHeld } from './order/async_lock.js';
 import * as FormatModule from './order/format.js';
@@ -300,9 +301,29 @@ function createOpFingerprintForSlot(bot: BotLike, order: ManagedOrder, finalInts
  * @returns {Array}
  */
 function getPendingBroadcasts(bot: BotLike): PendingEntry[] {
-    return (bot.manager && bot.manager._pendingBroadcasts instanceof Map)
-        ? Array.from(bot.manager._pendingBroadcasts.values()) as PendingEntry[]
-        : [];
+    const map = bot.manager && bot.manager._pendingBroadcasts instanceof Map
+        ? bot.manager._pendingBroadcasts
+        : null;
+    if (!map) return [];
+    // TTL hygiene: a lost resolve must not block CREATEs forever. Dropping an
+    // expired entry is safe because the pre-broadcast chain read re-verifies
+    // the level before the next CREATE; keeping it is what risks a permanent
+    // stuck backlog (37 entries in the 2026-11-03 incident).
+    const ttl = Number(TIMING?.PENDING_BROADCAST_TTL_MS) > 0
+        ? Number(TIMING.PENDING_BROADCAST_TTL_MS)
+        : 30 * 60 * 1000;
+    const now = Date.now();
+    for (const [fp, entry] of map) {
+        const at = Number((entry as PendingEntry)?.recordedAt) || 0;
+        if (at > 0 && now - at > ttl) {
+            map.delete(fp);
+            bot.manager.logger?.log?.(
+                `[COW] Dropped expired pending-broadcast entry ${String(fp)} (slot ${(entry as PendingEntry)?.slotId ?? '?'}, age ${Math.round((now - at) / 1000)}s)`,
+                'debug'
+            );
+        }
+    }
+    return Array.from(map.values()) as PendingEntry[];
 }
 
 /**
@@ -482,6 +503,8 @@ function recordPendingBroadcast(bot: BotLike, entry: PendingEntry & { opIndex?: 
     if (!bot.manager._pendingBroadcasts || !(bot.manager._pendingBroadcasts instanceof Map)) {
         bot.manager._pendingBroadcasts = new Map();
     }
+    // Prune expired entries before recording a new one (bounded map).
+    getPendingBroadcasts(bot);
     const fingerprint = createOpFingerprintForSlot(bot, entry.order, entry.finalInts, entry.order.id);
     if (!fingerprint) {
         bot.manager.logger.log?.(
@@ -3321,12 +3344,15 @@ function restoreSkippedUpdateSlotsInWorkingGrid(bot: BotLike, workingGrid: Insta
  * @param {Object} cowResult - The stale plan result
  * @param {number} replanDepth - Recursion depth (0 = first attempt)
  * @param {Object} preBroadcastGuard - The failed evaluateCommit result
- * @returns {Promise<{handled: boolean, result?: Object}>} handled=true when the
+ * @returns {Promise<{handled: boolean, result?: Object, placementTransferred?: boolean}>} handled=true when the
  *   batch was resolved by the re-plan (fresh plan executed, or stale plan
  *   skipped as already-consistent); handled=false when the caller must proceed
- *   with the original plan.
+ *   with the original plan. `placementTransferred` means the recursion now owns
+ *   the placement lease and the caller must not release it.
  */
-async function replanStaleBatch(bot: BotLike, cowResult: CowResult, replanDepth: number, preBroadcastGuard: JsonObj, seamPollIntervalMs?: number): Promise<{ handled: boolean; result?: JsonObj }> {
+async function replanStaleBatch(bot: BotLike, cowResult: CowResult, replanDepth: number, preBroadcastGuard: JsonObj, seamPollIntervalMs?: number, placementLease: PlacementLease | null = null): Promise<{ handled: boolean; result?: JsonObj; placementTransferred?: boolean }> {
+    const rebuildInProgress = typeof bot.manager?.isStructuralRebuildInProgress === 'function'
+        && bot.manager.isStructuralRebuildInProgress() === true;
     // STRUCTURAL REBUILD GUARD. A `grid-init`/resync staleness means the master
     // was rebuilt while this plan was in flight. The fresh master has no live
     // chain order IDs, so a re-plan would emit a create-only batch for levels
@@ -3335,9 +3361,16 @@ async function replanStaleBatch(bot: BotLike, cowResult: CowResult, replanDepth:
     // (2026-11-03: 25 duplicate orders). Abort instead and let the
     // reconcile (update-first) complete — fills stay recorded and are drained
     // by the bootstrap consumer / next reconcile.
-    const structuralRebuild = typeof bot.manager?.isStructuralRebuildStale === 'function'
-        ? bot.manager.isStructuralRebuildStale(preBroadcastGuard?.reason)
-        : orderUtils.isStructuralRebuildStaleReason(preBroadcastGuard?.reason);
+    //
+    // The progress flag is the authoritative signal, not the reason string: a
+    // rebuild mutates the master with contexts like `sync-pass1-partial`
+    // (those mutations are stamped `structural rebuild` by the manager), and
+    // a plan can reach here after the rebuild ended but while the reason still
+    // names a fill. Checking both closes the non-`grid-init` gap.
+    const structuralRebuild = rebuildInProgress
+        || (typeof bot.manager?.isStructuralRebuildStale === 'function'
+            ? bot.manager.isStructuralRebuildStale(preBroadcastGuard?.reason)
+            : orderUtils.isStructuralRebuildStaleReason(preBroadcastGuard?.reason));
     if (structuralRebuild) {
         bot.manager.logger.log(
             `[COW] Plan stale after a structural grid rebuild (${preBroadcastGuard.reason}); ` +
@@ -3351,11 +3384,21 @@ async function replanStaleBatch(bot: BotLike, cowResult: CowResult, replanDepth:
         // batch's pending-broadcast guard treat a phantom create as in flight.
         // Entries from an earlier unresolved batch are deliberately kept.
         clearPendingBroadcastsForSlots(bot, cowResult.actions);
-        await requestStructuralResync(
-            bot,
-            'plan stale after structural rebuild (deferred to reconcile)',
-            { reason: preBroadcastGuard.reason }
-        );
+        // A rebuild that is still running already owns the repair: requesting
+        // another structural resync here would start a second rebuild on top of
+        // it (churn loop). Only ask when the rebuild has already ended.
+        if (!rebuildInProgress) {
+            await requestStructuralResync(
+                bot,
+                'plan stale after structural rebuild (deferred to reconcile)',
+                { reason: preBroadcastGuard.reason }
+            );
+        } else {
+            bot.manager.logger.log(
+                '[COW] Structural rebuild still in progress; leaving the resync to the active rebuild (no churn request)',
+                'debug'
+            );
+        }
         return {
             handled: true,
             result: { executed: false, aborted: true, reason: 'STRUCTURAL_REBUILD_DEFERRED', hadRotation: false }
@@ -3436,8 +3479,10 @@ async function replanStaleBatch(bot: BotLike, cowResult: CowResult, replanDepth:
             clearPendingBroadcastsForSlots(bot, cowResult.actions);
             return {
                 handled: true,
+                placementTransferred: true,
                 result: await updateOrdersOnChainBatchCOW(bot, replanned, {
                     replanDepth: replanDepth + 1,
+                    placementLease,
                     // Carry the seam through the recursion explicitly: the inner
                     // frame re-sets and re-restores it, so it must not depend on
                     // the outer frame's side-channel value surviving.
@@ -3548,9 +3593,19 @@ async function waitForCowBroadcastSingleFlight(bot: BotLike, label: string): Pro
  * @returns {number}
  */
 function plannedUpdateSize(action: CowAction): number {
-    return Number.isFinite(Number(action.newSize))
+    const planned = Number.isFinite(Number(action.newSize))
         ? Number(action.newSize)
         : Number(action.order?.size || 0);
+    // A PARTIAL slot's booked size is the post-fill remainder. The plan's
+    // desired size is a full-side target and must not grow the order in place:
+    // target the booked remainder at plan time so the broadcast op is correct
+    // by construction (the clamp below stays as a defense-in-depth invariant).
+    const order = action.order;
+    if (order && order.state === ORDER_STATES.PARTIAL) {
+        const booked = Number(order.size);
+        if (Number.isFinite(booked) && booked > 0 && planned > booked) return booked;
+    }
+    return planned;
 }
 
 /**
@@ -3574,12 +3629,17 @@ function clampPostFillUpdateSize(bot: BotLike, masterOrder: ManagedOrder, newSiz
     const booked = Number(masterOrder.size);
     if (!Number.isFinite(target) || !Number.isFinite(booked) || booked <= 0) return target;
     if (target > booked) {
+        const slotKey = String(action?.id || masterOrder?.id || 'unknown');
+        const warned: Set<string> = (bot as unknown as { _clampPostFillWarnedSlots?: Set<string> })._clampPostFillWarnedSlots
+            || ((bot as unknown as { _clampPostFillWarnedSlots?: Set<string> })._clampPostFillWarnedSlots = new Set());
+        const firstHit = !warned.has(slotKey);
+        if (firstHit) warned.add(slotKey);
         bot.manager.logger.log(
             `[COW] Post-fill size clamp for ${action?.id || masterOrder?.id}: slot is PARTIAL with ` +
             `booked remaining ${Format.formatAmount(booked)} but the plan targets ` +
             `${Format.formatAmount(target)} — clamping to booked remaining. ` +
             `A partially-filled order must not be grown in place by a COW update (fill accounting divergence).`,
-            'warn'
+            firstHit ? 'warn' : 'debug'
         );
         return booked;
     }
@@ -3605,7 +3665,20 @@ async function runPreBroadcastGuards(bot: BotLike, cowResult: CowResult): Promis
     const chainOrderCandidates = Array.isArray(bot.manager?._lastUnmatchedChainOrders)
         ? bot.manager._lastUnmatchedChainOrders
         : [];
-    const createSlotValidation = validateCreateTargetSlots(actions, bot.manager?.orders, bot.manager?.assets, chainOrderCandidates, bot.manager?.config?.incrementPercent ?? null);
+    const createSlotValidation = validateCreateTargetSlots(
+        actions,
+        bot.manager?.orders,
+        bot.manager?.assets,
+        chainOrderCandidates,
+        bot.manager?.config?.incrementPercent ?? null,
+        getPendingBroadcasts(bot).map((entry) => ({
+            slotId: entry.slotId ?? entry.order?.id,
+            price: entry.order?.price,
+            size: entry.order?.size,
+            type: entry.orderType ?? entry.order?.type,
+            fingerprint: entry.fingerprint,
+        }))
+    );
     if (!createSlotValidation.isValid) {
         for (const violation of createSlotValidation.violations) {
             let reason: string;
@@ -3627,6 +3700,9 @@ async function runPreBroadcastGuards(bot: BotLike, cowResult: CowResult): Promis
                     break;
                 case 'slot_create_uncertain':
                     reason = `an earlier CREATE here has an unknown outcome (createUncertain)`;
+                    break;
+                case 'pending_broadcast_collision':
+                    reason = `a pending uncertain CREATE already targets this slot/price`;
                     break;
                 default:
                     reason = `existing orderId=${violation.currentOrderId}`;
@@ -4042,7 +4118,8 @@ async function updateOrdersOnChainBatchCOW(bot: BotLike, cowResult: CowResult, o
     try {
         return await updateOrdersOnChainBatchCOWBody(
             bot, cowResult, replanDepth,
-            seamPollIntervalMs ?? undefined
+            seamPollIntervalMs ?? undefined,
+            (options?.placementLease as PlacementLease | null | undefined) ?? null
         );
     } finally {
         // Restore only when this frame actually wrote a seam. The entry
@@ -4064,7 +4141,8 @@ async function updateOrdersOnChainBatchCOWBody(
     bot: BotLike,
     cowResult: CowResult,
     replanDepth: number,
-    seamPollIntervalMs: number | undefined
+    seamPollIntervalMs: number | undefined,
+    inheritedPlacementLease: PlacementLease | null = null
 ): Promise<JsonObj> {
     bot._currentCycleId = (Number.isFinite(Number(bot._currentCycleId)) ? Number(bot._currentCycleId) : 0) + 1;
     const { workingGrid, workingIndexes, workingBoundary, actions } = cowResult;
@@ -4097,6 +4175,45 @@ async function updateOrdersOnChainBatchCOWBody(
         return { executed: true, hadRotation: false };
     }
 
+    // Exclusive placement region (shared with startup reconcile Phase 2,
+    // correction drains, dust/residual cancels and pool swaps). Claim it BEFORE
+    // the pre-batch drain and before any other mutation: planning is read-only,
+    // but the drain and the broadcast are not, and a competing path that slips
+    // in between the drain and the old late claim is exactly the duplicate
+    // window this closes. Held through commit/uncertain-catch and released in
+    // the body's finally (or transferred to the re-plan recursion).
+    let heldPlacementLease: PlacementLease | null = inheritedPlacementLease;
+    const claimPlacement = async (stage: string): Promise<boolean> => {
+        if (heldPlacementLease) return true;
+        if (typeof bot.manager?.acquirePlacement !== 'function') return true;
+        const lease = await bot.manager.acquirePlacement('cow-broadcast', {
+            timeoutMs: SINGLE_FLIGHT_MAX_WAIT_MS,
+            isShuttingDown: () => bot._shuttingDown === true,
+        });
+        if (!lease) {
+            bot.manager.logger.log(
+                `[COW] ${stage}: exclusive placement region unavailable (timeout/shutdown); aborting this batch instead of overlapping another placement path.`,
+                'warn'
+            );
+            return false;
+        }
+        heldPlacementLease = lease;
+        return true;
+    };
+    const releasePlacement = () => {
+        const lease = heldPlacementLease;
+        heldPlacementLease = null;
+        lease?.release();
+    };
+
+    // Claim before the entry single-flight wait: the second batch then queues
+    // on placement instead of building a plan, and there is no lock-order
+    // inversion (both COW frames acquire placement before the COW slot).
+    if (!(await claimPlacement('entry'))) {
+        popPushedWorkingGrid(bot, cowResult);
+        return { executed: false, aborted: true, reason: 'PLACEMENT_REGION_UNAVAILABLE', hadRotation: false };
+    }
+
     // Single-flight COW broadcast guard (entry check): never broadcast two
     // batches concurrently. Overlapping broadcasts plan from the same base
     // grid version; when the first commits it bumps _gridVersion, so the
@@ -4105,6 +4222,7 @@ async function updateOrdersOnChainBatchCOWBody(
     // orphan fill. This entry wait is an optimization; the authoritative
     // atomic check-and-set happens right before the broadcast below.
     if (await waitForCowBroadcastSingleFlight(bot, 'entry')) {
+        releasePlacement();
         popPushedWorkingGrid(bot, cowResult);
         return { executed: false, aborted: true, reason: 'SHUTDOWN_IN_PROGRESS', hadRotation: false };
     }
@@ -4129,7 +4247,8 @@ async function updateOrdersOnChainBatchCOWBody(
             );
             const drainResult = await orderUtils.correctAllPriceMismatches(
                 bot.manager, bot.account as string, bot.privateKey as string,
-                chainOrders as unknown as Parameters<typeof orderUtils.correctAllPriceMismatches>[3]
+                chainOrders as unknown as Parameters<typeof orderUtils.correctAllPriceMismatches>[3],
+                { placementLease: heldPlacementLease }
             );
             if (drainResult?.failed > 0) {
                 bot.manager.logger.log(
@@ -4156,7 +4275,10 @@ async function updateOrdersOnChainBatchCOWBody(
     // block, pending/unmatched guards, crossed-book gate) — see
     // runPreBroadcastGuards. Refusals already popped the working grid.
     const guards = await runPreBroadcastGuards(bot, cowResult);
-    if (!guards.proceed) return guards.result ?? { executed: false, hadRotation: false };
+    if (!guards.proceed) {
+        releasePlacement();
+        return guards.result ?? { executed: false, hadRotation: false };
+    }
     const { crossingCandidates = [], intraBatchCandidates = [] } = guards;
 
     const { assetA, assetB } = bot.manager.assets;
@@ -4224,37 +4346,14 @@ async function updateOrdersOnChainBatchCOWBody(
     // broadcast on top of it (the exact overlap this guard prevents).
     let heldBroadcastSlot = false;
 
-    // Exclusive placement region (shared with startup reconcile Phase 2 and
-    // correction drains). `heldBroadcastSlot` only serializes COW batches;
-    // this lease serializes EVERY chain-mutating placement path, so a
-    // reconcile cannot broadcast the same price levels while this batch is in
-    // flight. Claimed together with the COW slot and released on every exit.
-    let heldPlacementLease: PlacementLease | null = null;
-    const claimPlacement = async (stage: string): Promise<boolean> => {
-        if (typeof bot.manager?.acquirePlacement !== 'function') return true;
-        const lease = await bot.manager.acquirePlacement('cow-broadcast', {
-            timeoutMs: SINGLE_FLIGHT_MAX_WAIT_MS,
-            isShuttingDown: () => bot._shuttingDown === true,
-        });
-        if (!lease) {
-            bot.manager.logger.log(
-                `[COW] ${stage}: exclusive placement region unavailable (timeout/shutdown); aborting this batch instead of overlapping another placement path.`,
-                'warn'
-            );
-            return false;
-        }
-        heldPlacementLease = lease;
-        return true;
-    };
-    const releasePlacement = () => {
-        if (heldPlacementLease) {
-            heldPlacementLease.release();
-            heldPlacementLease = null;
-        }
-    };
+    // Exclusive placement region is claimed at the top of the body (before the
+    // pre-batch drain). `heldBroadcastSlot` only serializes COW batches; the
+    // placement lease serializes EVERY chain-mutating path. Both are released
+    // on every exit; the re-plan recursion inherits the lease.
 
     try {
         bot._batchInFlight++;
+        (bot as unknown as { _batchInFlightStartedAt?: number })._batchInFlightStartedAt = Date.now();
         bot._markGridActivity('batch start');
         bot.manager._setRebalanceState(REBALANCE_STATES.BROADCASTING);
         bot.manager.startBroadcasting();
@@ -5300,8 +5399,9 @@ async function updateOrdersOnChainBatchCOWBody(
         });
         if (!preBroadcastGuard.canCommit) {
             // Bounded re-plan + proceed — policy documented on replanStaleBatch.
-            const replan = await replanStaleBatch(bot, cowResult, replanDepth, preBroadcastGuard, seamPollIntervalMs);
+            const replan = await replanStaleBatch(bot, cowResult, replanDepth, preBroadcastGuard, seamPollIntervalMs, heldPlacementLease);
             if (replan.handled) {
+                if (replan.placementTransferred) heldPlacementLease = null;
                 return replan.result ?? { executed: false, hadRotation: false };
             }
             // Fall through: proceed with the current plan (bounded policy).
@@ -5324,10 +5424,8 @@ async function updateOrdersOnChainBatchCOWBody(
             popPushedWorkingGrid(bot, cowResult);
             return { executed: false, aborted: true, reason: 'SHUTDOWN_IN_PROGRESS', hadRotation: false };
         }
-        if (!(await claimPlacement('pre-broadcast'))) {
-            popPushedWorkingGrid(bot, cowResult);
-            return { executed: false, aborted: true, reason: 'PLACEMENT_REGION_UNAVAILABLE', hadRotation: false };
-        }
+        // Placement was claimed at the top of the body, before the pre-batch
+        // drain, and is held through this broadcast and the commit.
         bot._cowBroadcastInFlight = true;
         heldBroadcastSlot = true;
 
@@ -5355,9 +5453,9 @@ async function updateOrdersOnChainBatchCOWBody(
                 );
                 bot._cowBroadcastInFlight = false;
                 heldBroadcastSlot = false;
-                releasePlacement();
-                const replan = await replanStaleBatch(bot, cowResult, replanDepth, postWaitGuard, seamPollIntervalMs);
+                const replan = await replanStaleBatch(bot, cowResult, replanDepth, postWaitGuard, seamPollIntervalMs, heldPlacementLease);
                 if (replan.handled) {
+                    if (replan.placementTransferred) heldPlacementLease = null;
                     return replan.result ?? { executed: false, hadRotation: false };
                 }
                 // No fill context for a re-plan (or the re-plan limit was
@@ -5722,7 +5820,10 @@ async function updateOrdersOnChainBatchCOWBody(
 
         throw err;
     } finally {
-        bot._batchInFlight--;
+        bot._batchInFlight = Math.max(0, bot._batchInFlight - 1);
+        if (bot._batchInFlight === 0) {
+            (bot as unknown as { _batchInFlightStartedAt?: number })._batchInFlightStartedAt = 0;
+        }
         if (heldBroadcastSlot) bot._cowBroadcastInFlight = false;
         releasePlacement();
         bot._markGridActivity('batch end');
