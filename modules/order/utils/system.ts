@@ -2013,6 +2013,44 @@ export function hasUnsettledFills(source: unknown): { unsettled: boolean; reason
 }
 
 /**
+ * Age of the OLDEST bot-level pipeline counter still raised.
+ *
+ * The two counters (`_batchInFlight`, `_recoverySyncInFlight`) each carry a
+ * `*StartedAt` stamp maintained by their raise site. A stale region watchdog
+ * needs their age to tell "the pipeline is making progress" from "the counter
+ * leaked with the region" — the placement watchdog uses it to refuse tearing
+ * down a region a live batch still owns. Lives here (next to
+ * `hasUnsettledFills`, the same bot/manager field-peeking contract) so the
+ * maintenance tick and the fill consumer cannot disagree about it.
+ *
+ * @param {Object} source - DEXBot-like (or OrderManager-like) instance
+ * @param {number} [nowMs] - Clock override (tests)
+ * @returns {number} Milliseconds since the oldest raised counter started, 0
+ *   when nothing is in flight or the stamp is missing
+ */
+export function getPipelineInFlightAgeMs(source: unknown, nowMs?: number): number {
+    if (!source || typeof source !== 'object') return 0;
+    const outer = source as { manager?: unknown };
+    const bot = (outer.manager && typeof outer.manager === 'object') ? outer : source;
+    const fields = bot as Record<string, unknown>;
+    const now = Number.isFinite(Number(nowMs)) ? Number(nowMs) : Date.now();
+    const pairs: Array<[string, string]> = [
+        ['_batchInFlight', '_batchInFlightStartedAt'],
+        ['_recoverySyncInFlight', '_recoverySyncInFlightStartedAt'],
+    ];
+    let oldest = -1;
+    for (const [countKey, startedKey] of pairs) {
+        const count = Number(fields[countKey]) || 0;
+        if (count <= 0) continue;
+        const startedAt = Number(fields[startedKey]) || 0;
+        if (!startedAt) continue;
+        const age = Math.max(0, now - startedAt);
+        if (age > oldest) oldest = age;
+    }
+    return oldest > 0 ? oldest : 0;
+}
+
+/**
  * Restore the persisted bot-scoped last-market-fill reference into the
  * manager. Deliberately independent of the boundary and the genesis: this is
  * the anchor spread correction uses to avoid trading through the last real

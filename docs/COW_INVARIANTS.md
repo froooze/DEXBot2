@@ -57,7 +57,7 @@ This document defines the non-negotiable behavioral invariants for the DEXBot2 s
   - `_clearOrderCachesLogic` must bump `_gridVersion` so an in-flight COW plan (baseVersion from the pre-swap grid) is refused at commit instead of committing over a regenerated zero-slot grid.
 
 - `INV-COW-006` Boundary moves only on fills and same-batch spread promotion
-  - Fund changes never move the boundary. Only boundary crawl (`deriveTargetBoundary`, `order/utils/order.ts`), spread promotion, and the fill-driven rail clamp move it. Promotion shifts it onto orders placed in the same atomic batch **and may absorb a same-side order already placed inside the band** (that order becomes a legal rail member once the boundary slides past it); only the empty band slot is a CREATE target, and the absorption still counts against the reserve/stranding depth caps.
+  - Fund changes never move the boundary. Only boundary crawl (`deriveTargetBoundary`, `order/utils/order.ts`), spread promotion, and the fill-driven rail clamp move it. Promotion shifts it onto orders placed in the same atomic batch **and may absorb a same-side order already placed inside the band** (that order is rail-typed by construction — a placed SPREAD slot is `ILLEGAL_SPREAD_STATE` in `validateOrder`, so "same-side" needs no extra resolution); it becomes a legal rail member once the boundary slides past it. Only the empty band slot is a CREATE target, and the absorption still counts against the reserve/stranding depth caps.
   - Funds drive order sizing/budget allocation only; `syncBoundaryToFunds`/`calculateFundDrivenBoundary` are deleted (1.5.3).
   - `deriveRailBoundary` (`dexbot_cow_runtime.ts`, pre-broadcast) clamps the committed boundary to the batch's resulting rails: `maxBuyIdx <= boundary <= minSellIdx - gapSlots - 1`. A fill's counter order is the rail fact, so it decides the boundary; an empty refill hole never outvotes it. Rail membership = the batch's own op destinations + master rail orders on their own side of the planned boundary (BUY at/below, SELL at/above the implied sellStart); a master order parked on the wrong side is a STRAY (refused-commit adoption, SPREAD-GUARD straggler, stranded hold) and is skipped, because clamping onto it would self-legalize the corrupt state (live: one stray sell clamped 138 → 115). Rail indices are the orders' LIVE chain price (`resolveLiveOrderLadderPosition`), not stale slot ids. A crossed/over-ceiling rail fails closed (`rail-crossed` / `rail-exceeds-grid`) and keeps the previous value instead of legalizing it; the result then passes the shared `validatePersistedBoundary` gate (with cancel/rotation sources allow-listed), so the rail clamp and the fill re-anchor end in one validator. The gate accepts a **violation-reducing repair**: a candidate that strands strictly fewer placed orders than the committed boundary is allowed (the fill-driven retreat case), while an equal count stays refused. The comparison uses the validator's own in-band count (`countInBandPlacements` / `boundaryMoveReducesStrands`), never a second stranding predicate.
 
@@ -183,7 +183,7 @@ This document defines the non-negotiable behavioral invariants for the DEXBot2 s
 
 - `INV-MAINT-001` Pipeline in-flight defers maintenance
   - When `isPipelineEmpty` returns `isEmpty=false` (batch in-flight, recovery-in-flight, or broadcasting active), `checkSpreadCondition` and divergence corrections must be skipped.
-  - Dust cancels broadcast directly to chain and are safe to call regardless of pipeline state.
+  - Dust cancels mutate the chain, so they take the **exclusive placement region** (`withPlacement('dust-cancel')`) and defer to the next cycle when it is busy or the bot is shutting down — they are NOT "safe regardless of pipeline state". The rotation batch that follows the cancels runs after the region is released and acquires its own lease.
   - Pipeline signals (`batchInFlight`, `recoveryInFlight`, `broadcasting`) must be passed to `isPipelineEmpty`.
 
 - `INV-MAINT-002` Illegal state abort
@@ -362,6 +362,13 @@ This document defines the non-negotiable behavioral invariants for the DEXBot2 s
 - `INV-BROADCAST-004` Truncated/empty reads are ambiguous, not authoritative absence
   - A `get_full_accounts` window capped at the order limit omits the freshest orders (by_account index = seller,id ascending — fresh creates sort last), so absence on a truncated/empty read can never free slots/capital, confirm a cancel, discard a batch, or clear pending-broadcast protection.
   - All absence decisions use `readOpenOrdersWithMeta`; truncated/empty snapshots defer (keep protection + request structural resync) instead of acting.
+
+- `INV-BROADCAST-005` One exclusive placement region; one lease-liveness predicate
+  - Every chain-mutating path (COW broadcast, reconcile Phase 1+2, correction drain, dust/residual cancel, pool swap) runs inside the exclusive placement region (`modules/order/placement_lock.ts`). The broadcast refcount only defers fills; it is not mutual exclusion.
+  - The region is NOT reentrant. Nested work receives the holder's lease and verifies it with `manager.isPlacementLeaseCurrent(lease)` — `isPlacementActive()` is true for ANY holder and must never stand in for ownership.
+  - Non-token holders must use `manager.withPlacement()` (single acquire/release contract, bounded wait, shutdown probe). `correctAllPriceMismatches` is the only nested consumer and takes the inherited lease explicitly.
+  - Pending-broadcast liveness has ONE policy (`getLivePendingBroadcasts`): TTL, or TTL + a sync completed after the record, or 2× TTL hard cap. Every reader (COW guard, reconcile CREATE, reconcile surplus sweep, crossing candidates) uses it.
+  - A PLACEMENT-BACKED hung region is torn down by ONE authority: `_clearStalePlacementRegion()` after `PLACEMENT_STALE_CLEAR_MS`, and it also clears that region's stale broadcast refcount atomically. The broadcast watchdog refuses to act while a placement lease is held (so it only clears a refcount leaked without a lease), and the placement watchdog refuses a teardown while a bot-level pipeline counter younger than the bound proves progress.
 
 ## Change Policy
 

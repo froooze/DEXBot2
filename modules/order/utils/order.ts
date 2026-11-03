@@ -1391,13 +1391,28 @@ async function correctAllPriceMismatches(
 ) {
     if (!manager || !manager._gridLock) return { corrected: 0, failed: 0, results: [] };
     const run = () => _correctAllPriceMismatchesLocked(manager, accountName, privateKey, accountOrders);
-    if (options.placementLease) return await run();
-    if (typeof manager.acquirePlacement !== 'function') return await run();
-    const timeoutMs = Number.isFinite(Number(options.timeoutMs)) ? Number(options.timeoutMs) : 5000;
-    const lease = await manager.acquirePlacement('correction-drain', { timeoutMs: Math.max(1, timeoutMs) });
-    if (!lease) {
-        return { corrected: 0, failed: 0, results: [], staleDropped: 0, deferred: true, reason: 'placement-active' };
+    // NESTED CALLER (COW pre-batch drain): the caller already owns the region.
+    // Reuse the inherited lease only while it STILL owns it — `isPlacementActive()`
+    // would also be true for a different holder (e.g. the watchdog force-released
+    // this lease and another path took the region), which would run the drain
+    // unprotected and re-open the duplicate window.
+    if (options.placementLease) {
+        const inherited = options.placementLease;
+        const stillCurrent = typeof manager.isPlacementLeaseCurrent === 'function'
+            ? manager.isPlacementLeaseCurrent(inherited)
+            : true;
+        if (stillCurrent) return await run();
     }
+    const timeoutMs = Math.max(1, Number.isFinite(Number(options.timeoutMs)) ? Number(options.timeoutMs) : 5000);
+    const deferredResult = { corrected: 0, failed: 0, results: [], staleDropped: 0, deferred: true, reason: 'placement-active' };
+    // Single acquire/release contract (placement_lock.withPlacement).
+    if (typeof manager.withPlacement === 'function') {
+        const placed = await manager.withPlacement('correction-drain', async () => run(), { timeoutMs });
+        return placed ?? deferredResult;
+    }
+    if (typeof manager.acquirePlacement !== 'function') return await run();
+    const lease = await manager.acquirePlacement('correction-drain', { timeoutMs });
+    if (!lease) return deferredResult;
     try {
         return await run();
     } finally {
@@ -2076,6 +2091,63 @@ function isCrossingCheckCandidate(o: CrossingCandidate | null | undefined, exclu
     return true;
 }
 /**
+ * LIVE (unexpired) pending-broadcast entries — the SINGLE liveness authority.
+ *
+ * A pending entry protects a slot/price whose uncertain CREATE may already be
+ * live on chain but is not adopted yet. Three readers need that set (the COW
+ * pre-broadcast guard, the reconcile CREATE path, and the reconcile surplus
+ * sweep) and they used to disagree: two re-implemented the TTL by hand with
+ * different rules and one read the raw map with no TTL at all, so a reconcile
+ * could stay blocked by an entry the COW guard already considered dead.
+ *
+ * Liveness rule (unchanged from the COW guard, now the only one):
+ * - younger than `PENDING_BROADCAST_TTL_MS` → live;
+ * - older than the TTL but a successful open-orders sync completed AFTER it was
+ *   recorded → expired (a caught-up read re-verifies the level);
+ * - older than 2× the TTL → expired regardless (a permanently lagging node must
+ *   not park CREATEs forever);
+ * - no usable `recordedAt` → live (fail closed, never a silent unblock).
+ *
+ * Expired entries are DELETED here; callers get the live list.
+ *
+ * @param {Object} manager - OrderManager (`_pendingBroadcasts`, `_lastSyncAt`)
+ * @param {Object} [options] - `now` clock override (tests)
+ * @returns {Array} Live pending-broadcast entries
+ */
+function getLivePendingBroadcasts(manager: OrderManagerLike | null | undefined, options: { now?: number } = {}): unknown[] {
+    const map = (manager as unknown as { _pendingBroadcasts?: unknown } | null | undefined)?._pendingBroadcasts;
+    if (!(map instanceof Map)) return [];
+    const ttl = Number(TIMING.PENDING_BROADCAST_TTL_MS) > 0
+        ? Number(TIMING.PENDING_BROADCAST_TTL_MS)
+        : 30 * 60 * 1000;
+    const now = Number.isFinite(Number(options?.now)) ? Number(options.now) : Date.now();
+    const lastSyncAt = Number((manager as unknown as { _lastSyncAt?: unknown })?._lastSyncAt) || 0;
+    const log = (manager as unknown as { logger?: { log?: (message: string, level?: string) => void } } | null | undefined)?.logger?.log;
+    for (const [fingerprint, rawEntry] of map as Map<string, unknown>) {
+        const entry = rawEntry as { recordedAt?: unknown; slotId?: unknown } | null | undefined;
+        const recordedAt = Number(entry?.recordedAt) || 0;
+        if (!(recordedAt > 0)) continue;
+        const age = now - recordedAt;
+        if (age <= ttl) continue;
+        const syncedSinceRecord = lastSyncAt > recordedAt;
+        if (!syncedSinceRecord && age <= ttl * 2) {
+            log?.(
+                `[COW] Pending-broadcast entry ${String(fingerprint)} is ${Math.round(age / 1000)}s old but no sync has completed since it was recorded; keeping it (fail-closed) until a caught-up read`,
+                'debug'
+            );
+            continue;
+        }
+        map.delete(fingerprint);
+        log?.(
+            `[COW] Dropped expired pending-broadcast entry ${String(fingerprint)} (slot ${entry?.slotId ?? '?'}, age ${Math.round(age / 1000)}s, ` +
+            `${syncedSinceRecord ? 'sync completed since record' : 'hard TTL cap'})`,
+            'warn'
+        );
+    }
+    return Array.from((map as Map<string, unknown>).values());
+}
+
+/**
  * Shared candidate set for crossing-placement checks: master orders plus
  * chain-side orders that may exist on chain but are not (yet) adopted into
  * the master grid — pending-broadcast wrappers from earlier uncertain
@@ -2107,8 +2179,9 @@ function buildCrossingCheckCandidates(manager: OrderManagerLike): CrossingCandid
         ? [...manager.orders.values()].map(withLivePrice)
         : [];
     if (manager._pendingBroadcasts instanceof Map) {
-        for (const entry of manager._pendingBroadcasts.values()) {
-            if (entry && entry.slotId && entry.order) candidates.push(withLivePrice(entry as unknown as CrossingCandidate));
+        for (const entry of getLivePendingBroadcasts(manager)) {
+            const wrapper = entry as { slotId?: unknown; order?: unknown } | null | undefined;
+            if (wrapper && wrapper.slotId && wrapper.order) candidates.push(withLivePrice(wrapper as unknown as CrossingCandidate));
         }
     }
     if (Array.isArray(manager._lastUnmatchedChainOrders)) {
@@ -4026,7 +4099,7 @@ function collectKnownOnChainOrderIds(mgr: OrderManagerLike, placedResults: unkno
     return { masterIds: [...masterIds], createIds: [...createIds], all: [...all] };
 }
 
-export { parseChainOrder, resolveLiveOrderLadderPosition, applyChainSizeToGridOrder, resolveExecutionPrice, resolveSlotIdForFillPrice, reviveVirtualSlotFromChain, attributeUnmatchedFillToGrid,  buildFillKey, correctOrderPriceOnChain, correctAllPriceMismatches, _validatePriceCorrectionEntry, _stampCorrectionProvenance, findLiveOrderOwnerByChainId, buildCreateOrderArgs, getOrderTypeFromUpdatedFlags, resolveConfiguredPriceBound, virtualizeOrder, convertToSpreadPlaceholder, toRailHolePlaceholder, geometryTypeForSlotIndex, detectGapEvacuationCandidates, updateGapEvacuationStreaks, resolveSpreadOrderSide, chainOrderMatchesSlot, chainOrderMatchesSlotWithTolerance, crossingCandidateChainId, isCrossingCheckCandidate, buildCrossingCheckCandidates, filterOrdersByType, buildOutsideInPairGroups, extractBatchOperationResults, formatUnmatchedChainOrder, isNonBlockingUnmatchedOrder, isStrandedHoldOrder, isOrderOnChain, isOrderVirtual, hasOnChainId, isOrderPlaced, isPhantomOrder, isSlotAvailable, isEmptyGridSlot, isOrderHealthy, checkSizeThreshold, checkSizesBeforeMinimum, calculateIdealBoundary, assignGridRoles, resolveOnChainRetypeType, shouldFlagOutOfSpread, buildIndexes, validateIndexes, ordersEqual, buildDelta, deriveTargetBoundary, isShiftEligibleFill, resolveEdgeCount, resolveEdgeOrders, selectEdgeSlots, getCoreOrdersTotal, getSideBudget, calculateBudgetedSizes, buildCreateOpFingerprint, isOrderGoneErrorMessage, isStructuralRebuildStaleReason, recordDuplicateOrphanDetection, clearDuplicateOrphanDetection, duplicateOrphanLogInfo, chainOrderUnchangedFromCache, detectCrossedBookPlan, collectKnownOnChainOrderIds, collectEdgePinnedFillIds, edgeOrderIdSet, liveWindowIdSet, checkGridPriceInvariant, reportGridPriceInvariant };
+export { parseChainOrder, resolveLiveOrderLadderPosition, applyChainSizeToGridOrder, resolveExecutionPrice, resolveSlotIdForFillPrice, reviveVirtualSlotFromChain, attributeUnmatchedFillToGrid, getLivePendingBroadcasts,  buildFillKey, correctOrderPriceOnChain, correctAllPriceMismatches, _validatePriceCorrectionEntry, _stampCorrectionProvenance, findLiveOrderOwnerByChainId, buildCreateOrderArgs, getOrderTypeFromUpdatedFlags, resolveConfiguredPriceBound, virtualizeOrder, convertToSpreadPlaceholder, toRailHolePlaceholder, geometryTypeForSlotIndex, detectGapEvacuationCandidates, updateGapEvacuationStreaks, resolveSpreadOrderSide, chainOrderMatchesSlot, chainOrderMatchesSlotWithTolerance, crossingCandidateChainId, isCrossingCheckCandidate, buildCrossingCheckCandidates, filterOrdersByType, buildOutsideInPairGroups, extractBatchOperationResults, formatUnmatchedChainOrder, isNonBlockingUnmatchedOrder, isStrandedHoldOrder, isOrderOnChain, isOrderVirtual, hasOnChainId, isOrderPlaced, isPhantomOrder, isSlotAvailable, isEmptyGridSlot, isOrderHealthy, checkSizeThreshold, checkSizesBeforeMinimum, calculateIdealBoundary, assignGridRoles, resolveOnChainRetypeType, shouldFlagOutOfSpread, buildIndexes, validateIndexes, ordersEqual, buildDelta, deriveTargetBoundary, isShiftEligibleFill, resolveEdgeCount, resolveEdgeOrders, selectEdgeSlots, getCoreOrdersTotal, getSideBudget, calculateBudgetedSizes, buildCreateOpFingerprint, isOrderGoneErrorMessage, isStructuralRebuildStaleReason, recordDuplicateOrphanDetection, clearDuplicateOrphanDetection, duplicateOrphanLogInfo, chainOrderUnchangedFromCache, detectCrossedBookPlan, collectKnownOnChainOrderIds, collectEdgePinnedFillIds, edgeOrderIdSet, liveWindowIdSet, checkGridPriceInvariant, reportGridPriceInvariant };
 export type { CrawlEntry }
 export { resolveEdgeAnchorPrice, resolveLiveEdgeAnchorPrice, compareEdge, collectRefillSlotIds, recordOrderPlacement, isFreshlyPlacedOrder, _filterUnmatchedChainOrders };
 

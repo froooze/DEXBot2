@@ -970,11 +970,12 @@ class OrderManager implements OrderManagerLike {
             this._structuralRebuildReason = null;
             this._structuralRebuildStartedAt = 0;
             // Re-arm the deferred work that was parked while the rebuild owned
-            // placement. The broadcast-region-end listener schedules the
-            // post-recovery rebalance (and drains queued fills); without this
-            // wake-up a fill deferred by the rebuild would only retry on the
-            // next unrelated region end.
-            if (this._deferredRebalanceAt) this._fireBroadcastRegionEnd();
+            // placement. Routed through the placement-region-end handler (not
+            // the raw broadcaster) so the "never wake into a live broadcast
+            // region" rule has exactly one spelling: the rebuild's own reconcile
+            // releases the broadcast refcount before this finally runs, but a
+            // nested rebuild must not wake work into an outer live region.
+            if (this._deferredRebalanceAt) this._handlePlacementRegionEnd();
         }
     }
 
@@ -1005,7 +1006,7 @@ class OrderManager implements OrderManagerLike {
     async withPlacement<T>(
         kind: string,
         fn: (lease: PlacementLease) => Promise<T>,
-        options: { timeoutMs?: number; isShuttingDown?: () => boolean; lease?: PlacementLease | null } = {}
+        options: { timeoutMs?: number; isShuttingDown?: () => boolean } = {}
     ): Promise<T | null> {
         return await runWithPlacement(this, kind, fn, options);
     }
@@ -1036,6 +1037,20 @@ class OrderManager implements OrderManagerLike {
     /** Whether another placement path currently holds the exclusive region. */
     isPlacementActive() {
         return this._placementLock.isHeld();
+    }
+
+    /**
+     * Whether the given lease is STILL the one that owns the region.
+     *
+     * The authoritative nesting predicate: a nested caller (the COW pre-batch
+     * drain) must verify its inherited lease with this before mutating.
+     * `isPlacementActive()` cannot answer it — it is true for any holder, so a
+     * lease invalidated by `forceRelease()` would still read as "live".
+     * @param {Object|null|undefined} lease - Lease to verify
+     * @returns {boolean}
+     */
+    isPlacementLeaseCurrent(lease: PlacementLease | null | undefined) {
+        return this._placementLock.isLeaseCurrent(lease);
     }
 
     /** Owner label of the active placement region, or null. */
@@ -1229,18 +1244,41 @@ class OrderManager implements OrderManagerLike {
     /**
      * Auto-clears a stale placement region after
      * TIMING.PLACEMENT_STALE_CLEAR_MS so a hung chain call / missed release
-     * cannot park fills and rebalances forever. There is no refcount to
-     * cross-check here (the lease IS the authority), so the bound is generous
-     * and the release is loud. The holder's lease becomes a no-op on release
-     * (token guard), so a late finally cannot release a successor.
+     * cannot park fills and rebalances forever. The holder's lease becomes a
+     * no-op on release (token guard), so a late finally cannot release a
+     * successor.
+     *
+     * TWO GUARDS, ONE TEARDOWN:
+     * - A bot-level batch/recovery still in flight and YOUNGER than the bound is
+     *   evidence of progress, so the region is not torn down (a long create-group
+     *   reconcile must survive). Only a batch older than the same bound is
+     *   treated as part of the hung region.
+     * - When the teardown does happen it also clears a broadcast refcount that
+     *   is itself past its bound, atomically. startBroadcasting() runs INSIDE the
+     *   placement region, so both clocks belong to the same region; clearing
+     *   them in one place stops the maintenance tick from tearing down placement
+     *   first and the refcount second (two authorities, one hung region).
+     *   `_clearStaleBroadcastFlag` still refuses to act on its own while a
+     *   placement lease is held.
      * @param {number} [maxAgeMs] - Override for tests
+     * @param {Object} [options] - `batchInFlightMs`: age of the oldest raised
+     *   bot-level pipeline counter (0/undefined when none).
      * @returns {boolean} true when a stale region was force-released
      */
-    _clearStalePlacementRegion(maxAgeMs: number = TIMING.PLACEMENT_STALE_CLEAR_MS): boolean {
+    _clearStalePlacementRegion(maxAgeMs: number = TIMING.PLACEMENT_STALE_CLEAR_MS, options: { batchInFlightMs?: number } = {}): boolean {
         if (!this.isPlacementActive()) return false;
         const heldMs = this.placementHeldForMs();
         const limit = Number(maxAgeMs) > 0 ? Number(maxAgeMs) : TIMING.PLACEMENT_STALE_CLEAR_MS;
         if (heldMs <= limit) return false;
+        const batchInFlightMs = Number(options?.batchInFlightMs);
+        if (Number.isFinite(batchInFlightMs) && batchInFlightMs > 0 && batchInFlightMs <= limit) {
+            this.logger?.log?.(
+                `[PLACEMENT] Watchdog skipped: region held by ${this.placementKind() || 'unknown'} for ${Math.round(heldMs / 1000)}s, ` +
+                `but the pipeline is still making progress (in flight ${Math.round(batchInFlightMs / 1000)}s)`,
+                'debug'
+            );
+            return false;
+        }
         const kind = this.placementKind() || 'unknown';
         this.logger?.log?.(
             `[PLACEMENT] Force-releasing stale placement region held by ${kind} for ${Math.round(heldMs / 1000)}s ` +
@@ -1248,6 +1286,20 @@ class OrderManager implements OrderManagerLike {
             'error'
         );
         this._placementLock.forceRelease();
+        // Same hung region: drop its broadcast refcount too (see JSDoc).
+        if (this._broadcastingFlag > 0 && this._broadcastingStartedAt > 0) {
+            const broadcastAgeMs = Date.now() - this._broadcastingStartedAt;
+            if (broadcastAgeMs > TIMING.BROADCAST_STALE_CLEAR_MS) {
+                this.logger?.log?.(
+                    `[PLACEMENT] Also clearing the stale broadcast region (${Math.round(broadcastAgeMs / 1000)}s) it held; ` +
+                    `one teardown for one hung region`,
+                    'warn'
+                );
+                this._broadcastingFlag = 0;
+                this._broadcastingStartedAt = 0;
+                this._fireBroadcastRegionEnd();
+            }
+        }
         return true;
     }
 
@@ -2163,6 +2215,13 @@ class OrderManager implements OrderManagerLike {
             // instead of waiting in-lock; processFillsOnly already recorded
             // the boundary crawls, so a later derivation applies them. The
             // region-end hook schedules the deferred rebalance.
+            //
+            // RE-ANCHOR BUDGET SNAPSHOT: the absolute fill anchor is a per-batch
+            // budget spent at PLAN time (strategy.calculateTargetGrid). Carry the
+            // pre-plan value so a stale-plan re-plan can hand back exactly what
+            // the abandoned plan spent (a static batch base would wrongly refund
+            // an anchor an earlier chunk legitimately committed).
+            const reanchorBudgetBefore = Number((this as unknown as { _boundaryReanchorBudget?: unknown })._boundaryReanchorBudget);
             const rebalanceResult = await this.performSafeRebalance(orders, excl, {
                 ...(options || {}),
                 deferIfBroadcasting: true
@@ -2172,6 +2231,7 @@ class OrderManager implements OrderManagerLike {
             // stale between planning and broadcast.
             rebalanceResult.fills = orders;
             rebalanceResult.excludeIds = excl || new Set();
+            (rebalanceResult as unknown as { _reanchorBudgetBeforePlan?: number })._reanchorBudgetBeforePlan = reanchorBudgetBefore;
             return rebalanceResult;
         }
 

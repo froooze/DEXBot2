@@ -17,6 +17,7 @@ const buildFillKey = lazyShim('./order/utils/order', 'buildFillKey');
 const correctAllPriceMismatches = lazyShim('./order/utils/order', 'correctAllPriceMismatches');
 const parseChainOrder = lazyShim('./order/utils/order', 'parseChainOrder');
 const retryPersistenceIfNeeded = lazyShim('./order/utils/system', 'retryPersistenceIfNeeded');
+const getPipelineInFlightAgeMs = lazyShim('./order/utils/system', 'getPipelineInFlightAgeMs');
 const { readOpenOrdersGuarded } = chainOrders;
 
 type ChainOrdersLike = typeof chainOrders;
@@ -1116,9 +1117,13 @@ async function consumeFillQueue(bot: BotLike, chainOrders: ChainOrdersLike) {
         }
         // Placement watchdog: a leaked/hung lease parks this queue; the
         // consumer is the one place guaranteed to run while the queue is
-        // non-empty (maintenance may be idle-gated by the same queue).
+        // non-empty (maintenance may be idle-gated by the same queue). The
+        // pipeline age lets the watchdog refuse a teardown while a live batch
+        // is still making progress.
         if (typeof bot.manager?._clearStalePlacementRegion === 'function') {
-            bot.manager._clearStalePlacementRegion();
+            bot.manager._clearStalePlacementRegion(undefined, {
+                batchInFlightMs: getPipelineInFlightAgeMs(bot),
+            });
         }
     } catch { /* watchdog must never break fill consumption */ }
 
@@ -1463,7 +1468,18 @@ async function consumeFillQueue(bot: BotLike, chainOrders: ChainOrdersLike) {
                         const correctionResult = await correctAllPriceMismatches(
                             bot.manager, bot.account, bot.privateKey, chainOrders
                         );
-                        if (correctionResult.failed > 0) bot.manager.logger.log(`${correctionResult.failed} corrections failed`, 'error');
+                        // The drain takes the exclusive placement region; a busy
+                        // region defers it (queued entries stay and the next
+                        // maintenance tick retries). Log it like the maintenance
+                        // path does, or the deferral is silently invisible.
+                        if (correctionResult?.deferred === true) {
+                            bot.manager.logger.log(
+                                `[FILL-QUEUE] Deferring price-correction drain: ${correctionResult.reason || 'placement region busy'}`,
+                                'info'
+                            );
+                        } else if (correctionResult.failed > 0) {
+                            bot.manager.logger.log(`${correctionResult.failed} corrections failed`, 'error');
+                        }
                     }
 
                 } finally {

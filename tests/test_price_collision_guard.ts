@@ -53,6 +53,8 @@ function makeManager(orders = [], assets = makeAssets()) {
         },
         logs,
         _applySync: async () => {},
+        // Uncertain-CREATE protection (liveness policy lives in utils/order).
+        _pendingBroadcasts: new Map(),
         getOrdersByTypeAndState: (type, state) => {
             return Array.from(orderMap.values()).filter(o => o && o.type === type && o.state === state);
         },
@@ -164,6 +166,66 @@ async function testCreateOrderFromGridSkipsOnCollision() {
     assert.ok(manager.logs.length > 0 && manager.logs[manager.logs.length - 1].msg.includes('SKIP'),
         'Should log skip message');
     console.log('✅ _createOrderFromGrid skips create on price collision');
+}
+
+async function testCreateOrderFromGridSkipsOnPendingBroadcastPriceLevel() {
+    let createCalled = false;
+    const chainOrders = makeChainOrders(async () => { createCalled = true; return []; });
+
+    const target = makeVirtualOrder('target-slot', 100, 50, ORDER_TYPES.BUY);
+    const manager = makeManager([target]);
+    // An uncertain CREATE for a DIFFERENT slot at the SAME price level: a
+    // rebuilt grid re-maps a price onto another slot id, so the slot-id check
+    // alone (the previous behaviour) misses exactly the duplicate the COW
+    // guard is written to block.
+    manager._pendingBroadcasts = new Map([['fp-1', {
+        slotId: 'other-slot',
+        orderType: ORDER_TYPES.BUY,
+        recordedAt: Date.now(),
+        order: { id: 'other-slot', price: 100, size: 50, type: ORDER_TYPES.BUY },
+    }]]);
+
+    await _createOrderFromGrid({
+        chainOrders,
+        account: 'test-account',
+        privateKey: 'test-key',
+        manager,
+        gridOrder: target,
+        dryRun: false,
+    });
+
+    assert.strictEqual(createCalled, false, 'must not duplicate a pending CREATE at the same price level from another slot');
+    assert.ok(
+        manager.logs.some((l) => String(l.msg).includes('PENDING-BROADCAST')),
+        'the refusal must be logged as a pending-broadcast skip'
+    );
+    console.log('✅ _createOrderFromGrid skips a pending CREATE at the same price level (different slot)');
+}
+
+async function testCreateOrderFromGridIgnoresPendingBroadcastAtOtherPrice() {
+    let createCalled = false;
+    const chainOrders = makeChainOrders(async () => { createCalled = true; return []; });
+
+    const target = makeVirtualOrder('target-slot', 100, 50, ORDER_TYPES.BUY);
+    const manager = makeManager([target]);
+    manager._pendingBroadcasts = new Map([['fp-2', {
+        slotId: 'other-slot',
+        orderType: ORDER_TYPES.BUY,
+        recordedAt: Date.now(),
+        order: { id: 'other-slot', price: 150, size: 50, type: ORDER_TYPES.BUY },
+    }]]);
+
+    await _createOrderFromGrid({
+        chainOrders,
+        account: 'test-account',
+        privateKey: 'test-key',
+        manager,
+        gridOrder: target,
+        dryRun: false,
+    });
+
+    assert.strictEqual(createCalled, true, 'a pending CREATE at another level must not block this one');
+    console.log('✅ _createOrderFromGrid does not over-block on an unrelated pending CREATE');
 }
 
 async function testCreateOrderFromGridProceedsWithoutCollision() {
@@ -536,6 +598,8 @@ async function testGridPriceIdentityPrimitives() {
 
     // _createOrderFromGrid
     await testCreateOrderFromGridSkipsOnCollision();
+    await testCreateOrderFromGridSkipsOnPendingBroadcastPriceLevel();
+    await testCreateOrderFromGridIgnoresPendingBroadcastAtOtherPrice();
     await testCreateOrderFromGridProceedsWithoutCollision();
     await testCreateOrderFromGridSkipsOnOwnOrderId();
     await testCreateOrderFromGridOrderIdCheckFiresBeforePriceCheck();

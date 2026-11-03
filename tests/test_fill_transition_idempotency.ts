@@ -158,6 +158,71 @@ async function runTests() {
             'the fill trade (totals and free) must be applied exactly once even when pass 1 resized the slot'
         );
     }
+    console.log(' - 6. an explicit partial applied amount is NOT masked by the legacy boolean...');
+    {
+        // The aggregated batch path reads `__chainSizeAlreadyApplied` off the
+        // LAST entry of a group while summing the explicit applied amounts. If
+        // the boolean counted as a floor it would collapse the remainder to 0
+        // and skip the unapplied part of the earlier fills (phantom residual).
+        const result = await engine._computeFillTransitionResult(
+            makeManager(),
+            makeParams({ alreadyAppliedInt: 1000, alreadyAppliedChainSize: true })
+        );
+        assert.strictEqual(result.isFull, false, 'a partially applied fill is not a full fill');
+        assert.ok(
+            Math.abs(Number(result.partialUpdate.size) - 3.0488) < 1e-9,
+            `the unapplied remainder must still be subtracted (expected 3.0488, got ${result.partialUpdate.size})`
+        );
+        assert.strictEqual(
+            String(result.partialUpdate.rawOnChain.for_sale), '30488',
+            'rawOnChain must carry the remainder-only size even when the boolean flag is set'
+        );
+    }
+
+    console.log(' - 7. a zero-remainder fill still verifies and cancels a chain residual...');
+    {
+        // Fill amount >= observed baseline clamps the remainder to 0. The slot
+        // must virtualize (never a 0-size PARTIAL), but the chain residual check
+        // must still run — skipping it strands a >= 1 base-unit order.
+        const mgr = makeManager();
+        let residualReads = 0;
+        (mgr as any)._readSingleOrderFn = async () => { residualReads += 1; return { for_sale: 42 }; };
+        const result = await engine._computeFillTransitionResult(mgr, makeParams({
+            filledAmount: 9.9,
+            filledAmountInt: 99000,
+            effectiveRawForSale: 33046,
+            rawForSaleInt: 33046,
+        }));
+        assert.strictEqual(result.isFull, true, 'no tradeable remainder => full fill');
+        assert.ok(result.residualCancel, 'the chain residual must still be scheduled for cancel');
+        assert.strictEqual(result.residualCancel.orderId, '1.7.137');
+        assert.ok(residualReads >= 1, 'the residual verification read must run');
+    }
+
+    console.log(' - 8. a corrupt slot price cannot produce a 0-size PARTIAL...');
+    {
+        // price 0 makes the quote-side rounding test undecidable (NaN), so the
+        // zero-remainder brake is the only thing preventing an invalid state.
+        const result = await engine._computeFillTransitionResult(makeManager(), makeParams({
+            matchedGridOrder: {
+                id: 'slot-9',
+                orderId: '1.7.9',
+                type: ORDER_TYPES.BUY,
+                state: ORDER_STATES.ACTIVE,
+                price: 0,
+                size: 1,
+                rawOnChain: { for_sale: '1' },
+            },
+            orderType: ORDER_TYPES.BUY,
+            filledAmount: 5,
+            filledAmountInt: 50000,
+            currentSizeIntFromGrid: 1,
+            rawForSaleInt: 1,
+            effectiveRawForSale: 1,
+        }));
+        assert.strictEqual(result.isFull, true, 'a clamped remainder must never yield a 0-size PARTIAL slot');
+    }
+
     console.log('\n✓ fill-transition idempotency tests PASSED!');
 }
 

@@ -275,7 +275,32 @@ The master grid (`this.orders`) is **immutable** - it can only be replaced atomi
 | `deepFreeze()` | `manager.ts` | Individual order objects are deep-frozen |
 | `_gridVersion` | `manager.ts` | Version counter for staleness detection |
 | `_gridLock` | `manager.ts` | AsyncLock serializes grid mutations |
+| `_placementLock` | `manager.ts` / `placement_lock.ts` | Exclusive placement region: serializes every chain-mutating path (COW broadcast, reconcile Phase 1+2, correction drain, dust/residual cancel, pool swap) |
 | Encapsulation | `manager.ts` | Index Sets are private; mutations only via `_applyOrderUpdate()` |
+
+### Exclusive Placement Region
+
+`_gridVersion` protects the MASTER from a stale plan; it does not stop two paths
+from broadcasting at the same time. That is the placement region
+(`modules/order/placement_lock.ts`): a non-reentrant FIFO lease claimed once per
+chain-mutating operation.
+
+- Non-token holders use `manager.withPlacement(kind, fn)`, which owns the bounded
+  wait, the shutdown probe and the release. The two token-level holders are the
+  COW batch body and startup reconcile (they hold the lease across plan →
+  broadcast → commit).
+- Nested work must NOT acquire again: it receives the holder's lease and verifies
+  it with `manager.isPlacementLeaseCurrent(lease)` — `isPlacementActive()` is true
+  for ANY holder, so it cannot prove ownership (a lease invalidated by
+  `forceRelease()` would still read as live).
+- Anything that cannot get the region aborts or defers its batch instead of
+  broadcasting unprotected (`[PLACEMENT]`/`[DUST]`/`[RESIDUAL]`/`[MAINT]` deferral
+  lines).
+- Leak protection: `_clearStalePlacementRegion()` force-releases a region held past
+  `TIMING.PLACEMENT_STALE_CLEAR_MS`, refuses while a bot-level pipeline counter
+  younger than that bound proves progress, and clears the hung region's stale
+  broadcast refcount in the same step. The broadcast-refcount watchdog mirrors the
+  rule in reverse (it refuses while a placement lease is held).
 
 ### Master Grid Update Pattern
 
@@ -609,7 +634,10 @@ anchor — a partial at a far slot is still a real trade, and its residual is th
 allow-listed case below.
 
 A move that strands **strictly fewer** placed orders than the committed boundary
-is accepted as a violation-reducing repair; an equal count still refuses. The
+is accepted as a violation-reducing repair; an equal count still refuses
+(canonical statement: `INV-COW-006` in
+[COW_INVARIANTS.md](COW_INVARIANTS.md#cow-pipeline) — this section is
+its rationale, not a second definition). The
 comparison uses `validatePersistedBoundary`'s own in-band count
 (`boundaryMoveReducesStrands`), so the fill re-anchor and the rail clamp cannot
 disagree about what "stranded" means. Within that bound, the fill's **own

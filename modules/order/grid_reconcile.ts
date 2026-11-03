@@ -15,7 +15,7 @@ import {
     isOrderPlaced, parseChainOrder, isOrderOnChain, findLiveOrderOwnerByChainId,
     chainOrderMatchesSlotWithTolerance,
     duplicateOrphanLogInfo, resolveEdgeCount,
-    reviveVirtualSlotFromChain,
+    reviveVirtualSlotFromChain, getLivePendingBroadcasts,
 } from './utils/order.js';
 import * as Format from './format.js';
 import { getErrorMessage } from '../utils/errors.js';
@@ -235,8 +235,6 @@ export async function reconcileGridOrders({
     options?: {
         /** Rebuild callers own the rebuild and must be allowed to reconcile. */
         allowDuringRebuild?: boolean;
-        /** Reuse an already-held placement lease instead of acquiring one. */
-        placementLease?: PlacementLease | null;
     };
 }) {
     // Parameter validation
@@ -290,12 +288,16 @@ export async function reconcileGridOrders({
     // chain (guarded: non-truncated, non-empty) so Phase 1/2 work from a
     // snapshot no older than the region. Held across Phase 1 + Phase 2 and
     // released after stopBroadcasting in the finally below.
-    let placementLease: PlacementLease | null = options.placementLease ?? null;
-    const ownsPlacementLease = !placementLease;
+    // TOKEN-LEVEL HOLDER: this function acquires and releases its own placement
+    // lease because it must span Phase 1 (planning) and Phase 2 (broadcasting)
+    // — a `withPlacement` callback body would invert the phase structure. Every
+    // OTHER chain-mutating path goes through `manager.withPlacement()`; keep it
+    // that way (see placement_lock.ts).
+    let placementLease: PlacementLease | null = null;
     let regionStarted = false;
     const releaseRegion = () => {
         if (regionStarted) manager.stopBroadcasting?.();
-        if (ownsPlacementLease) placementLease?.release();
+        placementLease?.release();
         placementLease = null;
     };
 
@@ -307,7 +309,7 @@ export async function reconcileGridOrders({
         + resolveEdgeCount(config, 'sell');
     let phase1Result;
     try {
-        if (!placementLease && typeof manager.acquirePlacement === 'function') {
+        if (typeof manager.acquirePlacement === 'function') {
             placementLease = await manager.acquirePlacement('startup-reconcile', { timeoutMs: 120000 });
             if (!placementLease) {
                 logger?.log?.(
@@ -841,9 +843,7 @@ export async function reconcileGridOrders({
                     const freshChainIds = new Set(freshParsed.map((x) => String(x.chain.id)));
                     const missingPhase2Ids = [...phase2CreatedOrderIds]
                         .filter((id) => !freshChainIds.has(String(id)));
-                    const pendingBroadcastCount = manager._pendingBroadcasts instanceof Map
-                        ? manager._pendingBroadcasts.size
-                        : 0;
+                    const pendingBroadcastCount = getLivePendingBroadcasts(manager).length;
                     let skipSurplusSweepReason = '';
                     if (missingPhase2Ids.length > 0) {
                         skipSurplusSweepReason =

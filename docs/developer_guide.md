@@ -907,18 +907,32 @@ _finishStartupSequence()
 
 **Critical Rule: Always acquire locks in ascending level order**
 
-The canonical 5-level hierarchy (defined at `manager.ts`):
+The canonical hierarchy (defined at `manager.ts`):
 
 ```
-Level 0: _fillProcessingLock  (fill processing — outermost)
-Level 1: _divergenceLock      (divergence checks)
-Level 2: _syncLock            (sync operations — timeout-protected)
-Level 3: _gridLock            (grid mutations)
-Level 4: _fundLock            (fund operations — innermost)
+Level 0:   _fillProcessingLock  (fill processing — outermost)
+Level 0.5: placement region     (exclusive chain-mutation mutex — PlacementLock)
+Level 1:   _divergenceLock      (divergence checks)
+Level 2:   _syncLock            (sync operations — timeout-protected)
+Level 3:   _gridLock            (grid mutations)
+Level 4:   _fundLock            (fund operations — innermost)
 ```
 
-All five locks live on the `OrderManager` instance. The `level` property is a
-convention marker — AsyncLock does not enforce it at runtime.
+All levels live on the `OrderManager` instance (the placement region is
+`_placementLock`, see `modules/order/placement_lock.ts`). The `level` property
+is a convention marker — AsyncLock does not enforce it at runtime, and
+`PlacementLock` is not an AsyncLock (it is a FIFO, non-reentrant lease).
+
+**Placement region (Level 0.5)** serializes every chain-mutating path: COW
+broadcasts, reconcile Phase 1+2, correction drains, dust/residual cancels and
+pool swaps. It is acquired **before** `_gridLock` and never while holding it,
+and it is `NOT` reentrant — nested work receives the holder's lease instead of
+acquiring again, and verifies it with `manager.isPlacementLeaseCurrent(lease)`
+(`isPlacementActive()` is true for ANY holder and must not be used for that).
+The canonical region order is:
+`startBroadcasting → placement → gridLock → fundLock → release placement → stopBroadcasting`.
+A leaked region is force-released by `_clearStalePlacementRegion()`, which also
+drops the hung region's stale broadcast refcount in the same step.
 
 **Why This Order?**
 
@@ -926,6 +940,9 @@ convention marker — AsyncLock does not enforce it at runtime.
 - Divergence checks (Level 1) nest inside fill processing
 - Sync operations (Level 2) are acquired before grid mutations — the timeout-protected lock is inner, so a stuck sync releases the outer lock
 - Grid mutations (Level 3) and fund operations (Level 4) are innermost
+- The placement region (Level 0.5) sits between fill processing and the grid
+  locks: it is broader than one grid mutation (it spans plan → broadcast →
+  commit) but must never be taken while a grid lock is held
 - All paths follow the same order
 
 **`adjustTotalBalance` Locking Contract** (v1.4.7):

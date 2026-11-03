@@ -10,6 +10,7 @@ import { lazyShim } from './lazy_shim.js';
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
 import { nowIso, fireStructuralResync, resolveLastFillGuardReference, hasUnsettledFills } from './order/utils/system.js';
+import { withPlacement } from './order/placement_lock.js';
 import { path } from './path_api.js';
 import * as chainOrders from './chain_orders.js';
 import * as grid from './order/grid.js';
@@ -87,6 +88,7 @@ const applyGridDivergenceCorrections = lazyShim('./order/utils/system', 'applyGr
 const updateGridFromBlockchainSnapshot = lazyShim('./order/grid', 'updateGridFromBlockchainSnapshot');
 const loadAmaCenterSnapshot = lazyShim('./order/utils/system', 'loadAmaCenterSnapshot');
 const sleep = lazyShim('./order/utils/system', 'sleep');
+const getPipelineInFlightAgeMs = lazyShim('./order/utils/system', 'getPipelineInFlightAgeMs');
 const parseJsonWithComments = lazyShim('./order/utils/system', 'parseJsonWithComments');
 const isPm2Runtime = lazyShim('./order/logger', 'isPm2Runtime');
 const isWrapperAdapterOwner = lazyShim('./launcher/adapter_requirement', 'isWrapperAdapterOwner');
@@ -115,6 +117,7 @@ const isStrandedHoldOrder = lazyShim('./order/utils/order', 'isStrandedHoldOrder
 const getSideBudget = lazyShim('./order/utils/order', 'getSideBudget');
 function getCoreOrdersTotal(config: unknown) { return require('./order/utils/order').getCoreOrdersTotal(config); }
 const correctAllPriceMismatches = lazyShim('./order/utils/order', 'correctAllPriceMismatches');
+const getLivePendingBroadcasts = lazyShim('./order/utils/order', 'getLivePendingBroadcasts');
 const isOrderOnChain = lazyShim('./order/utils/order', 'isOrderOnChain');
 const parseChainOrder = lazyShim('./order/utils/order', 'parseChainOrder');
 const parseSlotIndex = lazyShim('./order/utils/slot', 'parseSlotIndex');
@@ -2562,12 +2565,18 @@ async function executeMaintenanceLogic(bot: BotLike, context: string) {
     // Surface any over-long _gridLock hold first — observational only, and it
     // must run even when the rest of the tick defers on a broadcast region.
     checkGridLockHoldDuration(bot);
-    // Placement leak watchdog first: it is the authoritative mutex, and the
-    // broadcast/pipeline watchdogs cross-check against it.
-    try { bot.manager?._clearStalePlacementRegion?.(); } catch { /* observational */ }
-    // Clear stale broadcast flag first so any downstream gating on
-    // isBroadcastingActive() (e.g. recalculateFunds, BTS balance check)
-    // sees the freshest state rather than a hung flag.
+    // Placement leak watchdog first: it is the authoritative mutex and the one
+    // authority that may tear a hung region down (it also drops that region's
+    // stale broadcast refcount atomically). A live pipeline counter younger than
+    // the bound keeps the region alive, so a slow create-group reconcile is not
+    // cut out from under its own leases.
+    try {
+        bot.manager?._clearStalePlacementRegion?.(undefined, {
+            batchInFlightMs: getPipelineInFlightAgeMs(bot),
+        });
+    } catch { /* observational */ }
+    // Broadcast-flag watchdog: it refuses to act while a placement lease is
+    // held, so it only clears regions that never took the exclusive region.
     bot.manager._clearStaleBroadcastFlag();
     checkPipelineInFlightWatchdogs(bot);
 
@@ -2631,10 +2640,19 @@ async function executeMaintenanceLogic(bot: BotLike, context: string) {
     // with batch broadcasts — transient mismatches are expected during a COW cycle.
     // Also skip while a structural recovery reload is in flight (it runs without
     // the fill lock, so this check must gate on the recovery flag explicitly).
+    // Liveness count from the single authority; a test double that does not
+    // model it falls back to the raw map size (a COUNT only — never a second
+    // TTL policy), so a partial mock cannot make the gate throw.
+    let pendingBroadcastCount = 0;
+    try {
+        pendingBroadcastCount = Number(getLivePendingBroadcasts(bot.manager)?.length) || 0;
+    } catch {
+        pendingBroadcastCount = Number(bot.manager?._pendingBroadcasts?.size) || 0;
+    }
     if (
         !bot._recoverySyncInFlight &&
         !bot._batchInFlight &&
-        !(bot.manager?._pendingBroadcasts?.size > 0) &&
+        pendingBroadcastCount === 0 &&
         (bot._lightweightSyncCheckAt == null || Date.now() - bot._lightweightSyncCheckAt >= TIMING.LIGHTWEIGHT_SYNC_CHECK_INTERVAL_MS)
     ) {
         bot._lightweightSyncCheckAt = Date.now();
@@ -3117,10 +3135,12 @@ async function runWithPlacement<T>(
     fn: (lease: { kind: string; release(): void }) => Promise<T>,
     options: { timeoutMs?: number; isShuttingDown?: () => boolean } = {}
 ): Promise<T | null> {
-    if (typeof bot.manager.withPlacement === 'function') {
-        return await bot.manager.withPlacement(kind, fn, options);
-    }
-    return await fn({ kind, release: () => { /* no lock (mock/no manager) */ } });
+    // Bot-first adapter over the ONE acquire/release contract
+    // (modules/order/placement_lock.ts): it owns the bounded wait, the shutdown
+    // probe, the NOOP fallback for manager-less fakes and the release. Do not
+    // re-implement that here — a local copy already drifted once (it could not
+    // take a lease and skipped the lease-liveness check).
+    return await withPlacement(bot.manager, kind, fn, options);
 }
 
 /**

@@ -22,7 +22,9 @@ Reconciliation aligns the bot's model with on-chain reality. It runs at startup 
 
 The reconcile runs from [`recalculateGrid`](../modules/order/grid.ts) during startup full-resync. **There is no per-attempt wall-clock race around the reconcile itself** — an outer timeout would fire mid-batch and orphan in-flight broadcasts (the duplicate-accumulation death spiral). The reconcile is bounded only by the 10-minute total resync safety net, and every internal chain read follows the shared guarded-read standard.
 
-Phase 1 does all reasoning in memory under `_gridLock` (fast); Phases 2 and 3 execute outside that planning lock — holding it across RPC calls would block fills, sync, and divergence checks. Phase 2 holds the broadcasting single-flight marker, while the sync/apply paths it invokes follow the canonical lock hierarchy. No planning-phase grid lock spans a network operation.
+Phase 1 does all reasoning in memory under `_gridLock` (fast); Phases 2 and 3 execute outside that planning lock — holding it across RPC calls would block fills, sync, and divergence checks. **Both phases run inside the exclusive placement region** (`manager.acquirePlacement('startup-reconcile')`, acquired before the chain snapshot is trusted and released after `stopBroadcasting`), so no other chain-mutating path can broadcast between Phase 1's plan and Phase 2's execution. Phase 2 additionally holds the broadcasting single-flight marker (which only defers fills), while the sync/apply paths it invokes follow the canonical lock hierarchy. No planning-phase grid lock spans a network operation.
+
+The reconcile is not purely time-unbounded: besides the 10-minute total resync safety net it also waits up to 120 s for the placement region and re-reads the open-orders snapshot after acquiring it (planning from a snapshot older than the region is exactly the duplicate class). A reconcile that cannot get the region returns `null` and defers to the next sync cycle.
 
 Phase 2 and 3 both respect the `dryRun` flag: when true, no on-chain mutations are attempted — plans are logged but not executed.
 
@@ -260,12 +262,12 @@ The underlying rule is `INV-BROADCAST-004`: a capped `get_full_accounts` window 
 **`manager.ts` lock declaration** — canonical reference in [`developer_guide.md`](developer_guide.md#lock-ordering-for-deadlock-prevention).
 
 ```
-Level 0: _fillProcessingLock    Level 1: _divergenceLock
-Level 2: _syncLock              Level 3: _gridLock
-Level 4: _fundLock
+Level 0:   _fillProcessingLock    Level 0.5: placement region
+Level 1:   _divergenceLock        Level 2:   _syncLock
+Level 3:   _gridLock              Level 4:   _fundLock
 ```
 
-Acquire in ascending level order only. AsyncLock is re-entrant (nested `acquire()` run directly, not queued).
+Acquire in ascending level order only. AsyncLock is re-entrant (nested `acquire()` run directly, not queued); the placement region (`modules/order/placement_lock.ts`) is NOT re-entrant — it is a FIFO lease, and nested work must reuse the holder's lease (verified with `manager.isPlacementLeaseCurrent()`).
 
 ### Historical Correction (1.4.6)
 

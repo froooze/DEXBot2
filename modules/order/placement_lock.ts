@@ -12,10 +12,15 @@
  * Design notes:
  * - Token based (acquire returns a release lease) so callers can hold the
  *   region across a multi-chunk broadcast without wrapping the whole method
- *   in a callback.
- * - NOT reentrant. Placement paths do not nest: the COW re-plan calls
- *   performSafeRebalance, which only *observes* the lock (defers), it never
- *   acquires it. Keep that invariant if a new caller is added.
+ *   in a callback. The two token-level holders (COW broadcast body, startup
+ *   reconcile Phase 1+2) own their lease explicitly; every other path goes
+ *   through {@link withPlacement}, which is the one acquire/release contract.
+ * - NOT reentrant. Nested work must NOT acquire again: a caller that already
+ *   holds the region hands its lease to the specific inner operation (the COW
+ *   pre-batch drain does this via `correctAllPriceMismatches({ placementLease })`),
+ *   and that inner operation verifies it with
+ *   {@link PlacementCapableManager.isPlacementLeaseCurrent} before mutating —
+ *   `isPlacementActive()` is NOT a substitute, it is true for any holder.
  * - FIFO queue with a bounded wait. A waiter that times out or observes
  *   shutdown gets `null` and MUST abort its batch instead of broadcasting.
  */
@@ -24,6 +29,17 @@ export interface PlacementLease {
     kind: string;
     release(): void;
 }
+
+/**
+ * Lease → lock token registry.
+ *
+ * A lease object is all a nested caller holds, so it cannot prove ownership by
+ * `isPlacementActive()` (any holder satisfies that). The token the lock stamped
+ * into the lease at hand-out time is kept here out-of-band (WeakMap), which
+ * keeps the public lease shape unchanged while letting the lock answer "is this
+ * still the lease that owns the region?".
+ */
+const leaseTokens = new WeakMap<PlacementLease, number>();
 
 export interface PlacementAcquireOptions {
     timeoutMs?: number;
@@ -38,6 +54,8 @@ export interface PlacementCapableManager {
     acquirePlacement?(kind: string, options?: PlacementAcquireOptions): Promise<PlacementLease | null>;
     tryAcquirePlacement?(kind: string): PlacementLease | null;
     isPlacementActive?(): boolean;
+    /** Whether this lease still owns the region (see leaseTokens). */
+    isPlacementLeaseCurrent?(lease: PlacementLease | null | undefined): boolean;
     placementKind?(): string | null;
 }
 
@@ -50,9 +68,11 @@ const NOOP_PLACEMENT_LEASE: PlacementLease = { kind: 'noop', release: () => { /*
  * This is the single entry point every chain-mutating placement path should
  * use (COW broadcast, startup reconcile Phase 2, correction drains, dust /
  * residual cancels, pool swaps). It centralizes the acquire/release contract
- * so a path cannot forget to release, and it accepts an existing lease for
- * nested calls (a COW batch holds the region across its pre-batch correction
- * drain, so the drain must reuse that lease instead of deadlocking).
+ * so a path cannot forget to release.
+ *
+ * Nesting is NOT expressed here: a caller that already holds the region passes
+ * its lease to the specific inner operation, which then checks
+ * `isPlacementLeaseCurrent()` before mutating (see the placement_lock header).
  *
  * @returns `null` when the region could not be acquired (timeout/shutdown);
  *   callers must abort/defer their broadcast in that case.
@@ -61,17 +81,8 @@ export async function withPlacement<T>(
     manager: PlacementCapableManager | null | undefined,
     kind: string,
     fn: (lease: PlacementLease) => Promise<T>,
-    options: PlacementAcquireOptions & { lease?: PlacementLease | null } = {}
+    options: PlacementAcquireOptions = {}
 ): Promise<T | null> {
-    if (options.lease) {
-        // A nested caller may pass the lease it already holds. If the region is
-        // no longer active (stale lease after forceRelease / a missed release),
-        // do NOT run the mutation unprotected: fall through and acquire a
-        // fresh lease below.
-        const leaseStillLive = typeof manager?.isPlacementActive !== 'function'
-            || manager.isPlacementActive() === true;
-        if (leaseStillLive) return await fn(options.lease);
-    }
     if (!manager || typeof manager.acquirePlacement !== 'function') {
         return await fn(NOOP_PLACEMENT_LEASE);
     }
@@ -202,9 +213,16 @@ class PlacementLock {
         this._notifyRegionEnd();
     }
 
+    /** Whether the given lease is still the one that owns the region. */
+    isLeaseCurrent(lease: PlacementLease | null | undefined): boolean {
+        if (!lease || this._holder === null) return false;
+        const token = leaseTokens.get(lease);
+        return token !== undefined && token === this._token;
+    }
+
     _makeLease(kind: string, token: number): PlacementLease {
         let released = false;
-        return {
+        const lease: PlacementLease = {
             kind,
             release: () => {
                 if (released) return;
@@ -212,6 +230,8 @@ class PlacementLock {
                 this._release(token);
             },
         };
+        leaseTokens.set(lease, token);
+        return lease;
     }
 
     _release(token: number): void {

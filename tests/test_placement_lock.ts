@@ -144,6 +144,91 @@ async function testPlacementWatchdog() {
     console.log('  PASS');
 }
 
+async function testWatchdogRespectsLivePipeline() {
+    console.log('\n - the watchdog keeps a region a live (young) batch still owns...');
+    const { OrderManager } = require('../modules/order/index').default;
+    const mgr = new OrderManager({
+        assetA: 'BASE', assetB: 'QUOTE', startPrice: 100, minPrice: 50, maxPrice: 200,
+        incrementPercent: 10, targetSpreadPercent: 10,
+        botFunds: { buy: 1000, sell: 10 }, coreOrders: { buy: 2, sell: 2 },
+    });
+    const lease = await mgr.acquirePlacement('long-create-group');
+    assert.ok(lease);
+    (mgr as any)._placementLock._since = Date.now() - 16 * 60 * 1000;
+    assert.strictEqual(
+        mgr._clearStalePlacementRegion(undefined, { batchInFlightMs: 60_000 }),
+        false,
+        'a batch younger than the bound proves progress: no teardown'
+    );
+    assert.strictEqual(mgr.isPlacementActive(), true, 'the region must still be held');
+    assert.strictEqual(
+        mgr._clearStalePlacementRegion(undefined, { batchInFlightMs: 20 * 60 * 1000 }),
+        true,
+        'a batch past the same bound is part of the hung region'
+    );
+    assert.strictEqual(mgr.isPlacementActive(), false);
+    console.log('  PASS');
+}
+
+async function testOneAuthorityTearsDownAHungRegion() {
+    console.log('\n - one authority tears down a hung placement + broadcast region...');
+    const { OrderManager } = require('../modules/order/index').default;
+    const mgr = new OrderManager({
+        assetA: 'BASE', assetB: 'QUOTE', startPrice: 100, minPrice: 50, maxPrice: 200,
+        incrementPercent: 10, targetSpreadPercent: 10,
+        botFunds: { buy: 1000, sell: 10 }, coreOrders: { buy: 2, sell: 2 },
+    });
+    let regionEnds = 0;
+    mgr.addBroadcastRegionEndListener(() => { regionEnds += 1; });
+    mgr.startBroadcasting();
+    const lease = await mgr.acquirePlacement('hung-holder');
+    assert.ok(lease);
+    (mgr as any)._placementLock._since = Date.now() - 16 * 60 * 1000;
+    (mgr as any)._broadcastingStartedAt = Date.now() - 16 * 60 * 1000;
+
+    // The broadcast watchdog alone must not act while placement is held.
+    mgr._clearStaleBroadcastFlag();
+    assert.strictEqual(mgr.isBroadcastingActive(), true, 'the refcount watchdog must defer to a held placement lease');
+
+    assert.strictEqual(mgr._clearStalePlacementRegion(), true, 'the placement watchdog owns the teardown');
+    assert.strictEqual(mgr.isPlacementActive(), false);
+    assert.strictEqual(
+        mgr.isBroadcastingActive(), false,
+        'the broadcast refcount of the SAME hung region must be cleared in one step (not on a later tick)'
+    );
+    assert.strictEqual(regionEnds, 1, 'exactly one region-end notification');
+    console.log('  PASS');
+}
+
+async function testLeaseLiveness() {
+    console.log('\n - lease liveness is the token, not isPlacementActive()...');
+    const { OrderManager } = require('../modules/order/index').default;
+    const mgr = new OrderManager({
+        assetA: 'BASE', assetB: 'QUOTE', startPrice: 100, minPrice: 50, maxPrice: 200,
+        incrementPercent: 10, targetSpreadPercent: 10,
+        botFunds: { buy: 1000, sell: 10 }, coreOrders: { buy: 2, sell: 2 },
+    });
+    const lease = await mgr.acquirePlacement('a');
+    assert.ok(lease);
+    assert.strictEqual(mgr.isPlacementLeaseCurrent(lease), true, 'the holder lease is current');
+    assert.strictEqual(mgr.isPlacementLeaseCurrent(null), false, 'a missing lease is never current');
+
+    const waitP = mgr.acquirePlacement('b');
+    lease.release();
+    const handed = await waitP;
+    assert.ok(handed);
+    assert.strictEqual(mgr.isPlacementLeaseCurrent(lease), false, 'a released lease must not read as current after a handoff');
+    assert.strictEqual(mgr.isPlacementLeaseCurrent(handed), true, 'the handed-off lease is current');
+
+    (mgr as any)._placementLock._since = Date.now() - 16 * 60 * 1000;
+    assert.strictEqual(mgr._clearStalePlacementRegion(), true);
+    assert.strictEqual(
+        mgr.isPlacementLeaseCurrent(handed), false,
+        'a force-released lease must not read as current (isPlacementActive() alone would lie)'
+    );
+    console.log('  PASS');
+}
+
 async function testShutdownProbe() {
     console.log('\n - shutdown probe rejects acquisition...');
     const lock = new PlacementLock();
@@ -161,6 +246,9 @@ async function testShutdownProbe() {
     await testForceReleaseAba();
     await testRegionEndCallback();
     await testPlacementWatchdog();
+    await testWatchdogRespectsLivePipeline();
+    await testOneAuthorityTearsDownAHungRegion();
+    await testLeaseLiveness();
     await testShutdownProbe();
     console.log('\n✓ All placement lock tests passed');
 })().catch((err) => {

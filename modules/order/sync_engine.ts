@@ -1773,10 +1773,15 @@ class SyncEngine {
         const explicitApplied = Number.isFinite(Number(params.alreadyAppliedInt))
             ? Math.round(Number(params.alreadyAppliedInt))
             : 0;
-        // The legacy boolean is a FLOOR: a caller/fillOp that only carries
-        // `alreadyAppliedChainSize` (no explicit amount) still skips the whole
-        // fill. Production sets both together, so this is compatibility only.
-        const appliedFromBoolean = params.alreadyAppliedChainSize ? filledAmountInt : 0;
+        // The legacy boolean is a FALLBACK, never a floor: it carries no amount,
+        // so it can only speak for the whole fill. It is honoured ONLY when the
+        // caller supplied no explicit applied amount — otherwise a group in
+        // which ONE entry was marked would skip the unapplied remainder of its
+        // siblings (the aggregated batch path reads the flag off the last entry
+        // only, so the explicit sum must win).
+        const hasExplicitApplied = params.alreadyAppliedInt != null
+            && Number.isFinite(Number(params.alreadyAppliedInt));
+        const appliedFromBoolean = !hasExplicitApplied && params.alreadyAppliedChainSize ? filledAmountInt : 0;
         const appliedInt = Math.max(0, Math.min(
             filledAmountInt,
             Math.max(explicitApplied, appliedFromBoolean)
@@ -1794,7 +1799,7 @@ class SyncEngine {
         }
 
         const gridAlsoEmpty = currentSizeIntFromGrid <= 0;
-        let isEffectivelyFull = resolvedChainConfirmsEmpty || gridAlsoEmpty || newSizeInt <= 0;
+        let isEffectivelyFull = resolvedChainConfirmsEmpty || gridAlsoEmpty;
 
         // If the chain retains a real residual order after this fill, the bot
         // must cancel it explicitly. The chain only auto-culls ("culls small")
@@ -1872,6 +1877,22 @@ class SyncEngine {
                     );
                 }
             }
+        }
+
+        // ZERO-REMAINDER BRAKE: a fill that leaves nothing tradeable must never
+        // produce a 0-size PARTIAL slot (invalid order state), even when the
+        // quote-side rounding test above could not decide (a corrupt/zero slot
+        // price makes `otherSize` non-finite, so `<= 0` is false). Deliberately
+        // placed AFTER the residual verification: taking this brake earlier
+        // skipped the explicit cancel of a real chain residual — the exact
+        // stranding path `cancelResidualOrders` exists for.
+        if (!isEffectivelyFull && newSizeInt <= 0) {
+            isEffectivelyFull = true;
+            mgr.logger.log(
+                `[SYNC] Order ${matchedGridOrder.orderId} (slot ${matchedGridOrder.id}) leaves no tradeable remainder ` +
+                `(filled=${filledAmountInt} baseline=${currentSizeInt} applied=${appliedInt}); treating as a full fill.`,
+                'debug'
+            );
         }
 
         let fullUpdate: ManagedOrder | undefined;

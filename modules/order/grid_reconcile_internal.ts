@@ -10,7 +10,7 @@
 import { ORDER_TYPES, ORDER_STATES, TIMING, BTS_PRECISION } from '../constants.js';
 import { readOpenOrdersGuarded } from '../chain_orders.js';
 import { getMinOrderSize, getSingleDustThreshold, getAssetFees, getAssetFeesSafe, blockchainToFloat, findCrossedOrder, resolveGapBand, isSlotInRail, pricesOnSameLevel, pricesWithinHalfStep, sameGridLevel } from './utils/math.js';
-import { isOrderPlaced, parseChainOrder, buildCreateOrderArgs, buildOutsideInPairGroups, extractBatchOperationResults, chainOrderMatchesSlotWithTolerance, buildCrossingCheckCandidates, isCrossingCheckCandidate, getSideBudget, calculateBudgetedSizes, getCoreOrdersTotal, convertToSpreadPlaceholder, isOrderGoneErrorMessage, clearDuplicateOrphanDetection, resolveEdgeCount, resolveLiveEdgeAnchorPrice, edgeOrderIdSet, compareEdge, reportGridPriceInvariant, liveWindowIdSet } from './utils/order.js';
+import { isOrderPlaced, parseChainOrder, buildCreateOrderArgs, buildOutsideInPairGroups, extractBatchOperationResults, chainOrderMatchesSlotWithTolerance, buildCrossingCheckCandidates, isCrossingCheckCandidate, getSideBudget, calculateBudgetedSizes, getCoreOrdersTotal, convertToSpreadPlaceholder, isOrderGoneErrorMessage, clearDuplicateOrphanDetection, resolveEdgeCount, resolveLiveEdgeAnchorPrice, edgeOrderIdSet, compareEdge, reportGridPriceInvariant, liveWindowIdSet, getLivePendingBroadcasts } from './utils/order.js';
 import { parseSlotIndex } from './utils/slot.js';
 import { resolveAccountRef, isLastFillPlacementBlocked, hasUnsettledFills } from './utils/system.js';
 import * as Format from './format.js';
@@ -556,30 +556,54 @@ async function _createOrderFromGrid({ chainOrders, account, privateKey, manager,
     // PENDING-BROADCAST GUARD: an earlier uncertain CREATE for this slot may
     // already be live on chain but not yet adopted. The COW pre-broadcast guard
     // blocks the whole CREATE batch for this case; the reconcile/startup path
-    // must not re-create the same slot either (same duplicate class).
-    const pendingMap = (manager as unknown as { _pendingBroadcasts?: unknown })._pendingBroadcasts;
-    if (pendingMap instanceof Map) {
-        // This path does not run getPendingBroadcasts(), so apply the same
-        // hard age cap here: a permanently stale entry must not park a
-        // reconcile create forever. Placement is held and the chain snapshot
-        // was just re-read, so an entry older than the cap is resolved enough.
-        const ttl = Number(TIMING.PENDING_BROADCAST_TTL_MS) > 0 ? Number(TIMING.PENDING_BROADCAST_TTL_MS) : 30 * 60 * 1000;
-        const maxAge = ttl * 2;
-        const now = Date.now();
-        for (const entry of pendingMap.values()) {
-            const pending = entry as { slotId?: unknown; orderId?: unknown; order?: { id?: unknown } | null; recordedAt?: unknown } | null;
-            const recordedAt = Number(pending?.recordedAt) || 0;
-            if (recordedAt > 0 && now - recordedAt > maxAge) continue;
+    // must not re-create the same slot OR the same price level either (same
+    // duplicate class).
+    //
+    // Liveness comes from the shared authority (`getLivePendingBroadcasts`), so
+    // this path cannot disagree with the COW guard about what is expired. It
+    // checks BOTH the slot id and the price level: a rebuild re-maps a price
+    // onto a different slot id, and reconcile is exactly the rebuild path — so
+    // a slot-id-only check would miss the entry the COW guard was written to
+    // catch. Placement is held and the chain snapshot was just re-read, so a
+    // live entry here is authoritative.
+    {
+        const pendingEntries = getLivePendingBroadcasts(manager) as Array<{
+            slotId?: unknown; orderId?: unknown; orderType?: unknown;
+            order?: { id?: unknown; price?: unknown; size?: unknown; type?: unknown } | null;
+        }>;
+        for (const pending of pendingEntries) {
             const slotId = pending?.slotId ?? pending?.orderId ?? pending?.order?.id;
-            if (slotId != null && String(slotId) === String(gridOrder.id)) {
-                manager.logger?.log?.(
-                    `[_createOrderFromGrid] SKIP (PENDING-BROADCAST): Create for ${gridOrder.id} at ` +
-                    `${Format.formatPrice6(Number(gridOrder.price))} may already be live from an uncertain broadcast; ` +
-                    `waiting for recovery/adoption instead of duplicating it`,
-                    'warn'
-                );
-                return null;
-            }
+            if (slotId == null || String(slotId) !== String(gridOrder.id)) continue;
+            manager.logger?.log?.(
+                `[_createOrderFromGrid] SKIP (PENDING-BROADCAST): Create for ${gridOrder.id} at ` +
+                `${Format.formatPrice6(Number(gridOrder.price))} may already be live from an uncertain broadcast; ` +
+                `waiting for recovery/adoption instead of duplicating it`,
+                'warn'
+            );
+            return null;
+        }
+        for (const pending of pendingEntries) {
+            const pendingPrice = Number(pending?.order?.price);
+            if (!Number.isFinite(pendingPrice) || pendingPrice <= 0) continue;
+            const pendingType = pending?.orderType ?? pending?.order?.type;
+            if (pendingType && gridOrder.type && pendingType !== gridOrder.type) continue;
+            if (!pricesOnSameLevel(
+                pendingPrice,
+                Number(pending?.order?.size) || 0,
+                pendingType as string | undefined,
+                Number(gridOrder.price),
+                Number(gridOrder.size) || 0,
+                gridOrder.type,
+                manager.assets,
+                manager.config?.incrementPercent
+            )) continue;
+            manager.logger?.log?.(
+                `[_createOrderFromGrid] SKIP (PENDING-BROADCAST): Create for ${gridOrder.id} at ` +
+                `${Format.formatPrice6(Number(gridOrder.price))} would duplicate the price level of an uncertain ` +
+                `CREATE for slot ${String(pending?.slotId ?? '?')}; waiting for recovery/adoption`,
+                'warn'
+            );
+            return null;
         }
     }
 

@@ -88,7 +88,6 @@ const {
     ORDER_STATES,
     ORDER_TYPES,
     REBALANCE_STATES,
-    TIMING,
 } = constantsModule;
 import { acquireIfNotHeld } from './order/async_lock.js';
 import * as FormatModule from './order/format.js';
@@ -294,54 +293,16 @@ function createOpFingerprintForSlot(bot: BotLike, order: ManagedOrder, finalInts
 }
 
 /**
- * Read the pending-broadcast entries as an array. The manager map is
- * created lazily by recordPendingBroadcast, so every reader must guard
- * on `instanceof Map` — this helper is the single spelling of that guard.
+ * Read the pending-broadcast entries as an array.
+ *
+ * Thin wrapper over the single liveness authority (`getLivePendingBroadcasts`
+ * in `order/utils/order.ts`): TTL + caught-up-sync + 2× hard cap, with expired
+ * entries pruned. Do not re-implement the policy here.
  * @param {import('./dexbot_class.js').DEXBot} bot
  * @returns {Array}
  */
 function getPendingBroadcasts(bot: BotLike): PendingEntry[] {
-    const map = bot.manager && bot.manager._pendingBroadcasts instanceof Map
-        ? bot.manager._pendingBroadcasts
-        : null;
-    if (!map) return [];
-    // TTL hygiene: a lost resolve must not block CREATEs forever. Dropping an
-    // expired entry is safe because the pre-broadcast chain read re-verifies
-    // the level before the next CREATE; keeping it is what risks a permanent
-    // stuck backlog (37 entries in the 2026-11-03 incident).
-    const ttl = Number(TIMING?.PENDING_BROADCAST_TTL_MS) > 0
-        ? Number(TIMING.PENDING_BROADCAST_TTL_MS)
-        : 30 * 60 * 1000;
-    const now = Date.now();
-    // "Caught-up" evidence: a successful open-orders sync completed AFTER the
-    // entry was recorded means a later chain read (the pre-broadcast guard)
-    // can be trusted to see a landed CREATE. Without that evidence, age alone
-    // is not enough — a lagging node can still miss the order, and dropping
-    // the entry would re-open the duplicate window. The 2x hard cap keeps a
-    // permanently lagging node from parking CREATEs forever (the 2026-11-03
-    // backlog), at the cost of relying on the chain re-read.
-    const lastSyncAt = Number(bot.manager?._lastSyncAt) || 0;
-    for (const [fp, entry] of map) {
-        const at = Number((entry as PendingEntry)?.recordedAt) || 0;
-        if (!(at > 0)) continue;
-        const age = now - at;
-        if (age <= ttl) continue;
-        const syncedSinceRecord = lastSyncAt > at;
-        if (!syncedSinceRecord && age <= ttl * 2) {
-            bot.manager.logger?.log?.(
-                `[COW] Pending-broadcast entry ${String(fp)} is ${Math.round(age / 1000)}s old but no sync has completed since it was recorded; keeping it (fail-closed) until a caught-up read`,
-                'debug'
-            );
-            continue;
-        }
-        map.delete(fp);
-        bot.manager.logger?.log?.(
-            `[COW] Dropped expired pending-broadcast entry ${String(fp)} (slot ${(entry as PendingEntry)?.slotId ?? '?'}, age ${Math.round(age / 1000)}s, ` +
-            `${syncedSinceRecord ? 'sync completed since record' : 'hard TTL cap'})`,
-            'warn'
-        );
-    }
-    return Array.from(map.values()) as PendingEntry[];
+    return orderUtils.getLivePendingBroadcasts(bot?.manager) as PendingEntry[];
 }
 
 /**
@@ -3456,6 +3417,10 @@ async function replanStaleBatch(bot: BotLike, cowResult: CowResult, replanDepth:
     popPushedWorkingGrid(bot, cowResult);
 
     let replanned: CowResult | null = null;
+    // Pre-plan snapshot of the per-batch absolute-anchor budget (see the restore
+    // above). Kept at function scope so the fresh plan can carry it on for a
+    // second re-plan.
+    const reanchorBudgetBefore = Number((cowResult as unknown as { _reanchorBudgetBeforePlan?: unknown })._reanchorBudgetBeforePlan);
     try {
         // Restore the boundary-shift budget consumed by the abandoned plan:
         // it was built from the same fills and never shipped, so the re-plan
@@ -3464,6 +3429,14 @@ async function replanStaleBatch(bot: BotLike, cowResult: CowResult, replanDepth:
         // drifts conservative (boundary under-shift).
         if (bot.manager?._boundaryShiftBudgetBase != null) {
             bot.manager._boundaryShiftBudget = bot.manager._boundaryShiftBudgetBase;
+        }
+        // The absolute fill re-anchor is a per-batch BUDGET consumed at PLAN time
+        // (strategy.calculateTargetGrid). The abandoned plan's anchor was never
+        // committed, so hand it back: restore the value observed by the pre-plan
+        // snapshot carried on the plan. A static batch base would be wrong — an
+        // earlier chunk that legitimately committed its anchor must stay spent.
+        if (Number.isFinite(reanchorBudgetBefore)) {
+            (bot.manager as unknown as { _boundaryReanchorBudget?: number })._boundaryReanchorBudget = reanchorBudgetBefore;
         }
         if (typeof bot.manager.performSafeRebalance === 'function') {
             // skipBroadcastWait: this frame is itself inside the executor's
@@ -3495,6 +3468,11 @@ async function replanStaleBatch(bot: BotLike, cowResult: CowResult, replanDepth:
             // (duplicate orders). The recursion's guard will then abort +
             // reconcile instead.
             clearPendingBroadcastsForSlots(bot, cowResult.actions);
+            // Hand the same pre-plan snapshot to the fresh plan so a SECOND
+            // re-plan (its plan also goes stale) can restore the anchor again:
+            // the budget is per-batch, and every abandoned plan must give back
+            // only what IT spent.
+            (replanned as unknown as { _reanchorBudgetBeforePlan?: number })._reanchorBudgetBeforePlan = reanchorBudgetBefore;
             return {
                 handled: true,
                 placementTransferred: true,

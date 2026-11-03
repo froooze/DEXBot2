@@ -1132,15 +1132,17 @@ export interface OrderManagerLike {
   acquirePlacement?: (kind: string, options?: { timeoutMs?: number; isShuttingDown?: () => boolean }) => Promise<{ kind: string; release(): void } | null>;
   tryAcquirePlacement?: (kind: string) => { kind: string; release(): void } | null;
   isPlacementActive?: () => boolean;
+  /** Whether this lease still owns the region (authoritative nesting check). */
+  isPlacementLeaseCurrent?: (lease: { kind: string; release(): void } | null | undefined) => boolean;
   withPlacement?<T>(
     kind: string,
     fn: (lease: { kind: string; release(): void }) => Promise<T>,
-    options?: { timeoutMs?: number; isShuttingDown?: () => boolean; lease?: { kind: string; release(): void } | null }
+    options?: { timeoutMs?: number; isShuttingDown?: () => boolean }
   ): Promise<T | null>;
   placementKind?: () => string | null;
   placementHeldForMs?: () => number;
   /** Force-release a placement region held longer than the leak watchdog. */
-  _clearStalePlacementRegion?: (maxAgeMs?: number) => boolean;
+  _clearStalePlacementRegion?: (maxAgeMs?: number, options?: { batchInFlightMs?: number }) => boolean;
   /** Pass-1 chain-size markers (see note/consumeChainSizeAppliedFill). */
   _chainSizeAppliedFills?: Map<string, { filledInt: number; at: number }>;
   noteChainSizeAppliedFill?: (orderId: string, filledInt: number, maxAgeMs?: number) => void;

@@ -313,6 +313,62 @@ async function testStalePlanReplansOnceAndExecutes() {
     console.log('✓ COW-GUARD-REPLAN-001 passed');
 }
 
+async function testReplanRestoresReanchorBudget() {
+    console.log('\n[COW-GUARD-REPLAN-005] a stale re-plan hands back the abandoned plan\'s absolute anchor...');
+
+    const masterOrders = new Map([
+        ['slot-1', createOrder('slot-1')]
+    ]);
+    const { bot, manager, counters } = createGuardFixture(masterOrders);
+    const restore = installChainStubs(manager, counters);
+
+    manager._gridVersion = 1;
+    const staleWG = makeStaleWorkingGrid(manager);
+    const fills = [{ id: 'fill-1', type: ORDER_TYPES.BUY, price: 0.99, size: 5 }];
+    // The abandoned plan consumed the batch's single absolute anchor (1 -> 0).
+    (manager as any)._boundaryReanchorBudget = 0;
+
+    let budgetSeenDuringReplan: number | undefined;
+    manager.performSafeRebalance = async () => {
+        counters.replanCalls += 1;
+        budgetSeenDuringReplan = (manager as any)._boundaryReanchorBudget;
+        const freshWG = new WorkingGrid(manager.orders, { baseVersion: manager._gridVersion });
+        freshWG.set('slot-2', createVirtualCreateAction('slot-2', 1.1).order);
+        manager._currentWorkingGridStack.push(freshWG);
+        return {
+            workingGrid: freshWG,
+            workingIndexes: freshWG.getIndexes(),
+            workingBoundary: 0,
+            actions: [createVirtualCreateAction('slot-2', 1.1)],
+            _workingGridPushed: true
+        };
+    };
+
+    try {
+        manager._currentWorkingGridStack.push(staleWG);
+        await bot._updateOrdersOnChainBatchCOW({
+            workingGrid: staleWG,
+            workingIndexes: staleWG.getIndexes(),
+            workingBoundary: 0,
+            actions: [createVirtualCreateAction('slot-2', 1.1)],
+            fills,
+            excludeIds: new Set(['slot-1']),
+            _workingGridPushed: true,
+            // Snapshot taken by processFilledOrders BEFORE planning.
+            _reanchorBudgetBeforePlan: 1
+        });
+        assert.strictEqual(counters.replanCalls, 1, 'must re-plan once');
+        assert.strictEqual(
+            budgetSeenDuringReplan, 1,
+            'the fresh plan must see the pre-plan anchor budget: the abandoned anchor was never committed'
+        );
+    } finally {
+        restore();
+    }
+
+    console.log('✓ COW-GUARD-REPLAN-005 passed');
+}
+
 async function testReplanWithNoActionsSkipsStalePlan() {
     console.log('\n[COW-GUARD-REPLAN-002] re-plan with no executable actions skips the stale plan...');
 
@@ -458,6 +514,7 @@ async function testReplanThrowProceedsWithResync() {
 async function run() {
     console.log('Running COW guard bounded re-plan regression tests...');
     await testStalePlanReplansOnceAndExecutes();
+    await testReplanRestoresReanchorBudget();
     await testReplanWithNoActionsSkipsStalePlan();
     await testStaleAtReplanLimitProceedsWithResync();
     await testReplanThrowProceedsWithResync();

@@ -3629,10 +3629,16 @@ export function determineOrderSideByFunds(manager: OrderManagerLike, currentMark
         return (Number.isFinite(raw) && raw >= 0) ? Math.floor(raw) : GRID_LIMITS.MIN_SPREAD_ORDERS;
     }
 
-    // Collect contiguous empty gap-band slots adjacent to a rail edge for boundary
-    // promotion.  BUY walks upward from the boundary into the gap, SELL walks
-    // downward from the sell start; both stop at the first unavailable slot.
-    // Mirrors are collapsed into one directional walk (step +/- 1).
+    // Collect gap-band slots adjacent to a rail edge for boundary promotion.
+    // BUY walks upward from the boundary into the gap, SELL walks downward from
+    // the sell start. An EMPTY available slot is promoted; a same-side order
+    // already PLACED inside the band is ABSORBED (it becomes a legal rail member
+    // once the boundary slides past it) and only advances the depth; anything
+    // else (opposite-side placement, phantom, unavailable slot) stops the walk.
+    // "Same-side" is the slot's stored rail type by construction: a placed
+    // SPREAD slot is an ILLEGAL_SPREAD_STATE (validateOrder), so there is no
+    // side-neutral placement to resolve here. Mirrors are collapsed into one
+    // directional walk (step +/- 1).
     //
     // PROMOTION CAP (gap-band geometry): promotion may consume at most
     // bandSize − MIN_SPREAD_ORDERS slots, where bandSize = sellStartIdx −
