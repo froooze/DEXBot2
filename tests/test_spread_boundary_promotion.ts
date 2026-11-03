@@ -447,6 +447,115 @@ async function testNoDuplicateInRailSlot() {
     console.log('  PASS: overlapping candidate filters no longer duplicate a slot');
 }
 
+async function testPromotionAbsorbsPlacedInBandEdge() {
+    console.log('Running test: Promotion absorbs a placed same-side in-band edge');
+
+    // Post-crawl shape: boundary 3, gap 4 => sellStart 8, band 4-7. A SELL at
+    // 7 is already inside the band (it becomes a legal rail member once the
+    // boundary slides past it) and 6 is empty. Absorbing 7 must NOT plan a
+    // CREATE over the live order: the walk steps over it, promotes 6, and the
+    // boundary derives from the placed slot (3 - (8-6) = 1).
+    const manager = new OrderManager({
+        assetA: 'BASE',
+        assetB: 'QUOTE',
+        startPrice: 1,
+        botFunds: { buy: 1000, sell: 1000 },
+        coreOrders: { buy: 4, sell: 0 },
+        incrementPercent: 1,
+        targetSpreadPercent: 1
+    });
+    manager.assets = {
+        assetA: { id: '1.3.1', symbol: 'BASE', precision: 5 },
+        assetB: { id: '1.3.2', symbol: 'QUOTE', precision: 5 }
+    };
+    for (let i = 0; i < 12; i++) {
+        const isBuy = i === 0;
+        const isSell = i >= 7;
+        await manager._updateOrder({
+            id: `slot-${i}`,
+            price: 1 + i * 0.01,
+            type: isBuy ? ORDER_TYPES.BUY : isSell ? ORDER_TYPES.SELL : ORDER_TYPES.SPREAD,
+            state: (isBuy || isSell) ? ORDER_STATES.ACTIVE : ORDER_STATES.VIRTUAL,
+            size: (isBuy || isSell) ? 10 : 0,
+            orderId: (isBuy || isSell) ? `1.7.${400 + i}` : ''
+        });
+    }
+    manager.boundaryIdx = 3;
+    manager._gapSlots = 4;
+    await manager.setAccountTotals({ buy: 1000, sell: 1000, buyFree: 1000, sellFree: 1000 });
+    await manager.recalculateFunds();
+
+    const correction = await Grid.prepareSpreadCorrectionOrders(manager, ORDER_TYPES.SELL, 1);
+    assert.deepStrictEqual(
+        correction.ordersToPlace.map((o: any) => o.id),
+        ['slot-6'],
+        'the placed in-band edge is absorbed, only the empty slot is promoted'
+    );
+    assert.strictEqual(
+        correction.ordersToPlace.some((o: any) => o.id === 'slot-7'),
+        false,
+        'the absorbed live order must never be re-planned as a CREATE'
+    );
+    assert.strictEqual(correction.boundaryIdx, 1, 'boundary derives from the placed slot (3 -> 1)');
+
+    const cowResult = cowRuntime.buildCowResultFromPlan(
+        { manager: { orders: manager.orders, _gridVersion: 0, boundaryIdx: 3 } },
+        correction
+    );
+    assert.strictEqual(cowResult.workingBoundary, 1, 'COW plan carries the absorbed-slide boundary');
+    assert.strictEqual(cowResult.workingGrid.get('slot-7').type, ORDER_TYPES.SELL,
+        'the absorbed slot stays on the rail, not re-typed');
+
+    console.log('  PASS: in-band same-side edge absorbed without a duplicate CREATE');
+}
+
+async function testBuyPromotionAbsorbsPlacedInBandEdge() {
+    console.log('Running test: BUY promotion absorbs a placed same-side in-band edge');
+
+    // Mirror of the SELL case: boundary 3, gap 4 => band 4-7. A BUY at 4 is
+    // already inside the band; the slide absorbs it, promotes the next empty
+    // slot (5), and the boundary moves up to 5 (sellStart 10, ahead of the
+    // placed sells at 10-11).
+    const manager = new OrderManager({
+        assetA: 'BASE',
+        assetB: 'QUOTE',
+        startPrice: 1,
+        botFunds: { buy: 1000, sell: 1000 },
+        coreOrders: { buy: 4, sell: 0 },
+        incrementPercent: 1,
+        targetSpreadPercent: 1
+    });
+    manager.assets = {
+        assetA: { id: '1.3.1', symbol: 'BASE', precision: 5 },
+        assetB: { id: '1.3.2', symbol: 'QUOTE', precision: 5 }
+    };
+    for (let i = 0; i < 12; i++) {
+        const isBuy = i <= 3 || i === 4;
+        const isSell = i >= 10;
+        await manager._updateOrder({
+            id: `slot-${i}`,
+            price: 1 + i * 0.01,
+            type: isBuy ? ORDER_TYPES.BUY : isSell ? ORDER_TYPES.SELL : ORDER_TYPES.SPREAD,
+            state: (isBuy || isSell) ? ORDER_STATES.ACTIVE : ORDER_STATES.VIRTUAL,
+            size: (isBuy || isSell) ? 10 : 0,
+            orderId: (isBuy || isSell) ? `1.7.${500 + i}` : ''
+        });
+    }
+    manager.boundaryIdx = 3;
+    manager._gapSlots = 4;
+    await manager.setAccountTotals({ buy: 1000, sell: 1000, buyFree: 1000, sellFree: 1000 });
+    await manager.recalculateFunds();
+
+    const correction = await Grid.prepareSpreadCorrectionOrders(manager, ORDER_TYPES.BUY, 1);
+    assert.deepStrictEqual(
+        correction.ordersToPlace.map((o: any) => o.id),
+        ['slot-5'],
+        'the placed in-band BUY is absorbed, only the empty slot is promoted'
+    );
+    assert.strictEqual(correction.boundaryIdx, 5, 'boundary moves up past the absorbed and promoted slots');
+    console.log('  PASS: BUY in-band same-side edge absorbed without a duplicate CREATE');
+}
+
 async function runAll() {
     await testSpreadBoundaryPromotion();
     await testPromotionReservesMinSpread();
@@ -455,6 +564,8 @@ async function runAll() {
     await testPartialPlacementBoundaryPromotion();
     await testNullBoundaryBlocksPromotion();
     await testNoDuplicateInRailSlot();
+    await testPromotionAbsorbsPlacedInBandEdge();
+    await testBuyPromotionAbsorbsPlacedInBandEdge();
     console.log('✓ All spread boundary promotion tests passed');
 }
 

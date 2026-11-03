@@ -16,6 +16,7 @@
 
 const assert = require('assert');
 const { reanchorBoundaryFromLastFill } = require('../modules/order/utils/system');
+const { validatePersistedBoundary } = require('../modules/order/utils/math');
 const { ORDER_TYPES, ORDER_STATES } = require('../modules/constants');
 
 let passed = 0;
@@ -291,6 +292,35 @@ run('REANCHOR-21 the allow-list stays narrow: a FOREIGN in-band residual still r
     ]);
     assert.strictEqual(r.reanchored, false, `a foreign in-band order must still refuse the re-anchor, got ${JSON.stringify(r)}`);
     assert.ok(/unsafe/.test(String(r.reason)), `refusal must name the strand: ${JSON.stringify(r)}`);
+});
+
+run('REANCHOR-22 a move that strands FEWER orders than the committed boundary is a repair', () => {
+    // Committed 8 / gap 2 strands the placed sells at 9-10 (2). The BUY fill at
+    // slot 5 wants boundary 4; under 4 / gap 2 the band is 5-6 and only the
+    // stray buy at 5 is in-band (1). Strictly fewer => the re-anchor is the
+    // repair path for the post-crawl state, not a no-op.
+    const slots = makeSlots([5, 9, 10]);
+    const strict = validatePersistedBoundary(4, slots, 2);
+    assert.strictEqual(strict.reason, 'placed_order_in_band',
+        'the strict validator must still refuse the candidate on its own');
+    const r = reanchorBoundaryFromLastFill(makeManager(105, ORDER_TYPES.BUY), 8, slots, 2);
+    assert.strictEqual(r.reanchored, true, `expected the violation-reducing repair, got ${JSON.stringify(r)}`);
+    assert.strictEqual(r.boundaryIdx, 4, 'BUY fill at 5 => boundary 4');
+});
+
+run('REANCHOR-23 an equal strand count is not a repair', () => {
+    // Committed 8 strands 9-10 (2); candidate 4 strands the buys at 5-6 (2).
+    // "Not more" would accept this and legalize a different strand — only
+    // strictly fewer may move the boundary.
+    const r = reanchorBoundaryFromLastFill(
+        makeManager(105, ORDER_TYPES.BUY),
+        8,
+        makeSlots([5, 6, 9, 10]),
+        2
+    );
+    assert.strictEqual(r.reanchored, false, `equal strands must refuse, got ${JSON.stringify(r)}`);
+    assert.ok(/unsafe/.test(String(r.reason)), `refusal must name the strand: ${JSON.stringify(r)}`);
+    assert.strictEqual(r.boundaryIdx, 8, 'the committed boundary is kept');
 });
 
 console.log(`\nREANCHOR summary: ${passed} passed, ${failed} failed`);

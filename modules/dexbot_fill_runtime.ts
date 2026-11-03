@@ -152,13 +152,34 @@ async function processSweepOrphanFill(bot: BotLike, fill: unknown, fillOp: FillO
         return true;
     }
 
-    // GEOMETRY FIRST, then money. The order is unknown to the grid, but the
-    // fill still proves a trade at a price: attribute it (pivot + owed crawl)
-    // BEFORE crediting the proceeds, so a fill that never reaches the strategy
-    // cannot leave the LAST-FILL-GUARD pivot stale — the same split-brain the
-    // unmatched-fill path closes for a virtualised slot. Attribution refuses a
-    // price outside the frozen rail, so a shelf/manual order can never arm the
-    // pivot at a level this grid does not trade.
+    // ACCOUNTING FIRST, then geometry. The processed-fill ledger is the single
+    // authority on whether this fill was already booked: a replayed fill comes
+    // back as `duplicate` and has ALREADY armed the pivot and the owed crawl on
+    // its first delivery. Re-attributing that replay re-arms geometry from a
+    // stale execution price (live incident: a 12-minute-old replay re-recorded
+    // four crawls and teleported the boundary 165 -> 169). Crediting first is
+    // still before the strategy batch, so a first-delivery fill cannot leave the
+    // LAST-FILL-GUARD pivot stale — the same split-brain the unmatched-fill path
+    // closes for a virtualised slot. Attribution refuses a price outside the
+    // frozen rail, so a shelf/manual order can never arm the pivot at a level
+    // this grid does not trade.
+    const accountingResult = await bot._applyReplaySafeOrphanFillAccounting(fill, fillOp, {
+        context: opts.context,
+        logger: opts.logger,
+        replayMessage: opts.replayMessage,
+    });
+    // A replay already armed the pivot and the owed crawl on its first delivery,
+    // so it must not be re-attributed (the replay message is already logged by
+    // the accounting wrapper). `applied`, `error` and `missing_key` are first
+    // deliveries (or deliveries whose money never booked), so they still prove
+    // the trade and must arm the geometry.
+    if (accountingResult.status === 'duplicate') {
+        return false;
+    }
+    (opts.logger ?? bot.manager.logger).log?.(
+        `[${opts.label}] Processing funds for unknown order ${fillOp.order_id} (not in grid but crediting proceeds)`,
+        'warn'
+    );
     try {
         const pays = fillOp?.pays as { asset_id?: string; amount?: number } | undefined;
         const receives = fillOp?.receives as { asset_id?: string; amount?: number } | undefined;
@@ -170,16 +191,6 @@ async function processSweepOrphanFill(bot: BotLike, fill: unknown, fillOp: FillO
             receivesAmountRaw: receives?.amount ?? null,
         });
     } catch { /* attribution is best-effort: never block the credit */ }
-
-    (opts.logger ?? bot.manager.logger).log?.(
-        `[${opts.label}] Processing funds for unknown order ${fillOp.order_id} (not in grid but crediting proceeds)`,
-        'warn'
-    );
-    const accountingResult = await bot._applyReplaySafeOrphanFillAccounting(fill, fillOp, {
-        context: opts.context,
-        logger: opts.logger,
-        replayMessage: opts.replayMessage,
-    });
     return accountingResult.status === 'missing_key';
 }
 

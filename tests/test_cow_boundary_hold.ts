@@ -205,6 +205,39 @@ async function testHOLD009_ReserveSkipNeverPins() {
     console.log('✓ HOLD-009 passed');
 }
 
+async function testHOLD010_HoldIsScopedToPromotionDirection() {
+    console.log('\n[HOLD-010] A fill-driven retreat never pins the boundary...');
+    const refills = ['slot-92', 'slot-93'];
+    const skipped = new Set(['slot-92']);
+
+    // BUY promotion (94 > 91): the move advances toward the band holes -> hold.
+    const buyPromotion = resolveRefillBoundaryHold(94, 91, skipped, new Set(), refills, undefined, ORDER_TYPES.BUY);
+    assert.strictEqual(buyPromotion.effectiveBoundary, 91, 'BUY promotion holds on a skipped refill');
+    assert.deepStrictEqual(buyPromotion.heldRefillSlotIds, ['slot-92']);
+
+    // BUY retreat (88 < 91): a fill moved the boundary AWAY from the holes -> no hold.
+    const buyRetreat = resolveRefillBoundaryHold(88, 91, skipped, new Set(), refills, undefined, ORDER_TYPES.BUY);
+    assert.strictEqual(buyRetreat.effectiveBoundary, 88, 'BUY retreat must not be pinned by the hold');
+    assert.deepStrictEqual(buyRetreat.heldRefillSlotIds, []);
+
+    // SELL promotion (91 < 94): the mirror of the BUY promotion -> hold.
+    const sellPromotion = resolveRefillBoundaryHold(91, 94, skipped, new Set(), refills, undefined, ORDER_TYPES.SELL);
+    assert.strictEqual(sellPromotion.effectiveBoundary, 94, 'SELL promotion holds on a skipped refill');
+
+    // SELL retreat (94 > 91): fill-driven up-move -> no hold.
+    const sellRetreat = resolveRefillBoundaryHold(94, 91, skipped, new Set(), refills, undefined, ORDER_TYPES.SELL);
+    assert.strictEqual(sellRetreat.effectiveBoundary, 94, 'SELL retreat must not be pinned by the hold');
+
+    // No side evidence keeps the legacy hold (guarded default, never fail-open).
+    const unknown = resolveRefillBoundaryHold(88, 91, skipped, new Set(), refills);
+    assert.strictEqual(unknown.effectiveBoundary, 91, 'unknown side keeps the legacy hold');
+
+    // Unchanged boundary: hold or not, the effective value is the same.
+    const steady = resolveRefillBoundaryHold(91, 91, skipped, new Set(), refills, undefined, ORDER_TYPES.BUY);
+    assert.strictEqual(steady.effectiveBoundary, 91, 'steady boundary is a no-op either way');
+    console.log('✓ HOLD-010 passed');
+}
+
 async function runAllTests() {
     console.log('=== Boundary-Hold Test Suite ===\n');
     await testHOLD001_RefillIntersectHolds();
@@ -216,6 +249,7 @@ async function runAllTests() {
     await testHOLD007_PlanCarrierPassthrough();
     await testHOLD008_SkippedCreateRefillHolds();
     await testHOLD009_ReserveSkipNeverPins();
+    await testHOLD010_HoldIsScopedToPromotionDirection();
     console.log('\n=== All boundary-hold tests passed! ===');
 }
 

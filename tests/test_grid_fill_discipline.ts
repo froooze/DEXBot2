@@ -621,6 +621,43 @@ async function testSweepOrphanFillAttributesBeforeCrediting() {
     console.log('  ✓ in-grid arms the pivot, out-of-grid does not, credit unchanged');
 }
 
+async function testSweepOrphanReplayDoesNotRearmGeometry() {
+    console.log('\n[GD-11] a replayed orphan fill never re-arms the pivot/crawl');
+    const { processSweepOrphanFill } = require('../modules/dexbot_fill_runtime');
+    const genesis = buildGenesisFromPriceLevels(REVIVE_LADDER[4], 0.3, 2, REVIVE_LADDER);
+    const fill = {
+        id: '1.11.1401134100',
+        block_num: 115762940,
+        op: [77, {
+            order_id: null,
+            pays: { amount: Math.round(REVIVE_LADDER[3] * 2 * 1e5), asset_id: '1.3.0' },
+            receives: { amount: Math.round(2 * 1e4), asset_id: '1.3.100' },
+        }],
+    };
+
+    // Replay: the ledger already booked this fill, so its first delivery armed
+    // the geometry. Re-attributing would re-record a stale crawl and teleport
+    // the boundary (the live 165 -> 169 replay incident).
+    const replayBot = makeSweepBot({ genesis });
+    replayBot._applyReplaySafeOrphanFillAccounting = async () => ({ status: 'duplicate' });
+    await processSweepOrphanFill(replayBot, fill, fill.op[1], new Set(), { context: 'TEST', label: 'TEST' });
+    assert.strictEqual(replayBot.manager._lastFilledPrice, null, 'a duplicate must not re-arm the pivot');
+    assert.strictEqual(replayBot.manager._lastFilledType, null, 'a duplicate must not re-arm the pivot side');
+    assert.strictEqual(replayBot.manager.lastFillPivotSource, null, 'a duplicate must not claim fill provenance');
+
+    // A first delivery whose credit did not book (error/missing_key) still
+    // proves the trade and must arm the geometry.
+    for (const status of ['error', 'missing_key', 'applied']) {
+        const bot = makeSweepBot({ genesis });
+        bot._applyReplaySafeOrphanFillAccounting = async () => ({ status });
+        await processSweepOrphanFill(bot, fill, fill.op[1], new Set(), { context: 'TEST', label: 'TEST' });
+        assert(Math.abs(Number(bot.manager._lastFilledPrice) - REVIVE_LADDER[3]) < 0.01,
+            `${status} must still arm the pivot, got ${bot.manager._lastFilledPrice}`);
+        assert.strictEqual(bot.manager._lastFilledType, ORDER_TYPES.BUY);
+    }
+    console.log('  ✓ duplicate skips attribution; applied/error/missing_key still arm it');
+}
+
 async function main() {
     console.log('=== Grid fill discipline (buy lower / sell higher, no stale top-up) ===');
     await testPlacementPredicate();
@@ -634,6 +671,7 @@ async function main() {
     await testReconcileGridTreatsDarkLevelAsFilled();
     await testSpreadPlannerExcludesSameLevel();
     await testSweepOrphanFillAttributesBeforeCrediting();
+    await testSweepOrphanReplayDoesNotRearmGeometry();
     console.log('\nAll grid fill-discipline tests passed ✔');
 }
 

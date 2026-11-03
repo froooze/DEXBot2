@@ -1711,7 +1711,7 @@ function validateBoundaryCommit(
     orders: Iterable<unknown>,
     gapSlots: number,
     options: { rejectInBandPlacements?: boolean; allowInBandSlotIds?: Iterable<string> } = {}
-): { ok: boolean; reason?: string; detail?: string } {
+): { ok: boolean; reason?: string; detail?: string; inBandCount?: number } {
     // Absent-aware: null/undefined/'' means "no proposal" (ok), NOT boundary 0,
     // otherwise Number('') === 0 would self-legalize a fake boundary 0 commit.
     // Everything else non-numeric stays FAIL-CLOSED (corrupt/garbage, never
@@ -1807,6 +1807,7 @@ function validateBoundaryCommit(
         return {
             ok: false,
             reason: BOUNDARY_REJECT_PLACED_IN_BAND,
+            inBandCount,
             detail: `boundary=${raw} gapSlots=${gapSlots} placed count=${inBandCount} first idx=${firstInBandIdx} price=${firstInBandPrice} ` +
                 `sits strictly inside implied band (${raw}, ${sellStart})`
         };
@@ -1847,11 +1848,75 @@ function validatePersistedBoundary(
     orders: Iterable<unknown>,
     gapSlots: number,
     options: { allowInBandSlotIds?: Iterable<string> } = {}
-): { ok: boolean; reason?: string; detail?: string } {
+): { ok: boolean; reason?: string; detail?: string; inBandCount?: number } {
     return validateBoundaryCommit(proposedBoundary, orders, gapSlots, {
         rejectInBandPlacements: true,
         ...(options.allowInBandSlotIds ? { allowInBandSlotIds: options.allowInBandSlotIds } : {})
     });
+}
+
+/**
+ * Count the placed orders a boundary would strand inside its implied band.
+ *
+ * Returns 0 for a clean boundary, the validator's own count for a pure
+ * stranding rejection, and null for a STRUCTURAL refusal (crossed book, ceiling,
+ * range, non-integer) — the two are not comparable, so callers must not treat a
+ * structural refusal as "zero strands". Uses the same validator (and the same
+ * allow-list) as the commit/restore paths: no second stranding predicate.
+ *
+ * @param proposedBoundary - Boundary to judge
+ * @param orders - Placed-order slots
+ * @param gapSlots - Gap band width
+ * @param options - Optional in-band allow-list (a fill's own partial residual)
+ * @returns Strand count, or null when the refusal is structural
+ */
+function countInBandPlacements(
+    proposedBoundary: number | null | undefined,
+    orders: Iterable<unknown>,
+    gapSlots: number,
+    options: { allowInBandSlotIds?: Iterable<string> } = {}
+): number | null {
+    const check = validateBoundaryCommit(proposedBoundary, orders, gapSlots, {
+        rejectInBandPlacements: true,
+        ...(options.allowInBandSlotIds ? { allowInBandSlotIds: options.allowInBandSlotIds } : {})
+    });
+    if (check.ok) return 0;
+    if (check.reason === BOUNDARY_REJECT_PLACED_IN_BAND) {
+        // Unknown is NOT zero: a validator that cannot report the count must not
+        // read as "strands nothing" (the Number(null)===0 trap this stack keeps
+        // guarding). Fail closed instead.
+        const count = Number((check as { inBandCount?: unknown }).inBandCount);
+        return Number.isFinite(count) ? count : null;
+    }
+    return null;
+}
+
+/**
+ * Whether moving a boundary from `current` to `candidate` strands FEWER placed
+ * orders (a violation-reducing repair). Strictly fewer — an equal count is not
+ * a repair, and a structural refusal on either side is never a repair.
+ *
+ * This is the one rule behind the fill re-anchor and the rail clamp accepting a
+ * move the strict validator would refuse only for transient stranding; both
+ * bounds stay in force (fill-anchor direction at the caller, strand count here).
+ *
+ * @param currentBoundary - Boundary currently committed
+ * @param candidateBoundary - Proposed boundary
+ * @param orders - Placed-order slots
+ * @param gapSlots - Gap band width
+ * @param options - Optional in-band allow-list (a fill's own partial residual)
+ * @returns True when the candidate strands strictly fewer placed orders
+ */
+function boundaryMoveReducesStrands(
+    currentBoundary: number | null | undefined,
+    candidateBoundary: number | null | undefined,
+    orders: Iterable<unknown>,
+    gapSlots: number,
+    options: { allowInBandSlotIds?: Iterable<string> } = {}
+): boolean {
+    const current = countInBandPlacements(currentBoundary, orders, gapSlots, options);
+    const candidate = countInBandPlacements(candidateBoundary, orders, gapSlots, options);
+    return current !== null && candidate !== null && candidate < current;
 }
 
 /**
@@ -2322,7 +2387,7 @@ function buildGenesisFromPriceLevels(startPrice: number, incrementPercent: numbe
 
 export type { FeeCacheEntry };
 
-export { getBtsSide, getSellStartIdx, resolveGapBand, countGapBandSpread, calculateGapSlots, isSlotInRail, isSlotIndexInGapBand, isEvacuationRotationAllowed, isEvacuationSizeStillValid, validateBoundaryCommit, validatePersistedBoundary, isTransientInBandRejection, BOUNDARY_REJECT_PLACED_IN_BAND, resolveGapSlots, isPercentageString, isPositiveNumber, isPositiveNumberOrPercent, isPositiveInt, parsePercentageString, toDecimal, resolveRelativePrice, parseRelativeMultiplier, validateGridPriceBounds, isExplicitZeroAllocation, getPrecision, computeChainFundTotals, calculateAvailableFundsValue, deriveChainTruthFundBudget, adjustBudgetForBtsFees, getGridBestPrices, calculateSpreadFromOrders, resolveConfigValue, resolveConfigValueWithRegistry, hasValidAccountTotals, blockchainToFloat, floatToBlockchainInt, floorToBlockchainInt, quantizeFloat, normalizeInt, getPrecisionByOrderType, getPrecisionsForManager, getPrecisionSlack, quantumForPrecision, calculatePriceTolerance, findCrossedOrder, pricesOnSameLevel, sameGridPrice, validateOrderAmountsWithinLimits, getMinOrderSize, getDustThresholdFactor, getSingleDustThreshold, getDoubleDustThreshold, validateOrderSize, getAssetFees, getAssetFeesSafe, allocateFundsByWeights, calculateOrderSizes, calculateRotationOrderSizes, calculateGridSideDivergenceMetric, calculateOrderCreationFees, calculateSwapInAmount, _setFeeCache, cloneWeightDistribution, clamp, roundTo, fixedTo, roundToDecimals, priceLevelsForGenesis, priceForSlot, slotIndexForPrice, slotIdForPrice, assertSlotPriceInvariant, priceSlotEqual, derivePriceLevels, sameGridLevel, pricesWithinHalfStep, buildGenesisFromPriceLevels, hashPriceLevels, isChainPriceOutOfGrid }
+export { getBtsSide, getSellStartIdx, resolveGapBand, countGapBandSpread, calculateGapSlots, isSlotInRail, isSlotIndexInGapBand, isEvacuationRotationAllowed, isEvacuationSizeStillValid, validateBoundaryCommit, validatePersistedBoundary, countInBandPlacements, boundaryMoveReducesStrands, isTransientInBandRejection, BOUNDARY_REJECT_PLACED_IN_BAND, resolveGapSlots, isPercentageString, isPositiveNumber, isPositiveNumberOrPercent, isPositiveInt, parsePercentageString, toDecimal, resolveRelativePrice, parseRelativeMultiplier, validateGridPriceBounds, isExplicitZeroAllocation, getPrecision, computeChainFundTotals, calculateAvailableFundsValue, deriveChainTruthFundBudget, adjustBudgetForBtsFees, getGridBestPrices, calculateSpreadFromOrders, resolveConfigValue, resolveConfigValueWithRegistry, hasValidAccountTotals, blockchainToFloat, floatToBlockchainInt, floorToBlockchainInt, quantizeFloat, normalizeInt, getPrecisionByOrderType, getPrecisionsForManager, getPrecisionSlack, quantumForPrecision, calculatePriceTolerance, findCrossedOrder, pricesOnSameLevel, sameGridPrice, validateOrderAmountsWithinLimits, getMinOrderSize, getDustThresholdFactor, getSingleDustThreshold, getDoubleDustThreshold, validateOrderSize, getAssetFees, getAssetFeesSafe, allocateFundsByWeights, calculateOrderSizes, calculateRotationOrderSizes, calculateGridSideDivergenceMetric, calculateOrderCreationFees, calculateSwapInAmount, _setFeeCache, cloneWeightDistribution, clamp, roundTo, fixedTo, roundToDecimals, priceLevelsForGenesis, priceForSlot, slotIndexForPrice, slotIdForPrice, assertSlotPriceInvariant, priceSlotEqual, derivePriceLevels, sameGridLevel, pricesWithinHalfStep, buildGenesisFromPriceLevels, hashPriceLevels, isChainPriceOutOfGrid }
 
 /**
  * Round a value to a given factor.

@@ -3638,15 +3638,34 @@ export function determineOrderSideByFunds(manager: OrderManagerLike, currentMark
         const promotionQuota = Math.min(quota, maxPromotable, Math.max(0, maxDepth));
         const promoted: ManagedOrder[] = [];
         const step = isBuy ? 1 : -1;
+        // Depth counts EVERY band slot the boundary slide consumes, not only the
+        // new placements: a same-side order already PLACED inside the band is
+        // absorbed by the slide (it becomes a legal rail member once the
+        // boundary moves past it) and is not a placement target. Only empty
+        // available slots are returned. Absorbing is what repairs the
+        // post-crawl shape (boundary 169, sell 173 in-band, 170-172 empty):
+        // step over 173, promote 172, boundary 167. Pushing the placed slot
+        // would plan a CREATE over a live order (duplicate/occupied slot) and
+        // abort the batch, so it only advances `depth`.
+        let depth = 0;
         for (let idx = isBuy ? buyEndIdx + 1 : sellStartIdx - 1;
-            promoted.length < promotionQuota
+            promotionQuota > 0
+                && depth < maxDepth
+                && depth < maxPromotable
                 && (isBuy
                     ? idx <= sellStartIdx - 1 - spreadReserve
                     : idx >= buyEndIdx + 1 + spreadReserve);
             idx += step) {
             const slot = allSlotsByPrice[idx];
-            if (!slot || !isSlotAvailable(slot)) break;
+            if (!slot) break;
+            if (isOrderPlaced(slot) && slot.type === railType) {
+                depth++;
+                continue;
+            }
+            if (!isSlotAvailable(slot)) break;
             promoted.push(slot);
+            depth++;
+            if (promoted.length >= promotionQuota) break;
         }
         return promoted;
     }
@@ -3998,9 +4017,11 @@ export function determineOrderSideByFunds(manager: OrderManagerLike, currentMark
             .slice(0, missingSlots);
 
         // If the funded rail is full, the spread itself may be stale: the
-        // nearest empty slots are still in the gap band. Promote contiguous
-        // empty gap slots from that rail edge so correction can repair the
-        // boundary and place orders in one atomic COW commit.
+        // nearest empty slots are still in the gap band. Promote from that rail
+        // edge so correction can repair the boundary and place orders in one
+        // atomic COW commit. The walk may ABSORB a same-side order already
+        // placed inside the band (it becomes a rail member once the boundary
+        // slides past it); only empty slots become CREATE targets.
         //
         // Requires a KNOWN committed boundary: with a null/unknown boundary the
         // rail edges are fabricated (buyEndIdx=0), so promotion would place

@@ -274,11 +274,18 @@ async function testAllBlockedReasonsAreDistinguishable() {
         manager.btsBalance = { free: 1e9, total: 1e9, locked: 0 };
         manager.logger = { log: (msg: string) => { logs.push(String(msg)); } } as any;
         for (let i = 0; i <= 60; i++) {
-            const type = i <= 40
+            let type = i <= 40
                 ? ORDER_TYPES.BUY
                 : (i >= 40 + cfg.gapSlots + 1 ? ORDER_TYPES.SELL : ORDER_TYPES.SPREAD);
-            const live = (i >= cfg.liveBuy[0] && i <= cfg.liveBuy[1])
+            let live = (i >= cfg.liveBuy[0] && i <= cfg.liveBuy[1])
                 || (i >= cfg.liveSell[0] && i <= cfg.liveSell[1]);
+            // Optional opposite-side stray parked inside the band: the walk
+            // cannot absorb it (absorption is same-side only), so it must still
+            // break with the non-contiguous reason.
+            if (i === cfg.oppositeIdx) {
+                type = ORDER_TYPES.BUY;
+                live = true;
+            }
             await manager._updateOrder({
                 id: `slot-${i}`, price: price(i), type,
                 state: live ? ORDER_STATES.ACTIVE : ORDER_STATES.VIRTUAL,
@@ -293,7 +300,11 @@ async function testAllBlockedReasonsAreDistinguishable() {
         await manager.setAccountTotals({ buy: 0, sell: 20000, buyFree: 0, sellFree: 20000 });
         await manager.recalculateFunds();
         const correction = await Grid.prepareSpreadCorrectionOrders(manager, ORDER_TYPES.SELL, 1);
-        return { placed: correction.ordersToPlace.map((o: any) => o.id), logs };
+        return {
+            placed: correction.ordersToPlace.map((o: any) => o.id),
+            boundaryIdx: correction.boundaryIdx,
+            logs
+        };
     };
 
     // bandSize (2) == MIN_SPREAD_ORDERS (2) -> reserve-blocked
@@ -304,14 +315,22 @@ async function testAllBlockedReasonsAreDistinguishable() {
         'Reserve-blocked must be named as such (a config change is the fix)'
     );
 
-    // bandSize (6) but the slot adjacent to the sell edge is placed -> walk breaks
-    const noRun = await run({ gapSlots: 6, liveBuy: [36, 38], liveSell: [46, 50] });
+    // A same-side SELL already parked in the band is ABSORBED by the slide (it
+    // becomes a rail member), so the walk continues to the next empty slot.
+    // This replaced the old "adjacent slot placed => break" behavior.
+    const absorbed = await run({ gapSlots: 6, liveBuy: [36, 38], liveSell: [46, 50] });
+    assert.deepStrictEqual(absorbed.placed, ['slot-45'],
+        'A placed same-side edge is absorbed; the next empty band slot is promoted');
+    assert.strictEqual(absorbed.boundaryIdx, 38, 'boundary slides past both the absorbed and promoted slots');
+
+    // A stray on the OPPOSITE side inside the band is not absorbable -> break.
+    const noRun = await run({ gapSlots: 6, liveBuy: [36, 38], liveSell: [47, 50], oppositeIdx: 46 });
     assert.deepStrictEqual(noRun.placed, [], 'Non-contiguous band must place nothing');
     assert(
         /no contiguous empty run/.test(noRun.logs.join('\n')),
         'Non-contiguous band must be named as such (a geometry change is the fix)'
     );
-    console.log('  ✓ reserve-blocked and no-contiguous-run are both named');
+    console.log('  ✓ reserve-blocked, absorbed same-side edge, and no-contiguous-run are all named');
 }
 
 // --- 6. Null-price orphan must not evict a valid candidate (F3) ------------

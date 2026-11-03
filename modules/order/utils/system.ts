@@ -1577,7 +1577,9 @@ export function reanchorBoundaryFromLastFill(manager: OrderManagerLike, boundary
     // leaves the remainder at the fill slot, and any boundary that puts the
     // fill outside its window necessarily puts that slot inside the implied
     // band. Allow exactly that residual (PARTIAL, same side, same ladder
-    // level); every other in-band order still refuses the re-anchor.
+    // level); every other in-band order still refuses the re-anchor UNLESS the
+    // move strands strictly fewer placed orders than the committed boundary
+    // (the violation-reducing repair below).
     //
     // ANCHOR-AWARE: the residual sits at the slot the re-anchor is derived
     // from (`anchorIdx`), which is the batch EXTREMUM, not necessarily the
@@ -1610,7 +1612,31 @@ export function reanchorBoundaryFromLastFill(manager: OrderManagerLike, boundary
         check = { ok: false, reason: getErrorMessage(err) };
     }
     if (!check || check.ok !== true) {
-        return { boundaryIdx: boundary, reanchored: false, reason: `unsafe: ${check?.reason ?? 'unknown'}` };
+        // VIOLATION-REDUCING REPAIR: a fill-derived re-anchor may legitimately
+        // land while older strands are still waiting for GAP-EVAC. Refusing it
+        // keeps the window behind the fill (the counter order stays in-band);
+        // accepting it is safe only when the move strands STRICTLY FEWER placed
+        // orders than the committed boundary already does — the same bound the
+        // strict validator applies, measured instead of assumed. Structural
+        // refusals (crossed book, ceiling, range) are never a repair.
+        const repairsStrands = check?.reason === MathUtils.BOUNDARY_REJECT_PLACED_IN_BAND
+            && MathUtils.boundaryMoveReducesStrands(
+                boundary,
+                candidate,
+                slots ?? [],
+                gap,
+                allowedInBandSlotIds.length > 0 ? { allowInBandSlotIds: allowedInBandSlotIds } : undefined
+            );
+        if (!repairsStrands) {
+            return { boundaryIdx: boundary, reanchored: false, reason: `unsafe: ${check?.reason ?? 'unknown'}` };
+        }
+        try {
+            manager.logger?.log?.(
+                `[BOUNDARY] Re-anchor accepted as a violation-reducing repair: boundary ${boundary} -> ` +
+                `${candidate} strands fewer placed orders than the committed geometry (${check?.reason})`,
+                'warn'
+            );
+        } catch { /* logging is best-effort */ }
     }
     try {
         manager.logger?.log?.(

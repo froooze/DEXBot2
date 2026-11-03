@@ -483,7 +483,10 @@ The correction path is fund-only and never manufactures budget by shrinking a re
    is never a correction target: a top-up grows an order at its current price, so
    it cannot move bestBuy/bestSell and cannot narrow the spread.
 4. Contiguous gap-slot promotion may extend the window while preserving
-   MIN_SPREAD_ORDERS and the opposite placed rail.
+   MIN_SPREAD_ORDERS and the opposite placed rail. A same-side order already
+   **placed inside the band** is absorbed by the slide (it becomes a legal rail
+   member); the walk steps over it and promotes only the next empty slot, so a
+   placed edge never becomes a duplicate CREATE target.
 5. If free funds cannot cover every target, place the affordable prefix, then
    **rotate a resting same-side order** into each unfunded promoted gap slot
    (same booked size, never a new commitment). A fully allocated rail has ~0
@@ -605,9 +608,12 @@ rail-edge price would teleport the window to that edge (observed: boundary 29 �
 anchor — a partial at a far slot is still a real trade, and its residual is the
 allow-listed case below.
 
-A live order inside the re-typed band still refuses the re-anchor
-(`unsafe: placed_order_in_band`) with one deliberate exception: the fill's
-**own PARTIAL residual** at the anchor slot (same side, same ladder level) is
+A move that strands **strictly fewer** placed orders than the committed boundary
+is accepted as a violation-reducing repair; an equal count still refuses. The
+comparison uses `validatePersistedBoundary`'s own in-band count
+(`boundaryMoveReducesStrands`), so the fill re-anchor and the rail clamp cannot
+disagree about what "stranded" means. Within that bound, the fill's **own
+PARTIAL residual** at the anchor slot (same side, same ladder level) is
 allow-listed, because any boundary that puts the fill outside its window
 necessarily puts that remainder inside the band. A partial fill therefore no
 longer deadlocks the geometry; GAP-EVAC cleans the residual afterwards.
@@ -668,7 +674,10 @@ GAP-EVAC / the next plan owns the offending order. The result is then passed
 through the shared `validatePersistedBoundary` gate (skipped only for a sparse
 ladder, whose array-length ceiling would reject everything), with the slots the
 batch cancels or rotates away allow-listed — so the rail clamp and the re-anchor
-cannot disagree about what "stranded in the band" means.
+cannot disagree about what "stranded in the band" means. The gate accepts a
+candidate that strands **strictly fewer** placed orders than the committed
+boundary (the same violation-reducing rule the re-anchor uses), which is what
+lets a fill-derived retreat land while GAP-EVAC is still draining older strands.
 
 ### Live-Price Provenance (fill, gap, crossing)
 

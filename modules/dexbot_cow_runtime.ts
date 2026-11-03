@@ -2840,6 +2840,43 @@ function toRefillSlotIdSet(refillSlotIds: unknown): Set<string> {
 }
 
 /**
+ * Resolve the rail side of a plan's refill holes from the working grid (the
+ * planned CREATE/rotation type) with the master grid as fallback. Used only to
+ * scope the boundary hold to the promotion direction; an unknown side keeps the
+ * legacy hold (fail safe).
+ * @param refillSlotIds - Plan hole-CREATE/rotation destination ids
+ * @param workingGrid - Plan working grid (has the planned slot types)
+ * @param manager - Order manager (master fallback)
+ * @returns ORDER_TYPES.BUY / SELL, or null when no refill slot carries a side
+ */
+function resolveRefillSide(
+    refillSlotIds: unknown,
+    workingGrid: { get?: (id: string) => { type?: unknown } | null | undefined } | null | undefined,
+    manager: OrderManagerLike
+): string | null {
+    if (!Array.isArray(refillSlotIds)) return null;
+    let side: string | null = null;
+    for (const raw of refillSlotIds) {
+        if (typeof raw !== 'string' || raw.length === 0) continue;
+        const planned = workingGrid?.get?.(raw);
+        const master = manager?.orders instanceof Map ? manager.orders.get(raw) : null;
+        // Prefer the planned type, but fall back to the master type when the
+        // planned slot is side-neutral (SPREAD) or absent: a refill wire can
+        // carry an id whose working-grid entry was normalized away.
+        const plannedType = planned?.type;
+        const type = (plannedType === ORDER_TYPES.BUY || plannedType === ORDER_TYPES.SELL)
+            ? plannedType
+            : (master as { type?: unknown } | null | undefined)?.type;
+        if (type !== ORDER_TYPES.BUY && type !== ORDER_TYPES.SELL) continue;
+        // A one-sided plan is the norm; a mixed wire is not a usable direction
+        // signal, so report unknown and let the caller keep the legacy hold.
+        if (side !== null && side !== type) return null;
+        side = type;
+    }
+    return side;
+}
+
+/**
  * Boundary-hold decision for guard-skipped refills.
  * When a skipped slot is one of the plan's refill slots — a hole-CREATE that
  * justified the planned boundary shift — the committed boundary is kept: the
@@ -2849,6 +2886,10 @@ function toRefillSlotIdSet(refillSlotIds: unknown): Set<string> {
  * Unrelated vetoes (skip ids outside the refill set) never pin geometry.
  * The grid still commits; only the boundary value is held (same discipline
  * as the overrun-hold in validateBoundaryCommit).
+ *
+ * `refillSide` (BUY/SELL) scopes the hold to the boundary's PROMOTION
+ * direction; a fill-driven retreat, or a wire whose side cannot be resolved
+ * (null), keeps the legacy hold.
  */
 function resolveRefillBoundaryHold(
     workingBoundary: unknown,
@@ -2856,11 +2897,27 @@ function resolveRefillBoundaryHold(
     skippedUpdateSlotIds: Iterable<string> | null | undefined,
     clampedUpdateSlotIds: Iterable<string> | null | undefined,
     refillSlotIds: unknown,
-    skippedCreateSlotIds: Iterable<string> | null | undefined = undefined
+    skippedCreateSlotIds: Iterable<string> | null | undefined = undefined,
+    refillSide: unknown = null
 ): { effectiveBoundary: unknown; heldRefillSlotIds: string[] } {
     const refills = toRefillSlotIdSet(refillSlotIds);
     const heldRefillSlotIds: string[] = [];
-    if (refills.size > 0) {
+    // A refill hold is evidence for a boundary PROMOTION — the move advances
+    // TOWARD the band holes the refills would fill. A fill-driven retreat moves
+    // AWAY from them: the skipped holes are now band slots, so holding the old
+    // boundary would discard the fill-derived geometry (live incident: a hold
+    // kept 169 over a fill-derived 168 after the buy fills at 168/167). Judging
+    // the direction keeps the hold's own premise instead of adding a second
+    // geometry source. No side/geometry => legacy hold (fail safe, never
+    // fail-open into a boundary shift).
+    const working = Format.toKnownNumber(workingBoundary);
+    const committed = Format.toKnownNumber(committedBoundary);
+    const towardBand = refillSide === ORDER_TYPES.BUY
+        ? (Number.isFinite(working) && Number.isFinite(committed) ? Number(working) > Number(committed) : true)
+        : refillSide === ORDER_TYPES.SELL
+            ? (Number.isFinite(working) && Number.isFinite(committed) ? Number(working) < Number(committed) : true)
+            : true;
+    if (refills.size > 0 && towardBand) {
         const seen = new Set<string>();
         const skipCollections = skippedCreateSlotIds !== undefined
             ? [skippedUpdateSlotIds, clampedUpdateSlotIds, skippedCreateSlotIds]
@@ -3125,13 +3182,30 @@ export function deriveRailBoundary(
                 vacatedSlotIds.size > 0 ? { allowInBandSlotIds: vacatedSlotIds } : undefined
             );
             if (!check || check.ok !== true) {
-                return {
-                    boundary: null,
-                    maxBuyIdx,
-                    minSellIdx,
-                    clamped: false,
-                    reason: `unsafe: ${check?.reason ?? 'unknown'}${check?.detail ? ` (${check.detail})` : ''}`
-                };
+                // VIOLATION-REDUCING REPAIR (same rule as the fill re-anchor):
+                // the clamp may accept a move the strict validator refuses for
+                // transient stranding only when it strands STRICTLY FEWER placed
+                // orders than the committed boundary already does. This is what
+                // lets a fill-derived retreat land while GAP-EVAC is still
+                // draining older strands; structural refusals stay closed.
+                const committed = Format.toKnownNumber(manager?.boundaryIdx);
+                const repairsStrands = check?.reason === math.BOUNDARY_REJECT_PLACED_IN_BAND
+                    && math.boundaryMoveReducesStrands(
+                        Number.isFinite(committed) ? Number(committed) : null,
+                        next,
+                        slotsForGate,
+                        gap,
+                        vacatedSlotIds.size > 0 ? { allowInBandSlotIds: vacatedSlotIds } : undefined
+                    );
+                if (!repairsStrands) {
+                    return {
+                        boundary: null,
+                        maxBuyIdx,
+                        minSellIdx,
+                        clamped: false,
+                        reason: `unsafe: ${check?.reason ?? 'unknown'}${check?.detail ? ` (${check.detail})` : ''}`
+                    };
+                }
             }
         }
     }
@@ -5021,14 +5095,18 @@ async function updateOrdersOnChainBatchCOWBody(
         }
         // BOUNDARY HOLD: skipped refill slots strand empty rail holes past the
         // planned boundary (commit gate skips empties, self-legalizing) — hold
-        // the committed boundary; intersect-only, grid still commits.
+        // the committed boundary; intersect-only, grid still commits. The hold
+        // is scoped to the boundary's PROMOTION direction: a fill-driven retreat
+        // moves away from the holes and must not be pinned (see
+        // resolveRefillBoundaryHold).
         const refillHold = resolveRefillBoundaryHold(
             workingBoundary,
             bot.manager.boundaryIdx,
             skippedUpdateSlotIds as Iterable<string> | null | undefined,
             clampedUpdateSlotIds as Iterable<string> | null | undefined,
             cowResult?.refillSlotIds,
-            skippedCreateSlotIds as Iterable<string> | null | undefined
+            skippedCreateSlotIds as Iterable<string> | null | undefined,
+            resolveRefillSide(cowResult?.refillSlotIds, workingGrid, bot.manager)
         );
         effectiveBoundary = refillHold.effectiveBoundary as number;
         boundaryHeld = refillHold.heldRefillSlotIds.length > 0;

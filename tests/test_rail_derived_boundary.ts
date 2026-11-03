@@ -291,6 +291,43 @@ run('RAIL-13 the shared commit gate refuses a clamp that strands a placed order'
     assert.ok(/^unsafe: /.test(String(refused.reason)), `reason must come from the shared gate: ${JSON.stringify(refused)}`);
 });
 
+run('RAIL-15 a clamp that strands FEWER placed orders than the committed boundary is a repair', () => {
+    // Committed 8 / gap 2 strands the two sells at 9-10. The fill-derived
+    // clamp wants 4; under 4 / gap 2 only the stray buy at 5 is in-band (1
+    // strand). Strictly fewer => accept (the case that lets a fill retreat land
+    // while GAP-EVAC is still draining older strands).
+    const makeDense = (committedSellIds: number[]) => {
+        const orders = new Map<string, unknown>();
+        for (let i = 0; i < 12; i++) {
+            orders.set(`slot-${i}`, {
+                id: `slot-${i}`,
+                type: i <= 5 ? BUY : SELL,
+                state: ORDER_STATES.VIRTUAL,
+                orderId: null,
+                price: 100 + i,
+                size: 0
+            });
+        }
+        for (const idx of [5, ...committedSellIds]) {
+            const o = orders.get(`slot-${idx}`) as any;
+            o.orderId = `1.7.${idx}`;
+            o.state = ORDER_STATES.ACTIVE;
+            o.size = 10;
+        }
+        (orders.get('slot-5') as any).type = BUY;
+        for (const idx of committedSellIds) (orders.get(`slot-${idx}`) as any).type = SELL;
+        return { orders, boundaryIdx: 8, _gapSlots: 2 };
+    };
+    const repaired = deriveRailBoundary(makeDense([9, 10]), [], 4, 2);
+    assert.strictEqual(repaired.boundary, 4, `expected the repair to commit 4: ${JSON.stringify(repaired)}`);
+
+    // Equal strand count is NOT a repair: committed 8 strands only slot 9 (1),
+    // candidate 4 strands only slot 5 (1) -> refuse.
+    const refused = deriveRailBoundary(makeDense([9]), [], 4, 2);
+    assert.strictEqual(refused.boundary, null, `equal strands must fail closed: ${JSON.stringify(refused)}`);
+    assert.ok(/^unsafe: /.test(String(refused.reason)), `reason must come from the shared gate: ${JSON.stringify(refused)}`);
+});
+
 run('RAIL-14 the gate is skipped on a sparse ladder (array-length ceiling does not apply)', () => {
     // A partial/sparse master map (tests, or a slot-list that lost entries)
     // makes validateBoundaryCommit's length-derived ceiling meaningless; the
