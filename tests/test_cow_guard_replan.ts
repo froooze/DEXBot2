@@ -511,6 +511,52 @@ async function testReplanThrowProceedsWithResync() {
     console.log('✓ COW-GUARD-REPLAN-004 passed');
 }
 
+async function testBatchAbortsWhenPlacementLeaseWasTornDown() {
+    console.log('\n[COW-GUARD-REPLAN-006] a batch whose lease the watchdog force-released must not broadcast...');
+
+    const masterOrders = new Map([
+        ['slot-1', createOrder('slot-1')]
+    ]);
+    const { bot, manager, counters, logs } = createGuardFixture(masterOrders);
+    const restore = installChainStubs(manager, counters);
+
+    manager._gridVersion = 0;
+    // Placement IS used here, but the lease is no longer the owner: the
+    // stale-region watchdog force-released it after the batch parked on a slow
+    // read, so another path may hold the region now.
+    manager.acquirePlacement = async () => ({ kind: 'cow-broadcast', release: () => {} });
+    manager.isPlacementLeaseCurrent = () => false;
+
+    const freshWG = new WorkingGrid(manager.orders, { baseVersion: manager._gridVersion });
+    freshWG.set('slot-2', createVirtualCreateAction('slot-2', 1.1).order);
+
+    try {
+        manager._currentWorkingGridStack.push(freshWG);
+        const result = await bot._updateOrdersOnChainBatchCOW({
+            workingGrid: freshWG,
+            workingIndexes: freshWG.getIndexes(),
+            workingBoundary: 0,
+            actions: [createVirtualCreateAction('slot-2', 1.1)],
+            fills: [{ id: 'fill-1', type: ORDER_TYPES.BUY, price: 0.99, size: 5 }],
+            excludeIds: new Set(['slot-1']),
+            _workingGridPushed: true
+        });
+        assert.strictEqual(result.aborted, true, 'a batch without its region must abort');
+        assert.strictEqual(result.reason, 'PLACEMENT_LEASE_LOST', 'abort reason must name the lost lease');
+        assert.strictEqual(counters.executeBatchCalls, 0, 'nothing may be broadcast without the region');
+        assert.strictEqual(counters.commitCalls, 0, 'nothing may be committed without the region');
+        assert.strictEqual(manager._currentWorkingGridStack.length, 0, 'the abandoned grid must be popped (LIFO balance)');
+        assert(
+            logs.some((m: string) => m.includes('Placement lease was force-released')),
+            'the abort must be logged'
+        );
+    } finally {
+        restore();
+    }
+
+    console.log('✓ COW-GUARD-REPLAN-006 passed');
+}
+
 async function run() {
     console.log('Running COW guard bounded re-plan regression tests...');
     await testStalePlanReplansOnceAndExecutes();
@@ -518,6 +564,7 @@ async function run() {
     await testReplanWithNoActionsSkipsStalePlan();
     await testStaleAtReplanLimitProceedsWithResync();
     await testReplanThrowProceedsWithResync();
+    await testBatchAbortsWhenPlacementLeaseWasTornDown();
     console.log('\n✓ All COW guard re-plan regression tests passed');
 }
 

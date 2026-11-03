@@ -2013,20 +2013,21 @@ export function hasUnsettledFills(source: unknown): { unsettled: boolean; reason
 }
 
 /**
- * Age of the OLDEST bot-level pipeline counter still raised.
+ * Age of the most recent bot-level pipeline raise.
  *
  * The two counters (`_batchInFlight`, `_recoverySyncInFlight`) each carry a
- * `*StartedAt` stamp maintained by their raise site. A stale region watchdog
- * needs their age to tell "the pipeline is making progress" from "the counter
- * leaked with the region" — the placement watchdog uses it to refuse tearing
- * down a region a live batch still owns. Lives here (next to
+ * `*StartedAt` stamp maintained by their raise site; a nested raise (a COW
+ * re-plan, a second recovery frame) refreshes it, so this reports how long ago
+ * the pipeline LAST showed activity, not how long the oldest frame has been
+ * open. That is the question a stale-region watchdog needs: a recent raise is
+ * evidence of progress. Lives here (next to
  * `hasUnsettledFills`, the same bot/manager field-peeking contract) so the
  * maintenance tick and the fill consumer cannot disagree about it.
  *
  * @param {Object} source - DEXBot-like (or OrderManager-like) instance
  * @param {number} [nowMs] - Clock override (tests)
- * @returns {number} Milliseconds since the oldest raised counter started, 0
- *   when nothing is in flight or the stamp is missing
+ * @returns {number} Milliseconds since the most recent raise, 0 when nothing
+ *   is in flight or the stamp is missing
  */
 export function getPipelineInFlightAgeMs(source: unknown, nowMs?: number): number {
     if (!source || typeof source !== 'object') return 0;

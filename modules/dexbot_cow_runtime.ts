@@ -4356,6 +4356,25 @@ async function updateOrdersOnChainBatchCOWBody(
     // placement lease serializes EVERY chain-mutating path. Both are released
     // on every exit; the re-plan recursion inherits the lease.
 
+    // LEASE-LIVENESS RE-CHECK (the mirror of the nested drain's check): the
+    // stale-region watchdog may have force-released this lease while the batch
+    // was parked on a slow chain read, and another path can own the region by
+    // now. The OWNER has to verify before broadcasting, exactly like the drain
+    // it hands the lease to — otherwise the torn-down batch wakes up and
+    // broadcasts unprotected, which is the duplicate window the watchdog was
+    // allowed to open only because it believed the batch was hung.
+    if (heldPlacementLease
+        && typeof bot.manager.isPlacementLeaseCurrent === 'function'
+        && !bot.manager.isPlacementLeaseCurrent(heldPlacementLease)) {
+        bot.manager.logger.log(
+            '[COW] Placement lease was force-released while this batch was in flight (stale-region watchdog); ' +
+            'aborting this batch instead of broadcasting without the region.',
+            'warn'
+        );
+        popPushedWorkingGrid(bot, cowResult);
+        return { executed: false, aborted: true, reason: 'PLACEMENT_LEASE_LOST', hadRotation: false };
+    }
+
     bot._batchInFlight++;
     batchInFlightRaised = true;
     (bot as unknown as { _batchInFlightStartedAt?: number })._batchInFlightStartedAt = Date.now();

@@ -889,6 +889,44 @@ async function testPersistentDuplicateEscalatesToWarn() {
     console.log('✅ Regression 9e passed: persistent duplicate escalates info -> warn');
 }
 
+// Regression 9i: the reconcile is a token-level placement holder (Phase 1 plan
+// + Phase 2 broadcast). If the stale-region watchdog force-released its lease
+// after planning, Phase 2 must be discarded — broadcasting the plan without the
+// region is the duplicate window the teardown exists to avoid.
+async function testPlanDiscardedWhenPlacementLeaseWasTornDown() {
+    let leaseReleases = 0;
+    let regionStarts = 0;
+    let regionStops = 0;
+    const { manager, chainOpenOrders, chainOrders, cancelCalls } = makeDuplicateOrphanScenario({
+        acquirePlacement: async () => ({ kind: 'startup-reconcile', release: () => { leaseReleases++; } }),
+        isPlacementLeaseCurrent: () => false,
+        startBroadcasting: () => { regionStarts++; },
+        stopBroadcasting: () => { regionStops++; },
+    });
+    const logs = [];
+    manager.logger = { log: (msg: any, level: any) => { logs.push({ msg: String(msg), level }); } } as any;
+
+    const result = await reconcileGridOrders({
+        manager,
+        config: { coreOrders: { sell: 1, buy: 0 } },
+        account: 'acct',
+        privateKey: 'pk',
+        chainOrders,
+        chainOpenOrders,
+    });
+
+    assert.strictEqual(result, null, 'a reconcile without its region must discard the plan');
+    assert.strictEqual(cancelCalls(), 0, 'no Phase-2 mutation may run without the region');
+    assert.strictEqual(regionStarts, 1, 'Phase 1 still starts its broadcast region');
+    assert.strictEqual(regionStops, 1, 'the refused reconcile must release the broadcast region');
+    assert.strictEqual(leaseReleases, 1, 'the stale lease must still be released (no leak)');
+    assert.ok(
+        logs.some((l) => l.msg.includes('placement lease was force-released after planning')),
+        'the refusal must be logged'
+    );
+    console.log('✅ Regression 9i passed: reconcile discards its plan when the placement lease was torn down');
+}
+
 (async () => {
     console.log('\n========== STARTUP RECONCILE REGRESSION TESTS ==========\n');
     await testUnmatchedCancelReleasesFundsAndHandlesNullEntries();
@@ -907,6 +945,7 @@ async function testPersistentDuplicateEscalatesToWarn() {
     await testStartupRejectsChangedCancellationSnapshot();
     await testStartupAllowsUntouchedPlanAfterEarlierCorrectionCancel();
     await testStartupAmbiguousReadSkipsCancellations();
+    await testPlanDiscardedWhenPlacementLeaseWasTornDown();
     console.log('\n✅ Startup reconcile regression tests passed!\n');
 })().catch((err) => {
     console.error('\n❌ STARTUP RECONCILE REGRESSION TEST FAILED:');

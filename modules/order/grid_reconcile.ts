@@ -567,6 +567,25 @@ export async function reconcileGridOrders({
     // well as Phase 2's I/O.
 
     try {
+        // LEASE-LIVENESS GATE (Phase 2 is the first mutation). This reconcile is
+        // one of the two token-level holders; the stale-region watchdog may have
+        // force-released the lease while Phase 1 or the pre-cancel chain read was
+        // slow, and another path can own the region by now. Phase 1 touched only
+        // the master (no chain effect), and the next cycle re-reads the chain
+        // after re-acquiring the region, so dropping this plan is recoverable —
+        // broadcasting it unprotected is the duplicate window the teardown was
+        // supposed to be safe about. The mirror of the COW body's check.
+        if (placementLease
+            && typeof manager.isPlacementLeaseCurrent === 'function'
+            && !manager.isPlacementLeaseCurrent(placementLease)) {
+            logger?.log?.(
+                'Startup reconcile: placement lease was force-released after planning (stale-region watchdog); ' +
+                'discarding the plan instead of broadcasting without the region.',
+                'warn'
+            );
+            return null;
+        }
+
         const { plannedCreates, plannedUpdates, plannedCancels, chainSellCount, chainBuyCount } = phase1Result;
 
         // Execute planned cancellations (duplicates, edge, excess) outside lock.

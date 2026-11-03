@@ -994,8 +994,10 @@ class OrderManager implements OrderManagerLike {
      *
      * SINGLE SOURCE OF TRUTH: every caller that can broadcast (COW, startup
      * reconcile Phase 2, correction drain, dust/residual cancels, pool swaps)
-     * must go through this helper. Pass an existing `lease` when nesting (a
-     * COW batch holds the region across its pre-batch drain).
+     * must go through this helper. It is NOT reentrant: a nested caller must not
+     * call it again — the COW body hands its lease to the pre-batch drain
+     * (`correctAllPriceMismatches({ placementLease })`), which verifies it with
+     * `isPlacementLeaseCurrent()` before mutating.
      *
      * Lock hierarchy: acquire placement BEFORE `_gridLock`; never acquire it
      * while holding `_gridLock` (Level 0.5 — see `manageLocks`).
@@ -1254,14 +1256,16 @@ class OrderManager implements OrderManagerLike {
      *   reconcile must survive). Only a batch older than the same bound is
      *   treated as part of the hung region.
      * - When the teardown does happen it also clears a broadcast refcount that
-     *   is itself past its bound, atomically. startBroadcasting() runs INSIDE the
-     *   placement region, so both clocks belong to the same region; clearing
-     *   them in one place stops the maintenance tick from tearing down placement
-     *   first and the refcount second (two authorities, one hung region).
-     *   `_clearStaleBroadcastFlag` still refuses to act on its own while a
-     *   placement lease is held.
+     *   is itself past its bound, atomically. A refcount raised by a placement
+     *   holder belongs to the same region (the COW body and the reconcile call
+     *   startBroadcasting() INSIDE it), so clearing both in one place stops the
+     *   maintenance tick from tearing down placement first and the refcount
+     *   second (two authorities, one hung region). A refcount raised OUTSIDE any
+     *   region (the spread-correction pre-broadcast hold in `order/grid.ts`) is
+     *   not this region's and is left to `_clearStaleBroadcastFlag`, which still
+     *   refuses to act on its own while a placement lease is held.
      * @param {number} [maxAgeMs] - Override for tests
-     * @param {Object} [options] - `batchInFlightMs`: age of the oldest raised
+     * @param {Object} [options] - `batchInFlightMs`: age of the LAST raised
      *   bot-level pipeline counter (0/undefined when none).
      * @returns {boolean} true when a stale region was force-released
      */
