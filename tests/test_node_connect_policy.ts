@@ -93,6 +93,35 @@ async function testCNP007_UnknownActiveAligns() {
     console.log('✓ CNP-007 passed');
 }
 
+async function testCNP008_AlignKeepsActiveNodeLast() {
+    console.log('\n[CNP-008] Align keeps the connected node in the candidate list (appended last)...');
+    const healthy = ['wss://alt.test/ws', 'wss://third.test/ws'];
+    const activeNode = 'wss://active.test/ws';
+    const r = resolveConnectedNodeAction({
+        ...BASE,
+        activeNode,
+        getHealthyNodes: () => healthy,
+    });
+    assert.strictEqual(r.action, 'align');
+    assert.deepStrictEqual(
+        r.nodes,
+        [...healthy, activeNode],
+        'active node must survive setNodes(), otherwise the transport tears down a healthy socket'
+    );
+    assert.deepStrictEqual(healthy, ['wss://alt.test/ws', 'wss://third.test/ws'], 'input list must not be mutated');
+    console.log('✓ CNP-008 passed');
+}
+
+async function testCNP009_AlignDoesNotDuplicateActiveNode() {
+    console.log('\n[CNP-009] Align never duplicates an already-listed active node...');
+    const r = resolveConnectedNodeAction({ ...BASE, activeNode: 'wss://alt.test/ws' });
+    assert.deepStrictEqual(r, {
+        action: 'align',
+        nodes: ['wss://good.test/ws', 'wss://alt.test/ws'],
+    });
+    console.log('✓ CNP-009 passed');
+}
+
 async function runAllTests() {
     console.log('=== Node Connect Policy Test Suite ===\n');
     await testCNP001_HealthyActiveAligns();
@@ -102,6 +131,8 @@ async function runAllTests() {
     await testCNP005_ReconnectInProgressSuppresses();
     await testCNP006_HealthCheckDisabledSuppresses();
     await testCNP007_UnknownActiveAligns();
+    await testCNP008_AlignKeepsActiveNodeLast();
+    await testCNP009_AlignDoesNotDuplicateActiveNode();
     console.log('\n=== All node-connect-policy tests passed! ===');
 }
 

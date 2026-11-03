@@ -18,6 +18,7 @@ const {
     orderNodesFromHealthCache,
     orderNodesForSettings,
     readHealthCache,
+    removeNodesFromHealthCache,
 } = require('../modules/node_health_cache');
 const { NODE_MANAGEMENT } = require('../modules/constants');
 
@@ -499,6 +500,201 @@ process.on('exit', () => {
         fs.rmSync(stateDir, { recursive: true, force: true });
     }
     console.log('✓ Disabled health check ordering test passed\n');
+}
+
+// ============================================================================
+// Test 19: A stable node outranks a faster flapping node
+// ============================================================================
+{
+    console.log('Test 19: Stable node outranks a faster flapping node');
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dexbot-node-churn-'));
+    try {
+        const nm = createNodeManager({ list: ['fast', 'stable'], stateDir });
+        const fast = nm.nodeStats.get('fast');
+        const stable = nm.nodeStats.get('stable');
+        fast.status = 'healthy';
+        fast.latencyMs = 50;
+        stable.status = 'healthy';
+        stable.latencyMs = 350;
+
+        // No churn yet: ping alone decides (this is the old behaviour).
+        assert.deepStrictEqual(nm.getHealthyNodes(), ['fast', 'stable'], 'fast node leads while stable');
+
+        // One live drop, then a probe re-admits the node (status healthy again).
+        nm.reportNodeFailure('fast', 'WebSocket closed code=1006', 'connection', Date.now() - 10 * 60 * 1000);
+        fast.status = 'healthy';
+        assert.deepStrictEqual(nm.getHealthyNodes(), ['stable', 'fast'], 'churn penalty demotes the fast node');
+        assert.strictEqual(nm.getBestNode(), 'stable');
+
+        const fastStats = nm.getStats().find((s: any) => s.url === 'fast');
+        assert.strictEqual(fastStats.drops24h, 1, 'churn is visible in stats');
+        assert.ok(fastStats.flapPenaltyMs > 0, 'penalty reported');
+
+        // Churn counters are exposed per node for logging/diagnostics.
+        const churn = nm.getNodeChurn('fast');
+        assert.strictEqual(churn.dropsLastHour, 1);
+        assert.strictEqual(churn.drops24h, 1);
+        assert.strictEqual(churn.dropTimes.length, 1);
+        assert.strictEqual(nm.getSummary().totalDrops24h, 1);
+        assert.strictEqual(nm.getNodeChurn('unknown'), null);
+
+        // A stale drop no longer penalizes the node.
+        fast.dropTimes = [Date.now() - 25 * 60 * 60 * 1000];
+        assert.deepStrictEqual(nm.getHealthyNodes(), ['fast', 'stable'], 'expired churn stops counting');
+    } finally {
+        fs.rmSync(stateDir, { recursive: true, force: true });
+    }
+    console.log('✓ Stable-node ranking test passed\n');
+}
+
+// ============================================================================
+// Test 20: Health cache carries connection churn (drops/h)
+// ============================================================================
+{
+    console.log('Test 20: Health cache carries connection churn');
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dexbot-node-churn-cache-'));
+    try {
+        const nm = createNodeManager({ list: ['fast', 'stable'], stateDir });
+        nm.nodeStats.get('fast').status = 'healthy';
+        nm.nodeStats.get('fast').latencyMs = 50;
+        nm.nodeStats.get('stable').status = 'healthy';
+        nm.nodeStats.get('stable').latencyMs = 350;
+        nm.reportNodeFailure('fast', 'WebSocket closed code=1006', 'connection', Date.now() - 10 * 60 * 1000);
+        nm.nodeStats.get('fast').status = 'healthy';
+        nm.saveHealthCache();
+
+        const cache = readHealthCache({ stateDir });
+        assert.ok(cache, 'health cache readable');
+        const fastEntry = cache.nodes.find((n: any) => n.url === 'fast');
+        assert.ok(fastEntry, 'flapping node present');
+        assert.strictEqual(fastEntry.drops24h, 1, '24h churn count persisted');
+        assert.strictEqual(fastEntry.dropsLastHour, 1, 'last-hour churn count persisted');
+        assert.strictEqual(fastEntry.dropsPerHour, Math.round((1 / 24) * 100) / 100, 'drops/h persisted');
+        assert.ok(fastEntry.flapPenaltyMs > 0, 'penalty persisted');
+        assert.strictEqual(fastEntry.dropTimes.length, 1, 'drop timestamps persisted for decay maths');
+        assert.deepStrictEqual(
+            cache.nodes.map((n: any) => n.url),
+            ['stable', 'fast'],
+            'cache is ordered by effective latency, not raw ping'
+        );
+
+        // A restarted process must not start with a blank churn slate.
+        const reloaded = createNodeManager({ list: ['fast', 'stable'], stateDir });
+        assert.strictEqual(reloaded.nodeStats.get('fast').dropTimes.length, 1, 'churn survives a restart');
+        assert.deepStrictEqual(reloaded.getHealthyNodes(), [], 'unchecked nodes are not selectable yet');
+        reloaded.nodeStats.get('fast').status = 'healthy';
+        reloaded.nodeStats.get('fast').latencyMs = 50;
+        reloaded.nodeStats.get('stable').status = 'healthy';
+        reloaded.nodeStats.get('stable').latencyMs = 350;
+        assert.deepStrictEqual(reloaded.getHealthyNodes(), ['stable', 'fast'], 'restored churn keeps ranking stable-first');
+
+        // Removing one node from the cache must not erase another's history.
+        removeNodesFromHealthCache('stable', { stateDir });
+        const trimmed = readHealthCache({ stateDir });
+        const fastAfter = trimmed.nodes.find((n: any) => n.url === 'fast');
+        assert.strictEqual(fastAfter.dropTimes.length, 1, 'churn preserved when a sibling node is removed');
+    } finally {
+        fs.rmSync(stateDir, { recursive: true, force: true });
+    }
+    console.log('✓ Health cache churn test passed\n');
+}
+
+// ============================================================================
+// Test 21: Health-cache ordering prefers stability over raw latency
+// ============================================================================
+{
+    console.log('Test 21: Health-cache ordering prefers stability over raw latency');
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dexbot-node-churn-order-'));
+    try {
+        const nm = createNodeManager({ list: ['fast', 'stable'], stateDir });
+        nm.nodeStats.get('fast').status = 'healthy';
+        nm.nodeStats.get('fast').latencyMs = 50;
+        nm.nodeStats.get('fast').dropTimes = [Date.now() - 60 * 1000];
+        nm.nodeStats.get('stable').status = 'healthy';
+        nm.nodeStats.get('stable').latencyMs = 350;
+        nm.saveHealthCache();
+
+        // Consumed by the credential daemon: it re-reads the cache every hour and
+        // must not be pushed back onto the flapping node.
+        assert.deepStrictEqual(
+            orderNodesFromHealthCache(['fast', 'stable'], { stateDir }),
+            ['stable', 'fast'],
+            'daemon-facing ordering prefers the stable node'
+        );
+    } finally {
+        fs.rmSync(stateDir, { recursive: true, force: true });
+    }
+    console.log('✓ Health-cache stability ordering test passed\n');
+}
+
+// ============================================================================
+// Test 22: Operator-tuned flap scoring reaches ranking and the health cache
+// ============================================================================
+{
+    console.log('Test 22: Operator-tuned flap scoring is applied consistently');
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dexbot-node-churn-tune-'));
+    try {
+        // A tiny haircut (100ms/drop) must NOT demote a 50ms node behind a 350ms
+        // one, unlike the 5000ms default: this proves the knob is wired, not
+        // merely defaulted.
+        const nm = createNodeManager({
+            list: ['fast', 'stable'],
+            stateDir,
+            healthCheck: { flapPenaltyMsPerDrop: 100, flapPenaltyMaxMs: 200 },
+        });
+        assert.strictEqual(nm.config.healthCheck.flapPenaltyMsPerDrop, 100, 'per-drop cost honoured');
+        assert.strictEqual(nm.config.healthCheck.flapPenaltyMaxMs, 200, 'penalty cap honoured');
+
+        nm.nodeStats.get('fast').status = 'healthy';
+        nm.nodeStats.get('fast').latencyMs = 50;
+        nm.nodeStats.get('stable').status = 'healthy';
+        nm.nodeStats.get('stable').latencyMs = 350;
+        nm.reportNodeFailure('fast', 'WebSocket closed code=1006', 'connection', Date.now() - 60 * 1000);
+        nm.nodeStats.get('fast').status = 'healthy';
+
+        assert.strictEqual(nm.getNodeChurn('fast').penaltyMs, 100, 'penalty uses the configured cost');
+        assert.deepStrictEqual(
+            nm.getHealthyNodes(),
+            ['fast', 'stable'],
+            'a 100ms penalty does not outweigh a 300ms latency advantage'
+        );
+
+        // The cap wins: 5000ms nominally, capped at 200ms, so the node keeps rank.
+        const capped = createNodeManager({
+            list: ['fast', 'stable'],
+            healthCheck: { flapPenaltyMaxMs: 200 },
+        });
+        capped.nodeStats.get('fast').status = 'healthy';
+        capped.nodeStats.get('fast').latencyMs = 50;
+        capped.nodeStats.get('stable').status = 'healthy';
+        capped.nodeStats.get('stable').latencyMs = 350;
+        capped.reportNodeFailure('fast', 'WebSocket closed code=1006', 'connection', Date.now() - 60 * 1000);
+        capped.nodeStats.get('fast').status = 'healthy';
+        assert.strictEqual(capped.getNodeChurn('fast').penaltyMs, 200, 'penalty cap honoured');
+        assert.deepStrictEqual(capped.getHealthyNodes(), ['fast', 'stable'], 'capped penalty keeps 50ms node ahead');
+
+        // The cache must be ordered with the SAME tuning, otherwise the daemon
+        // (which trusts cache order) would disagree with the bot.
+        nm.saveHealthCache();
+        const cmd = createNodeManager({
+            list: ['fast', 'stable'],
+            stateDir,
+            healthCheck: { flapPenaltyMsPerDrop: 5000 },
+        });
+        assert.strictEqual(cmd.nodeStats.get('fast').dropTimes.length, 1, 'churn reloaded from a differently-tuned cache');
+        cmd.nodeStats.get('fast').status = 'healthy';
+        cmd.nodeStats.get('fast').latencyMs = 50;
+        cmd.nodeStats.get('stable').status = 'healthy';
+        cmd.nodeStats.get('stable').latencyMs = 350;
+        assert.deepStrictEqual(
+            cmd.getHealthyNodes(),
+            ['stable', 'fast'],
+            'the default 5000ms cost demotes the flapping node, independent of the cache writer tuning'
+        );
+    } finally {
+        fs.rmSync(stateDir, { recursive: true, force: true });
+    }
+    console.log('✓ Tunable flap-scoring test passed\n');
 }
 
 console.log('='.repeat(60));

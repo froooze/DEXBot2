@@ -70,6 +70,7 @@ modules/
 ├── chain_keys.ts                  master-password vault + signing-key retrieval
 ├── daemon_node_health.ts          daemon-side node failure ledger (shared rules)
 ├── node_failure_ledger.ts         node failure counting shared by bot + daemon
+├── node_flap_score.ts            time-decayed connection-churn score used for node ranking
 ├── node_health_cache.ts           shared node-health cache file I/O + ordering
 ├── socket_json_client.ts          newline-delimited JSON Unix-socket client
 ├── market_adapter_whitelist.ts    adapter whitelist I/O

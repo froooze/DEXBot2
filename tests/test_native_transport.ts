@@ -810,6 +810,62 @@ async function testShouldSkipNode() {
     }
 }
 
+// ── Test: a disconnect names the node it closed ──────────────────────────
+
+async function testDisconnectLogAttribution() {
+    const { createTransport } = require('../modules/bitshares-native/transport');
+    const { setGlobalConsoleLevel, getGlobalConsoleLevel } = require('../modules/order/logger');
+    const port = 18000 + Math.floor(Math.random() * 1000);
+    const wsServer = await createWsServer(port);
+    const url = `ws://127.0.0.1:${port}/ws`;
+
+    // The logger routes info -> console.log. Capture it so we can assert on the
+    // status line itself: an intentional disconnect used to clear nodeUrl before
+    // emitting the status change, logging `(node=null)` and making 120 of 172
+    // closes in a live run unattributable.
+    const originalLog = console.log;
+    const originalWarn = console.warn;
+    const previousConsoleLevel = getGlobalConsoleLevel();
+    const lines: string[] = [];
+    const collect = (...args: any[]) => { lines.push(args.join(' ')); };
+
+    try {
+        // Pin the console level so the assertion does not depend on whatever
+        // LOG_LEVEL the operator's general.settings.json happens to carry.
+        setGlobalConsoleLevel('debug');
+        const transport = createTransport({ keepAliveIntervalMs: 60000, connectTimeoutMs: 1000 });
+        await transport.connect([url], false);
+
+        console.log = collect;
+        console.warn = collect;
+        transport.disconnect();
+
+        assert.strictEqual(transport.getNodeUrl(), null, 'active node must be cleared after disconnect');
+
+        const statusLines = lines.filter((line) => line.includes('[Transport]') && line.includes('status change:'));
+        assert.ok(statusLines.length > 0, `expected a transport status line, got: ${JSON.stringify(lines)}`);
+        const closeLine = statusLines.find((line) => line.includes('connected -> closed'));
+        assert.ok(closeLine, `expected a connected -> closed line, got: ${JSON.stringify(statusLines)}`);
+        assert.ok(
+            closeLine!.includes(`node=${url}`),
+            `disconnect must name the node it closed, got: ${closeLine}`
+        );
+        assert.ok(
+            !closeLine!.includes('node=null'),
+            `disconnect must not log node=null, got: ${closeLine}`
+        );
+
+        console.log = originalLog;
+        console.warn = originalWarn;
+        console.log('  PASS: disconnect log names the closed node');
+    } finally {
+        setGlobalConsoleLevel(previousConsoleLevel);
+        console.log = originalLog;
+        console.warn = originalWarn;
+        (wsServer as any).close();
+    }
+}
+
 // ── Run all tests ────────────────────────────────────────────────────────
 
 (async () => {
@@ -825,6 +881,7 @@ async function testShouldSkipNode() {
         await testCloseClassification();
         await testForceReconnect();
         await testShouldSkipNode();
+        await testDisconnectLogAttribution();
         console.log('\n=== All transport tests passed ===');
     } catch (e) {
         if (!STRICT_TEST && isEnvironmentError(e)) {

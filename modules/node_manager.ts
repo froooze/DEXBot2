@@ -15,7 +15,9 @@
  *    - Automatic blacklisting of failed nodes
  *
  * 2. Intelligent Node Selection
- *    - Selects lowest-latency healthy node
+ *    - Ranks nodes by measured latency plus a time-decayed connection-churn
+ *      penalty (see modules/node_flap_score.ts), so a fast node that keeps
+ *      dropping its socket loses to a stable slightly-slower one
  *    - Falls back to slow nodes if no healthy ones available
  *    - Respects user-preferred node if healthy
  *
@@ -47,7 +49,6 @@ const require = createRequire(import.meta.url);
 import Logger from './order/logger.js';
 import { NODE_MANAGEMENT } from './constants.js';
 import { PATHS, getNodeBlacklistFile } from './paths.js';
-import { compareNodeHealth } from './node_health_cache.js';
 import { writeJsonFileAtomic } from './bots_file_lock.js';
 import { getStorage } from './storage/index.js';
 const storage = getStorage();
@@ -55,9 +56,16 @@ const { readJSON } = storage;
 import { createFailureLedger } from './node_failure_ledger.js';
 const _WebSocket = globalThis.WebSocket;
 import {
+    readHealthCache,
     resolveHealthCacheFile,
     writeHealthCache,
 } from './node_health_cache.js';
+import {
+    dropCounters,
+    effectiveLatencyMs,
+    pruneDropTimes,
+    recordDrop,
+} from './node_flap_score.js';
 import { getErrorMessage, getErrorCode } from './utils/errors.js';
 import { nowIso } from './order/utils/system.js';
 
@@ -70,8 +78,14 @@ interface NodeManagerConfig {
         timeoutMs?: number;
         maxPingMs?: number;
         blacklistThreshold?: number;
-        // Consecutive successful probes required to clear live-transport strikes.
-        liveFailureSuccessStreak?: number;
+        /** Strikes live this long without a new failure before being forgiven. */
+        strikeDecayMs?: number;
+        /** Time for a connection drop's selection penalty to halve. */
+        flapHalfLifeMs?: number;
+        /** Effective-latency cost of one fresh (undecayed) drop. */
+        flapPenaltyMsPerDrop?: number;
+        /** Ceiling for the decayed penalty, so a degraded node stays usable. */
+        flapPenaltyMaxMs?: number;
         enabled?: boolean;
     };
     selection?: {
@@ -93,8 +107,14 @@ interface NodeStat {
     lastErrorMessage: string | null;
     chainId: string | null;
     blacklistedAt: number | null;
-    healthCheckSuccessStreak: number;
-    lastFailureSource: string | null;
+    /** When the most recent strike was recorded (drives strike decay). */
+    lastFailureAtMs: number | null;
+    /**
+     * Timestamps of live-transport drops inside the flap window. This is the
+     * stability signal node selection ranks on (see modules/node_flap_score.ts)
+     * and the value persisted into the shared health cache as drops/h.
+     */
+    dropTimes: number[];
 }
 
 interface ResolvedNodeManagerConfig {
@@ -104,7 +124,10 @@ interface ResolvedNodeManagerConfig {
         timeoutMs: number;
         maxPingMs: number;
         blacklistThreshold: number;
-        liveFailureSuccessStreak: number;
+        strikeDecayMs: number;
+        flapHalfLifeMs: number;
+        flapPenaltyMsPerDrop: number;
+        flapPenaltyMaxMs: number;
         enabled: boolean;
     };
     selection: { strategy: string; preferredNode: string | null };
@@ -115,10 +138,44 @@ interface PersistedBlacklistEntry {
     blacklistedAt: number | null;
     failureCount: number;
     lastErrorMessage: string | null;
+    /** Optional for backward compatibility with older state files. */
+    lastFailureAtMs?: number | null;
+}
+
+/**
+ * Failure sources that count as a live-operation reliability event for churn
+ * scoring/selection.
+ *
+ * Included:
+ * - `connection`   an unexpected socket close (code 1006/1001 etc.)
+ * - `keep-alive`   the socket stayed open but stopped answering
+ * - `broadcast`    a signed batch was accepted but never confirmed in time
+ *                  (BROADCAST_DEADLINE) — the socket is up, the node is not
+ *                  serving us, which is exactly the instability selection
+ *                  should penalize
+ *
+ * Excluded:
+ * - `health-check`    probe-side noise; it already moves the node out of the
+ *                     healthy set, and probes may fail for reasons that never
+ *                     affect a live session
+ * - `forced-reconnect` a client-side recovery attempt, not evidence that the
+ *                     node is bad (same rule as shouldCountNodeStrike in
+ *                     bitshares_client)
+ */
+const CHURN_SOURCES = new Set(['connection', 'keep-alive', 'broadcast']);
+
+/** Positive finite number or the fallback (config may carry 0/NaN/strings). */
+function positiveOr(value: unknown, fallback: number): number {
+    const n = Number(value);
+    return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
 /**
  * NodeManager - Manages health checking and selection of BitShares nodes
+ *
+ * Selection ranks healthy nodes on `latency + decayed churn penalty`, keeps a
+ * time-decaying strike count for blacklisting, and exposes per-node churn
+ * counters (drops/h) for logging and the shared health cache.
  *
  * @class
  * @param {Object} config - Configuration object
@@ -128,8 +185,12 @@ interface PersistedBlacklistEntry {
  * @param {number} [config.healthCheck.timeoutMs=5000] - Timeout for each health check
  * @param {number} [config.healthCheck.maxPingMs=3000] - Max acceptable latency
  * @param {number} [config.healthCheck.blacklistThreshold=3] - Failures before blacklist
+ * @param {number} [config.healthCheck.strikeDecayMs] - Lifetime of a strike without a new failure
+ * @param {number} [config.healthCheck.flapHalfLifeMs] - Half-life of a connection-drop penalty
+ * @param {number} [config.healthCheck.flapPenaltyMsPerDrop] - Effective-latency cost per fresh drop
+ * @param {number} [config.healthCheck.flapPenaltyMaxMs] - Cap on the decayed churn penalty
  * @param {Object} [config.selection] - Node selection settings
- * @param {string} [config.selection.strategy="latency"] - Selection strategy
+ * @param {string} [config.selection.strategy="latency"] - Selection strategy (latency + churn penalty)
  * @param {string} [config.selection.preferredNode] - Optional preferred node (if healthy)
  */
 class NodeManager {
@@ -162,9 +223,10 @@ class NodeManager {
                 timeoutMs: config.healthCheck?.timeoutMs ?? NODE_MANAGEMENT.HEALTH_CHECK_TIMEOUT_MS,
                 maxPingMs: config.healthCheck?.maxPingMs ?? NODE_MANAGEMENT.MAX_PING_MS,
                 blacklistThreshold: config.healthCheck?.blacklistThreshold ?? NODE_MANAGEMENT.BLACKLIST_THRESHOLD,
-                liveFailureSuccessStreak: Number(config.healthCheck?.liveFailureSuccessStreak) > 0
-                    ? Number(config.healthCheck?.liveFailureSuccessStreak)
-                    : NODE_MANAGEMENT.LIVE_FAILURE_HEALTH_SUCCESS_STREAK,
+                strikeDecayMs: positiveOr(config.healthCheck?.strikeDecayMs, NODE_MANAGEMENT.FAILURE_STRIKE_DECAY_MS),
+                flapHalfLifeMs: positiveOr(config.healthCheck?.flapHalfLifeMs, NODE_MANAGEMENT.FLAP_HALF_LIFE_MS),
+                flapPenaltyMsPerDrop: positiveOr(config.healthCheck?.flapPenaltyMsPerDrop, NODE_MANAGEMENT.FLAP_PENALTY_MS_PER_DROP),
+                flapPenaltyMaxMs: positiveOr(config.healthCheck?.flapPenaltyMaxMs, NODE_MANAGEMENT.FLAP_PENALTY_MAX_MS),
                 enabled: config.healthCheck?.enabled ?? true
             },
             selection: {
@@ -192,6 +254,7 @@ class NodeManager {
         });
         this.initializeNodeStats();
         this.loadBlacklistState();
+        this.loadChurnHistory();
 
         // Blacklist warning dedup: track last warn time per node+error to suppress repeats.
         this._lastBlacklistWarnMs = new Map();
@@ -225,10 +288,8 @@ class NodeManager {
                     lastErrorMessage: null,
                     chainId: null,
                     blacklistedAt: null,
-                    // Recovery confirmation: how many consecutive successful
-                    // probes since the last live-transport failure.
-                    healthCheckSuccessStreak: 0,
-                    lastFailureSource: null
+                    lastFailureAtMs: null,
+                    dropTimes: []
                 });
             }
         }
@@ -250,6 +311,7 @@ class NodeManager {
                 stats.failureCount = typeof entry.failureCount === 'number' ? entry.failureCount : this.config.healthCheck.blacklistThreshold;
                 stats.blacklistedAt = typeof entry.blacklistedAt === 'number' ? entry.blacklistedAt : Date.now();
                 stats.lastErrorMessage = typeof entry.lastErrorMessage === 'string' ? entry.lastErrorMessage : null;
+                stats.lastFailureAtMs = typeof entry.lastFailureAtMs === 'number' ? entry.lastFailureAtMs : null;
                 // Seed the shared ledger so counting continues across restarts
                 // (a persisted blacklist must still count toward the threshold
                 // until the cooldown expires or a health check re-admits the
@@ -281,7 +343,8 @@ class NodeManager {
                         status: 'blacklisted',
                         blacklistedAt: stats.blacklistedAt,
                         failureCount: stats.failureCount,
-                        lastErrorMessage: stats.lastErrorMessage
+                        lastErrorMessage: stats.lastErrorMessage,
+                        lastFailureAtMs: stats.lastFailureAtMs
                     };
                 }
             }
@@ -295,13 +358,56 @@ class NodeManager {
     }
 
     /**
+     * Seed the in-memory drop history from the shared health cache.
+     *
+     * Churn has to survive process restarts: a bot that is restarted every few
+     * hours would otherwise start every node at zero drops and re-select the
+     * flapping endpoint immediately. The cache is written by whichever process
+     * last ran a health sweep, so treat it as advisory (any parse/age problem
+     * just means "no history yet").
+     * @private
+     */
+    private loadChurnHistory(): void {
+        try {
+            const cache = readHealthCache({
+                healthCacheFile: this.healthCacheFile,
+                // Keep history that is newer than the flap window; a 4h probe
+                // staleness limit would throw away a valid 24h drop history.
+                maxAgeMs: NODE_MANAGEMENT.FLAP_WINDOW_MS,
+            });
+            if (!cache || !Array.isArray(cache.nodes)) return;
+            const now = Date.now();
+            for (const entry of cache.nodes) {
+                const stats = entry?.url ? this.nodeStats.get(entry.url) : undefined;
+                if (!stats || !Array.isArray(entry.dropTimes) || entry.dropTimes.length === 0) continue;
+                const flapOptions = this._flapOptions(now);
+                stats.dropTimes = pruneDropTimes(entry.dropTimes, now, flapOptions.windowMs);
+                if (stats.dropTimes.length > 0) {
+                    const counters = dropCounters(stats.dropTimes, flapOptions);
+                    this.logger.debug(
+                        `Loaded churn history for ${entry.url.substring(0, 40)}... ` +
+                        `(${counters.drops24h} drop(s)/24h, penalty ~${counters.penaltyMs}ms)`
+                    );
+                }
+            }
+        } catch (err) {
+            this.logger.debug(`Churn history unavailable: ${getErrorMessage(err)}`);
+        }
+    }
+
+    /**
      * Persist the latest healthy/slow node ordering for lightweight consumers
      * such as the credential daemon.
      * @private
      */
     private saveHealthCache(): void {
         try {
-            writeHealthCache(this.nodeStats.values() as unknown as Parameters<typeof writeHealthCache>[0], { healthCacheFile: this.healthCacheFile });
+            writeHealthCache(this.nodeStats.values() as unknown as Parameters<typeof writeHealthCache>[0], {
+                healthCacheFile: this.healthCacheFile,
+                // Pass this manager's tuning so the persisted drops/h counters
+                // and ordering match what the bot itself would compute.
+                flap: this._flapOptions(),
+            });
         } catch (err) {
             this.logger.warn(`Failed to save node health cache: ${getErrorMessage(err)}`);
         }
@@ -374,6 +480,10 @@ class NodeManager {
                     stats.status = 'unchecked';
                     stats.failureCount = 0;
                     stats.blacklistedAt = null;
+                    stats.lastFailureAtMs = null;
+                    // Churn history is intentionally kept: a node coming off
+                    // blacklist still has to prove stability, and the flap
+                    // penalty is what keeps it behind a node that never drops.
                     this.failureLedger.reset(nodeUrl);
                     this.saveBlacklistState();
                     this.logger.info(`${nodeUrl.substring(0, 40)}... blacklist cooldown expired, re-enabling`);
@@ -454,43 +564,66 @@ class NodeManager {
     }
 
     /**
-     * Record a successful health-probe result: set status/latency and decide
-     * whether to clear the failure ledger.
+     * Remaining (decayed) strikes for a node at `nowMs`.
      *
-     * A single successful probe must not erase strikes that came from the live
-     * transport. Require `liveFailureSuccessStreak` consecutive successes before
-     * clearing those, so a genuinely flapping node keeps accumulating toward
-     * BLACKLIST_THRESHOLD while a recovered node is still re-admitted (status is
-     * set either way). Strikes whose last source was a health check clear on the
-     * first success, preserving normal probe recovery.
+     * A strike is worth 1.0 when recorded and falls linearly to 0 across
+     * `strikeDecayMs`. Linear decay (not exponential) keeps the threshold
+     * meaningful: three strikes on the same day still blacklist, while a node
+     * that failed once three days ago starts from 0 again. The remainder is
+     * rounded *up*, so a fresh single strike is not silently discounted to 0
+     * within minutes by the rounding step.
+     */
+    _decayedStrikeCount(stats: NodeStat, nowMs: number = Date.now()): number {
+        if (stats.failureCount <= 0) return 0;
+        if (!stats.lastFailureAtMs) return stats.failureCount;
+        const decayMs = this.config.healthCheck.strikeDecayMs;
+        const age = Math.max(0, nowMs - stats.lastFailureAtMs);
+        if (age >= decayMs) return 0;
+        const remainingFactor = 1 - age / decayMs;
+        return Math.max(0, Math.ceil(stats.failureCount * remainingFactor));
+    }
+
+    /**
+     * Record a successful health-probe result: set status/latency and let the
+     * strike count decay.
      *
-     * @returns {{ recovered: boolean, failureCount: number }}
+     * This deliberately no longer *resets* strikes: the old
+     * liveFailureSuccessStreak rule cleared a live-transport strike after two
+     * successful probes, and with a 4h probe interval that forgave a
+     * once-a-day flapper twice a day — every failure logged "attempt 1/3" and
+     * the node was never blacklisted. Strikes now age out on their own
+     * (`strikeDecayMs`), so probe success can re-admit a node's *status*
+     * without erasing the evidence that it drops connections.
+     *
+     * @returns {{ recovered: boolean, failureCount: number }} whether every
+     *   strike has aged out, and the remaining count.
      */
     _recordHealthCheckSuccess(nodeUrl: string, status: string, latencyMs: number | null, chainId: string | null): { recovered: boolean; failureCount: number } {
         const stats = this.nodeStats.get(nodeUrl);
         if (!stats) return { recovered: false, failureCount: 0 };
-
-        const priorSource = stats.lastFailureSource;
-        const liveFailure = !!priorSource && priorSource !== 'health-check';
-        stats.healthCheckSuccessStreak = (stats.healthCheckSuccessStreak || 0) + 1;
-        const successStreak = this.config.healthCheck.liveFailureSuccessStreak;
-        const recovered = !liveFailure || stats.healthCheckSuccessStreak >= successStreak;
 
         stats.status = status;
         stats.latencyMs = latencyMs;
         stats.lastCheckTime = nowIso();
         stats.lastErrorMessage = null;
         stats.chainId = chainId;
-        if (recovered) {
-            stats.failureCount = 0;
-            stats.lastFailureSource = null;
-            stats.healthCheckSuccessStreak = 0;
-            this.failureLedger.reset(nodeUrl);
-        } else {
-            this.logger.debug(
-                `${nodeUrl.substring(0, 40)}... ${status} but retaining ${stats.failureCount} live-transport strike(s) ` +
-                `(success streak ${stats.healthCheckSuccessStreak}/${successStreak})`
-            );
+
+        const remaining = this._decayedStrikeCount(stats);
+        const recovered = remaining <= 0;
+        if (stats.failureCount > 0) {
+            if (remaining <= 0) {
+                stats.failureCount = 0;
+                stats.lastFailureAtMs = null;
+                this.failureLedger.reset(nodeUrl);
+            } else {
+                stats.failureCount = remaining;
+                // Keep the ledger and the visible count in step, otherwise the
+                // next failure would blacklist on stale evidence.
+                this.failureLedger.seed(nodeUrl, { failureCount: remaining, blacklistedUntil: 0 });
+                this.logger.debug(
+                    `${nodeUrl.substring(0, 40)}... ${status} but retaining ${remaining} decaying strike(s)`
+                );
+            }
         }
         return { recovered, failureCount: stats.failureCount };
     }
@@ -654,20 +787,55 @@ class NodeManager {
     }
 
     /**
-     * Get list of healthy nodes sorted by latency (best first)
+     * Flap-scoring options built from this manager's configuration.
+     * Single place that maps config -> the pure ranking maths, so the ranking,
+     * the logged counters and the persisted health cache always agree.
+     * @private
+     */
+    private _flapOptions(nowMs: number = Date.now()): { nowMs: number; windowMs: number; halfLifeMs: number; penaltyMsPerDrop: number; maxPenaltyMs: number } {
+        return {
+            nowMs,
+            windowMs: NODE_MANAGEMENT.FLAP_WINDOW_MS,
+            halfLifeMs: this.config.healthCheck.flapHalfLifeMs,
+            penaltyMsPerDrop: this.config.healthCheck.flapPenaltyMsPerDrop,
+            maxPenaltyMs: this.config.healthCheck.flapPenaltyMaxMs,
+        };
+    }
+
+    /**
+     * Get list of healthy nodes, best first.
+     *
+     * Ranking is `measured latency + decayed connection-churn penalty`, so a
+     * 50ms node that drops its socket daily loses to a stable 350ms node. See
+     * modules/node_flap_score.ts for the penalty maths.
      * @returns {string[]} Array of node URLs
      */
     getHealthyNodes(): string[] {
         const preferredNode = this.config.selection.preferredNode;
-        const healthy = Array.from(this.nodeStats.values())
-            .filter((stat) => stat.status === 'healthy' || stat.status === 'slow')
+        const flapOptions = this._flapOptions();
+        const healthyStats = Array.from(this.nodeStats.values())
+            .filter((stat) => stat.status === 'healthy' || stat.status === 'slow');
+        // Precompute one rank per node: doing it inside the comparator would
+        // prune and re-sort every node's drop history O(n log n) times.
+        const ranks = new Map<NodeStat, number>();
+        for (const stat of healthyStats) {
+            ranks.set(stat, effectiveLatencyMs(stat.latencyMs, stat.dropTimes, flapOptions));
+        }
+        const healthy = healthyStats
             .sort((a, b) => {
                 if (preferredNode) {
                     const aPreferred = a.url === preferredNode && a.status === 'healthy';
                     const bPreferred = b.url === preferredNode && b.status === 'healthy';
                     if (aPreferred !== bPreferred) return aPreferred ? -1 : 1;
                 }
-                return compareNodeHealth(a, b);
+                if (a.status !== b.status) return a.status === 'healthy' ? -1 : 1;
+                // Compare without subtracting: two unknown latencies are both
+                // Infinity, and Infinity - Infinity is NaN (an unstable sort
+                // comparator).
+                const aRank = ranks.get(a) ?? Infinity;
+                const bRank = ranks.get(b) ?? Infinity;
+                if (aRank === bRank) return 0;
+                return aRank < bRank ? -1 : 1;
             })
             .map((stat) => stat.url);
 
@@ -675,7 +843,21 @@ class NodeManager {
     }
 
     /**
-     * Get the single best (lowest latency) healthy node
+     * Connection-churn counters for one node (drops/h, decayed score, penalty).
+     * Used for logging and for the shared health cache.
+     * @param {string} nodeUrl - Node URL
+     * @returns {Object|null} Churn counters or null for an unknown node
+     */
+    getNodeChurn(nodeUrl: string, nowMs: number = Date.now()): { dropTimes: number[]; flapScore: number; penaltyMs: number; dropsLastHour: number; drops24h: number; dropsPerHour: number } | null {
+        const stats = this.nodeStats.get(nodeUrl);
+        if (!stats) return null;
+        const flapOptions = this._flapOptions(nowMs);
+        const dropTimes = pruneDropTimes(stats.dropTimes, nowMs, flapOptions.windowMs);
+        return { dropTimes, ...dropCounters(dropTimes, flapOptions) };
+    }
+
+    /**
+     * Get the single best-ranked healthy node (latency + churn penalty)
      * @returns {string|null} Best node URL or null if none available
      */
     getBestNode(): string | null {
@@ -712,9 +894,12 @@ class NodeManager {
      * failure ledger — the same rules the credential daemon applies.
      * @param {string} nodeUrl - Node URL that failed
      * @param {string} [errorMessage] - Optional error description
-     * @param {string} [source] - Failure source ('health-check' or 'broadcast'); controls log level
+     * @param {string} [source] - Failure source ('health-check', 'broadcast',
+     *   'connection', 'keep-alive'); controls log level and churn accounting
+     * @param {number} [nowMs] - Timestamp for the strike/drop (defaults to now;
+     *   injectable so tests do not need to sleep past the report cooldown)
      */
-    reportNodeFailure(nodeUrl: string, errorMessage?: string, source?: string): void {
+    reportNodeFailure(nodeUrl: string, errorMessage?: string, source?: string, nowMs: number = Date.now()): void {
         const stats = this.nodeStats.get(nodeUrl);
         if (!stats) {
             this.logger.warn(`Node ${nodeUrl} not in configured list, cannot report failure`);
@@ -722,16 +907,24 @@ class NodeManager {
         }
         const isHealthCheck = source === 'health-check';
 
-        const result = this.failureLedger.recordFailure(nodeUrl);
+        const result = this.failureLedger.recordFailure(nodeUrl, nowMs);
 
         stats.failureCount = result.failureCount;
         stats.lastCheckTime = nowIso();
         if (errorMessage) stats.lastErrorMessage = errorMessage;
-        // Remember the source so a later health-check success knows whether the
-        // strike came from the live transport (retain) or a probe (clearable).
-        // Recorded even when the ledger rate-limits this report.
-        stats.lastFailureSource = source || 'unknown';
-        stats.healthCheckSuccessStreak = 0;
+
+        const counted = result.outcome === 'counted' || result.outcome === 'blacklisted';
+        // A counted strike refreshes the decay clock. Recording it even for
+        // probe failures keeps `failureCount` and its age consistent.
+        if (counted) {
+            stats.lastFailureAtMs = nowMs;
+        }
+        // Only live-operation failures feed the churn score used by selection
+        // (see CHURN_SOURCES). Rate-limited reports restate the same event, so
+        // they are excluded along with blacklisted-node repeats.
+        if (counted && source && CHURN_SOURCES.has(source)) {
+            stats.dropTimes = recordDrop(stats.dropTimes, nowMs, this._flapOptions(nowMs).windowMs);
+        }
 
         if (result.outcome === 'rate-limited' || result.outcome === 'skipped-blacklisted') {
             return;
@@ -739,17 +932,25 @@ class NodeManager {
 
         if (result.outcome === 'blacklisted') {
             stats.status = 'blacklisted';
-            stats.blacklistedAt = Date.now();
+            stats.blacklistedAt = nowMs;
             this.saveBlacklistState();
             this.saveHealthCache();
 
             if (this._shouldLogBlacklistWarning(nodeUrl, errorMessage || '')) {
-                this.logger.warn(`✗ ${nodeUrl.substring(0, 40)}... BLACKLISTED after ${result.failureCount} failures (${errorMessage || 'unknown'})`);
+                const churn = this.getNodeChurn(nodeUrl);
+                this.logger.warn(
+                    `✗ ${nodeUrl.substring(0, 40)}... BLACKLISTED after ${result.failureCount} failures (${errorMessage || 'unknown'}) ` +
+                    `[churn ${churn ? `${churn.drops24h} drop(s)/24h, +${churn.penaltyMs}ms` : 'n/a'}]`
+                );
             }
         } else {
             stats.status = 'failed';
             const log = isHealthCheck ? this.logger.debug.bind(this.logger) : this.logger.warn.bind(this.logger);
-            log(`⚠ ${nodeUrl.substring(0, 40)}... FAILED attempt ${result.failureCount}/${result.threshold} (${errorMessage || 'unknown'})`);
+            const churn = this.getNodeChurn(nodeUrl);
+            log(
+                `⚠ ${nodeUrl.substring(0, 40)}... FAILED attempt ${result.failureCount}/${result.threshold} (${errorMessage || 'unknown'})` +
+                (churn && churn.drops24h > 0 ? ` [churn ${churn.drops24h} drop(s)/24h, +${churn.penaltyMs}ms]` : '')
+            );
         }
     }
 
@@ -763,6 +964,7 @@ class NodeManager {
             stats.status = 'blacklisted';
             stats.failureCount = this.config.healthCheck.blacklistThreshold;
             stats.blacklistedAt = Date.now();
+            stats.lastFailureAtMs = stats.blacklistedAt;
             this.failureLedger.seed(nodeUrl, {
                 failureCount: stats.failureCount,
                 blacklistedUntil: stats.blacklistedAt + this.BLACKLIST_COOLDOWN_MS,
@@ -785,8 +987,10 @@ class NodeManager {
             stats.latencyMs = null;
             stats.lastErrorMessage = null;
             stats.blacklistedAt = null;
-            stats.lastFailureSource = null;
-            stats.healthCheckSuccessStreak = 0;
+            stats.lastFailureAtMs = null;
+            // An explicit reset is the operator saying "give this node a clean
+            // slate": churn history goes with the strikes.
+            stats.dropTimes = [];
             this.failureLedger.reset(nodeUrl);
             this._clearBlacklistWarningCooldown(nodeUrl);
             this.saveBlacklistState();
@@ -806,8 +1010,8 @@ class NodeManager {
             stats.lastErrorMessage = null;
             stats.chainId = null;
             stats.blacklistedAt = null;
-            stats.lastFailureSource = null;
-            stats.healthCheckSuccessStreak = 0;
+            stats.lastFailureAtMs = null;
+            stats.dropTimes = [];
         }
         this.failureLedger.clear();
         this._clearBlacklistWarningCooldown();
@@ -820,22 +1024,29 @@ class NodeManager {
      * Get current node statistics (for monitoring/logging)
      * @returns {Array<Object>} Array of node stats
      */
-    getStats(): Array<{ url: string; status: string; latencyMs: number | null; failureCount: number; lastCheckTime: string | null; lastErrorMessage: string | null }> {
-        return Array.from(this.nodeStats.values()).map((stat) => ({
-            url: stat.url,
-            status: stat.status,
-            latencyMs: stat.latencyMs,
-            failureCount: stat.failureCount,
-            lastCheckTime: stat.lastCheckTime,
-            lastErrorMessage: stat.lastErrorMessage
-        }));
+    getStats(): Array<{ url: string; status: string; latencyMs: number | null; failureCount: number; lastCheckTime: string | null; lastErrorMessage: string | null; drops24h: number; dropsPerHour: number; flapPenaltyMs: number }> {
+        const nowMs = Date.now();
+        return Array.from(this.nodeStats.values()).map((stat) => {
+            const churn = this.getNodeChurn(stat.url, nowMs);
+            return {
+                url: stat.url,
+                status: stat.status,
+                latencyMs: stat.latencyMs,
+                failureCount: stat.failureCount,
+                lastCheckTime: stat.lastCheckTime,
+                lastErrorMessage: stat.lastErrorMessage,
+                drops24h: churn ? churn.drops24h : 0,
+                dropsPerHour: churn ? churn.dropsPerHour : 0,
+                flapPenaltyMs: churn ? churn.penaltyMs : 0
+            };
+        });
     }
 
     /**
      * Get summary statistics
      * @returns {Object} Summary stats
      */
-    getSummary(): { monitoring: boolean; counts: Record<string, number>; bestNode: string | null; avgLatency: number | null } {
+    getSummary(): { monitoring: boolean; counts: Record<string, number>; bestNode: string | null; avgLatency: number | null; totalDrops24h: number } {
         const stats = Array.from(this.nodeStats.values());
         const counts: Record<string, number> = {
             total: stats.length,
@@ -854,12 +1065,18 @@ class NodeManager {
         const avgLatency = statsWithLatency.length > 0
             ? Math.round(statsWithLatency.reduce((sum, s) => sum + (s.latencyMs as number), 0) / statsWithLatency.length)
             : null;
+        const nowMs = Date.now();
+        const totalDrops24h = stats.reduce((sum, s) => {
+            const churn = this.getNodeChurn(s.url, nowMs);
+            return sum + (churn ? churn.drops24h : 0);
+        }, 0);
 
         return {
             monitoring: this.monitoringActive,
             counts,
             bestNode,
-            avgLatency
+            avgLatency,
+            totalDrops24h
         };
     }
 }

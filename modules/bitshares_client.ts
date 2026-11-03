@@ -29,11 +29,12 @@
  * 10. getNodeManager() - Get the NodeManager instance
  * 11. getNodeStats() - Get node health statistics
  * 12. getNodeSummary() - Get node summary
- * 13. getConnectionError() - Get last connection error
- * 14. onReconnect(callback) - Register reconnect callback
- * 15. withTimeout(promise, timeoutMs, options) - Wrap promise with timeout (re-exported from order/utils/timeout.js)
- * 16. _assessFailover() - Internal failover assessment
- * 17. _internal - @internal Internal state (connected flag) — test-only, do not rely on in production
+ * 13. getActiveNodeUrl() - Node currently in use (for failure attribution)
+ * 14. getConnectionError() - Get last connection error
+ * 15. onReconnect(callback) - Register reconnect callback
+ * 16. withTimeout(promise, timeoutMs, options) - Wrap promise with timeout (re-exported from order/utils/timeout.js)
+ * 17. _assessFailover() - Internal failover assessment
+ * 18. _internal - @internal Internal state (connected flag) — test-only, do not rely on in production
  * ===============================================================================
  */
 
@@ -65,6 +66,7 @@ interface NativeClientRef {
     getNodes(): string[];
     getStatus(): string;
     getCoreAsset(): unknown;
+    isConnected?(): boolean;
     transport?: { getNodeUrl?(): string | undefined };
     db: Record<string, unknown>;
     history: Record<string, unknown>;
@@ -388,6 +390,29 @@ async function restartBitsharesConnection(serverList: string | string[] | null |
         ? serverList.filter((server: unknown) => typeof server === 'string' && server.trim())
         : [];
     if (servers.length === 0) return false;
+
+    // Keep an already-healthy socket. The transport's own connect() no-op only
+    // applies when its candidate list still contains the active node, and this
+    // function used to bypass that by disconnecting first — so every
+    // maintenance/refresh cycle tore down a working connection (logs showed
+    // 88 such socket cycles in 18 days, each costing a re-login, a
+    // re-subscribe and a safety-net sync). If the node we are on is still an
+    // acceptable target, re-point the candidate list and keep the socket.
+    //
+    // Never keep a blacklisted node: that would defeat the post-connect switch
+    // in handleConnectionStatus('connected'). Wedged-session recovery does not
+    // depend on this path — the transport's forceReconnect (api-id recovery and
+    // the fill-channel watchdog) is unaffected by the skip.
+    const activeNode = _nativeClient?.transport?.getNodeUrl?.() ?? null;
+    const alreadyConnected = _nativeClient?.isConnected?.() ?? false;
+    const activeNodeUsable = !!activeNode && !(nodeManager?.isBlacklisted(activeNode) ?? false);
+    if (alreadyConnected && activeNode && activeNodeUsable && servers.includes(activeNode)) {
+        _nativeClient.setNodes(servers);
+        if (!suppressConnectionLog) {
+            logger.info(`${reason}: keeping existing connection to ${activeNode}`);
+        }
+        return true;
+    }
 
     try {
         reconnectInProgress = true;
@@ -762,6 +787,20 @@ function getNodeStats() {
     ensureInitialized();
     return nodeManager?.getStats();
 }
+/**
+ * The node the transport is currently connected to (null when unknown).
+ *
+ * Use this — not `nodeManager.getBestNode()` — when attributing a failure to a
+ * node: the best node is the lowest-ranked *candidate* and need not be the one
+ * that served the request.
+ *
+ * Deliberately does NOT call ensureInitialized(): this is called from failure
+ * and logging paths, and lazily creating the whole client stack just to return
+ * null would be worse than reporting null.
+ */
+function getActiveNodeUrl(): string | null {
+    return _nativeClient?.transport?.getNodeUrl?.() ?? null;
+}
 function getNodeSummary() {
     ensureInitialized();
     return nodeManager?.getSummary();
@@ -773,8 +812,8 @@ function getConnectionError() {
 const _internal = {
     get connected() { return connected; },
 };
-const _default = { BitShares: _lazyBitShares, createAccountClient, waitForConnected, getConnectionStatus, disconnectClient, reconnectForCycle, setSuppressConnectionLog, isSuppressConnectionLog, onReconnect, withTimeout, _assessFailover: assessFailover, getNodeManager, getNodeStats, getNodeSummary, getConnectionError, _internal }
+const _default = { BitShares: _lazyBitShares, createAccountClient, waitForConnected, getConnectionStatus, disconnectClient, reconnectForCycle, setSuppressConnectionLog, isSuppressConnectionLog, onReconnect, withTimeout, _assessFailover: assessFailover, getNodeManager, getNodeStats, getNodeSummary, getActiveNodeUrl, getConnectionError, _internal }
 
 export default _default;
 
-export { _lazyBitShares as BitShares, createAccountClient, waitForConnected, getConnectionStatus, disconnectClient, reconnectForCycle, setSuppressConnectionLog, isSuppressConnectionLog, onReconnect, withTimeout, assessFailover as _assessFailover, getNodeManager, getNodeStats, getNodeSummary, getConnectionError, _internal }
+export { _lazyBitShares as BitShares, createAccountClient, waitForConnected, getConnectionStatus, disconnectClient, reconnectForCycle, setSuppressConnectionLog, isSuppressConnectionLog, onReconnect, withTimeout, assessFailover as _assessFailover, getNodeManager, getNodeStats, getNodeSummary, getActiveNodeUrl, getConnectionError, _internal }

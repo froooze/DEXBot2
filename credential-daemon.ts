@@ -878,8 +878,19 @@ function refreshNodeList() {
         try {
             const bestNodes = orderNodesForSettings(settings);
             if (bestNodes && bestNodes.length > 0) {
-                _nativeNodeList = bestNodes;
-                _nativeChainClient.setNodes(bestNodes);
+                // Never evict the node this daemon is currently connected to.
+                // setNodes() replaces the transport candidate list, and
+                // transport.connect() only keeps its socket when that list
+                // still contains the active node — so a refresh built from the
+                // health cache (which omits nodes that are momentarily
+                // unhealthy) used to force a full teardown on the next
+                // broadcast. Appending it as the last candidate is enough.
+                const activeNode = _nativeChainClient.transport?.getNodeUrl?.();
+                const nodes = activeNode && !bestNodes.includes(activeNode)
+                    ? [...bestNodes, activeNode]
+                    : bestNodes;
+                _nativeNodeList = nodes;
+                _nativeChainClient.setNodes(nodes);
                 daemonLogger.log?.(`[credential-daemon] Node list refreshed: using best ${bestNodes.length} nodes from cache.`);
             }
         } catch (err) {

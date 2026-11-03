@@ -86,8 +86,11 @@
  *       DEFAULT_NODES: List of BitShares nodes for redundancy
  *       HEALTH_CHECK_INTERVAL_MS, HEALTH_CHECK_TIMEOUT_MS, MAX_PING_MS
  *       BLACKLIST_THRESHOLD: Failures before node is blacklisted
+ *       FAILURE_STRIKE_DECAY_MS: How long a live-transport strike lasts
+ *       FLAP_WINDOW_MS / FLAP_HALF_LIFE_MS / FLAP_PENALTY_MS_PER_DROP /
+ *       FLAP_PENALTY_MAX_MS: time-decayed connection-churn penalty
  *       EXPECTED_CHAIN_ID: BitShares mainnet chain ID validation
- *       SELECTION_STRATEGY: Node selection algorithm (latency-based)
+ *       SELECTION_STRATEGY: Node selection algorithm (latency + churn penalty)
  *
  *   13. UPDATER - Version checking and update notification
  *       ACTIVE, REPOSITORY_URL, BRANCH, SCHEDULE
@@ -141,6 +144,12 @@ import { BUILD_DIR } from './utils/build_dir.js';
 import { readGeneralSettings } from './general_settings.js';
 import { mergeSettings, buildNodesView } from './settings_merge.js';
 import { getErrorMessage } from './utils/errors.js';
+import {
+    DEFAULT_FLAP_HALF_LIFE_MS,
+    DEFAULT_FLAP_PENALTY_MAX_MS,
+    DEFAULT_FLAP_PENALTY_MS_PER_DROP,
+    DEFAULT_FLAP_WINDOW_MS,
+} from './node_flap_score.js';
 const ORDER_TYPES = Object.freeze({
     SELL: 'sell',
     BUY: 'buy',
@@ -1175,17 +1184,33 @@ let NODE_MANAGEMENT = {
     BLACKLIST_COOLDOWN_MS: 24 * 60 * 60 * 1000,  // 24 hours before retrying blacklisted nodes
     FAILURE_REPORT_COOLDOWN_MS: 1000,   // Min ms between failure count increments (prevents rapid-fire blacklisting)
 
-    // Consecutive successful health probes required before a node whose last
-    // failure came from the live transport (not a health check) gets its
-    // failure ledger reset. Prevents a single "is it up?" probe from erasing
-    // live-transport strikes, so flapping nodes still reach BLACKLIST_THRESHOLD.
-    LIVE_FAILURE_HEALTH_SUCCESS_STREAK: 2,
+    // Strike decay: a live-transport failure counts as a strike, and strikes
+    // fade out over this window instead of being erased by a successful health
+    // probe. With a 4h probe interval and a once-a-day flapper, the old
+    // success-streak reset wiped every strike before it could reach
+    // BLACKLIST_THRESHOLD (every failure logged "attempt 1/3"), so a node that
+    // drops its socket daily was selected forever. A strike is fully forgiven
+    // only after this long without a new failure.
+    FAILURE_STRIKE_DECAY_MS: 24 * 60 * 60 * 1000,  // 24 hours
+
+    // Flapping (connection-churn) scoring used by node selection: a node ranks
+    // on `latency + penalty`, where the penalty is the time-decayed weight of
+    // its recent transport drops. Zero recent drops means ping alone decides.
+    // Values come from modules/node_flap_score.ts so the ranking maths and the
+    // defaults here can never drift apart.
+    FLAP_WINDOW_MS: DEFAULT_FLAP_WINDOW_MS,          // only the trailing day counts
+    FLAP_HALF_LIFE_MS: DEFAULT_FLAP_HALF_LIFE_MS,    // a drop's weight halves every 12h
+    FLAP_PENALTY_MS_PER_DROP: DEFAULT_FLAP_PENALTY_MS_PER_DROP,  // +5s effective latency per fresh drop
+    FLAP_PENALTY_MAX_MS: DEFAULT_FLAP_PENALTY_MAX_MS,            // cap so a degraded node stays a last resort
 
     // Expected chain ID (BitShares mainnet)
     EXPECTED_CHAIN_ID: '4018d7844c78f6a6c41c6a552b898022310fc5dec06da467ee7905a8dad512c8',
 
-    // Selection strategy
-    SELECTION_STRATEGY: 'latency'       // latency-based selection
+    // Selection strategy. 'latency' means latency + the time-decayed flap
+    // penalty (see FLAP_* above): the fastest node wins only while it is also
+    // stable, which is what stops a cheap Cloudflare endpoint that drops every
+    // few hours from outranking a slightly slower endpoint that never drops.
+    SELECTION_STRATEGY: 'latency'
 };
 
 // Pipeline timeout configuration

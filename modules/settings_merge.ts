@@ -94,6 +94,11 @@ const NODES_SUBKEY_MAP: Record<string, Record<string, string>> = {
         timeoutMs: 'HEALTH_CHECK_TIMEOUT_MS',
         maxPingMs: 'MAX_PING_MS',
         blacklistThreshold: 'BLACKLIST_THRESHOLD',
+        // Strike lifetime and flapping penalty (see modules/node_flap_score.ts).
+        strikeDecayMs: 'FAILURE_STRIKE_DECAY_MS',
+        flapHalfLifeMs: 'FLAP_HALF_LIFE_MS',
+        flapPenaltyMsPerDrop: 'FLAP_PENALTY_MS_PER_DROP',
+        flapPenaltyMaxMs: 'FLAP_PENALTY_MAX_MS',
     },
     selection: {
         strategy: 'SELECTION_STRATEGY',
@@ -133,6 +138,10 @@ interface NodesHealthCheckView {
     timeoutMs?: number;
     maxPingMs?: number;
     blacklistThreshold?: number;
+    strikeDecayMs?: number;
+    flapHalfLifeMs?: number;
+    flapPenaltyMsPerDrop?: number;
+    flapPenaltyMaxMs?: number;
     [key: string]: unknown;
 }
 
@@ -168,6 +177,10 @@ function buildNodesView(nm: UnknownRecord): NodesView {
             timeoutMs: nm.HEALTH_CHECK_TIMEOUT_MS as number | undefined,
             maxPingMs: nm.MAX_PING_MS as number | undefined,
             blacklistThreshold: nm.BLACKLIST_THRESHOLD as number | undefined,
+            strikeDecayMs: nm.FAILURE_STRIKE_DECAY_MS as number | undefined,
+            flapHalfLifeMs: nm.FLAP_HALF_LIFE_MS as number | undefined,
+            flapPenaltyMsPerDrop: nm.FLAP_PENALTY_MS_PER_DROP as number | undefined,
+            flapPenaltyMaxMs: nm.FLAP_PENALTY_MAX_MS as number | undefined,
         },
         selection: {
             strategy: nm.SELECTION_STRATEGY as string | undefined,

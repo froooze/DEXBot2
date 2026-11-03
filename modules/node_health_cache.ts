@@ -3,6 +3,11 @@
 import { NODE_MANAGEMENT } from './constants.js';
 import { getNodeHealthCacheFile } from './paths.js';
 import { writeJsonFileAtomic } from './bots_file_lock.js';
+import {
+    dropCounters,
+    flapPenaltyMs,
+    pruneDropTimes,
+} from './node_flap_score.js';
 import { getStorage } from './storage/index.js';
 const storage = getStorage();
 const { readJSON } = storage;
@@ -12,6 +17,18 @@ interface HealthCacheOptions {
     stateDir?: string;
     now?: number;
     maxAgeMs?: number;
+    /**
+     * Flap-scoring tuning of the writer/reader. Defaults to
+     * modules/node_flap_score.ts values (which modules/constants.ts also reuses),
+     * so an operator who tuned `NODES.healthCheck.flap*` gets counters and
+     * ordering that match their bot's own ranking instead of the stock maths.
+     */
+    flap?: {
+        windowMs?: number;
+        halfLifeMs?: number;
+        penaltyMsPerDrop?: number;
+        maxPenaltyMs?: number;
+    };
 }
 
 interface NodeHealthStat {
@@ -19,6 +36,8 @@ interface NodeHealthStat {
     status?: string;
     latencyMs?: number;
     lastCheckTime?: string | number | null;
+    /** Transport drop timestamps (see modules/node_flap_score.ts). */
+    dropTimes?: number[];
 }
 
 interface NodeHealthCacheEntry {
@@ -26,6 +45,18 @@ interface NodeHealthCacheEntry {
     status: string;
     latencyMs: number | null;
     lastCheckTime: string | number | null;
+    /**
+     * Connection churn, persisted so every consumer (bots, credential daemon)
+     * can see stability and not just ping. `dropTimes` is the source of truth
+     * for decay; the counters are derived for readers that only look at the
+     * JSON.
+     */
+    dropTimes: number[];
+    flapScore: number;
+    flapPenaltyMs: number;
+    dropsLastHour: number;
+    drops24h: number;
+    dropsPerHour: number;
 }
 
 interface NodeHealthCachePayload {
@@ -63,27 +94,65 @@ function normalizeNodeList(nodes: unknown): string[] {
 }
 
 /**
- * Comparator for healthy/slow nodes: healthy first, then by ascending latency.
+ * Comparator for healthy/slow nodes: healthy first, then by *effective*
+ * latency (measured ping + decayed connection-churn penalty).
  * Shared by node_health_cache and node_manager.
  */
-function compareNodeHealth(a: { status: string; latencyMs?: number | null }, b: { status: string; latencyMs?: number | null }): number {
+function compareNodeHealth(a: { status: string; latencyMs?: number | null; dropTimes?: number[]; flapPenaltyMs?: number }, b: { status: string; latencyMs?: number | null; dropTimes?: number[]; flapPenaltyMs?: number }, nowMs: number = Date.now(), flap?: HealthCacheOptions['flap']): number {
     if (a.status !== b.status) return a.status === 'healthy' ? -1 : 1;
-    return (a.latencyMs ?? Infinity) - (b.latencyMs ?? Infinity);
+    // Compare without subtracting: two unknown latencies are both Infinity,
+    // and Infinity - Infinity is NaN (an unstable sort comparator).
+    const aRank = nodeRankLatency(a, nowMs, flap);
+    const bRank = nodeRankLatency(b, nowMs, flap);
+    if (aRank === bRank) return 0;
+    return aRank < bRank ? -1 : 1;
 }
 
-function buildHealthCachePayload(stats: Iterable<NodeHealthStat> | ArrayLike<NodeHealthStat> | null | undefined, now: number = Date.now()): NodeHealthCachePayload {
+/** Ranking latency: measured ping plus the churn penalty, Infinity when unknown. */
+function nodeRankLatency(node: { latencyMs?: number | null; dropTimes?: number[]; flapPenaltyMs?: number }, nowMs: number, flap?: HealthCacheOptions['flap']): number {
+    if (typeof node.latencyMs !== 'number' || !Number.isFinite(node.latencyMs)) return Infinity;
+    // Prefer the penalty the writer persisted: recomputing from dropTimes here
+    // would silently apply *this* reader's tuning (or the stock defaults) over
+    // the one the cache was ordered with.
+    if (typeof node.flapPenaltyMs === 'number' && Number.isFinite(node.flapPenaltyMs)) {
+        return node.latencyMs + node.flapPenaltyMs;
+    }
+    const penalty = Array.isArray(node.dropTimes)
+        ? flapPenaltyMs(node.dropTimes, { nowMs, ...flap })
+        : 0;
+    return node.latencyMs + penalty;
+}
+
+function buildHealthCachePayload(stats: Iterable<NodeHealthStat> | ArrayLike<NodeHealthStat> | null | undefined, now: number = Date.now(), flap: HealthCacheOptions['flap'] = undefined): NodeHealthCachePayload {
+    const flapOptions = {
+        nowMs: now,
+        windowMs: flap?.windowMs ?? NODE_MANAGEMENT.FLAP_WINDOW_MS,
+        halfLifeMs: flap?.halfLifeMs ?? NODE_MANAGEMENT.FLAP_HALF_LIFE_MS,
+        penaltyMsPerDrop: flap?.penaltyMsPerDrop ?? NODE_MANAGEMENT.FLAP_PENALTY_MS_PER_DROP,
+        maxPenaltyMs: flap?.maxPenaltyMs ?? NODE_MANAGEMENT.FLAP_PENALTY_MAX_MS,
+    };
     const nodes: NodeHealthCacheEntry[] = Array.from(stats || [])
         .filter((stat): stat is NodeHealthStat & { status: 'healthy' | 'slow'; url: string } =>
             !!stat && (stat.status === 'healthy' || stat.status === 'slow') && typeof stat.url === 'string' && stat.url.trim() !== ''
         )
-        .map((stat) => ({
-            url: stat.url,
-            status: stat.status,
-            latencyMs: Number.isFinite(stat.latencyMs) ? (stat.latencyMs ?? null) : null,
-            lastCheckTime: stat.lastCheckTime || null,
-        }));
+        .map((stat) => {
+            const dropTimes = pruneDropTimes(stat.dropTimes, now, flapOptions.windowMs);
+            const counters = dropCounters(dropTimes, flapOptions);
+            return {
+                url: stat.url,
+                status: stat.status,
+                latencyMs: Number.isFinite(stat.latencyMs) ? (stat.latencyMs ?? null) : null,
+                lastCheckTime: stat.lastCheckTime || null,
+                dropTimes,
+                flapScore: counters.flapScore,
+                flapPenaltyMs: counters.penaltyMs,
+                dropsLastHour: counters.dropsLastHour,
+                drops24h: counters.drops24h,
+                dropsPerHour: counters.dropsPerHour,
+            };
+        });
 
-    nodes.sort(compareNodeHealth);
+    nodes.sort((a, b) => compareNodeHealth(a, b, now, flap));
 
     return {
         version: 1,
@@ -96,7 +165,7 @@ function buildHealthCachePayload(stats: Iterable<NodeHealthStat> | ArrayLike<Nod
 function writeHealthCache(stats: Iterable<NodeHealthStat> | ArrayLike<NodeHealthStat> | null | undefined, options: HealthCacheOptions = {}): NodeHealthCachePayload {
     const file = resolveHealthCacheFile(options);
     const now = Number.isFinite(options.now) ? options.now! : Date.now();
-    const payload = buildHealthCachePayload(stats, now);
+    const payload = buildHealthCachePayload(stats, now, options.flap);
     // Atomic write: see writeJsonFileAtomic in bots_file_lock.ts. A torn
     // health cache would either lose all health history or fail to parse.
     writeJsonFileAtomic(file, payload);
@@ -120,7 +189,11 @@ function readHealthCache(options: HealthCacheOptions = {}): NodeHealthCachePaylo
             .filter((node): node is NodeHealthCacheEntry & { status: 'healthy' | 'slow' } =>
                 !!node && (node.status === 'healthy' || node.status === 'slow') && typeof node.url === 'string' && node.url.trim() !== ''
             )
-            .sort(compareNodeHealth);
+            .map((node) => ({
+                ...node,
+                dropTimes: pruneDropTimes(node.dropTimes, now, options.flap?.windowMs ?? NODE_MANAGEMENT.FLAP_WINDOW_MS),
+            }))
+            .sort((a, b) => compareNodeHealth(a, b, now, options.flap));
 
         return {
             ...payload,
@@ -144,12 +217,14 @@ function removeNodesFromHealthCache(urls: string | string[], options: HealthCach
     if (!cache.nodes.some((n) => n && n.url && toRemove.has(n.url))) return null;
     const remaining = cache.nodes
         .filter((n) => !n || !n.url || !toRemove.has(n.url))
-        .map((n) => ({
-            url: n.url,
-            status: n.status,
-            latencyMs: n.latencyMs ?? undefined,
-            lastCheckTime: n.lastCheckTime,
-        }));
+        // Spread, not a field whitelist: dropping a node must not erase the
+        // churn history (dropTimes) of the nodes that stay.
+        .map((n) => ({ ...n, latencyMs: n.latencyMs ?? undefined, lastCheckTime: n.lastCheckTime }));
+    // The rewrite re-derives the drops/h counters from `dropTimes` using the
+    // caller's tuning (stock defaults when the caller has no bot config, e.g.
+    // the credential daemon). A bot that tuned NODES.healthCheck.flap* restores
+    // its own numbers on its next health sweep; until then the ordering can be
+    // computed with defaults, which is the best a tuning-less process can do.
     return writeHealthCache(remaining, { ...options, now: Date.now() });
 }
 
@@ -197,5 +272,5 @@ function orderNodesForSettings(settings: NodeSettings, options: HealthCacheOptio
     });
 }
 
-export { compareNodeHealth, orderNodesFromHealthCache, orderNodesForSettings, readHealthCache, removeNodesFromHealthCache, resolveConfiguredNodes, resolveHealthCacheFile, writeHealthCache }
+export { compareNodeHealth, nodeRankLatency, orderNodesFromHealthCache, orderNodesForSettings, readHealthCache, removeNodesFromHealthCache, resolveConfiguredNodes, resolveHealthCacheFile, writeHealthCache }
 

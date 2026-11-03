@@ -3002,11 +3002,16 @@ export async function withBlockchainRetry<T>(
         } catch (err) {
             lastError = err;
 
-            // Report node failure so NodeManager can blacklist and trigger failover
+            // Report node failure so NodeManager can blacklist and trigger failover.
+            // Attribute it to the node that actually served the attempt —
+            // getBestNode() is the top *candidate*, which is frequently a
+            // different node than the connected one, so using it punished an
+            // innocent node and left the failing one in place.
             try {
-                const { getNodeManager } = require('../../bitshares_client');
+                const { getNodeManager, getActiveNodeUrl } = require('../../bitshares_client');
                 const nodeManager = getNodeManager?.();
-                const nodeUrl = nodeManager?.getBestNode?.();
+                const nodeUrl = (typeof getActiveNodeUrl === 'function' ? getActiveNodeUrl() : null)
+                    || nodeManager?.getBestNode?.();
                 if (nodeUrl && typeof nodeManager.reportNodeFailure === 'function') {
                     nodeManager.reportNodeFailure(nodeUrl, getErrorMessage(err), 'blockchain-op');
                 }
@@ -3024,9 +3029,11 @@ export async function withBlockchainRetry<T>(
 
     // All retries exhausted — force-switch to a different node and retry once more
     try {
-        const { getNodeManager, reconnectForCycle } = require('../../bitshares_client');
+        const { getNodeManager, reconnectForCycle, getActiveNodeUrl } = require('../../bitshares_client');
         const nodeManager = getNodeManager?.();
-        const failedNode = nodeManager?.getBestNode?.();
+        // Blacklist the node the operation ran on, not the best candidate.
+        const failedNode = (typeof getActiveNodeUrl === 'function' ? getActiveNodeUrl() : null)
+            || nodeManager?.getBestNode?.();
         if (failedNode && typeof nodeManager.blacklistNode === 'function') {
             nodeManager.blacklistNode(failedNode);
             logger?.log?.(

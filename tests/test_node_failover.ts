@@ -361,38 +361,70 @@ process.on('exit', () => {
 }
 
 // ============================================================================
-// Test 13: Live-transport strikes survive a single health-check success
+// Test 13: Strikes decay with time instead of being wiped by a probe success
 // ============================================================================
 {
-    console.log('Test 13: Live-transport strike retention');
+    console.log('Test 13: Strike decay and connection-churn accounting');
 
+    const url = 'wss://flap.test/ws';
     const nm = createNodeManager({
-        list: ['wss://flap.test/ws'],
+        list: [url],
         healthCheck: { blacklistThreshold: 3 }
     });
-    const url = 'wss://flap.test/ws';
+    const stats = nm.nodeStats.get(url);
 
-    // A live-transport failure is a strike.
+    // A live-transport drop is a strike AND churn evidence.
     nm.reportNodeFailure(url, 'keep-alive failed 3 times', 'keep-alive');
-    assert.strictEqual(nm.nodeStats.get(url).failureCount, 1, 'live strike recorded');
+    assert.strictEqual(stats.failureCount, 1, 'live strike recorded');
+    assert.strictEqual(stats.dropTimes.length, 1, 'live drop recorded for churn scoring');
+    assert.strictEqual(nm.getNodeChurn(url).drops24h, 1, 'churn counter sees the drop');
 
-    // One successful probe must NOT erase it (retain until the streak is met).
+    // A successful probe re-admits the node but must NOT erase the strike: the
+    // old liveFailureSuccessStreak rule cleared it after two probes (8h at the
+    // 4h probe interval), which forgave a once-a-day flapper before it could
+    // ever reach the threshold — every failure logged "attempt 1/3".
     const r1 = nm._recordHealthCheckSuccess(url, 'healthy', 10, 'chain');
-    assert.strictEqual(r1.recovered, false, 'not recovered after 1 success');
-    assert.strictEqual(nm.nodeStats.get(url).failureCount, 1, 'live strike retained after 1 success');
-    assert.strictEqual(nm.nodeStats.get(url).status, 'healthy', 'node re-admitted while strike retained');
+    assert.strictEqual(r1.recovered, false, 'a fresh strike is retained');
+    assert.strictEqual(stats.failureCount, 1, 'probe success does not erase a live strike');
+    assert.strictEqual(stats.status, 'healthy', 'node re-admitted while the strike ages out');
 
-    // Second consecutive success clears it.
     const r2 = nm._recordHealthCheckSuccess(url, 'healthy', 10, 'chain');
-    assert.strictEqual(r2.recovered, true, 'recovered after 2 successes');
-    assert.strictEqual(nm.nodeStats.get(url).failureCount, 0, 'live strike cleared after streak');
+    assert.strictEqual(r2.recovered, false, 'a second probe success still does not erase it');
+    assert.strictEqual(stats.failureCount, 1, 'strike retained across probes');
 
-    // A health-check-sourced failure clears on the very next success.
-    nm.reportNodeFailure(url, 'probe failed', 'health-check');
-    assert.strictEqual(nm.nodeStats.get(url).failureCount, 1, 'probe strike recorded');
+    // Half-way through the decay window a strike is still standing...
+    stats.lastFailureAtMs = Date.now() - NODE_MANAGEMENT.FAILURE_STRIKE_DECAY_MS / 2;
+    assert.strictEqual(nm._decayedStrikeCount(stats), 1, 'ceil keeps a single decaying strike visible');
+
+    // ...and after the full window it is forgiven without any probe at all.
+    stats.lastFailureAtMs = Date.now() - NODE_MANAGEMENT.FAILURE_STRIKE_DECAY_MS - 1000;
     const r3 = nm._recordHealthCheckSuccess(url, 'healthy', 10, 'chain');
-    assert.strictEqual(r3.recovered, true, 'probe strike clears on first success');
-    assert.strictEqual(nm.nodeStats.get(url).failureCount, 0, 'probe strike cleared');
+    assert.strictEqual(r3.recovered, true, 'strike aged out');
+    assert.strictEqual(stats.failureCount, 0, 'decayed strike cleared');
+    assert.strictEqual(stats.lastFailureAtMs, null, 'decay clock reset');
+
+    // Churn history outlives the strike: it is the selection signal, and must
+    // not be erased just because the node was re-admitted.
+    assert.strictEqual(stats.dropTimes.length, 1, 'churn history is independent of strike decay');
+
+    // Repeated drops inside one window accumulate toward blacklisting.
+    const stormUrl = 'wss://storm.test/ws';
+    const storm = createNodeManager({ list: [stormUrl], healthCheck: { blacklistThreshold: 3 } });
+    const t0 = Date.now() - 10 * 60 * 1000;
+    storm.reportNodeFailure(stormUrl, 'closed 1006', 'connection', t0);
+    storm.reportNodeFailure(stormUrl, 'closed 1006', 'connection', t0 + 2000);
+    storm.reportNodeFailure(stormUrl, 'closed 1006', 'connection', t0 + 4000);
+    assert.strictEqual(storm.isBlacklisted(stormUrl), true, 'three drops still blacklist');
+    assert.strictEqual(storm.nodeStats.get(stormUrl).dropTimes.length, 3, 'all three drops counted as churn');
+    assert.strictEqual(storm.getNodeChurn(stormUrl).drops24h, 3, 'churn counters see all three drops');
+
+    // Probe failures and forced reconnects are not node-badness evidence for
+    // the churn score.
+    const clean = createNodeManager({ list: ['wss://clean.test/ws'] });
+    clean.reportNodeFailure('wss://clean.test/ws', 'probe timeout', 'health-check');
+    assert.strictEqual(clean.nodeStats.get('wss://clean.test/ws').dropTimes.length, 0, 'health-check failure is not churn');
+    clean.reportNodeFailure('wss://clean.test/ws', 'forced reconnect: wedged session', 'forced-reconnect');
+    assert.strictEqual(clean.nodeStats.get('wss://clean.test/ws').dropTimes.length, 0, 'forced reconnect is not churn');
 
     // Selection helpers used by the transport predicate.
     assert.strictEqual(nm.isBlacklisted(url), false, 'healthy node not blacklisted');
@@ -403,24 +435,19 @@ process.on('exit', () => {
     assert.strictEqual(nm.isBlacklisted(url), true, 'blacklisted detected');
     assert.strictEqual(nm.shouldAvoidNode(url), true, 'blacklisted node avoided');
 
-    // An explicit 0 must fall back to the default, not silently disable the
-    // retention safety net (0 would make `streak >= 0` always true).
+    // An explicit 0 for the decay window must fall back to the default rather
+    // than disabling decay (a 0 window would forgive every strike instantly).
     const zeroCfg = createNodeManager({
         list: ['wss://zero.test/ws'],
-        healthCheck: { liveFailureSuccessStreak: 0 }
+        healthCheck: { strikeDecayMs: 0 }
     });
     assert.strictEqual(
-        zeroCfg.config.healthCheck.liveFailureSuccessStreak,
-        NODE_MANAGEMENT.LIVE_FAILURE_HEALTH_SUCCESS_STREAK,
-        'explicit 0 falls back to the default retention streak'
+        zeroCfg.config.healthCheck.strikeDecayMs,
+        NODE_MANAGEMENT.FAILURE_STRIKE_DECAY_MS,
+        'explicit 0 falls back to the default decay window'
     );
-    const zeroUrl = 'wss://zero.test/ws';
-    zeroCfg.reportNodeFailure(zeroUrl, 'keep-alive failed 3 times', 'keep-alive');
-    const zeroR1 = zeroCfg._recordHealthCheckSuccess(zeroUrl, 'healthy', 10, 'chain');
-    assert.strictEqual(zeroR1.recovered, false, 'zero-config still retains a live strike after 1 success');
-    assert.strictEqual(zeroCfg.nodeStats.get(zeroUrl).failureCount, 1, 'live strike retained under fallback default');
 
-    console.log('✓ Live-transport strike retention test passed\n');
+    console.log('✓ Strike decay and churn accounting test passed\n');
 }
 
 console.log('='.repeat(60));

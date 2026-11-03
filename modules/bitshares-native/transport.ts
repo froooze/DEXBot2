@@ -207,11 +207,24 @@ function createTransport(config: TransportConfig = {}) {
         return false;
     }
 
-    function setStatus(newStatus: TransportStatus): void {
+    /**
+     * Publish a transport status change.
+     *
+     * `displayNode` exists so teardown paths can name the node they are
+     * closing *after* the active-node field has been cleared. Before this, an
+     * intentional disconnect logged `(node=null)`, which made 120 of 172
+     * closes in a live log run unattributable — the single biggest hole in
+     * connection diagnostics.
+     *
+     * `onStatusChange` is never handed the display value: it reads the live
+     * transport state via getNodeUrl(), which is null after disconnect().
+     */
+    function setStatus(newStatus: TransportStatus, displayNode?: string | null): void {
         if (status !== newStatus) {
             const prevStatus = status;
             status = newStatus;
-            transportLogger.info(`status change: ${prevStatus} -> ${newStatus} (node=${nodeUrl})`);
+            const logNode = displayNode === undefined ? nodeUrl : displayNode;
+            transportLogger.info(`status change: ${prevStatus} -> ${newStatus} (node=${logNode})`);
             if (onStatusChange) {
                 try { onStatusChange(newStatus, nodeUrl); } catch (_) {}
             }
@@ -335,7 +348,7 @@ function createTransport(config: TransportConfig = {}) {
         });
     }
 
-    function setupMessageHandler(socket: WebSocketLike): void {
+    function setupMessageHandler(socket: WebSocketLike, socketUrl: string): void {
         socket.onmessage = (raw: unknown) => {
             let msg: RpcMessage;
             try { msg = JSON.parse((raw as { data: string }).data) as RpcMessage; } catch (_) { return; }
@@ -401,7 +414,11 @@ function createTransport(config: TransportConfig = {}) {
 
         socket.onerror = (evt: SocketEventLike) => {
             const msg = evt && evt.message ? evt.message : 'WebSocket connection error';
-            transportLogger.warn(`WebSocket error on ${nodeUrl}: ${msg}`);
+            // Name the socket's own node, not the currently active one: a
+            // superseded socket can still emit an error after a switch, and
+            // logging it against `nodeUrl` blamed the wrong node (or logged
+            // `on null`).
+            transportLogger.warn(`WebSocket error on ${socketUrl}: ${msg}`);
         };
     }
 
@@ -422,7 +439,7 @@ function createTransport(config: TransportConfig = {}) {
         reconnectAttempts = 0;
         // A successful connection clears the deprioritization for this node.
         failedNodes.delete(url);
-        setupMessageHandler(socket);
+        setupMessageHandler(socket, url);
         return (async () => {
             if (validateNode) {
                 await validateNode();
@@ -620,8 +637,9 @@ function createTransport(config: TransportConfig = {}) {
             try { socket.close(); } catch (_) {}
         }
         connectingSockets.clear();
+        const closingNode = nodeUrl;
         nodeUrl = null;
-        setStatus('closed');
+        setStatus('closed', closingNode);
     }
 
     /**
