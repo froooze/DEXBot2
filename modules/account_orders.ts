@@ -660,6 +660,34 @@ class AccountOrders {
   }
 
   /**
+   * Load the persisted sync-pass-1 "size already applied" markers.
+   * Stored in the free-form debugInputs blob (no order-row schema change).
+   * Returns a sanitized `{ orderId: { filledInt, at } }` map (empty when
+   * absent/malformed); freshness/TTL enforcement happens manager-side.
+   * @param {boolean} forceReload - If true, reload from disk
+   * @returns {Object}
+   */
+  loadChainSizeAppliedFills(forceReload: boolean = false) {
+    this._ensureLoaded(forceReload);
+    const out: Record<string, { filledInt: number; at: number }> = {};
+    const stored = this.data && this.data.debugInputs
+      ? (this.data.debugInputs as Record<string, unknown>).chainSizeAppliedFills
+      : null;
+    if (!stored || typeof stored !== 'object') return out;
+    let count = 0;
+    for (const [id, raw] of Object.entries(stored as Record<string, unknown>)) {
+      if (!id || count >= 500) continue;
+      const e = raw as { filledInt?: unknown; at?: unknown } | null;
+      const filledInt = Math.round(Number(e?.filledInt));
+      const at = Number(e?.at);
+      if (!Number.isFinite(filledInt) || filledInt <= 0 || !Number.isFinite(at)) continue;
+      out[id] = { filledInt, at };
+      count++;
+    }
+    return out;
+  }
+
+  /**
    * Erase a persisted last-market-fill row that restoreLastMarketFill
    * rejected (TTL expiry / malformed). Mirrors clearPersistedLastFillPivot:
    * without an explicit erase a dead row would re-arm the same rejection on

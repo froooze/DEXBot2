@@ -16,11 +16,12 @@
 const assert = require('assert');
 const { rejectCorruptedGridSnapshot } = require('../modules/dexbot_state_recovery');
 
-function makeBot({ queued = 0, batchInFlight = 0, deferredRebalance = 0, owedCrawls = 0, deferredFills = false } = {}) {
+function makeBot({ queued = 0, batchInFlight = 0, recoveryInFlight = 0, placementHeld = false, deferredRebalance = 0, owedCrawls = 0, deferredFills = false } = {}) {
     const state = { cleared: 0, backedUp: 0, warnings: [] };
     const bot = {
         _incomingFillQueue: Array.from({ length: queued }, (_, i) => ({ key: `f${i}` })),
         _batchInFlight: batchInFlight,
+        _recoverySyncInFlight: recoveryInFlight,
         _deferredFillsPending: deferredFills,
         _warn: (message) => state.warnings.push(String(message)),
         _restoreBoundary: () => {},
@@ -29,6 +30,8 @@ function makeBot({ queued = 0, batchInFlight = 0, deferredRebalance = 0, owedCra
             _pendingFillCrawls: Array.from({ length: owedCrawls }, () => ({ slotId: 'slot-1', side: 'buy', ts: Date.now() })),
             _clearPendingFillCrawls: () => {},
             _resetLastFillPivot: () => {},
+            isPlacementActive: () => placementHeld === true,
+            placementKind: () => (placementHeld ? 'startup-reconcile' : null),
             checkFundDriftAfterFills: () => ({ isValid: false, driftSell: 11.71, driftBuy: 8068.19 }),
             logger: { log: () => {} },
         },
@@ -65,6 +68,10 @@ async function runTests() {
     await expectSkipped('deferred rebalance', { deferredRebalance: Date.now() });
     await expectSkipped('owed crawls', { owedCrawls: 1 });
     await expectSkipped('deferred fill drain', { deferredFills: true });
+
+    console.log(' - 3b. recovery sync / placement region gate the check...');
+    await expectSkipped('recovery sync in flight', { recoveryInFlight: 1 });
+    await expectSkipped('placement held', { placementHeld: true });
 
     console.log(' - 4. settled pipeline still rejects genuine drift...');
     {

@@ -588,12 +588,40 @@ async function testPostWaitStalenessTriggersReplan() {
     console.log('✓ COW-SINGLE-FLIGHT-005 passed');
 }
 
+
+async function testPlacementReleasedOnPreBroadcastThrow() {
+    console.log('\n[COW-PLACEMENT-006] pre-broadcast throw releases the placement lease...');
+    const { bot, manager } = makeBot();
+    const PlacementLock = require('../modules/order/placement_lock').default;
+    const placement = new PlacementLock();
+    const m = manager as any;
+    m.acquirePlacement = (kind: string, opts: any) => placement.acquire(kind, opts);
+    m.isPlacementActive = () => placement.isHeld();
+    m.placementKind = () => placement.kind();
+    m.placementHeldForMs = () => placement.heldForMs();
+    // lockOrders runs after the placement claim and (pre-fix) outside the
+    // release finally — a throw here leaked the lease forever.
+    manager.lockOrders = () => { throw new Error('lockOrders boom'); };
+    const { cowResult } = makeCreateAction(bot, 'slot-leak-1');
+
+    await assert.rejects(
+        () => bot._updateOrdersOnChainBatchCOW(cowResult),
+        /lockOrders boom/,
+        'the pre-broadcast throw must propagate'
+    );
+    assert.strictEqual(placement.isHeld(), false, 'placement lease must be released on a pre-broadcast throw');
+    assert.strictEqual(bot._batchInFlight, 0, 'an aborted frame must not leave _batchInFlight raised');
+    assert.strictEqual(bot._cowBroadcastInFlight, false, 'an aborted frame must not hold the COW broadcast slot');
+    console.log('✓ COW-PLACEMENT-006 passed');
+}
+
 async function main() {
     await testSingleFlightDefersSecondBroadcast();
     await testFlagClearedOnFailedBroadcast();
     await testPreBroadcastRaceRecheck();
     await testEarlyReturnDoesNotClearAnotherBatchSlot();
     await testPostWaitStalenessTriggersReplan();
+    await testPlacementReleasedOnPreBroadcastThrow();
     testsComplete = true;
     console.log('\n✓ All COW single-flight tests passed!');
 }

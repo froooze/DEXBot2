@@ -1139,6 +1139,15 @@ export interface OrderManagerLike {
   ): Promise<T | null>;
   placementKind?: () => string | null;
   placementHeldForMs?: () => number;
+  /** Force-release a placement region held longer than the leak watchdog. */
+  _clearStalePlacementRegion?: (maxAgeMs?: number) => boolean;
+  /** Pass-1 chain-size markers (see note/consumeChainSizeAppliedFill). */
+  _chainSizeAppliedFills?: Map<string, { filledInt: number; at: number }>;
+  noteChainSizeAppliedFill?: (orderId: string, filledInt: number, maxAgeMs?: number) => void;
+  consumeChainSizeAppliedFillAmount?: (orderId: string, filledInt: number, maxAgeMs?: number) => number;
+  consumeChainSizeAppliedFill?: (orderId: string, filledInt: number, maxAgeMs?: number) => boolean;
+  snapshotChainSizeAppliedFills?: () => Record<string, { filledInt: number; at: number }>;
+  restoreChainSizeAppliedFills?: (payload: unknown) => void;
   isStructuralRebuildStale?: (reason: unknown) => boolean;
   addBroadcastRegionEndListener(listener: () => void): void;
   _applySync(data: unknown, src: string): Promise<unknown>;

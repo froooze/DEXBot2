@@ -1832,27 +1832,19 @@ class Accountant {
          if (assetAPrecision === undefined || assetBPrecision === undefined) return false;
 
          // Idempotency with sync pass 1: an open-orders pass may already have
-         // resized the slot from the same post-fill chain snapshot and
-         // recalculated free funds from it. Crediting/shrinking again here is
-         // the double-apply regression (3.6604 -> 3.3046 -> 2.9488 and an
-         // over-credited free balance). Consume the marker only when the fill's
-         // base amount matches the pass-1 delta; otherwise account normally.
-         // A limit-order fill always PAYS the order's base asset (assetA for a
-         // SELL, assetB for a BUY); the order's `size` and pass-1 delta are in
-         // that same base unit. `receives` is the quote side and must not be
-         // used here.
+         // resized the slot from the same post-fill chain snapshot (and
+         // released that commitment into free). The fill transition must not
+         // shrink/release the same base units a second time (3.6604 -> 3.3046
+         // -> 2.9488). The trade's pays/receives are still applied here — pass
+         // 1 never books them. A limit-order fill always PAYS the order's base
+         // asset (assetA for a SELL, assetB for a BUY); the order's `size` and
+         // the pass-1 delta are in that same base unit. `receives` is the
+         // quote side and must not be used for the marker.
          const filledBaseInt = Number(pays.amount);
-         const chainSizeAlreadyApplied = Number.isFinite(filledBaseInt)
-             && typeof (mgr as unknown as { consumeChainSizeAppliedFill?: (id: string, filledInt: number) => boolean }).consumeChainSizeAppliedFill === 'function'
-             && (mgr as unknown as { consumeChainSizeAppliedFill: (id: string, filledInt: number) => boolean })
-                 .consumeChainSizeAppliedFill(String(fillOp.order_id), filledBaseInt);
-         if (chainSizeAlreadyApplied) {
-             (fillOp as unknown as { __chainSizeAlreadyApplied?: boolean }).__chainSizeAlreadyApplied = true;
-             mgr?.logger?.log?.(
-                 `[FILL-DEDUP] Fill ${fillKey || fillOp.order_id} already absorbed by sync pass 1 (base delta ${filledBaseInt}); skipping duplicate fund adjustment`,
-                 'debug'
-             );
-         }
+         // The marker is consumed LATER, just before the adjustments are
+         // applied: a duplicate fill key or a failed dedup-key persist must not
+         // eat marker units a following split fill of the same order needs.
+         let appliedInt = 0;
 
          // Derive all numeric effects before recording the fill key.
          // This keeps retries safe if a later computation unexpectedly fails.
@@ -1882,12 +1874,13 @@ class Accountant {
          if (btsRefundAdjustment) {
              balanceAdjustments.push(btsRefundAdjustment);
          }
-         if (chainSizeAlreadyApplied) {
-             // Pass 1's recalculation already reflected both the reduced
-             // commitment and the chain-total proceeds; applying these again
-             // would over-credit. Keep the dedupe-key bookkeeping below.
-             balanceAdjustments.length = 0;
-         }
+         // IMPORTANT: do NOT clear `balanceAdjustments` when pass 1 already
+         // resized the slot. Pass 1's updateOptimisticFreeBalance only RELEASES
+         // the commitment into free; it never applies the trade's pays/receives.
+         // The duplicate the marker protects against is the second SIZE release
+         // in the fill transition, which is handled by __chainSizeAppliedInt
+         // (subtract only the remainder). Zeroing this list dropped the actual
+         // trade until the post-batch reanchor happened to repair it.
 
          let processedAt: number | null = null;
           const tracker = this.manager.processedFillTracker;
@@ -1921,7 +1914,30 @@ class Accountant {
               }
           }
 
-          await this._applyBalanceAdjustments(balanceAdjustments);
+          // Consume the pass-1 marker only now that this fill is not a
+         // duplicate and its dedup key is queued. Partial consumption: pass 1
+         // may have absorbed only part of this fill (A+B observed, fill A
+         // drained now); the transition subtracts only the remainder.
+         const consumeApplied = (mgr as unknown as { consumeChainSizeAppliedFillAmount?: (id: string, filledInt: number) => number }).consumeChainSizeAppliedFillAmount;
+         if (Number.isFinite(filledBaseInt) && typeof consumeApplied === 'function') {
+             appliedInt = Math.max(0, Math.min(
+                 Math.round(Number(consumeApplied.call(mgr, String(fillOp.order_id), filledBaseInt)) || 0),
+                 Math.round(filledBaseInt)
+             ));
+         }
+         if (appliedInt > 0) {
+             (fillOp as unknown as { __chainSizeAlreadyApplied?: boolean }).__chainSizeAlreadyApplied = true;
+             (fillOp as unknown as { __chainSizeAppliedInt?: number }).__chainSizeAppliedInt = appliedInt;
+             mgr?.logger?.log?.(
+                 `[FILL-DEDUP] Fill ${fillKey || fillOp.order_id}: ${appliedInt}/${Math.round(filledBaseInt)} base units already absorbed by sync pass 1; the transition will not shrink them again`,
+                 'debug'
+             );
+         } else {
+             delete (fillOp as unknown as { __chainSizeAlreadyApplied?: boolean }).__chainSizeAlreadyApplied;
+             delete (fillOp as unknown as { __chainSizeAppliedInt?: number }).__chainSizeAppliedInt;
+         }
+
+         await this._applyBalanceAdjustments(balanceAdjustments);
 
           // Flush the queued dedup key now that balance adjustments succeeded.
           // For IMMEDIATE mode, this persists durably. For BATCHED mode, the
@@ -1938,6 +1954,12 @@ class Accountant {
                       await this.adjustTotalBalance(adj.orderType, -adj.delta, 'rollback-' + adj.operation);
                   }
                   processedFillStore.discard(fillKey, processedAt || Date.now());
+                  // The marker was consumed for this attempt; the rolled-back
+                  // fill must be able to skip the pass-1 size release on retry.
+                  if (appliedInt > 0 && typeof (mgr as unknown as { noteChainSizeAppliedFill?: (id: string, n: number) => void }).noteChainSizeAppliedFill === 'function') {
+                      (mgr as unknown as { noteChainSizeAppliedFill: (id: string, n: number) => void })
+                          .noteChainSizeAppliedFill(String(fillOp.order_id), appliedInt);
+                  }
                   throw err;
               }
           }

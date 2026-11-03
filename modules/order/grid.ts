@@ -1101,6 +1101,20 @@ export async function loadGrid(manager: OrderManagerLike, grid: ManagedOrder[], 
 
             // RC-2: Use logic helper
             _clearOrderCachesLogic(manager);
+            // Restart durability: merge the pass-1 "size already applied"
+            // markers persisted with this snapshot (live markers win on
+            // conflict), so a fill replayed after a crash is not subtracted a
+            // second time.
+            try {
+                const restoreMarkers = (manager as unknown as { restoreChainSizeAppliedFills?: (p: unknown) => void }).restoreChainSizeAppliedFills;
+                const acct = manager.accountOrders as unknown as { loadChainSizeAppliedFills?: (force?: boolean) => Record<string, unknown> } | undefined;
+                const persistedMarkers = typeof acct?.loadChainSizeAppliedFills === 'function'
+                    ? acct.loadChainSizeAppliedFills()
+                    : null;
+                if (typeof restoreMarkers === 'function' && persistedMarkers) {
+                    restoreMarkers.call(manager, persistedMarkers);
+                }
+            } catch { /* marker restore is best-effort; normal accounting still applies */ }
 
             // resetFunds under _fundLock only — no persistGrid needed (grid already
             // on disk). For the resync variant see recalculateGrid (grid.ts:~1037)
@@ -1857,6 +1871,10 @@ export async function initializeGrid(manager: OrderManagerLike): Promise<void> {
         // RC-2: Wrap atomic changes in grid lock
         await manager._gridLock.acquire(async () => {
             _clearOrderCachesLogic(manager);
+            // Regeneration replaces every chain order id: pass-1 size markers
+            // keyed by the old ids are no longer evidence (unlike a snapshot
+            // RELOAD, which restores/merges the persisted markers).
+            manager._chainSizeAppliedFills = new Map();
             await manager._fundLock.acquire(async () => {
                 await manager.resetFunds();
             });

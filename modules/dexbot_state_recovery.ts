@@ -698,12 +698,18 @@ async function rejectCorruptedGridSnapshot(bot: BotLike, context: string) {
     // destructive decision on a settled pipeline.
     const pipeline = hasUnsettledFills(bot);
     const batchInFlight = Number((bot as unknown as { _batchInFlight?: unknown })._batchInFlight) || 0;
+    const recoveryInFlight = Number((bot as unknown as { _recoverySyncInFlight?: unknown })._recoverySyncInFlight) || 0;
+    const placementHeld = typeof bot.manager.isPlacementActive === 'function' && bot.manager.isPlacementActive() === true;
     const deferredRebalance = Number((bot.manager as unknown as { _deferredRebalanceAt?: unknown })._deferredRebalanceAt) || 0;
-    if (pipeline.unsettled || batchInFlight > 0 || deferredRebalance > 0) {
+    if (pipeline.unsettled || batchInFlight > 0 || recoveryInFlight > 0 || placementHeld || deferredRebalance > 0) {
+        const why = pipeline.reason
+            || (batchInFlight > 0 ? 'batch in flight'
+                : recoveryInFlight > 0 ? 'recovery sync in flight'
+                    : placementHeld ? `placement region held by ${bot.manager.placementKind?.() || 'unknown'}`
+                        : 'deferred rebalance pending');
         bot._warn?.(
             `[SNAPSHOT-REJECT] Skipping corruption check (${context}): pipeline not settled — ` +
-            `${pipeline.reason || (batchInFlight > 0 ? 'batch in flight' : 'deferred rebalance pending')}; ` +
-            `the snapshot is preserved and re-checked once fills settle`
+            `${why}; the snapshot is preserved and re-checked once fills settle`
         );
         return false;
     }

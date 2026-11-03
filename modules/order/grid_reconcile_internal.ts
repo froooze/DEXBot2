@@ -553,6 +553,36 @@ async function _createOrderFromGrid({ chainOrders, account, privateKey, manager,
         return null;
     }
 
+    // PENDING-BROADCAST GUARD: an earlier uncertain CREATE for this slot may
+    // already be live on chain but not yet adopted. The COW pre-broadcast guard
+    // blocks the whole CREATE batch for this case; the reconcile/startup path
+    // must not re-create the same slot either (same duplicate class).
+    const pendingMap = (manager as unknown as { _pendingBroadcasts?: unknown })._pendingBroadcasts;
+    if (pendingMap instanceof Map) {
+        // This path does not run getPendingBroadcasts(), so apply the same
+        // hard age cap here: a permanently stale entry must not park a
+        // reconcile create forever. Placement is held and the chain snapshot
+        // was just re-read, so an entry older than the cap is resolved enough.
+        const ttl = Number(TIMING.PENDING_BROADCAST_TTL_MS) > 0 ? Number(TIMING.PENDING_BROADCAST_TTL_MS) : 30 * 60 * 1000;
+        const maxAge = ttl * 2;
+        const now = Date.now();
+        for (const entry of pendingMap.values()) {
+            const pending = entry as { slotId?: unknown; orderId?: unknown; order?: { id?: unknown } | null; recordedAt?: unknown } | null;
+            const recordedAt = Number(pending?.recordedAt) || 0;
+            if (recordedAt > 0 && now - recordedAt > maxAge) continue;
+            const slotId = pending?.slotId ?? pending?.orderId ?? pending?.order?.id;
+            if (slotId != null && String(slotId) === String(gridOrder.id)) {
+                manager.logger?.log?.(
+                    `[_createOrderFromGrid] SKIP (PENDING-BROADCAST): Create for ${gridOrder.id} at ` +
+                    `${Format.formatPrice6(Number(gridOrder.price))} may already be live from an uncertain broadcast; ` +
+                    `waiting for recovery/adoption instead of duplicating it`,
+                    'warn'
+                );
+                return null;
+            }
+        }
+    }
+
     const createPrice = gridOrder.price;
 
     // CROSSING-PLACEMENT GUARD: a create must not cross an opposite-side

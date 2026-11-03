@@ -86,7 +86,7 @@ async function runTests() {
         );
     }
 
-    console.log(' - 3. manager marker round-trip matches the fill delta...');
+    console.log(' - 3. manager marker accumulates and consumes partially (split/aggregated fills)...');
     {
         const { OrderManager } = require('../modules/order/index').default;
         const mgr = new OrderManager({
@@ -95,13 +95,69 @@ async function runTests() {
             botFunds: { buy: 1000, sell: 10 }, coreOrders: { buy: 2, sell: 2 },
         });
         mgr.noteChainSizeAppliedFill('1.7.137', 3558);
-        assert.strictEqual(mgr.consumeChainSizeAppliedFill('1.7.137', 3558), true, 'matching delta consumes the marker');
-        assert.strictEqual(mgr.consumeChainSizeAppliedFill('1.7.137', 3558), false, 'marker is consumed once');
-        mgr.noteChainSizeAppliedFill('1.7.138', 3558);
-        assert.strictEqual(mgr.consumeChainSizeAppliedFill('1.7.138', 999), false, 'a different fill amount does not consume it');
-        assert.strictEqual(mgr.consumeChainSizeAppliedFill('1.7.138', 3557, -1), false, 'an expired marker is dropped');
+        mgr.noteChainSizeAppliedFill('1.7.137', 3558);
+        assert.strictEqual(mgr.consumeChainSizeAppliedFillAmount('1.7.137', 3558), 3558, 'first split fill consumes its share');
+        assert.strictEqual(mgr.consumeChainSizeAppliedFillAmount('1.7.137', 3558), 3558, 'second split fill consumes the remainder');
+        assert.strictEqual(mgr.consumeChainSizeAppliedFillAmount('1.7.137', 3558), 0, 'marker is exhausted');
+
+        mgr.noteChainSizeAppliedFill('1.7.139', 1000);
+        assert.strictEqual(mgr.consumeChainSizeAppliedFillAmount('1.7.139', 3558), 1000, 'a smaller marker covers only itself');
+        assert.strictEqual(mgr.consumeChainSizeAppliedFillAmount('1.7.139', 2558), 0, 'remaining portion is normal accounting');
+
+        mgr.noteChainSizeAppliedFill('1.7.140', 3558);
+        assert.strictEqual(mgr.consumeChainSizeAppliedFill('1.7.140', 3558, -1), false, 'an expired marker is dropped');
+
+        mgr.noteChainSizeAppliedFill('1.7.142', 7116);
+        const snapshot = mgr.snapshotChainSizeAppliedFills();
+        const restored = new OrderManager({
+            assetA: 'BASE', assetB: 'QUOTE', startPrice: 100, minPrice: 50, maxPrice: 200,
+            incrementPercent: 10, targetSpreadPercent: 10,
+            botFunds: { buy: 1000, sell: 10 }, coreOrders: { buy: 2, sell: 2 },
+        });
+        restored.restoreChainSizeAppliedFills(snapshot);
+        assert.strictEqual(restored.consumeChainSizeAppliedFillAmount('1.7.142', 7116), 7116, 'persisted marker survives restore');
     }
 
+    console.log(' - 4. partial pass-1 coverage subtracts only the remainder...');
+    {
+        const result = await engine._computeFillTransitionResult(makeManager(), makeParams({ alreadyAppliedInt: 1000 }));
+        assert.ok(
+            Math.abs(Number(result.partialUpdate.size) - 3.0488) < 1e-9,
+            `remainder-only shrink expected 3.0488, got ${result.partialUpdate.size}`
+        );
+        assert.strictEqual(String(result.partialUpdate.rawOnChain.for_sale), '30488', 'rawOnChain carries the remainder-only size');
+    }
+
+    console.log(' - 5. pass-1 marker does not drop the trade (pays/receives) from accounting...');
+    {
+        const Accountant = require('../modules/order/accounting').default;
+        const makeMgr = () => ({
+            assets: { assetA: { id: '1.3.0', precision: 5 }, assetB: { id: '1.3.1', precision: 5 } },
+            config: { assetA: 'BASE', assetB: 'QUOTE' },
+            logger: { log: () => {} },
+            orders: new Map(),
+            accountTotals: { buy: 100000, sell: 1000, buyFree: 100000, sellFree: 1000 },
+            _fundLock: { acquire: async (fn: any) => await fn() },
+            processedFillTracker: new Map(),
+            processedFillStore: null,
+        });
+        const fillOp = {
+            order_id: '1.7.141',
+            pays: { asset_id: '1.3.0', amount: 35580 },
+            receives: { asset_id: '1.3.1', amount: 4850000 },
+            is_maker: true,
+        };
+        const baseline = makeMgr();
+        await new Accountant(baseline).processFillAccounting({ ...fillOp }, null, {});
+        const marked: any = makeMgr();
+        marked.consumeChainSizeAppliedFillAmount = () => 35580;
+        await new Accountant(marked).processFillAccounting({ ...fillOp }, null, {});
+        assert.deepStrictEqual(
+            marked.accountTotals,
+            baseline.accountTotals,
+            'the fill trade (totals and free) must be applied exactly once even when pass 1 resized the slot'
+        );
+    }
     console.log('\n✓ fill-transition idempotency tests PASSED!');
 }
 

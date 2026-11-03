@@ -119,6 +119,31 @@ async function testRegionEndCallback() {
     console.log('  PASS');
 }
 
+
+async function testPlacementWatchdog() {
+    console.log('\n - stale placement region watchdog force-releases; fresh lease is kept...');
+    const { OrderManager } = require('../modules/order/index').default;
+    const mgr = new OrderManager({
+        assetA: 'BASE', assetB: 'QUOTE', startPrice: 100, minPrice: 50, maxPrice: 200,
+        incrementPercent: 10, targetSpreadPercent: 10,
+        botFunds: { buy: 1000, sell: 10 }, coreOrders: { buy: 2, sell: 2 },
+    });
+    const stale = await mgr.acquirePlacement('test-holder');
+    assert.ok(stale);
+    (mgr as any)._placementLock._since = Date.now() - 16 * 60 * 1000;
+    assert.strictEqual(mgr._clearStalePlacementRegion(), true, 'a 16-minute hold must be force-released');
+    assert.strictEqual(mgr.isPlacementActive(), false, 'the region must be free after the watchdog');
+    stale.release();
+    assert.strictEqual(mgr.isPlacementActive(), false, 'a stale lease release must not affect a successor');
+
+    const fresh = await mgr.acquirePlacement('test-holder');
+    assert.ok(fresh);
+    assert.strictEqual(mgr._clearStalePlacementRegion(), false, 'a fresh region must not be force-released');
+    assert.strictEqual(mgr.isPlacementActive(), true);
+    fresh.release();
+    console.log('  PASS');
+}
+
 async function testShutdownProbe() {
     console.log('\n - shutdown probe rejects acquisition...');
     const lock = new PlacementLock();
@@ -135,6 +160,7 @@ async function testShutdownProbe() {
     await testTimeout();
     await testForceReleaseAba();
     await testRegionEndCallback();
+    await testPlacementWatchdog();
     await testShutdownProbe();
     console.log('\n✓ All placement lock tests passed');
 })().catch((err) => {

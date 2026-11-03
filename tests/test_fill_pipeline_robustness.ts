@@ -329,6 +329,65 @@ async function testDEFER007_FrozenRegionStillFallsThrough() {
     console.log('✓ DEFER-007 passed');
 }
 
+
+async function testDEFER008_PlacementHoldUsesWatchdogBound() {
+    console.log('\n[DEFER-008] A placement hold defers past the broadcast bound (watchdog owns the release)...');
+    let now = 1_000_000;
+    const regionStart = now - 5_000;
+    const bot: any = {
+        manager: {
+            isBroadcastingActive: () => false,
+            isPlacementActive: () => true,
+            placementHeldForMs: () => now - regionStart,
+        },
+        _fillBroadcastDeferSince: 0,
+    };
+    assert.deepStrictEqual(
+        shouldDeferFillForBroadcast(bot, now),
+        { defer: true, stuckFallback: false },
+        'a live placement region must defer fills'
+    );
+    // Past the broadcast-flag bound: a legitimate reconcile (observed ~8 min)
+    // still owns placement and must keep fills deferred.
+    now = regionStart + Number(TIMING.FILL_BROADCAST_DEFER_MAX_MS) + 60_000;
+    assert.deepStrictEqual(
+        shouldDeferFillForBroadcast(bot, now),
+        { defer: true, stuckFallback: false },
+        'placement holds must not fall through at the broadcast bound'
+    );
+    // Last-resort valve: only past the placement watchdog + margin does the
+    // consumer fall through (the watchdog should have released it already).
+    now = 1_000_000 + Number(TIMING.PLACEMENT_STALE_CLEAR_MS) + Number(TIMING.BROADCAST_DEFER_SAFETY_MARGIN_MS) + 1;
+    assert.deepStrictEqual(
+        shouldDeferFillForBroadcast(bot, now),
+        { defer: false, stuckFallback: true },
+        'stuck placement past its watchdog must not starve fills'
+    );
+
+    // COW/reconcile hold BOTH the broadcast refcount and placement. The
+    // placement lease owns the region's lifetime, so the broadcast bound must
+    // not force a fall-through mid-reconcile.
+    let bothNow = 2_000_000;
+    const bothStart = bothNow - 6_000;
+    const bothBot: any = {
+        manager: {
+            isBroadcastingActive: () => true,
+            _broadcastingStartedAt: bothStart,
+            isPlacementActive: () => true,
+            placementHeldForMs: () => bothNow - bothStart,
+        },
+        _fillBroadcastDeferSince: 0,
+    };
+    shouldDeferFillForBroadcast(bothBot, bothNow);
+    bothNow += Number(TIMING.FILL_BROADCAST_DEFER_MAX_MS) + 60_000;
+    assert.deepStrictEqual(
+        shouldDeferFillForBroadcast(bothBot, bothNow),
+        { defer: true, stuckFallback: false },
+        'a placement-backed broadcast region must use the placement watchdog bound'
+    );
+    console.log('✓ DEFER-008 passed');
+}
+
 async function testCFG002_DeferBoundExceedsStaleClear() {
     console.log('\n[CFG-002] Fill deferral bound outlasts the stale-broadcast watchdog...');
     assert.ok(Number(TIMING.BROADCAST_STALE_CLEAR_MS) > 0, 'watchdog threshold must be configured');
@@ -348,6 +407,7 @@ async function runAllTests() {
     await testDEFER005_MissingManagerFailsOpen();
     await testDEFER006_RegionAdvanceRearmsBound();
     await testDEFER007_FrozenRegionStillFallsThrough();
+    await testDEFER008_PlacementHoldUsesWatchdogBound();
     await testCFG002_DeferBoundExceedsStaleClear();
     await testHOLD010_ConsecutiveTrackingAndSnapshot();
     await testHOLD011_ClearResetsAndNullManagerSafe();

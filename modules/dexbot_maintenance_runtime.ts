@@ -2476,6 +2476,27 @@ function scheduleDeferredGridResync(ctx: MaintenanceCtx, options: JsonObj = {}) 
 }
 
 /**
+ * Raise/lower the recovery-sync in-flight counter as a pair that also
+ * maintains `_recoverySyncInFlightStartedAt`. The leak watchdog keys off the
+ * timestamp: incrementing without it makes the watchdog skip the window (or
+ * use a stale timestamp and force-clear a live recovery).
+ * @param {import('./dexbot_class.js').DEXBot} bot
+ */
+function raiseRecoveryInFlight(bot: BotLike) {
+    bot._recoverySyncInFlight = (bot._recoverySyncInFlight || 0) + 1;
+    (bot as unknown as { _recoverySyncInFlightStartedAt?: number })._recoverySyncInFlightStartedAt = Date.now();
+}
+
+/** @param {import('./dexbot_class.js').DEXBot} bot */
+function lowerRecoveryInFlight(bot: BotLike) {
+    bot._recoverySyncInFlight = Math.max(0, (bot._recoverySyncInFlight || 0) - 1);
+    if ((bot._recoverySyncInFlight || 0) === 0) {
+        (bot as unknown as { _recoverySyncInFlightStartedAt?: number })._recoverySyncInFlightStartedAt = 0;
+        drainFillQueueAfterPipelineClear(bot);
+    }
+}
+
+/**
  * Leak watchdog for the bot-level pipeline counters. A missed decrement parks
  * the fill queue indefinitely; there is no stale-clear equivalent for
  * _batchInFlight / _recoverySyncInFlight. Surface the age every tick, and only
@@ -2522,6 +2543,10 @@ function checkPipelineInFlightWatchdogs(bot: BotLike) {
         );
         botAny[check.countKey] = 0;
         botAny[check.startedKey] = 0;
+        // Wake the fill consumer: the deferred branch gates on this counter
+        // without rescheduling, so a force-clear that does not drain would
+        // leave the queue parked until an unrelated event.
+        drainFillQueueAfterPipelineClear(bot);
     }
 }
 
@@ -2537,6 +2562,9 @@ async function executeMaintenanceLogic(bot: BotLike, context: string) {
     // Surface any over-long _gridLock hold first — observational only, and it
     // must run even when the rest of the tick defers on a broadcast region.
     checkGridLockHoldDuration(bot);
+    // Placement leak watchdog first: it is the authoritative mutex, and the
+    // broadcast/pipeline watchdogs cross-check against it.
+    try { bot.manager?._clearStalePlacementRegion?.(); } catch { /* observational */ }
     // Clear stale broadcast flag first so any downstream gating on
     // isBroadcastingActive() (e.g. recalculateFunds, BTS balance check)
     // sees the freshest state rather than a hung flag.
@@ -3489,12 +3517,11 @@ async function requestGridReset(bot: BotLike, reason: string = 'structural chang
     // entirely (no concurrent mutation race) instead of racing them behind a
     // lock.
     if (options.skipFillLock === true || !bot.manager._fillProcessingLock || bot.manager._fillProcessingLock.isReentrant()) {
-        bot._recoverySyncInFlight = (bot._recoverySyncInFlight || 0) + 1;
+        raiseRecoveryInFlight(bot);
         try {
             return await performGridResync(bot, resetOptions);
         } finally {
-            bot._recoverySyncInFlight = Math.max(0, (bot._recoverySyncInFlight || 0) - 1);
-            if ((bot._recoverySyncInFlight || 0) === 0) drainFillQueueAfterPipelineClear(bot);
+            lowerRecoveryInFlight(bot);
         }
     }
 
@@ -3582,12 +3609,12 @@ function wireStructuralGridResyncRequest(bot: BotLike) {
                 // prevents a fill arriving mid-reload from starting a new COW
                 // batch whose broadcast would overlap the reload and force an
                 // avoidable commit refusal + re-adoption cycle.
-                bot._recoverySyncInFlight = (bot._recoverySyncInFlight || 0) + 1;
+                raiseRecoveryInFlight(bot);
                 let persistedResult: JsonObj;
                 try {
                     persistedResult = await bot._recoverFromPersistedGrid() as JsonObj;
                 } finally {
-                    bot._recoverySyncInFlight = Math.max(0, (bot._recoverySyncInFlight || 0) - 1);
+                    lowerRecoveryInFlight(bot);
                 }
                 if (persistedResult.success) {
                     if (bot.manager?._recoveryState) {
@@ -3615,7 +3642,7 @@ function wireStructuralGridResyncRequest(bot: BotLike) {
                     // generation orphans). _recoverFromPersistedGrid already
                     // incremented and released the counter; increment again
                     // for the full-resync branch.
-                    bot._recoverySyncInFlight = (bot._recoverySyncInFlight || 0) + 1;
+                    raiseRecoveryInFlight(bot);
                     let resetResult: JsonObj;
                     try {
                         resetResult = await (bot.requestGridReset('rms_structural_grid_resync', {
@@ -3627,8 +3654,7 @@ function wireStructuralGridResyncRequest(bot: BotLike) {
                             skipFillLock: true,
                         })) as JsonObj;
                     } finally {
-                        bot._recoverySyncInFlight = Math.max(0, (bot._recoverySyncInFlight || 0) - 1);
-                        if ((bot._recoverySyncInFlight || 0) === 0) drainFillQueueAfterPipelineClear(bot);
+                        lowerRecoveryInFlight(bot);
                     }
                 if (resetResult && bot.manager?._recoveryState) {
                     bot.manager._recoveryState = { ...bot.manager._recoveryState, attemptCount: 0, lastAttemptAt: 0, lastFailureAt: 0 };

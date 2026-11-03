@@ -730,13 +730,21 @@ async function testStartupRejectsChangedCancellationSnapshot() {
         },
     };
     let cancelCalls = 0;
+    // The reconcile refreshes the chain snapshot AFTER acquiring placement
+    // (planning must not run on a pre-wait view), then re-reads again right
+    // before executing a cancel. Model that: the first (planning) read is the
+    // caller's snapshot, and the pre-cancel read observes the change.
+    let readCalls = 0;
     const chainOrders = {
         updateOrder: async () => {},
         buildUpdateOrderOp: async () => ({ op: { op_name: 'limit_order_update', op_data: { fee: { amount: 0, asset_id: '1.3.0' } } } }),
         executeBatch: async () => ({ success: true, operation_results: [] }),
         cancelOrder: async () => { cancelCalls++; },
         createOrder: async () => [],
-        readOpenOrders: async () => [changed],
+        readOpenOrders: async () => {
+            readCalls++;
+            return readCalls === 1 ? [initial] : [changed];
+        },
     };
 
     await reconcileGridOrders({

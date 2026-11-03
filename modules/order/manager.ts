@@ -1072,41 +1072,131 @@ class OrderManager implements OrderManagerLike {
      * to stay idempotent: subtracting/crediting the same fill again shrinks the
      * order twice and over-credits free balance (2026-11-03 log: 3.6604 ->
      * 3.3046 by pass 1, then 3.3046 -> 2.9488 by the fill batch).
+     *
+     * Markers ACCUMULATE: two pass-1 detections before the fill queue drains
+     * (or one aggregated fill-history entry covering both) must add up, not
+     * overwrite — an overwritten marker makes the batch total unmatchable and
+     * re-opens the double-shrink. The map is mirrored into the persisted grid
+     * snapshot (debugInputs) so a restart between pass 1 and fill processing
+     * does not lose the evidence.
      * @param {string} orderId - Chain order id
      * @param {number} filledInt - Base-amount delta in chain integer units
      * @returns {void}
      */
-    noteChainSizeAppliedFill(orderId: string, filledInt: number) {
+    noteChainSizeAppliedFill(orderId: string, filledInt: number, maxAgeMs: number = TIMING.CHAIN_SIZE_APPLIED_MARKER_TTL_MS) {
         const id = String(orderId || '');
         const amount = Math.round(Number(filledInt));
         if (!id || !Number.isFinite(amount) || amount <= 0) return;
         if (!(this._chainSizeAppliedFills instanceof Map)) this._chainSizeAppliedFills = new Map();
-        this._chainSizeAppliedFills.set(id, { filledInt: amount, at: Date.now() });
+        const now = Date.now();
+        const ttl = Number.isFinite(Number(maxAgeMs)) ? Number(maxAgeMs) : TIMING.CHAIN_SIZE_APPLIED_MARKER_TTL_MS;
+        const existing = this._chainSizeAppliedFills.get(id);
+        const stillFresh = existing && (now - Number(existing.at)) <= ttl;
+        this._chainSizeAppliedFills.set(id, {
+            filledInt: (stillFresh ? Number(existing.filledInt) : 0) + amount,
+            at: now,
+        });
+        // Bounded: chain-order ids turn over continuously, and this map only
+        // needs to survive the pass-1 -> fill-batch window.
+        if (this._chainSizeAppliedFills.size > 500) {
+            for (const [key, marker] of this._chainSizeAppliedFills) {
+                if (now - Number(marker.at) > ttl) this._chainSizeAppliedFills.delete(key);
+            }
+        }
     }
 
     /**
-     * Consume a pass-1 chain-size marker when it matches this fill's base
-     * amount (within one chain unit, for rounding). Returns true when the
-     * fill's fund/size impact is already reflected in the books.
-     * A stale marker (fill history never arrived) expires instead of
-     * suppressing a later unrelated fill.
+     * Consume a pass-1 chain-size marker for a fill without requiring an exact
+     * total match. Returns the number of chain-size units this fill may treat
+     * as ALREADY reflected in `rawOnChain` (0 when there is no marker).
+     *
+     * Partial consumption is the split-batch case: pass 1 absorbed A+B, the
+     * fill queue drains A first (marker keeps B), then B. The old all-or-nothing
+     * match rejected both and double-shrunk the slot twice.
      * @param {string} orderId - Chain order id
      * @param {number} filledInt - Base-amount delta in chain integer units
      * @param {number} [maxAgeMs] - Marker freshness bound
-     * @returns {boolean}
+     * @returns {number} Applied (already-in-snapshot) amount, 0..filledInt
      */
-    consumeChainSizeAppliedFill(orderId: string, filledInt: number, maxAgeMs: number = 5 * 60 * 1000): boolean {
+    consumeChainSizeAppliedFillAmount(orderId: string, filledInt: number, maxAgeMs: number = TIMING.CHAIN_SIZE_APPLIED_MARKER_TTL_MS): number {
         const id = String(orderId || '');
         const amount = Math.round(Number(filledInt));
+        if (!id || !Number.isFinite(amount) || amount <= 0) return 0;
         const marker = this._chainSizeAppliedFills?.get(id);
-        if (!marker) return false;
-        if (Date.now() - Number(marker.at) > maxAgeMs) {
+        if (!marker) return 0;
+        const ttl = Number.isFinite(Number(maxAgeMs)) ? Number(maxAgeMs) : TIMING.CHAIN_SIZE_APPLIED_MARKER_TTL_MS;
+        if (Date.now() - Number(marker.at) > ttl) {
             this._chainSizeAppliedFills.delete(id);
-            return false;
+            return 0;
         }
-        if (!Number.isFinite(amount) || Math.abs(Number(marker.filledInt) - amount) > 1) return false;
-        this._chainSizeAppliedFills.delete(id);
-        return true;
+        const available = Math.max(0, Math.round(Number(marker.filledInt)));
+        if (available <= 0) {
+            this._chainSizeAppliedFills.delete(id);
+            return 0;
+        }
+        const applied = Math.min(available, amount);
+        if (available - applied > 0) {
+            this._chainSizeAppliedFills.set(id, { filledInt: available - applied, at: Date.now() });
+        } else {
+            this._chainSizeAppliedFills.delete(id);
+        }
+        return applied;
+    }
+
+    /**
+     * Boolean compatibility wrapper for {@link consumeChainSizeAppliedFillAmount}.
+     * @param {string} orderId - Chain order id
+     * @param {number} filledInt - Base-amount delta in chain integer units
+     * @param {number} [maxAgeMs] - Marker freshness bound
+     * @returns {boolean} true when any part of the fill was already applied
+     */
+    consumeChainSizeAppliedFill(orderId: string, filledInt: number, maxAgeMs: number = TIMING.CHAIN_SIZE_APPLIED_MARKER_TTL_MS): boolean {
+        return this.consumeChainSizeAppliedFillAmount(orderId, filledInt, maxAgeMs) > 0;
+    }
+
+    /**
+     * Merge persisted pass-1 markers into the in-memory set (recovery reload).
+     * Live markers win on conflict: they may already be partially consumed,
+     * and replacing them with the older persisted total would double-count.
+     * Entries are sanitized and the clock is freshened (see below).
+     * @param {unknown} payload - `{ [orderId]: { filledInt, at } }`
+     * @returns {void}
+     */
+    restoreChainSizeAppliedFills(payload: unknown) {
+        if (!(this._chainSizeAppliedFills instanceof Map)) this._chainSizeAppliedFills = new Map();
+        if (!payload || typeof payload !== 'object') return;
+        const now = Date.now();
+        // A persisted marker exists only because pass 1 applied the size but
+        // the fill history had NOT been processed when the snapshot was
+        // written. Freshen its clock on restore: the 5-minute TTL then covers
+        // the post-restart replay window instead of rejecting evidence simply
+        // because the process was down longer than the live TTL.
+        for (const [id, raw] of Object.entries(payload as Record<string, unknown>)) {
+            const entry = raw as { filledInt?: unknown; at?: unknown } | null;
+            const filledInt = Math.round(Number(entry?.filledInt));
+            const at = Number(entry?.at);
+            if (!id || !Number.isFinite(filledInt) || filledInt <= 0 || !Number.isFinite(at)) continue;
+            if (this._chainSizeAppliedFills.has(id)) continue;
+            this._chainSizeAppliedFills.set(id, { filledInt, at: now });
+        }
+    }
+
+    /** Snapshot the live pass-1 markers for persistence (empty when none). */
+    snapshotChainSizeAppliedFills(): Record<string, { filledInt: number; at: number }> {
+        const out: Record<string, { filledInt: number; at: number }> = {};
+        if (!(this._chainSizeAppliedFills instanceof Map)) return out;
+        const now = Date.now();
+        const ttl = Number(TIMING.CHAIN_SIZE_APPLIED_MARKER_TTL_MS) > 0
+            ? Number(TIMING.CHAIN_SIZE_APPLIED_MARKER_TTL_MS)
+            : 5 * 60 * 1000;
+        for (const [id, entry] of this._chainSizeAppliedFills) {
+            const filledInt = Math.round(Number(entry?.filledInt));
+            const at = Number(entry?.at);
+            if (!id || !Number.isFinite(filledInt) || filledInt <= 0 || !Number.isFinite(at)) continue;
+            if (now - at > ttl) continue;
+            out[id] = { filledInt, at };
+        }
+        return out;
     }
 
     /**
@@ -1134,6 +1224,31 @@ class OrderManager implements OrderManagerLike {
             // every waiter to abandon its batch instead of broadcasting.
             this._placementLock.forceRelease();
         }
+    }
+
+    /**
+     * Auto-clears a stale placement region after
+     * TIMING.PLACEMENT_STALE_CLEAR_MS so a hung chain call / missed release
+     * cannot park fills and rebalances forever. There is no refcount to
+     * cross-check here (the lease IS the authority), so the bound is generous
+     * and the release is loud. The holder's lease becomes a no-op on release
+     * (token guard), so a late finally cannot release a successor.
+     * @param {number} [maxAgeMs] - Override for tests
+     * @returns {boolean} true when a stale region was force-released
+     */
+    _clearStalePlacementRegion(maxAgeMs: number = TIMING.PLACEMENT_STALE_CLEAR_MS): boolean {
+        if (!this.isPlacementActive()) return false;
+        const heldMs = this.placementHeldForMs();
+        const limit = Number(maxAgeMs) > 0 ? Number(maxAgeMs) : TIMING.PLACEMENT_STALE_CLEAR_MS;
+        if (heldMs <= limit) return false;
+        const kind = this.placementKind() || 'unknown';
+        this.logger?.log?.(
+            `[PLACEMENT] Force-releasing stale placement region held by ${kind} for ${Math.round(heldMs / 1000)}s ` +
+            `(watchdog ${Math.round(limit / 1000)}s); fills/rebalances must not stay parked`,
+            'error'
+        );
+        this._placementLock.forceRelease();
+        return true;
     }
 
     /**

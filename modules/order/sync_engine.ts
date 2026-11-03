@@ -243,9 +243,14 @@ interface FillTransitionParams {
      */
     fillPrice?: number | null;
     /**
-     * True when sync pass 1 already applied this fill's chain-size delta. The
-     * transition must then use the observed chain size directly instead of
-     * subtracting the fill again (double shrink + double credit incident).
+     * Base-amount units of this fill already reflected in the chain snapshot
+     * by sync pass 1. The transition subtracts only `filledAmountInt -
+     * alreadyAppliedInt`; a partial value handles split/aggregated fills.
+     */
+    alreadyAppliedInt?: number;
+    /**
+     * Backward-compatible boolean form: true means the whole fill was already
+     * applied (equivalent to alreadyAppliedInt = filledAmountInt).
      */
     alreadyAppliedChainSize?: boolean;
 }
@@ -1381,6 +1386,13 @@ class SyncEngine {
                             // (or credit) it a second time.
                             (mgr as unknown as { noteChainSizeAppliedFill?: (id: string, filledInt: number) => void })
                                 .noteChainSizeAppliedFill?.(String(gridOrder.orderId), currentSizeInt - chainSizeInt);
+                            // The marker is persisted with the grid snapshot
+                            // (debugInputs). Force the snapshot dirty AFTER
+                            // recording it: a flush already queued by
+                            // _applyOrderUpdate may have captured the grid
+                            // without the marker, and a crash in that window
+                            // would replay the fill as a second shrink.
+                            mgr._markGridDirty?.();
                         }
                     } else {
                         const spreadOrder = convertToSpreadPlaceholder(gridOrder);
@@ -1753,14 +1765,24 @@ class SyncEngine {
         const currentSizeInt = Number.isFinite(effectiveRawForSale)
             ? Math.max(0, Math.round(effectiveRawForSale))
             : currentSizeIntFromGrid;
-        const newSizeInt = params.alreadyAppliedChainSize
-            // Pass 1 already resized the slot from this chain snapshot. The
-            // snapshot is post-fill, so the observed for_sale IS the remaining
-            // size; subtracting filledAmount again would remove the fill twice.
-            ? (Number.isFinite(effectiveRawForSale)
-                ? Math.max(0, Math.min(currentSizeInt, Math.round(effectiveRawForSale)))
-                : currentSizeIntFromGrid)
-            : Math.max(0, currentSizeInt - filledAmountInt);
+        // `rawOnChain.for_sale` may already include the part of this fill that
+        // sync pass 1 absorbed. Subtract only the NOT-yet-applied remainder;
+        // subtracting the whole fill (or none of it) is the double-shrink /
+        // growth pair from the 2026-11-03 incident. Both forms are supported:
+        // the explicit applied amount (partial coverage) and the legacy boolean.
+        const explicitApplied = Number.isFinite(Number(params.alreadyAppliedInt))
+            ? Math.round(Number(params.alreadyAppliedInt))
+            : 0;
+        // The legacy boolean is a FLOOR: a caller/fillOp that only carries
+        // `alreadyAppliedChainSize` (no explicit amount) still skips the whole
+        // fill. Production sets both together, so this is compatibility only.
+        const appliedFromBoolean = params.alreadyAppliedChainSize ? filledAmountInt : 0;
+        const appliedInt = Math.max(0, Math.min(
+            filledAmountInt,
+            Math.max(explicitApplied, appliedFromBoolean)
+        ));
+        const remainingFillInt = Math.max(0, filledAmountInt - appliedInt);
+        const newSizeInt = Math.max(0, currentSizeInt - remainingFillInt);
         const newSize = blockchainToFloat(newSizeInt, precision);
 
         if (Number.isFinite(effectiveRawForSale) && currentSizeInt !== currentSizeIntFromGrid) {
@@ -1772,7 +1794,7 @@ class SyncEngine {
         }
 
         const gridAlsoEmpty = currentSizeIntFromGrid <= 0;
-        let isEffectivelyFull = resolvedChainConfirmsEmpty || gridAlsoEmpty;
+        let isEffectivelyFull = resolvedChainConfirmsEmpty || gridAlsoEmpty || newSizeInt <= 0;
 
         // If the chain retains a real residual order after this fill, the bot
         // must cancel it explicitly. The chain only auto-culls ("culls small")
@@ -1881,14 +1903,10 @@ class SyncEngine {
             let updatedOrder: ManagedOrder = { ...matchedWithoutDeferredFee, type: orderType, state: ORDER_STATES.PARTIAL };
 
             if (updatedOrder.rawOnChain && updatedOrder.rawOnChain.for_sale !== undefined) {
-                const baselineForSale = (chainRefetched && Number.isFinite(effectiveRawForSale))
-                    ? effectiveRawForSale
-                    : toFiniteNumber(updatedOrder.rawOnChain.for_sale);
-                // When pass 1 already applied this fill, the snapshot's for_sale
-                // is post-fill; do NOT subtract the fill from it a second time.
-                const nextForSaleInt = params.alreadyAppliedChainSize
-                    ? newSizeInt
-                    : Math.max(0, Math.round(baselineForSale) - filledAmountInt);
+                // The snapshot's for_sale is the authoritative remaining size
+                // after the not-yet-applied portion was subtracted above; it is
+                // never decremented a second time.
+                const nextForSaleInt = newSizeInt;
                 updatedOrder.rawOnChain = {
                     ...updatedOrder.rawOnChain,
                     for_sale: String(nextForSaleInt),
@@ -2048,6 +2066,7 @@ class SyncEngine {
                         historyId,
                         isMaker,
                         fillPrice: ctx.fillPrice,
+                        alreadyAppliedInt: Math.max(0, Math.round(Number((fillOp as unknown as { __chainSizeAppliedInt?: number }).__chainSizeAppliedInt) || 0)),
                         alreadyAppliedChainSize: Boolean((fillOp as unknown as { __chainSizeAlreadyApplied?: boolean }).__chainSizeAlreadyApplied)
                     });
 
@@ -2332,8 +2351,10 @@ class SyncEngine {
                         // Sum the integer filled amounts across this order's fills so
                         // the single transition reflects the total consumption.
                         let totalFilledAmountInt = 0;
+                        let totalAppliedInt = 0;
                         for (const ctx of group) {
                             totalFilledAmountInt += ctx.filledAmountInt;
+                            totalAppliedInt += Math.max(0, Math.round(Number((ctx.entry.fillOp as unknown as { __chainSizeAppliedInt?: number }).__chainSizeAppliedInt) || 0));
                         }
                         const totalFilledAmount = blockchainToFloat(totalFilledAmountInt, precision);
 
@@ -2364,6 +2385,7 @@ class SyncEngine {
                             historyId: lastCtx.entry.historyId,
                             isMaker: lastCtx.entry.isMaker,
                             fillPrice: lastCtx.fillPrice,
+                            alreadyAppliedInt: Math.min(totalFilledAmountInt, Math.max(0, totalAppliedInt)),
                             alreadyAppliedChainSize: Boolean((lastCtx.entry.fillOp as unknown as { __chainSizeAlreadyApplied?: boolean }).__chainSizeAlreadyApplied)
                         });
 

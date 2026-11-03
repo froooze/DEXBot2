@@ -278,52 +278,78 @@ export async function reconcileGridOrders({
         return null;
     }
 
-    const parsedChain: ParsedChainEntry[] = (chainOpenOrders || [])
-        .map((co) => ({ chain: co, parsed: parseChainOrder(co, manager.assets) }))
-        .filter((x): x is ParsedChainEntry => x.parsed !== null);
-
-    const activeCfg = (config && config.coreOrders) ? config.coreOrders : {};
-    let targetBuy = Math.max(0, Number.isFinite(Number(activeCfg.buy)) ? Number(activeCfg.buy) : 1)
-        + resolveEdgeCount(config, 'buy');
-    let targetSell = Math.max(0, Number.isFinite(Number(activeCfg.sell)) ? Number(activeCfg.sell) : 1)
-        + resolveEdgeCount(config, 'sell');
-
-    const chainBuys = parsedChain.filter((x) => x.parsed.type === ORDER_TYPES.BUY).map((x) => x.chain);
-    const chainSells = parsedChain.filter((x) => x.parsed.type === ORDER_TYPES.SELL).map((x) => x.chain);
-
-    // PHASE 1: In-memory reconciliation under lock — pure planning, no blockchain I/O.
-    // All cancellations are collected into plannedCancels and executed in Phase 2.
-    // This keeps the lock hierarchy clean (no _gridLock held across sync calls).
-    // Acquire the exclusive placement region BEFORE Phase 1: Phase 1 is not
-    // read-only (phantom cleanup, revive, adoption) and its decisions must not
-    // interleave with a COW/drain that mutates the same chain levels. Held
-    // across Phase 1 + Phase 2 and released after stopBroadcasting in the
-    // finally below (canonical order: start region -> placement -> work ->
-    // stop region -> release placement).
+    // PHASE 1: In-memory reconciliation under lock — planning runs with no
+    // blockchain I/O INSIDE the lock. All cancellations are collected into
+    // plannedCancels and executed in Phase 2. This keeps the lock hierarchy
+    // clean (no _gridLock held across sync calls).
+    //
+    // The exclusive placement region is acquired BEFORE the chain snapshot is
+    // used: the caller read the chain before this call, and waiting up to 120s
+    // for placement lets another path broadcast in between. Planning from that
+    // stale view is the duplicate-class race. After the acquire we re-read the
+    // chain (guarded: non-truncated, non-empty) so Phase 1/2 work from a
+    // snapshot no older than the region. Held across Phase 1 + Phase 2 and
+    // released after stopBroadcasting in the finally below.
     let placementLease: PlacementLease | null = options.placementLease ?? null;
     const ownsPlacementLease = !placementLease;
-    if (!placementLease && typeof manager.acquirePlacement === 'function') {
-        placementLease = await manager.acquirePlacement('startup-reconcile', { timeoutMs: 120000 });
-        if (!placementLease) {
-            logger?.log?.(
-                'Startup reconcile: exclusive placement region unavailable (timeout/shutdown); deferring to the next sync cycle.',
-                'warn'
-            );
-            return null;
-        }
-    }
-    const regionStarted = typeof manager.startBroadcasting === 'function';
+    let regionStarted = false;
     const releaseRegion = () => {
         if (regionStarted) manager.stopBroadcasting?.();
         if (ownsPlacementLease) placementLease?.release();
         placementLease = null;
     };
 
+    let chainSnapshot: ChainOrder[] = Array.isArray(chainOpenOrders) ? chainOpenOrders : [];
+    const activeCfg = (config && config.coreOrders) ? config.coreOrders : {};
+    let targetBuy = Math.max(0, Number.isFinite(Number(activeCfg.buy)) ? Number(activeCfg.buy) : 1)
+        + resolveEdgeCount(config, 'buy');
+    let targetSell = Math.max(0, Number.isFinite(Number(activeCfg.sell)) ? Number(activeCfg.sell) : 1)
+        + resolveEdgeCount(config, 'sell');
     let phase1Result;
     try {
-        // Start the broadcast region INSIDE the try: if it throws, the catch
-        // below releases the placement lease (finding: acquire outside try
-        // leaked the lease when startBroadcasting failed).
+        if (!placementLease && typeof manager.acquirePlacement === 'function') {
+            placementLease = await manager.acquirePlacement('startup-reconcile', { timeoutMs: 120000 });
+            if (!placementLease) {
+                logger?.log?.(
+                    'Startup reconcile: exclusive placement region unavailable (timeout/shutdown); deferring to the next sync cycle.',
+                    'warn'
+                );
+                return null;
+            }
+        }
+        try {
+            const refreshed = await readOpenOrdersGuarded(chainOrders, account, {
+                log: (msg: string, level?: string) => logger?.log?.(msg, level),
+                label: 'STARTUP-RECONCILE',
+                detail: 'post-placement refresh',
+                deferEmpty: true,
+            });
+            if (Array.isArray(refreshed) && refreshed.length > 0) {
+                chainSnapshot = refreshed;
+                logger?.log?.(
+                    `Startup reconcile: refreshed ${chainSnapshot.length} open order(s) after acquiring placement`,
+                    'debug'
+                );
+            }
+        } catch (readErr) {
+            // Keep the caller's snapshot; the Phase 2 re-checks still guard the
+            // destructive decisions.
+            logger?.log?.(
+                `Startup reconcile: post-acquire open-orders refresh failed (${getErrorMessage(readErr)}); using caller snapshot`,
+                'warn'
+            );
+        }
+
+        const parsedChain: ParsedChainEntry[] = chainSnapshot
+            .map((co) => ({ chain: co, parsed: parseChainOrder(co, manager.assets) }))
+            .filter((x): x is ParsedChainEntry => x.parsed !== null);
+
+        const chainBuys = parsedChain.filter((x) => x.parsed.type === ORDER_TYPES.BUY).map((x) => x.chain);
+        const chainSells = parsedChain.filter((x) => x.parsed.type === ORDER_TYPES.SELL).map((x) => x.chain);
+
+        // Start the broadcast region INSIDE the try so a throw releases the
+        // placement lease in the catch below.
+        regionStarted = typeof manager.startBroadcasting === 'function';
         if (regionStarted) manager.startBroadcasting?.();
         phase1Result = await manager._gridLock.acquire(async () => {
         if (typeof manager._applyOrderUpdate !== 'function') {
@@ -331,9 +357,9 @@ export async function reconcileGridOrders({
         }
         const applyUpdate = manager._applyOrderUpdate.bind(manager);
 
-        const chainIds = new Set<string>((Array.isArray(chainOpenOrders) ? chainOpenOrders : []).map(o => o?.id).filter((id): id is string => Boolean(id)));
+        const chainIds = new Set<string>((Array.isArray(chainSnapshot) ? chainSnapshot : []).map(o => o?.id).filter((id): id is string => Boolean(id)));
         const chainOrderById = new Map<string, ChainOrder>();
-        for (const raw of (Array.isArray(chainOpenOrders) ? chainOpenOrders : [])) {
+        for (const raw of (Array.isArray(chainSnapshot) ? chainSnapshot : [])) {
             if (raw?.id) chainOrderById.set(String(raw.id), raw);
         }
         for (const order of manager.orders.values()) {
@@ -399,7 +425,7 @@ export async function reconcileGridOrders({
             }
         }
 
-        const unmatchedChain = (Array.isArray(chainOpenOrders) ? chainOpenOrders : []).filter((co) => co && !matchedChainOrderIds.has(co.id));
+        const unmatchedChain = (Array.isArray(chainSnapshot) ? chainSnapshot : []).filter((co) => co && !matchedChainOrderIds.has(co.id));
         let unmatchedParsed: ParsedChainEntry[] = unmatchedChain
             .map((co) => ({ chain: co, parsed: parseChainOrder(co, manager.assets) }))
             .filter((x): x is ParsedChainEntry => x.parsed !== null);
@@ -553,7 +579,7 @@ export async function reconcileGridOrders({
             for (const cancelPlan of plannedCancels) {
                 if (cancelPlan?.chainOrderId) phase2CancellationPlanIds.add(String(cancelPlan.chainOrderId));
             }
-            const initialChainSignature = _startupChainSnapshotSignature(chainOpenOrders || [], manager);
+            const initialChainSignature = _startupChainSnapshotSignature(chainSnapshot || [], manager);
             let currentChainSignature: Map<string, string> | null = null;
             try {
                 const currentChainOrders = await readOpenOrdersGuarded(chainOrders, account, {

@@ -596,17 +596,26 @@ function shouldDeferFillForBroadcast(bot: BotLike, nowMs?: number): { defer: boo
     const now = Number.isFinite(Number(nowMs)) ? Number(nowMs) : Date.now();
     let active = false;
     let regionStartedAt = 0;
+    let viaPlacement = false;
     try {
-        active = bot?.manager?.isBroadcastingActive?.() === true;
-        if (active) {
+        const broadcastingActive = bot?.manager?.isBroadcastingActive?.() === true;
+        const placementActive = bot?.manager?.isPlacementActive?.() === true;
+        // Placement is the authoritative mutex AND the lease that owns the
+        // region's lifetime. A reconcile/COW holds BOTH (startBroadcasting is
+        // called inside the placement region), so `viaPlacement` must win even
+        // when the broadcast refcount is also active: only the placement
+        // watchdog can end a legitimate 8-minute reconcile, and the broadcast
+        // deferral bound (150s) would otherwise drop fills into the region.
+        active = broadcastingActive || placementActive;
+        viaPlacement = placementActive;
+        if (broadcastingActive) {
             regionStartedAt = Number(bot?.manager?._broadcastingStartedAt) || 0;
-        } else if (bot?.manager?.isPlacementActive?.() === true) {
+        } else if (placementActive) {
             // Placement is the authoritative mutex; the broadcast refcount is
             // only advisory. A correction drain / reconcile Phase 2 / dust
             // cancel holds placement WITHOUT startBroadcasting(), so gating on
             // the refcount alone lets fills book accounting while that path
             // broadcasts. Treat the placement hold as a live region.
-            active = true;
             const heldMs = Number(bot?.manager?.placementHeldForMs?.()) || 0;
             // Round to a second: placementHeldForMs() grows between calls, and
             // raw millisecond jitter would look like an advancing region and
@@ -631,9 +640,23 @@ function shouldDeferFillForBroadcast(bot: BotLike, nowMs?: number): { defer: boo
         bot._fillBroadcastDeferRegionAt = regionStartedAt;
         bot._fillBroadcastDeferSince = now;
     }
-    const deferMaxMs = Number(TIMING?.FILL_BROADCAST_DEFER_MAX_MS) > 0
-        ? Number(TIMING.FILL_BROADCAST_DEFER_MAX_MS)
-        : 60000;
+    // Placement holds are cleared by the placement watchdog
+    // (_clearStalePlacementRegion), NOT by falling through into a broadcast:
+    // a legitimate long reconcile (the 2026-11 live run had ~8-minute
+    // windows) must keep fills deferred, while a leaked lease is force-
+    // released by the watchdog this consumer invokes. The fallback bound here
+    // is therefore only a last-resort valve sized past that watchdog.
+    const placementStaleMs = Number(TIMING?.PLACEMENT_STALE_CLEAR_MS) > 0
+        ? Number(TIMING.PLACEMENT_STALE_CLEAR_MS)
+        : 15 * 60 * 1000;
+    const placementSafetyMs = Number(TIMING?.BROADCAST_DEFER_SAFETY_MARGIN_MS) > 0
+        ? Number(TIMING.BROADCAST_DEFER_SAFETY_MARGIN_MS)
+        : 30000;
+    const deferMaxMs = viaPlacement
+        ? placementStaleMs + placementSafetyMs
+        : (Number(TIMING?.FILL_BROADCAST_DEFER_MAX_MS) > 0
+            ? Number(TIMING.FILL_BROADCAST_DEFER_MAX_MS)
+            : 60000);
     const since = Number(bot?._fillBroadcastDeferSince) || 0;
     if (!since) bot._fillBroadcastDeferSince = now;
     if (since && (now - since) >= deferMaxMs) {
@@ -1090,6 +1113,12 @@ async function consumeFillQueue(bot: BotLike, chainOrders: ChainOrdersLike) {
     try {
         if (typeof bot.manager?._clearStaleBroadcastFlag === 'function') {
             bot.manager._clearStaleBroadcastFlag();
+        }
+        // Placement watchdog: a leaked/hung lease parks this queue; the
+        // consumer is the one place guaranteed to run while the queue is
+        // non-empty (maintenance may be idle-gated by the same queue).
+        if (typeof bot.manager?._clearStalePlacementRegion === 'function') {
+            bot.manager._clearStalePlacementRegion();
         }
     } catch { /* watchdog must never break fill consumption */ }
 

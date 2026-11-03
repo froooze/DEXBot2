@@ -344,6 +344,21 @@ let TIMING = {
     BATCH_INFLIGHT_STALE_MS: 10 * 60 * 1000,
     RECOVERY_INFLIGHT_STALE_MS: 10 * 60 * 1000,
 
+    // PLACEMENT_STALE_CLEAR_MS: a placement lease (COW / reconcile / drain)
+    // has no natural deadline — a hung chain call or a missed release can hold
+    // the exclusive region forever. Fills and rebalances defer while it is
+    // held, so the watchdog force-releases a region held far longer than any
+    // legitimate path. Sized above the longest observed reconcile (~8 min) and
+    // the COW batch ceiling; unlike the broadcast refcount there is no
+    // "re-arm on progress" signal, so err generous.
+    PLACEMENT_STALE_CLEAR_MS: 15 * 60 * 1000,
+
+    // CHAIN_SIZE_APPLIED_MARKER_TTL_MS: a sync-pass-1 "size already applied"
+    // marker is only meaningful until the matching fill history arrives. Stale
+    // markers are ignored/dropped so they cannot suppress an unrelated later
+    // fill of the same order.
+    CHAIN_SIZE_APPLIED_MARKER_TTL_MS: 5 * 60 * 1000,
+
     // STRUCTURAL_REBUILD_DEFER_MAX_MS: fill-driven rebalances defer while a
     // structural rebuild runs. A hung rebuild (e.g. a 10-minute reconcile) must
     // not defer them silently for its whole duration: after this bound, log at

@@ -1095,6 +1095,14 @@ export async function persistGridSnapshot(manager: OrderManagerLike, accountOrde
         // Bot-scoped market-fill reference: survives grid regeneration, used
         // by spread correction as the price it must not trade through.
         const lastMarketFill = buildLastMarketFillPayload(manager);
+        // Restart durability for the pass-1 "size already applied" markers.
+        // They live on the manager only, so a crash between pass 1 and the
+        // fill-history batch would lose the evidence and replay the fill as a
+        // second shrink. Persisted in the existing free-form debugInputs blob
+        // (no schema change to the order rows).
+        const chainSizeAppliedFills = typeof manager.snapshotChainSizeAppliedFills === 'function'
+            ? manager.snapshotChainSizeAppliedFills()
+            : undefined;
         await accountOrders.storeMasterGrid(
             orders,
             btsFeesOwed,
@@ -1104,7 +1112,8 @@ export async function persistGridSnapshot(manager: OrderManagerLike, accountOrde
                 persistedAt: nowIso(),
                 config: debugConfig,
                 accountTotals,
-                btsBalance
+                btsBalance,
+                ...(chainSizeAppliedFills !== undefined ? { chainSizeAppliedFills } : {})
             },
             fillKeys,
             genesis,

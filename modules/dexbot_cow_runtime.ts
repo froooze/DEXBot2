@@ -313,15 +313,33 @@ function getPendingBroadcasts(bot: BotLike): PendingEntry[] {
         ? Number(TIMING.PENDING_BROADCAST_TTL_MS)
         : 30 * 60 * 1000;
     const now = Date.now();
+    // "Caught-up" evidence: a successful open-orders sync completed AFTER the
+    // entry was recorded means a later chain read (the pre-broadcast guard)
+    // can be trusted to see a landed CREATE. Without that evidence, age alone
+    // is not enough — a lagging node can still miss the order, and dropping
+    // the entry would re-open the duplicate window. The 2x hard cap keeps a
+    // permanently lagging node from parking CREATEs forever (the 2026-11-03
+    // backlog), at the cost of relying on the chain re-read.
+    const lastSyncAt = Number(bot.manager?._lastSyncAt) || 0;
     for (const [fp, entry] of map) {
         const at = Number((entry as PendingEntry)?.recordedAt) || 0;
-        if (at > 0 && now - at > ttl) {
-            map.delete(fp);
+        if (!(at > 0)) continue;
+        const age = now - at;
+        if (age <= ttl) continue;
+        const syncedSinceRecord = lastSyncAt > at;
+        if (!syncedSinceRecord && age <= ttl * 2) {
             bot.manager.logger?.log?.(
-                `[COW] Dropped expired pending-broadcast entry ${String(fp)} (slot ${(entry as PendingEntry)?.slotId ?? '?'}, age ${Math.round((now - at) / 1000)}s)`,
+                `[COW] Pending-broadcast entry ${String(fp)} is ${Math.round(age / 1000)}s old but no sync has completed since it was recorded; keeping it (fail-closed) until a caught-up read`,
                 'debug'
             );
+            continue;
         }
+        map.delete(fp);
+        bot.manager.logger?.log?.(
+            `[COW] Dropped expired pending-broadcast entry ${String(fp)} (slot ${(entry as PendingEntry)?.slotId ?? '?'}, age ${Math.round(age / 1000)}s, ` +
+            `${syncedSinceRecord ? 'sync completed since record' : 'hard TTL cap'})`,
+            'warn'
+        );
     }
     return Array.from(map.values()) as PendingEntry[];
 }
@@ -4214,6 +4232,30 @@ async function updateOrdersOnChainBatchCOWBody(
         return { executed: false, aborted: true, reason: 'PLACEMENT_REGION_UNAVAILABLE', hadRotation: false };
     }
 
+    // Everything after a successful claim runs INSIDE this try/finally: the
+    // placement lease is released on every exit, including a throw from the
+    // pre-broadcast drain/guards. An acquire outside the try leaked the lease
+    // on any throw, and a leaked lease parks the fill queue (placement-aware
+    // deferral) while the broadcast watchdog refuses to clear it.
+    const operations: unknown[] = [];
+    const opContexts: OpPhase[] = [];
+    const idsToLock = new Set();
+    for (const action of actions) {
+        if (action.type === COW_ACTIONS.CANCEL && action.orderId) {
+            idsToLock.add(action.orderId);
+            if (action.id) idsToLock.add(action.id);
+        } else if (action.type === COW_ACTIONS.CREATE && action.id) {
+            idsToLock.add(action.id);
+        } else if (action.type === COW_ACTIONS.UPDATE && action.orderId) {
+            idsToLock.add(action.orderId);
+            if (action.id) idsToLock.add(action.id);
+        }
+    }
+    let heldBroadcastSlot = false;
+    let batchInFlightRaised = false;
+    let ordersLocked = false;
+    try {
+
     // Single-flight COW broadcast guard (entry check): never broadcast two
     // batches concurrently. Overlapping broadcasts plan from the same base
     // grid version; when the first commits it bumps _gridVersion, so the
@@ -4282,8 +4324,6 @@ async function updateOrdersOnChainBatchCOWBody(
     const { crossingCandidates = [], intraBatchCandidates = [] } = guards;
 
     const { assetA, assetB } = bot.manager.assets;
-    const operations: unknown[] = [];
-    const opContexts: OpPhase[] = [];
     const skippedUpdateSlotIds = new Set();
     let skippedUpdateCount = 0;
     // Guard-skipped CREATE slot ids (hole-refills never placed). Fed to the
@@ -4322,20 +4362,8 @@ async function updateOrdersOnChainBatchCOWBody(
     // chunk, applied sequentially) before the crossing order lands.
     const cancelOpIndexByOrderId = new Map<string, number>();
 
-    const idsToLock = new Set();
-    for (const action of actions) {
-        if (action.type === COW_ACTIONS.CANCEL && action.orderId) {
-            idsToLock.add(action.orderId);
-            if (action.id) idsToLock.add(action.id);
-        } else if (action.type === COW_ACTIONS.CREATE && action.id) {
-            idsToLock.add(action.id);
-        } else if (action.type === COW_ACTIONS.UPDATE && action.orderId) {
-            idsToLock.add(action.orderId);
-            if (action.id) idsToLock.add(action.id);
-        }
-    }
-
     bot.manager.lockOrders(idsToLock);
+    ordersLocked = true;
 
     // Ownership of the single-flight broadcast slot for THIS frame. Only the
     // frame that claimed the slot (set bot._cowBroadcastInFlight = true below)
@@ -4344,19 +4372,18 @@ async function updateOrdersOnChainBatchCOWBody(
     // throw) never owns the slot and MUST NOT clear it — an unconditional clear
     // would wipe a concurrent batch's in-flight flag and let a third batch
     // broadcast on top of it (the exact overlap this guard prevents).
-    let heldBroadcastSlot = false;
 
     // Exclusive placement region is claimed at the top of the body (before the
     // pre-batch drain). `heldBroadcastSlot` only serializes COW batches; the
     // placement lease serializes EVERY chain-mutating path. Both are released
     // on every exit; the re-plan recursion inherits the lease.
 
-    try {
-        bot._batchInFlight++;
-        (bot as unknown as { _batchInFlightStartedAt?: number })._batchInFlightStartedAt = Date.now();
-        bot._markGridActivity('batch start');
-        bot.manager._setRebalanceState(REBALANCE_STATES.BROADCASTING);
-        bot.manager.startBroadcasting();
+    bot._batchInFlight++;
+    batchInFlightRaised = true;
+    (bot as unknown as { _batchInFlightStartedAt?: number })._batchInFlightStartedAt = Date.now();
+    bot._markGridActivity('batch start');
+    bot.manager._setRebalanceState(REBALANCE_STATES.BROADCASTING);
+    bot.manager.startBroadcasting();
 
         // P3 — freeze the guard pivot once per batch: per-action refreshes
         // mutated the pivot mid-batch (02:03 pivots drifted 0.001523→0.001529
@@ -5695,7 +5722,7 @@ async function updateOrdersOnChainBatchCOWBody(
         // and we can commit the working grid directly, bypassing the expensive
         // reconciliation state machine. This handles the ~90% case where the
         // chain accepted the transaction but the response was lost.
-        if (err instanceof BroadcastUncertainError && getErrorField<boolean>(err, 'partialOnChainState') !== true) {
+        if (err instanceof BroadcastUncertainError && heldBroadcastSlot && getErrorField<boolean>(err, 'partialOnChainState') !== true) {
             try {
                 const confirmation = await pollChainForConfirmation(bot, opContexts);
                 if (confirmation.allConfirmed) {
@@ -5820,14 +5847,16 @@ async function updateOrdersOnChainBatchCOWBody(
 
         throw err;
     } finally {
-        bot._batchInFlight = Math.max(0, bot._batchInFlight - 1);
-        if (bot._batchInFlight === 0) {
-            (bot as unknown as { _batchInFlightStartedAt?: number })._batchInFlightStartedAt = 0;
+        if (batchInFlightRaised) {
+            bot._batchInFlight = Math.max(0, bot._batchInFlight - 1);
+            if (bot._batchInFlight === 0) {
+                (bot as unknown as { _batchInFlightStartedAt?: number })._batchInFlightStartedAt = 0;
+            }
         }
         if (heldBroadcastSlot) bot._cowBroadcastInFlight = false;
         releasePlacement();
-        bot._markGridActivity('batch end');
-        bot.manager.unlockOrders(idsToLock);
+        if (batchInFlightRaised) bot._markGridActivity('batch end');
+        if (ordersLocked) bot.manager.unlockOrders(idsToLock);
 
         if (!bot._shuttingDown && bot._incomingFillQueue.length > 0) {
             bot._scheduleFillConsumerRestart(chainOrders);

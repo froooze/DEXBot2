@@ -1212,9 +1212,11 @@ class DEXBot implements BotLike {
         // One absolute boundary re-anchor per drained fill batch: each fill
         // event re-anchoring + a fresh COW plan amplified churn (6 re-anchors
         // in ~1 min). The crawl still runs per chunk; the absolute anchor is
-        // the expensive geometry jump and only the first plan in the batch
-        // needs it.
-        (this.manager as unknown as { _boundaryReanchorAllowed?: boolean })._boundaryReanchorAllowed = true;
+        // the expensive geometry jump. A BUDGET (not a boolean) is nest-safe:
+        // a nested/overlapping fill cycle restores the outer budget instead of
+        // silently re-enabling multiple anchors.
+        const prevReanchorBudget = (this.manager as unknown as { _boundaryReanchorBudget?: number })._boundaryReanchorBudget;
+        (this.manager as unknown as { _boundaryReanchorBudget?: number })._boundaryReanchorBudget = 1;
         let anyDeferred = false;
         try {
             const activeSell = this.manager?.config?.coreOrders?.sell ?? 1;
@@ -1292,7 +1294,11 @@ class DEXBot implements BotLike {
             if (this.manager) {
                 delete this.manager._boundaryShiftBudget;
                 delete this.manager._boundaryShiftBudgetBase;
-                (this.manager as unknown as { _boundaryReanchorAllowed?: boolean })._boundaryReanchorAllowed = undefined;
+                if (prevReanchorBudget === undefined) {
+                    delete (this.manager as unknown as { _boundaryReanchorBudget?: number })._boundaryReanchorBudget;
+                } else {
+                    (this.manager as unknown as { _boundaryReanchorBudget?: number })._boundaryReanchorBudget = prevReanchorBudget;
+                }
             }
             if (typeof this.manager?.resumeFundRecalc === 'function') {
                 await this.manager.resumeFundRecalc();

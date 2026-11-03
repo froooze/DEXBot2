@@ -63,7 +63,15 @@ export async function withPlacement<T>(
     fn: (lease: PlacementLease) => Promise<T>,
     options: PlacementAcquireOptions & { lease?: PlacementLease | null } = {}
 ): Promise<T | null> {
-    if (options.lease) return await fn(options.lease);
+    if (options.lease) {
+        // A nested caller may pass the lease it already holds. If the region is
+        // no longer active (stale lease after forceRelease / a missed release),
+        // do NOT run the mutation unprotected: fall through and acquire a
+        // fresh lease below.
+        const leaseStillLive = typeof manager?.isPlacementActive !== 'function'
+            || manager.isPlacementActive() === true;
+        if (leaseStillLive) return await fn(options.lease);
+    }
     if (!manager || typeof manager.acquirePlacement !== 'function') {
         return await fn(NOOP_PLACEMENT_LEASE);
     }
