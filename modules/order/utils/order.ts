@@ -31,7 +31,7 @@
  *   - buildCreateOrderArgs(order, assetA, assetB) - Build create order arguments
  *   - getOrderTypeFromUpdatedFlags(buyUpdated, sellUpdated) - Get type from update flags
  *   - resolveConfiguredPriceBound(value, fallback, startPrice, mode) - Resolve price bounds
- *   - buildFillKey(fillOrParts) - Build a stable fill dedupe key
+ *   - buildFillKey(fillOrParts) - Stable fill dedupe key (delegates to order/fill_ledger.ts)
  *   - buildCreateOpFingerprint(params) - Build fingerprint for create operations
  *
  * SECTION 4: STATE TRANSITIONS & PLACEHOLDERS (6 functions)
@@ -123,6 +123,7 @@ import { sleep } from './system.js';
 import { getErrorMessage, getErrorCode, getErrorName } from '../../utils/errors.js';
 import { hasGenesisLadder } from '../genesis_policy.js';
 import { parseSlotIndex } from './slot.js';
+import { fillKeyOf, resolveTradedSide } from '../fill_ledger.js';
 import { pendingBroadcastTtlMs } from '../lifecycle.js';
 import type { PlacementLease } from '../placement_lock.js';
 import type { OrderManagerLike, PendingPriceCorrection, ChainOrder, ParsedChainOrder, AssetPair, AssetInfo, OrderType, ManagedOrder, UnmatchedChainOrder, CowAction, ProjectedFunds } from '../../types.js';
@@ -631,17 +632,11 @@ function attributeUnmatchedFillToGrid(
         }
     }
 
-    // Side from the asset that was PAID: paying the quote (assetB) buys the
-    // base, paying the base sells it. Independent of any slot type. When the
-    // fill event carries no pays asset (malformed/degraded), fall back to the
-    // matched slot's rail type — the side must never be guessed from the price.
-    let type: string | null = null;
-    if (input.paysAssetId != null && input.paysAssetId === assets.assetB.id) type = ORDER_TYPES.BUY;
-    else if (input.paysAssetId != null && input.paysAssetId === assets.assetA.id) type = ORDER_TYPES.SELL;
-    if (type !== ORDER_TYPES.BUY && type !== ORDER_TYPES.SELL && slot
-        && (slot.type === ORDER_TYPES.BUY || slot.type === ORDER_TYPES.SELL)) {
-        type = slot.type;
-    }
+    // Side from the asset that was PAID (order/fill_ledger.ts): paying the
+    // quote buys the base, paying the base sells it. Independent of the slot
+    // type; a malformed fill with no pays asset falls back to the slot's type
+    // and the side is never guessed from the price.
+    const type = resolveTradedSide(input.paysAssetId, assets, slot?.type);
     if (type !== ORDER_TYPES.BUY && type !== ORDER_TYPES.SELL) return false;
 
     const execPrice = resolveExecutionPrice(
@@ -979,22 +974,18 @@ async function applyChainSizeToGridOrder(manager: OrderManagerLike, gridOrder: M
 }
 
 /**
- * Build a stable fill dedupe key.
- * Accepts either a fill-history entry or explicit parts.
- * Returns null if required fields are missing — callers should
- * skip dedup rather than operate on a degraded key.
+ * Build a stable fill dedupe key: `orderId:blockNum:historyId`.
+ *
+ * Delegates to `order/fill_ledger.ts` — the single owner of fill identity.
+ * Kept exported under this name because `dexbot_fill_runtime` resolves it
+ * through a lazy shim and the orphan path reuses it. Returns null when a
+ * required field is missing: callers skip dedup rather than operate on a
+ * degraded key.
  *
  * @param {Object} fillOrParts - Fill entry ({ op, block_num, id }) or { orderId, blockNum, historyId }
- * @returns {string|null} Stable key in order:block:history form, or null if fields are missing
+ * @returns {string|null} Stable key, or null if fields are missing
  */
-function buildFillKey(fillOrParts: { op?: unknown[]; orderId?: string; block_num?: number; blockNum?: number; id?: string; historyId?: string } | null | undefined) {
-    const fillOp = fillOrParts?.op?.[1] as { order_id?: string } | undefined;
-    const orderId = fillOp?.order_id ?? fillOrParts?.orderId;
-    const blockNum = fillOrParts?.block_num ?? fillOrParts?.blockNum;
-    const historyId = fillOrParts?.id ?? fillOrParts?.historyId;
-    if (!orderId || blockNum == null || !historyId) return null;
-    return `${orderId}:${blockNum}:${historyId}`;
-}
+const buildFillKey = fillKeyOf;
 
 function _currentCorrectionGridOrder(manager: OrderManagerLike, correctionInfo: PendingPriceCorrection): ManagedOrder | null {
     const slotId = correctionInfo?.gridOrder?.id;
@@ -2186,9 +2177,12 @@ function isCrossingCheckCandidate(o: CrossingCandidate | null | undefined, exclu
  * @param {Object} [options] - `now` clock override (tests)
  * @returns {Array} Live pending-broadcast entries
  */
-function getLivePendingBroadcasts(manager: OrderManagerLike | null | undefined, options: { now?: number } = {}): unknown[] {
+function getLivePendingBroadcasts(manager: OrderManagerLike | null | undefined, options: { now?: number; gc?: boolean } = {}): unknown[] {
     const map = (manager as unknown as { _pendingBroadcasts?: unknown } | null | undefined)?._pendingBroadcasts;
     if (!(map instanceof Map)) return [];
+    // READ-ONLY mode for predicates: the blocker resolver asks "is anything
+    // unresolved?" from a gate that must not mutate state or emit GC log lines.
+    const gc = options?.gc !== false;
     // Single definition of the TTL and its fixture fallback (lifecycle.ts).
     const ttl = pendingBroadcastTtlMs();
     const now = Number.isFinite(Number(options?.now)) ? Number(options.now) : Date.now();
@@ -2202,12 +2196,15 @@ function getLivePendingBroadcasts(manager: OrderManagerLike | null | undefined, 
         if (age <= ttl) continue;
         const syncedSinceRecord = lastSyncAt > recordedAt;
         if (!syncedSinceRecord && age <= ttl * 2) {
-            log?.(
-                `[COW] Pending-broadcast entry ${String(fingerprint)} is ${Math.round(age / 1000)}s old but no sync has completed since it was recorded; keeping it (fail-closed) until a caught-up read`,
-                'debug'
-            );
+            if (gc) {
+                log?.(
+                    `[COW] Pending-broadcast entry ${String(fingerprint)} is ${Math.round(age / 1000)}s old but no sync has completed since it was recorded; keeping it (fail-closed) until a caught-up read`,
+                    'debug'
+                );
+            }
             continue;
         }
+        if (!gc) continue;
         map.delete(fingerprint);
         // Abandoned, not resolved: the order may be live. Route through the
         // lifecycle so the slot records `unknown` instead of becoming a clean

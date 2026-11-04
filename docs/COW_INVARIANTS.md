@@ -221,6 +221,8 @@ not by the seven per-site structures that used to disagree
 - `INV-SYNC-008` SPREAD-typed fills resolve the real side
   - A SPREAD slot can carry an on-chain order (spread-correction activation). Fill processing must resolve the real BUY/SELL side (chain order type, pays asset, or price-vs-startPrice convention) before pushing the fill or computing the transition.
   - A SPREAD-typed fill would silently drop the `deriveTargetBoundary` shift and produce an illegal SPREAD+on-chain state rejected by `validateOrder`.
+  - The pays-asset mapping has ONE implementation (`order/fill_ledger.ts` `resolveTradedSide`, used by `_computeFillContext`, the unmatched-fill attribution and the queued pivot refresh). The SPREAD price fallback stays with the caller that owns the ladder (`resolveSpreadOrderSide`).
+  - `slot.type` is the ACCOUNTING side and is retagged to the traded side by a partial-fill transition (so `size` stays dimensionally consistent for `recalculateFunds`). It is NOT rail identity: a repair proof must also read the level's geometry (`geometryTypeForSlotIndex`), and a fill-retagged slot on the opposite rail is still wrong-side. See `docs/FILL_PIPELINE.md` INV-FILL-002/INV-FILL-006.
 
 ---
 
@@ -308,6 +310,8 @@ not by the seven per-site structures that used to disagree
 
 - `INV-RECON-006` Fresh-placement cancels are deferred for a grace window
   - A CANCEL action targeting an `orderId` placed within `TIMING.SURPLUS_CANCEL_GRACE_MS` (15 min) is deferred. The timestamp is written by the lifecycle write funnel (and by `recordOrderPlacement` for manager-shaped callers) into `manager._placedAt`, and tested by `isFreshlyPlacedOrder`.
+  - **Exemption (chain-observed wrong side).** A CANCEL for an order the correction queue holds as a chain-observed `typeMismatch` (`entry.typeMismatch === true` with a `chainOrderId`) is exempt: the chain already proved the side is wrong, so parking it adds a second 15-minute wait after the pre-batch drain deferred (active region) or failed. A plan-shaped CANCEL whose reason is `type-mismatch` is NOT exempt — it only proves master ≠ target, which is the stale-target lag this grace exists for. The exemption is a queue-provenance fact, not a grid blocker: see `docs/FILL_PIPELINE.md` INV-FILL-004.
+  - A queued `typeMismatch` entry stays valid while the level's stored type OR its rail geometry still disagrees with the chain side; a retagged `slot.type` alone is not a repair (INV-SYNC-008 / `docs/FILL_PIPELINE.md` INV-FILL-006).
   - `COWRebalanceEngine.execute` drops the whole slot's action group for a deferred cancel (dropping only the CANCEL would let a paired CREATE fold back into an UPDATE and re-materialize the placement), then re-syncs the deferred slots from master via `workingGrid.syncFromMaster` so the commit does not virtualize a still-live order.
   - Divergence correction (`applyGridDivergenceCorrections`) applies the same guard after dropping any queued committed-size UPDATE for the not-desired/size-0 slot.
   - `grid-load`/`grid-init` load contexts are excluded so restarts do not suppress the sweep.

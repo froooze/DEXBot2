@@ -9,7 +9,7 @@ import { lazyShim } from './lazy_shim.js';
 
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
-import { nowIso, fireStructuralResync, resolveLastFillGuardReference, hasUnsettledFills } from './order/utils/system.js';
+import { nowIso, fireStructuralResync, resolveLastFillGuardReference, hasUnsettledFills, resolveGridUpdateBlockers, noteGridUpdateBlockers } from './order/utils/system.js';
 import { withPlacement } from './order/placement_lock.js';
 import { path } from './path_api.js';
 import * as chainOrders from './chain_orders.js';
@@ -812,10 +812,34 @@ async function maybeRunTargetedDriftReconciliation(bot: BotLike, context: string
     // resolves against the crawled rail. No cooldown stamp, so the retry is
     // immediate once the fills settle.
     const unsettled = hasUnsettledFills(bot);
-    if (unsettled.unsettled) {
+    const gridBlockers = resolveGridUpdateBlockers(bot);
+    // Escalation: only an UNREADABLE pipeline state escalates, and only after
+    // GRID_BLOCKED_ESCALATE_CYCLES consecutive attempts. A busy pipeline is
+    // normal work; the placement/broadcast watchdogs own their own bounds.
+    const blockedGate = noteGridUpdateBlockers(bot, gridBlockers);
+    if (blockedGate.escalate) {
+        const codes = gridBlockers.map((b) => b.code).join(',');
         bot._log(
-            `[TARGETED-SYNC] Deferring ${context} reconciliation: ${unsettled.reason} — ` +
-            `the rail must absorb the fills before it is topped up`,
+            `[GRID-BLOCKED] ${blockedGate.cycles} consecutive blocked cycle(s) with unreadable pipeline state ` +
+            `(${codes}); requesting a structural resync`,
+            'error'
+        );
+        fireStructuralResync(
+            bot,
+            'grid update blocked by unreadable pipeline state',
+            { cycles: blockedGate.cycles, codes },
+            '[GRID-BLOCKED]'
+        );
+    }
+    if (gridBlockers.length > 0) {
+        // Any blocker defers the reconcile: it is a chain-mutating update, and
+        // mutating while a fill batch, a broadcast or a placement region is
+        // unresolved is what built the stale-master plans this gate exists for.
+        const codes = gridBlockers.map((b) => b.code).join(',');
+        const reason = unsettled.reason || gridBlockers[0].detail;
+        bot._log(
+            `[TARGETED-SYNC] Deferring ${context} reconciliation: ${reason} ` +
+            `[${codes}] — the rail must absorb the fills before it is topped up`,
             'debug'
         );
         return false;

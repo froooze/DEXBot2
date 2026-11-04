@@ -34,6 +34,7 @@ const { validateCreateTargetSlots, evaluateCommit, hasExecutableActions, stampGa
 import * as math from './order/utils/math.js';
 const { validateOrderSize, findCrossedOrder, sameGridLevel, isEvacuationRotationAllowed, isEvacuationSizeStillValid, getSellStartIdx, getPrecisionByOrderType, isSlotIndexInGapBand, getAssetFeesSafe, blockchainToFloat, floatToBlockchainInt, quantizeFloat } = math;
 import { parseSlotIndex } from './order/utils/slot.js';
+import { resolveTradedSide } from './order/fill_ledger.js';
 import type { PlacementLease } from './order/placement_lock.js';
 
 /**
@@ -2439,10 +2440,13 @@ function refreshLastFillPivotFromQueue(bot: BotLike): boolean {
                     const recvAmt = Number(receives.amount);
                     if (Number.isFinite(paysAmt) && paysAmt > 0 && Number.isFinite(recvAmt) && recvAmt > 0) {
                         const paysFloat = (base: number, precision: number) => base / Math.pow(10, precision);
-                        if (paysId != null && paysId === assets.assetA.id) {
+                        // Side from the paid asset through the shared resolver
+                        // (order/fill_ledger.ts); the price math stays here.
+                        const paysSide = resolveTradedSide(paysId, assets);
+                        if (paysSide === ORDER_TYPES.SELL) {
                             type = ORDER_TYPES.SELL;
                             price = paysFloat(recvAmt, assets.assetB.precision) / paysFloat(paysAmt, assets.assetA.precision);
-                        } else if (paysId != null && paysId === assets.assetB.id) {
+                        } else if (paysSide === ORDER_TYPES.BUY) {
                             type = ORDER_TYPES.BUY;
                             price = paysFloat(paysAmt, assets.assetB.precision) / paysFloat(recvAmt, assets.assetA.precision);
                         }

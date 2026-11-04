@@ -171,6 +171,7 @@ import {
 } from './utils/order.js';
 import { parseSlotIndex } from './utils/slot.js';
 import { readSlotLifecycle } from './lifecycle.js';
+import { resolveTradedSide } from './fill_ledger.js';
 import {
     resolveProcessedFillPersistenceMode
 } from './processed_fill_store.js';
@@ -1774,17 +1775,16 @@ class SyncEngine {
         // also selects the correct size asset (BUY sizes are quote, SELL
         // sizes are base), so `filledAmount`/`precision` stay dimensionally
         // consistent with the resting order's size.
-        let orderType: OrderType = matchedGridOrder.type;
-        if (paysAssetId != null && paysAssetId === assets.assetB.id) {
-            orderType = ORDER_TYPES.BUY;
-        } else if (paysAssetId != null && paysAssetId === assets.assetA.id) {
-            orderType = ORDER_TYPES.SELL;
-        } else if (orderType === ORDER_TYPES.SPREAD) {
-            // No usable pays asset (legacy/malformed fill): resolve SPREAD
-            // without leaking SPREAD into the transition (validateOrder treats
-            // an on-chain SPREAD state as fatal ILLEGAL_SPREAD_STATE).
-            orderType = resolveSpreadOrderSide(matchedGridOrder.price, mgr.config.startPrice) as OrderType;
-        }
+        // One resolver for "which side did this trade" (order/fill_ledger.ts):
+        // the paid asset is chain truth, the slot type is only the fallback.
+        // A SPREAD slot carries no rail side, so it is resolved from the
+        // price-vs-startPrice convention without leaking SPREAD into the
+        // transition (validateOrder treats an on-chain SPREAD state as fatal
+        // ILLEGAL_SPREAD_STATE).
+        const fallbackSide = matchedGridOrder.type === ORDER_TYPES.SPREAD
+            ? resolveSpreadOrderSide(matchedGridOrder.price, mgr.config.startPrice)
+            : matchedGridOrder.type;
+        const orderType = (resolveTradedSide(paysAssetId, assets, fallbackSide) ?? matchedGridOrder.type) as OrderType;
         const currentSize = toFiniteNumber(matchedGridOrder.size);
         const precision = (orderType === ORDER_TYPES.SELL) ? assets.assetA.precision : assets.assetB.precision;
 

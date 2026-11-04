@@ -1078,6 +1078,15 @@ let FILL_PROCESSING = {
     // FILL_PROCESSING in general.settings.json).
     COALESCE_BACKLOG_REPLAY: false,
 
+    // GRID_BLOCKED_ESCALATE_CYCLES: how many consecutive attempts a grid update
+    // may be refused with an UNREADABLE pipeline state before the blocker
+    // escalation fires a structural resync. A cycle count, not a timing window:
+    // it is deliberately not a TIMING entry (see modules/timing_policy.ts) and
+    // must not be turned into one. Only `unknown-blocker` escalates — a busy
+    // pipeline (fills in flight, an unresolved broadcast, a held placement
+    // region) is normal work and is bounded by its own watchdog.
+    GRID_BLOCKED_ESCALATE_CYCLES: 12,
+
     // MAX_CONSECUTIVE_CONSUMER_FAILURES: Threshold for the _consumeFillQueue
     // watchdog. Below this count, the consumer re-schedules on every failure
     // via setImmediate. At or above this count, the consumer switches to

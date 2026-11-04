@@ -55,6 +55,7 @@ const NAMES = {
         // runtime): stubbed settled here so the resync stages below exercise
         // their own subject instead of the new deferral gates.
         'hasUnsettledFills', 'isLastFillPlacementBlocked',
+        'resolveGridUpdateBlockers', 'noteGridUpdateBlockers',
     ],
     format: ['formatCurrency', 'formatMetric2', 'isValidNumber', 'toFiniteNumber', 'toKnownNumber', 'formatPrice6', 'formatPercent'],
     orderUtils: [
@@ -218,6 +219,8 @@ function installCoreResyncMocks({ snapshotMode = 'live' } = {}) {
         applyGridDivergenceCorrections: async () => ({}),
         hasUnsettledFills: () => ({ unsettled: false, reason: null }),
         isLastFillPlacementBlocked: () => ({ blocked: false, pivot: null }),
+        resolveGridUpdateBlockers: () => [],
+        noteGridUpdateBlockers: () => ({ cycles: 0, escalate: false }),
         sleep: async () => {},
     });
 }
@@ -713,6 +716,8 @@ function installDivergenceMocks(opts) {
         nowIso: () => new Date().toISOString(),
         hasUnsettledFills: () => ({ unsettled: false, reason: null }),
         isLastFillPlacementBlocked: () => ({ blocked: false, pivot: null }),
+        resolveGridUpdateBlockers: () => [],
+        noteGridUpdateBlockers: () => ({ cycles: 0, escalate: false }),
         sleep: async () => {},
     });
     defineEsmMockAbs(require.resolve('../modules/order/grid'), NAMES.grid, {
@@ -897,6 +902,8 @@ async function testDexbotClassPerformGridResyncForwardsOptions() {
         nowIso: () => new Date().toISOString(),
         hasUnsettledFills: () => ({ unsettled: false, reason: null }),
         isLastFillPlacementBlocked: () => ({ blocked: false, pivot: null }),
+        resolveGridUpdateBlockers: () => [],
+        noteGridUpdateBlockers: () => ({ cycles: 0, escalate: false }),
         sleep: async () => {},
     });
     defineEsmMockAbs(require.resolve('../modules/order/utils/validate'), NAMES.validate, {

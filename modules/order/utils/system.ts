@@ -82,7 +82,7 @@ const require = createRequire(import.meta.url);
 import { path } from '../../path_api.js';
 import { getStorage } from '../../storage/index.js';
 const storage = getStorage();
-import { API_LIMITS, ORDER_TYPES, ORDER_STATES, COW_ACTIONS, FEE_PARAMETERS, BTS_PRECISION, PIPELINE_TIMING, NATIVE_CLIENT, GRID_LIMITS, TIMING } from '../../constants.js';
+import { API_LIMITS, ORDER_TYPES, ORDER_STATES, COW_ACTIONS, FEE_PARAMETERS, BTS_PRECISION, PIPELINE_TIMING, NATIVE_CLIENT, GRID_LIMITS, TIMING, FILL_PROCESSING } from '../../constants.js';
 import { PATHS } from '../../paths.js';
 import { toFiniteNumber, isValidNumber, toKnownNumber } from '../format.js';
 import * as MathUtils from './math.js';
@@ -1977,7 +1977,182 @@ export function isLastFillPlacementBlocked(manager: OrderManagerLike | null | un
 }
 
 /**
+ * Why a grid update was refused this cycle.
+ *
+ * These are the ONLY reasons `resolveGridUpdateBlockers` may report. The list
+ * is closed on purpose: a new reason must be added here (and to
+ * `tests/test_grid_update_blockers.ts`), so "the grid did not update" can never
+ * be explained by an unprintable string again.
+ */
+export type GridUpdateBlockerCode =
+    | 'fill-queued'
+    | 'fill-deferred'
+    | 'fill-in-flight'
+    | 'crawl-owed'
+    | 'broadcast-pending'
+    | 'placement-held'
+    | 'rebuild-active'
+    | 'unknown-blocker';
+
+export interface GridUpdateBlocker {
+    code: GridUpdateBlockerCode;
+    detail: string;
+}
+
+/** Pipeline state the fill blockers are derived from. `ok: false` means UNREADABLE, not settled. */
+export interface FillPipelineState {
+    ok: boolean;
+    queued: number;
+    deferred: boolean;
+    inFlight: number;
+    owed: number;
+    error?: string;
+}
+
+/**
+ * Read the fill-pipeline counters ONCE, from a bot or a bare manager.
+ *
+ * This is the only place that peeks these fields. The previous projection
+ * (`hasUnsettledFills`) swallowed every read error and returned "settled",
+ * which is a fail-OPEN answer in a fail-closed system: an unreadable queue
+ * looked like an idle one and the grid was updated from a stale master.
+ * Unreadable is now a first-class state (`ok: false`), surfaced as
+ * `unknown-blocker`.
+ *
+ * These counters are pipeline bookkeeping, not lifecycle evidence: absence
+ * decisions still use the lifecycle registry (INV-LIFE-003), so this reader
+ * cannot become a second evidence set.
+ */
+export function readFillPipelineState(source: unknown): FillPipelineState {
+    const settled: FillPipelineState = { ok: true, queued: 0, deferred: false, inFlight: 0, owed: 0 };
+    if (!source || typeof source !== 'object') return settled;
+    try {
+        const outer = source as { manager?: unknown; _incomingFillQueue?: unknown; _deferredFillsPending?: unknown };
+        const mgr = (outer.manager && typeof outer.manager === 'object'
+            ? outer.manager
+            : outer) as { _pendingFillCrawls?: unknown; _fillBatchInFlight?: unknown };
+        const queue = outer._incomingFillQueue;
+        if (queue !== undefined && queue !== null && !Array.isArray(queue)) {
+            return { ...settled, ok: false, error: '_incomingFillQueue is not an array' };
+        }
+        const crawls = (mgr as { _pendingFillCrawls?: unknown })._pendingFillCrawls;
+        if (crawls !== undefined && crawls !== null && !Array.isArray(crawls)) {
+            return { ...settled, ok: false, error: '_pendingFillCrawls is not an array' };
+        }
+        const inFlightRaw = mgr._fillBatchInFlight;
+        const inFlight = Number(inFlightRaw);
+        if (inFlightRaw !== undefined && inFlightRaw !== null && !Number.isFinite(inFlight)) {
+            return { ...settled, ok: false, error: '_fillBatchInFlight is not a number' };
+        }
+        return {
+            ok: true,
+            queued: Array.isArray(queue) ? queue.length : 0,
+            deferred: outer._deferredFillsPending === true,
+            inFlight: Number.isFinite(inFlight) && inFlight > 0 ? inFlight : 0,
+            owed: Array.isArray(crawls) ? crawls.length : 0,
+        };
+    } catch (err) {
+        return { ok: false, queued: 0, deferred: false, inFlight: 0, owed: 0, error: getErrorMessage(err) };
+    }
+}
+
+/**
+ * Every reason the grid must NOT be mutated this cycle, as codes.
+ *
+ * Composition only — no new evidence: the fill counters come from
+ * `readFillPipelineState`, the broadcast policy from `getLivePendingBroadcasts`
+ * (INV-BROADCAST-005), the region from `isPlacementActive`, the rebuild flag
+ * from the manager. A grid blocker (may the grid mutate?) is deliberately NOT
+ * the per-action fresh-placement grace and NOT a known-wrong-side fact; those
+ * stay with the planner and the correction queue (INV-RECON-006).
+ */
+function fillStateBlockers(state: FillPipelineState): GridUpdateBlocker[] {
+    if (!state.ok) {
+        return [{ code: 'unknown-blocker', detail: state.error || 'fill pipeline state unreadable' }];
+    }
+    const blockers: GridUpdateBlocker[] = [];
+    if (state.queued > 0) blockers.push({ code: 'fill-queued', detail: `${state.queued} fill(s) queued for processing` });
+    if (state.deferred) blockers.push({ code: 'fill-deferred', detail: 'deferred fill drain pending' });
+    if (state.inFlight > 0) blockers.push({ code: 'fill-in-flight', detail: 'fill batch in flight' });
+    if (state.owed > 0) blockers.push({ code: 'crawl-owed', detail: `${state.owed} owed boundary crawl(s)` });
+    return blockers;
+}
+
+export function resolveGridUpdateBlockers(source: unknown, options: { now?: number } = {}): GridUpdateBlocker[] {
+    const now = Number.isFinite(Number(options.now)) ? Number(options.now) : Date.now();
+    const blockers: GridUpdateBlocker[] = fillStateBlockers(readFillPipelineState(source));
+    if (!source || typeof source !== 'object') return blockers;
+    const outer = source as { manager?: unknown };
+    const mgr = (outer.manager && typeof outer.manager === 'object' ? outer.manager : source) as OrderManagerLike & {
+        isPlacementActive?: () => boolean;
+        placementKind?: () => string;
+        isStructuralRebuildInProgress?: () => boolean;
+    };
+    try {
+        if (typeof mgr.isPlacementActive === 'function' && mgr.isPlacementActive() === true) {
+            const kind = typeof mgr.placementKind === 'function' ? mgr.placementKind() : '';
+            blockers.push({ code: 'placement-held', detail: `placement region held by ${kind || 'unknown'}` });
+        }
+        if (typeof mgr.isStructuralRebuildInProgress === 'function' && mgr.isStructuralRebuildInProgress() === true) {
+            blockers.push({ code: 'rebuild-active', detail: 'structural rebuild in progress' });
+        }
+        // Read-only: a predicate must not GC the pending set or emit log lines.
+        const pending = OrderUtils.getLivePendingBroadcasts(mgr, { now, gc: false });
+        const pendingCount = Array.isArray(pending) ? pending.length : 0;
+        if (pendingCount > 0) {
+            blockers.push({ code: 'broadcast-pending', detail: `${pendingCount} unresolved broadcast(s)` });
+        }
+    } catch (err) {
+        if (!blockers.some((b) => b.code === 'unknown-blocker')) {
+            blockers.push({ code: 'unknown-blocker', detail: `blocker probe failed: ${getErrorMessage(err)}` });
+        }
+    }
+    return blockers;
+}
+
+/**
+ * Count consecutive blocked cycles and decide whether the state is STUCK.
+ *
+ * Escalation is deliberately narrow: only `unknown-blocker` (unreadable
+ * pipeline state) escalates. A busy pipeline (`fill-in-flight`,
+ * `broadcast-pending`, a held region) is normal work and must not trigger a
+ * structural resync — the placement/broadcast watchdogs own those bounds. The
+ * counter is a cycle count, not a timing window: it is NOT a `TIMING` entry and
+ * must not be classified in `modules/timing_policy.ts`.
+ *
+ * @returns `{ cycles, escalate }`; `escalate` is true exactly when the state
+ *   stayed unreadable for `FILL_PROCESSING.GRID_BLOCKED_ESCALATE_CYCLES`
+ *   consecutive attempts.
+ */
+export function noteGridUpdateBlockers(
+    source: unknown,
+    blockers: GridUpdateBlocker[] | null | undefined,
+    options: { limit?: number } = {},
+): { cycles: number; escalate: boolean } {
+    if (!source || typeof source !== 'object') return { cycles: 0, escalate: false };
+    const holder = (source as { manager?: unknown }).manager && typeof (source as { manager?: unknown }).manager === 'object'
+        ? (source as { manager: Record<string, unknown> }).manager
+        : (source as Record<string, unknown>);
+    const list = Array.isArray(blockers) ? blockers : [];
+    const unreadable = list.some((b) => b && b.code === 'unknown-blocker');
+    if (list.length === 0 || !unreadable) {
+        holder._gridUpdateBlockedCycles = 0;
+        return { cycles: 0, escalate: false };
+    }
+    const prev = Number(holder._gridUpdateBlockedCycles);
+    const cycles = (Number.isFinite(prev) && prev > 0 ? prev : 0) + 1;
+    holder._gridUpdateBlockedCycles = cycles;
+    const rawLimit = Number(options.limit ?? FILL_PROCESSING.GRID_BLOCKED_ESCALATE_CYCLES);
+    const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? rawLimit : 12;
+    return { cycles, escalate: cycles >= limit };
+}
+
+/**
  * Are fills still UNSETTLED (arrived but not yet absorbed by the grid)?
+ *
+ * Projection over `resolveGridUpdateBlockers` so the prose reason and the code
+ * cannot disagree. Kept as a boolean for its existing callers; new callers
+ * should ask for the codes.
  *
  * While this returns true the master grid still holds filled slots as ACTIVE
  * and the boundary has not crawled for them, so any geometry-derived plan
@@ -1993,23 +2168,13 @@ export function isLastFillPlacementBlocked(manager: OrderManagerLike | null | un
  * @returns {{unsettled: boolean, reason: string|null}}
  */
 export function hasUnsettledFills(source: unknown): { unsettled: boolean; reason: string | null } {
-    if (!source || typeof source !== 'object') return { unsettled: false, reason: null };
-    const outer = source as { manager?: unknown; _incomingFillQueue?: unknown; _deferredFillsPending?: unknown };
-    const mgr = (outer.manager && typeof outer.manager === 'object'
-        ? outer.manager
-        : outer) as { _pendingFillCrawls?: unknown; _fillBatchInFlight?: unknown };
-    try {
-        const queued = Array.isArray(outer._incomingFillQueue) ? outer._incomingFillQueue.length : 0;
-        if (queued > 0) return { unsettled: true, reason: `${queued} fill(s) queued for processing` };
-        if (outer._deferredFillsPending === true) return { unsettled: true, reason: 'deferred fill drain pending' };
-        const inFlight = Number(mgr._fillBatchInFlight);
-        if (Number.isFinite(inFlight) && inFlight > 0) return { unsettled: true, reason: 'fill batch in flight' };
-        const owed = Array.isArray(mgr._pendingFillCrawls) ? mgr._pendingFillCrawls.length : 0;
-        if (owed > 0) return { unsettled: true, reason: `${owed} owed boundary crawl(s)` };
-    } catch {
-        return { unsettled: false, reason: null };
-    }
-    return { unsettled: false, reason: null };
+    // Fill state only: this predicate answers "have the fills settled?", not
+    // "is the host busy?" (placement/broadcast/rebuild are the full resolver's
+    // business). A projection that pulled the host codes in would report fills
+    // unsettled whenever, say, a placement probe threw.
+    const fill = fillStateBlockers(readFillPipelineState(source))[0];
+    if (!fill) return { unsettled: false, reason: null };
+    return { unsettled: true, reason: fill.detail };
 }
 
 /**
