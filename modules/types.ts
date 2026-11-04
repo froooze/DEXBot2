@@ -172,25 +172,18 @@ export interface ChainOrdersLike {
   [key: string]: unknown;
 }
 
-/**
- * Minimal runtime surface shared by the `dexbot_*_runtime.ts` layer. This is
- * a seeded interface to grow as each runtime file is typed — the index
- * signature keeps the many `_camelCase` internals reachable (as `unknown`)
- * while the common surface gets real types. Replace index-signature reads with
- * named fields as the relevant owners are typed.
- */
-/**
- * The DexBot runtime surface used by the `dexbot_*_runtime.ts` layer (and the
- * `DexBot` class itself, which structurally satisfies it). No index signature:
- * every member the runtime touches is enumerated, so a typo or an undeclared
- * internal is a compile error instead of a silent `unknown`.
- */
 /** Credential-daemon signing token (used until the private key is unlocked). */
 export interface SigningToken {
   accountName: string;
   socketPath?: string;
 }
 
+/**
+ * The `DEXBot` runtime surface used by the `dexbot_*_runtime.ts` layer (the
+ * `DEXBot` class itself structurally satisfies it). No index signature: every
+ * member the runtime touches is enumerated, so a typo or an undeclared internal
+ * is a compile error instead of a silent `unknown`.
+ */
 export interface BotLike {
 
   // --- identity / config ---
@@ -759,12 +752,12 @@ interface AccountTotalsGate {
   [key: string]: unknown;
 }
 
-/** Accountant surface the sync engine calls directly. */
 /** Result of `accountant.processFillAccounting()`. */
 interface FillAccountingResult extends UnknownRecord {
   status: string;
 }
 
+/** Accountant surface the sync engine calls directly. */
 interface AccountantLike {
   processFillAccounting(fillOp: unknown, fillKey: string, options?: UnknownRecord): Promise<boolean>;
   adjustTotalBalance(orderType: string, delta: number, operation: string): Promise<unknown>;
@@ -963,17 +956,6 @@ interface ManagerRecoveryState {
 }
 
 /**
- * The contract the order engine consumes from `OrderManager`. This is the
- * decoupled interface the `modules/order/**` layer types its `manager`
- * parameters against, so the engine does not need to import the concrete
- * class (avoiding a runtime import cycle). `OrderManager` structurally
- * satisfies it.
- *
- * Optional members are either wired in later by the runtime layer
- * (e.g. `requestStructuralGridResync`, `notifyBoundaryUpdate`) or read only
- * defensively; keep them optional so partial test doubles still type-check.
- */
-/**
  * Three-valued result of an operation whose outcome is not always knowable.
  *
  * The engine used to encode this as an ad-hoc `uncertain: true` property next
@@ -1048,6 +1030,17 @@ export interface CreditRuntimeLike {
   shutdown(): Promise<unknown>;
 }
 
+/**
+ * The contract the order engine consumes from `OrderManager`. This is the
+ * decoupled interface the `modules/order/**` layer types its `manager`
+ * parameters against, so the engine does not need to import the concrete
+ * class (avoiding a runtime import cycle). `OrderManager` structurally
+ * satisfies it.
+ *
+ * Optional members are either wired in later by the runtime layer
+ * (e.g. `requestStructuralGridResync`, `notifyBoundaryUpdate`) or read only
+ * defensively; keep them optional so partial test doubles still type-check.
+ */
 export interface OrderManagerLike {
   /**
    * Unified order-lifecycle read surface (see modules/order/lifecycle.ts).

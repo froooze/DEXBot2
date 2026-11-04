@@ -12,13 +12,13 @@
  *
  *   effectiveLatency = latencyMs + flapPenaltyMs
  *   flapScore        = Σ 0.5 ^ (age_i / halfLife)
- *   flapPenaltyMs    = min(flapScore * penaltyPerDrop, maxPenaltyMs)
+ *   flapPenaltyMs    = min(flapScore * DEFAULT_FLAP_PENALTY_MS_PER_DROP, DEFAULT_FLAP_PENALTY_MAX_MS)
  *
- * A node with no recent drops ranks on its ping alone. One drop costs
- * `penaltyPerDrop` of effective latency and then fades with `halfLife`, so a
- * node that flaps once and then behaves is re-admitted automatically, a node
- * that keeps flapping stays at the back of the list, and nothing has to be
- * "reset" by a lucky health probe (the old
+ * A node with no recent drops ranks on its ping alone. One undecayed drop costs
+ * DEFAULT_FLAP_PENALTY_MS_PER_DROP of effective latency and then fades with the
+ * half-life, so a node that flaps once and then behaves is re-admitted
+ * automatically, a node that keeps flapping stays at the back of the list, and
+ * nothing has to be "reset" by a lucky health probe (the old
  * LIVE_FAILURE_HEALTH_SUCCESS_STREAK wipe-on-success counter).
  *
  * Everything here is pure: callers own persistence and logging. Drop history

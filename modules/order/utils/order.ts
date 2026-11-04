@@ -5,10 +5,10 @@
  * Includes grid indexing, order comparison, delta building, and strategy calculations.
  *
  * ===============================================================================
- * TABLE OF CONTENTS (76 exported functions)
+ * TABLE OF CONTENTS (82 exported functions)
  * ===============================================================================
  *
- * SECTION 1: CHAIN ORDER MATCHING & RECONCILIATION (7 functions)
+ * SECTION 1: CHAIN ORDER MATCHING & RECONCILIATION (11 functions)
  *   - parseChainOrder(chainOrder, assets) - Parse blockchain order to grid format
  *   - applyChainSizeToGridOrder(manager, gridOrder, chainSize) - Apply chain size to grid
  *   - correctOrderPriceOnChain(manager, correctionInfo, ...) - Correct order price on chain
@@ -16,6 +16,10 @@
  *   - _validatePriceCorrectionEntry(...) - Drain-time staleness check for a queued correction
  *   - _stampCorrectionProvenance(...) - Stamp queue provenance on a correction entry
  *   - findLiveOrderOwnerByChainId(...) - Find the live grid slot that owns a chain order
+ *   - resolveLiveOrderLadderPosition(...) - Ladder position of a live chain order
+ *   - resolveExecutionPrice(...) - Execution price from the paid/received amounts
+ *   - resolveSlotIdForFillPrice(...) - Slot a fill price belongs to under the genesis ladder
+ *   - attributeUnmatchedFillToGrid(...) - Attribute a fill whose slot was already virtualised
  *
  * SECTION 2: CROSSING-PLACEMENT GUARDS (8 functions)
  *   - chainOrderMatchesSlot(...) - Exact chain-order/grid-slot match
@@ -34,8 +38,9 @@
  *   - buildFillKey(fillOrParts) - Stable fill dedupe key (delegates to order/fill_ledger.ts)
  *   - buildCreateOpFingerprint(params) - Build fingerprint for create operations
  *
- * SECTION 4: STATE TRANSITIONS & PLACEHOLDERS (6 functions)
+ * SECTION 4: STATE TRANSITIONS & PLACEHOLDERS (7 functions)
  *   - virtualizeOrder(order) - Convert order to VIRTUAL state
+ *   - reviveVirtualSlotFromChain(...) - Re-materialise a virtualised slot from its chain order
  *   - convertToSpreadPlaceholder(order) - Convert order to SPREAD placeholder
  *   - toRailHolePlaceholder(order) - Convert to a rail-typed hole placeholder
  *   - geometryTypeForSlotIndex(...) - BUY/SELL type for a slot index
@@ -47,8 +52,9 @@
  *   - updateGapEvacuationStreaks(...) - Tick per-slot gap-evacuation streak counter
  *   - collectRefillSlotIds(...) - Refill-slot wire for the COW boundary hold
  *
- * SECTION 6: FILTERING & DRIFT DIAGNOSTICS (11 functions)
+ * SECTION 6: FILTERING & DRIFT DIAGNOSTICS (12 functions)
  *   - filterOrdersByType(orders, orderType) - Filter orders by type
+ *   - isStructuralRebuildStaleReason(reason) - Whether a refusal label means a structural rebuild
  *   - buildOutsideInPairGroups(items, accessors) - Outside->center pair grouping
  *   - extractBatchOperationResults(result) - Extract operation_results from chain batch result
  *   - formatUnmatchedChainOrder(order) - Format structural drift diagnostics
@@ -106,10 +112,14 @@
  *   - checkGridPriceInvariant(...) - The price emitted for a slot must equal its genesis price
  *   - reportGridPriceInvariant(...) - Report one GRID-PRICE-INVARIANT check
  *
- * SECTION 14: PERSISTED CRAWL & PLACEMENT GRACE (2 functions)
+ * SECTION 14: PERSISTED CRAWL & PLACEMENT GRACE (2 functions + the CrawlEntry type)
  *   - consumePendingFillCrawls(...) - Apply recorded-but-uncommitted fill crawls to the boundary
  *   - isFreshlyPlacedOrder(...) - Chain order placed within the surplus-cancel grace
  *     (the stamp itself is written only by the lifecycle funnel)
+ *
+ * SECTION 15: LIVE BROADCAST & EDGE PROJECTIONS (2 functions)
+ *   - getLivePendingBroadcasts(manager, options?) - Live pending-broadcast list (expired entries deleted)
+ *   - collectEdgePinnedFillIds(manager, fills) - Fill ids pinned to the configured/live edge
  *
  * ===============================================================================
  */

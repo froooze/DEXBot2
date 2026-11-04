@@ -2299,7 +2299,7 @@ function stopBotsConfigPollInterval(bot: BotLike) {
 /**
  * Release the market adapter runtime for a bot.
  * In PM2 mode this is a no-op; in direct mode it calls the shared runtime's releaseBot.
- * @param {import('./dexbot_class.js').DEXBot} bot
+ * @param {unknown} _bot - Unused; release is keyed by botId.
  * @param {string} botId - Bot identifier
  * @param {string} [context='shutdown'] - Context label for logging
  * @returns {Promise<any>}

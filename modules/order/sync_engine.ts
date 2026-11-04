@@ -15,7 +15,7 @@
  * Uses AsyncLock to prevent concurrent sync operations (defense-in-depth locking).
  *
  * ===============================================================================
- * TABLE OF CONTENTS - SyncEngine Class (12 methods) + module-level helpers
+ * TABLE OF CONTENTS - SyncEngine Class (14 methods) + module-level helpers
  * ===============================================================================
  *
  * MODULE-LEVEL HELPERS (internal, not exported):
@@ -42,42 +42,46 @@
  *   4. _performSyncFromOpenOrders(mgr, precA, precB, parsedChain, rawChain, options) - Core sync logic (internal)
  *      Performs actual two-pass reconciliation without locking
  *      Pass 1: Match grid orders to chain (known grid → chain, includes orphan cleanup)
- *      Pass 2: Add missing chain orders (unknown chain → grid)
+ *      Pass 2: Bind unmatched chain orders to their genesis-ladder slot (chain → grid)
  *
- * FILL PROCESSING (5 methods)
+ * FILL PROCESSING (6 methods)
  *   5. _findMatchingGridOrder(mgr, orderId) - Look up the grid slot owning a chain order (internal)
  *
- *   6. _computeFillContext(mgr, matchedGridOrder, paysAssetId, paysAmountRaw) -
- *      Resolve the asset/side context for a fill (internal)
+ *   6. _computeFillContext(mgr, matchedGridOrder, paysAssetId, paysAmountRaw,
+ *      receivesAssetId, receivesAmountRaw) - Resolve the asset/side context for
+ *      a fill (internal)
  *
  *   7. _computeFillTransitionResult(mgr, params) - Compute the post-fill slot
  *      transition and fund deltas without mutating state (internal, async)
  *
- *   8. syncFromFillHistory(fill) - Process single fill event synchronously
+ *   8. _absorbUnmatchedFill(mgr, params) - Attribute a fill whose slot was
+ *      already virtualised (thin wrapper over utils/order.ts) (internal, async)
+ *
+ *   9. syncFromFillHistory(fill) - Process single fill event synchronously
  *      Updates grid order state based on fill data
  *      Updates fund state and accounting
  *      Handles both maker and taker fills
  *
- *   9. syncFromFillHistoryBatch(fills) - Process multiple fill events in batch
+ *  10. syncFromFillHistoryBatch(fills) - Process multiple fill events in batch
  *      Acquires _gridLock once for all fills in block group
  *      Batches drift refetch into one get_objects RPC call
  *      Applies all grid mutations in a single applyGridUpdateBatch
  *
  * FULL SYNCHRONIZATION (2 methods - async)
- *  10. _assertGenesisInvariant(mgr) - Fail-closed check that a snapshot has a genesis ladder (internal)
+ *  11. _assertGenesisInvariant(mgr) - Fail-closed check that a snapshot has a genesis ladder (internal)
  *
- *  11. synchronizeWithChain(chainData, source) - Full sync (fetch + sync) (async)
+ *  12. synchronizeWithChain(chainData, source) - Full sync (fetch + sync) (async)
  *      Fetches fresh account balances
  *      Calls syncFromOpenOrders() with chain data
  *      Source: event type that triggered sync (fill, poll, broadcast, etc.)
  *
  * ACCOUNT STATE (2 methods - async)
- *  12. fetchAccountBalancesAndSetTotals() - Fetch account totals (async)
+ *  13. fetchAccountBalancesAndSetTotals() - Fetch account totals (async)
  *      Retrieves BUY/SELL totals and free balances from blockchain
  *      Sets manager.accountTotals
  *      Triggers fund recalculation
  *
- *  13. initializeAssets() - Initialize asset metadata (async)
+ *  14. initializeAssets() - Initialize asset metadata (async)
  *      Fetches asset precision and other metadata
  *      Sets manager.assets
  *      Called once at bot startup
@@ -101,10 +105,16 @@
  * - Update sizes and mark as filled if needed
  * - Downgrade to VIRTUAL if not found on-chain
  *
- * PASS 2: Chain → Grid
- * - For each chain order not matched to grid order
- * - Create new grid order for unexpected chain order
- * - Mark as ACTIVE with blockchain orderId
+ * PASS 2: Chain → Grid (genesis-frozen nearest-slot adoption)
+ * - For each chain order not matched in pass 1, resolve its slot from the
+ *   frozen price ladder (`slotIndexForPrice`) and adopt it there
+ * - No tolerance matcher remains: without a ladder the E2 gate refuses the
+ *   sync, and a ladder-less grid defers every orphan instead of matching it
+ * - A price outside the grid range is HELD/deferred (nearest slot is only
+ *   reported as a hint) — it is never adopted into a rail slot
+ * - An order whose price cannot be resolved to a slot is queued for a
+ *   cancel-only correction; the deferred (no-ladder / out-of-grid) cases are
+ *   logged and held, never dropped silently
  *
  * ===============================================================================
  */
@@ -648,72 +658,15 @@ class SyncEngine {
     }
 
     /**
-     * Reconcile grid orders against fresh blockchain open orders snapshot.
-     * This is the MAIN SYNCHRONIZATION MECHANISM that corrects the grid state when
-     * the blockchain state diverges from our local expectations.
+     * Reconcile grid orders against a fresh blockchain open-orders snapshot.
+     * This is the MAIN SYNCHRONIZATION MECHANISM: it corrects the grid when the
+     * chain state diverges from local expectations. The two-pass structure, the
+     * lock hierarchy and the per-pass rules live in the module header; the
+     * fail-closed genesis gate (E2) runs before anything is touched.
      *
-     * CRITICAL: This method uses AsyncLock (defense-in-depth) to ensure only one
-     * full-sync operation runs at a time. WITHIN that lock, per-order locks prevent
-     * concurrent createOrder/cancelOrder races.
-     *
-     * LOCK HIERARCHY:
-     * 1. _syncLock (AsyncLock): Ensures only one full-sync at a time
-     * 2. Per-order locks (shadowOrderIds): Protect specific orders during sync
-     * 3. Lock refresh mechanism: Prevents timeout during long reconciliation
-     *
-     * RECONCILIATION FLOW:
-     * ========================================================================
-     * This method performs a two-pass reconciliation:
-     *
-     * PASS 1: Match grid orders to chain orders (known grid → chain lookup)
-     * - For each grid order with an orderId, find the matching chain order
-     * - Detect partial fills: if chain size < grid size, downgrade to PARTIAL state
-     * - Detect full fills: if order no longer exists on chain, convert to SPREAD
-     * - Detect price slippage: flag orders for price correction if needed
-     * - Update grid order sizes to match chain reality
-     *
-     * PASS 2: Orphan chain orders (chain → grid lookup)
-     * - For chain orders not matched in Pass 1, find best grid slot match
-     * - This handles cases where an order was placed but grid lost track (race condition)
-     * - Uses price tolerance and geometric proximity to find the best match
-     * - Once matched, retroactively assign orderId and synchronize state
-     *
-     * CRITICAL RULES:
-     * 1. ACTIVE orders can only stay ACTIVE if size matches chain exactly
-     *    If chain size < grid size → must transition to PARTIAL
-     * 2. If an ACTIVE order is not found on chain → it filled → convert to SPREAD
-     * 3. Precision matters: Use blockchain integer arithmetic to compare sizes
-     *    Floating point comparisons can give false positives for partial fills
-     * 4. Size updates are applied via applyChainSizeToGridOrder() which handles
-     *    precision conversion and may adjust sizes slightly for blockchain granularity
-     *
-      * PRICE TOLERANCE CALCULATION:
-      * calculatePriceTolerance() can return null in these cases:
-      *   1. assets parameter is null/missing
-      *   2. gridPrice is 0 or null (invalid price)
-      *   3. orderSize is 0 or null (invalid size - orders should not sync with 0 size)
-      *   4. assetA or assetB precision is undefined (asset metadata not loaded)
-      * When tolerance is null, we treat it as 0 (strict: any price difference flagged).
-      * This is safe because null signals a configuration/data issue, not a real order.
-      *
-      * RETURNS: { filledOrders, updatedOrders, ordersNeedingCorrection }
-      * - filledOrders: Orders that completed (now SPREAD placeholders)
-      * - updatedOrders: All orders modified during sync (state changes, size updates)
-      * - ordersNeedingCorrection: Orders with price slippage requiring correction
-     *
-     * EDGE CASES HANDLED:
-     * - Orphan chain orders (placed but grid lost track due to race condition)
-     * - Partial fills (size reduced on chain)
-     * - Full fills (order removed from chain completely)
-     * - Price tolerance (small slippage acceptable, large slippage flagged)
-     * - Precision mismatches (blockchain integer precision vs float grid)
-     * - Double spending prevention (each chain order matched to at most one grid order)
-     */
-    /**
-     * Synchronize grid orders with blockchain open orders snapshot.
      * @param {Array|null} chainOrders - Array of blockchain order objects
      * @param {Object} [options={}] - Sync options (e.g., { skipAccounting: true })
-     * @returns {Promise<Object>} Result with filledOrders, updatedOrders, ordersNeedingCorrection
+     * @returns {Promise<SyncResult>} filledOrders, updatedOrders, ordersNeedingCorrection
      */
     async syncFromOpenOrders(chainOrders: unknown[] | null, options: Record<string, unknown> = {}): Promise<SyncResult> {
         const mgr = this.manager;
@@ -2522,55 +2475,6 @@ class SyncEngine {
     }
 
     /**
-     * High-level dispatcher for different blockchain synchronization sources.
-     * Routes to the appropriate sync strategy based on the data source.
-     *
-     * SOURCES AND STRATEGIES:
-     * ========================================================================
-     * source: 'createOrder'
-     *   Purpose: Grid order was successfully placed on-chain
-     *   Data: { gridOrderId, chainOrderId, isPartialPlacement, fee }
-     *   Action:
-     *     1. Look up grid order by gridOrderId
-     *     2. Assign the returned chainOrderId (so we can find it later)
-     *     3. Transition state based on isPartialPlacement:
-     *        - false → ACTIVE (full order placed)
-     *        - true → PARTIAL (placed as partial, likely due to insufficient funds)
-     *     4. Update optimistic chainFree balance (deduct fees if BTS pair)
-     *   Fund Impact: Funds transition from free → locked/committed
-     *
-     * source: 'cancelOrder'
-     *   Purpose: Grid order was successfully cancelled on-chain
-     *   Data: The chainOrderId to cancel
-     *   Action:
-     *     1. Find grid order by orderId (reverse lookup)
-     *     2. Transition to VIRTUAL (order no longer on-chain)
-     *     3. Clear orderId so it can be re-used
-     *     4. Update optimistic chainFree balance (add funds back as free)
-     *   Fund Impact: Funds transition from locked → free
-     *   Note: This is used for direct cancellations (not rotation/consolidation)
-     *
-     * source: 'readOpenOrders' or 'periodicBlockchainFetch'
-     *   Purpose: Full snapshot sync of all open orders from blockchain
-     *   Data: Array of chain orders from blockchain API
-     *   Action: Delegates to syncFromOpenOrders() for full reconciliation
-     *   Use Case: Periodic health check or startup initialization
-     *
-     * FUND TRACKING:
-     * Both 'createOrder' and 'cancelOrder' call updateOptimisticFreeBalance() to
-     * keep the optimistic chainFree balance in sync with actual on-chain state.
-     * This prevents fund leaks where placed orders weren't deducted or cancelled
-     * orders weren't released.
-     *
-     * RETURNS: { newOrders, ordersNeedingCorrection }
-     * Most callers use ordersNeedingCorrection to flag price corrections needed.
-     * Only syncFromOpenOrders() populates ordersNeedingCorrection.
-     *
-     * @param {Object} chainData - Chain event data
-     * @param {string} source - Source identifier ('createOrder', 'cancelOrder', 'readOpenOrders', etc.)
-     * @returns {Promise<Object>} { newOrders, ordersNeedingCorrection }
-     */
-    /**
      * E2 invariant assert: a manager holding grid slots but no price ladder is
      * in the undefined state the grid-price invariant forbids (INV-GRID-004).
      *
@@ -2621,6 +2525,55 @@ class SyncEngine {
         }
     }
 
+    /**
+     * High-level dispatcher for the different blockchain synchronization
+     * sources. Routes each source to its strategy and returns a uniform result
+     * shape.
+     *
+     * SOURCES AND STRATEGIES:
+     * ========================================================================
+     * source: 'createOrder'
+     *   Purpose: Grid order was successfully placed on-chain
+     *   Data: { gridOrderId, chainOrderId, isPartialPlacement, expectedType, fee, order? }
+     *   Action:
+     *     1. Look up grid order by gridOrderId
+     *     2. Assign the returned chainOrderId (so we can find it later)
+     *     3. Transition state based on isPartialPlacement:
+     *        - false → ACTIVE (full order placed)
+     *        - true → PARTIAL (placed as partial, likely due to insufficient funds)
+     *     4. Apply the transition through _applyOrderUpdate (skipAccounting:
+     *        false), which owns the optimistic chainFree update and the BTS fee
+     *   Fund Impact: Funds transition from free → locked/committed
+     *
+     * source: 'cancelOrder'
+     *   Purpose: Grid order was successfully cancelled on-chain
+     *   Data: The chainOrderId to cancel
+     *   Action:
+     *     1. Find grid order by orderId (reverse lookup)
+     *     2. Transition to VIRTUAL (order no longer on-chain)
+     *     3. Clear orderId so it can be re-used
+     *     4. Apply the transition through _applyOrderUpdate
+     *   Fund Impact: Funds transition from locked → free
+     *   Note: This is used for direct cancellations (not rotation/consolidation).
+     *         A cancel whose slot vanished still deducts its fee from the totals
+     *         via adjustTotalBalance, so the books cannot drift.
+     *
+     * source: 'readOpenOrders' or 'periodicBlockchainFetch'
+     *   Purpose: Full snapshot sync of all open orders from blockchain
+     *   Data: Array of chain orders from blockchain API
+     *   Action: Delegates to syncFromOpenOrders() for full reconciliation
+     *   Use Case: Periodic health check or startup initialization
+     *
+     * FUND TRACKING:
+     * The two event sources move funds through _applyOrderUpdate (and, for an
+     * unmatched cancel, adjustTotalBalance), so the optimistic chainFree balance
+     * cannot be bypassed by an event path. This prevents fund leaks where placed
+     * orders weren't deducted or cancelled orders weren't released.
+     *
+     * @param {Object} chainData - Chain event data
+     * @param {string} source - Source identifier ('createOrder', 'cancelOrder', 'readOpenOrders', 'periodicBlockchainFetch')
+     * @returns {Promise<Object>} { newOrders, filledOrders, updatedOrders, ordersNeedingCorrection }
+     */
     async synchronizeWithChain(chainData: SyncChainData, source: string) {
         const mgr = this.manager;
         if (!mgr.assets) return { newOrders: [], filledOrders: [], updatedOrders: [], ordersNeedingCorrection: [] };

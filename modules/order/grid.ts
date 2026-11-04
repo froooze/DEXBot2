@@ -12,7 +12,7 @@
  * - Detects and flags out-of-spread conditions
  *
  * ===============================================================================
- * TABLE OF CONTENTS - Grid Functions (34 exports)
+ * TABLE OF CONTENTS - Grid Functions (34 exports + internal helpers)
  * ===============================================================================
  *
  * CONFIGURATION & CALCULATION (2 functions)
@@ -80,6 +80,13 @@
  *  32. isGridBloated(manager, orders) - Check whether the grid is bloated
  *  33. isGridBloatGraceActive(manager) - Check the bloat grace state
  *  34. clearGridBloatFlag(manager) - Clear the bloat state
+ *
+ * SPREAD STALL MERGING (1 function)
+ *  35. mergeSpreadStalls(...) - Merge two side stalls so starvation cannot mask a cause
+ *
+ * REBUILD FILL ANCHOR (2 functions)
+ *  36. anchorRebuildBoundaryToLastFill(...) - Anchor a rebuilt boundary to the last fill
+ *  37. applyRebuildFillAnchor(...) - Apply the anchor and re-type the rails for it
  *
  * ===============================================================================
  *
@@ -673,7 +680,7 @@ export function clearGridBloatFlag(manager: OrderManagerLike): void {
      * Unifies budget calculation and fee deduction for all grid sizing scenarios.
      * Ensures consistent fund context (Allocated vs Total) across the bot.
      *
-     * @param {import('./types').OrderManager} manager - OrderManager instance
+     * @param {import('../types.js').OrderManagerLike} manager - OrderManager instance
      * @param {string} side - 'buy' or 'sell'
      * @returns {Promise<any|null>}
      * @private
@@ -908,7 +915,7 @@ export function createOrderGrid(config: GridConfig) {
      * Note: Uses explicit assignment instead of .clear() to enforce COW semantics:
      * - Replace the master grid atomically with a fresh Map instance
      * - Avoid mutating any previously referenced Map object
-     * @param {import('./types').OrderManager} manager - OrderManager instance
+     * @param {import('../types.js').OrderManagerLike} manager - OrderManager instance
      * @private
      */
 function _clearOrderCachesLogic(manager: OrderManagerLike): void {
@@ -935,7 +942,7 @@ function _clearOrderCachesLogic(manager: OrderManagerLike): void {
      *   the creation-time value instead of recomputing from live config
      * - Sanitizes phantom orders (ACTIVE/PARTIAL without orderId → VIRTUAL)
      *
-     * @param {import('./types').OrderManager} manager - The manager instance.
+     * @param {import('../types.js').OrderManagerLike} manager - The manager instance.
      * @param {Array<any>} grid - The persisted grid array.
      * @param {number|null} [boundaryIdx=null] - The master boundary index.
      * @returns {Promise<void>}
@@ -2088,7 +2095,7 @@ export async function initializeGrid(manager: OrderManagerLike): Promise<void> {
 
     /**
      * Full grid resynchronization from blockchain state.
-     * @param {import('./types').OrderManager} manager - The manager instance.
+     * @param {import('../types.js').OrderManagerLike} manager - The manager instance.
      * @param {Object} opts - Options for resynchronization.
      * @param {Function} opts.readOpenOrdersFn - Function to read open orders.
      * @param {Object} opts.chainOrders - Chain orders module.
@@ -2244,7 +2251,7 @@ export async function recalculateGrid(manager: OrderManagerLike, opts: { readOpe
     /**
      * Check for grid divergence and trigger update if threshold is met.
      *
-     * @param {import('./types').OrderManager} manager - Manager instance with order state
+     * @param {import('../types.js').OrderManagerLike} manager - Manager instance with order state
      * @returns {unknown}
      */
 export function checkAndUpdateGridIfNeeded(manager: OrderManagerLike): { buyUpdated: boolean; sellUpdated: boolean; buyShrink: boolean; sellShrink: boolean } {
@@ -2373,7 +2380,7 @@ export function checkAndUpdateGridIfNeeded(manager: OrderManagerLike): { buyUpda
      * Non-slot-N shelf/manual orders are excluded (never resized by the
      * geometric pass; same gate as _recalculateGridOrderSizesFromBlockchain).
      *
-     * @param {import('./types').OrderManager} manager - Manager instance with order state
+     * @param {import('../types.js').OrderManagerLike} manager - Manager instance with order state
      * @returns {{ buyUpdated: boolean; sellUpdated: boolean; buyShrink: boolean; sellShrink: boolean }}
      */
 function _computeCommittedSizeDriftSync(manager: OrderManagerLike): { buyUpdated: boolean; sellUpdated: boolean; buyShrink: boolean; sellShrink: boolean } {
@@ -2557,7 +2564,7 @@ export async function checkCommittedSizeDrift(manager: OrderManagerLike): Promis
      *     - Apply: size=500 (no cap check)
      *     - Result: slot[1] ready for placement, will consume from sideFree when placed
      *
-     * @param {import('./types').OrderManager} manager - OrderManager instance
+     * @param {import('../types.js').OrderManagerLike} manager - OrderManager instance
      * @param {string} orderType - ORDER_TYPES.BUY or ORDER_TYPES.SELL
      * @param {Object} [options] - Options object
      * @param {import('./working_grid.js')} [options.workingGrid] - Working grid for COW pattern
@@ -2731,7 +2738,7 @@ export async function _recalculateGridOrderSizesFromBlockchain(manager: OrderMan
      * Creates working grid, calculates new sizes, generates UPDATE actions.
      * Master grid is only updated after successful blockchain confirmation.
      *
-     * @param {import('./types').OrderManager} manager - Manager instance
+     * @param {import('../types.js').OrderManagerLike} manager - Manager instance
      * @param {string} orderType - 'buy', 'sell', or 'both' - which sides to update
      * @param {boolean} [fromBlockchainTimer=false] - If true, skip refetch of account totals (already current)
      * @param {number|null} [overrideBoundaryIdx=null] - Optional override for boundary index
@@ -2835,7 +2842,7 @@ export async function updateGridFromBlockchainSnapshot(manager: OrderManagerLike
      *
      * @param {Array<any>} calculatedGrid - Ideal calculated grid
      * @param {Array<any>} persistedGrid - Persisted grid state
-     * @param {import('./types').OrderManager|null} [manager=null] - Manager instance (for grid lock access)
+     * @param {import('../types.js').OrderManagerLike|null} [manager=null] - Manager instance (for grid lock access)
      * @returns {Promise<any>}
      */
 export async function compareGrids(calculatedGrid: unknown[], persistedGrid: unknown[], manager: OrderManagerLike | null = null): Promise<{ buy: { metric: number; updated: boolean }; sell: { metric: number; updated: boolean }; totalMetric?: number; thresholdPct?: number }> {
@@ -2978,7 +2985,7 @@ export async function compareGrids(calculatedGrid: unknown[], persistedGrid: unk
      * Unified divergence monitoring.
      * Performs both Ratio-based and RMS-based divergence checks.
      * 
-     * @param {import('./types').OrderManager} manager - Manager instance
+     * @param {import('../types.js').OrderManagerLike} manager - Manager instance
      * @param {Array<any>} calculatedGrid - Ideal/calculated grid
      * @param {Array<any>} persistedGrid - Current/persisted grid
      * @returns {Promise<any>}
@@ -3026,8 +3033,8 @@ export async function monitorDivergence(manager: OrderManagerLike, calculatedGri
     /**
      * Collect on-chain buy and sell orders from the manager.
      * Filters to orders with valid orderId and positive size.
-     * @param {import('./types').OrderManager} manager - The manager instance.
-     * @returns {{onChainBuys: Array<import('./types').Order>, onChainSells: Array<import('./types').Order>}}
+     * @param {import('../types.js').OrderManagerLike} manager - The manager instance.
+     * @returns {{onChainBuys: ManagedOrder[], onChainSells: ManagedOrder[]}}
      */
 function _getOnChainOrders(manager: OrderManagerLike): { onChainBuys: ManagedOrder[]; onChainSells: ManagedOrder[] } {
         // Slot-N gated: fork-kept shelf/manual orders (non-slot-N ids, e.g.
@@ -3052,7 +3059,7 @@ function _getOnChainOrders(manager: OrderManagerLike): { onChainBuys: ManagedOrd
 
     /**
      * Calculate current market spread using on-chain orders.
-     * @param {import('./types').OrderManager} manager - The manager instance.
+     * @param {import('../types.js').OrderManagerLike} manager - The manager instance.
      * @returns {number} The calculated spread percentage.
      */
 export function calculateCurrentSpread(manager: OrderManagerLike): number {
@@ -3076,8 +3083,8 @@ export function calculateCurrentSpread(manager: OrderManagerLike): number {
      * - RACE CONDITION WINDOW: Between lock release and blockchain submission
      * - MITIGATION: Pre-flight fund verification before submission; comprehensive error handling
      *
-     * @param {import('./types').OrderManager} manager - Manager instance
-     * @param {Object} BitShares - BitShares API client
+     * @param {import('../types.js').OrderManagerLike} manager - Manager instance
+     * @param {unknown} _BitShares - BitShares client, forwarded to the live-market-price refresh.
      * @param {Function|null} [updateOrdersOnChainBatch=null] - Optional batch update function
      * @returns {Promise<any>}
      */
@@ -3482,7 +3489,7 @@ export async function checkSpreadCondition(manager: OrderManagerLike, _BitShares
      * flagged as violations. The "Edge-First" placement strategy intentionally
      * creates these gaps to maximize grid coverage during fund expansion.
      *
-     * @param {import('./types').OrderManager} manager - The manager instance.
+     * @param {import('../types.js').OrderManagerLike} manager - The manager instance.
      * @param {Function|null} [updateOrdersOnChainBatch=null] - Optional batch update function.
      * @returns {Promise<any>}
      */
@@ -3521,7 +3528,7 @@ export async function checkGridHealth(manager: OrderManagerLike, _updateOrdersOn
      * Returns boolean flags plus the actual dust order objects so callers can act
      * on individual orders (dust is cancelled immediately on detection).
      *
-     * @param {import('./types').OrderManager} manager
+     * @param {import('../types.js').OrderManagerLike} manager
      * @returns {Promise<any>}
      */
 export async function checkWindowDust(manager: OrderManagerLike): Promise<{ buyDust: boolean; sellDust: boolean; buyDustOrders: ManagedOrder[]; sellDustOrders: ManagedOrder[] }> {
@@ -3616,7 +3623,7 @@ export async function checkWindowDust(manager: OrderManagerLike): Promise<{ buyD
      * Returns a Map<orderId, threshold> using the same sizing context as
      * _getDustOrders so eligibility and dust classification stay consistent.
      * @private
-     * @param {import('./types').OrderManager} manager
+     * @param {import('../types.js').OrderManagerLike} manager
      * @param {string} type - ORDER_TYPES.BUY or ORDER_TYPES.SELL
      * @returns {Promise<Map<string, number>>}
      */
@@ -3655,7 +3662,7 @@ async function _computeDustThresholdMap(manager: OrderManagerLike, type: OrderTy
      * Shares the same sizing context as _hasAnyDust but returns the actual order
      * objects so callers can act on them (e.g. auto-cancel).
      * @private
-     * @param {import('./types').OrderManager} manager
+     * @param {import('../types.js').OrderManagerLike} manager
      * @param {Array<any>} partials - Candidate partial orders to test.
      * @param {string} type - ORDER_TYPES.BUY or ORDER_TYPES.SELL
      * @param {Map<string, number>} [thresholdMap=null] - Optional precomputed per-slot dust thresholds.
@@ -3676,7 +3683,7 @@ async function _getDustOrders(manager: OrderManagerLike, partials: ManagedOrder[
 
     /**
      * Check if any partial orders on a side represent "dust" that should be cleaned.
-     * @param {import('./types').OrderManager} manager - Manager instance
+     * @param {import('../types.js').OrderManagerLike} manager - Manager instance
      * @param {Array<any>} partials - Partial orders to check
      * @param {string} type - ORDER_TYPES.BUY or ORDER_TYPES.SELL
      * @returns {Promise<boolean>} true if dust partials exist
@@ -3688,7 +3695,7 @@ async function _hasAnyDust(manager: OrderManagerLike, partials: ManagedOrder[], 
 
     /**
      * Public dust helper shared by StrategyEngine and Grid health checks.
-     * @param {import('./types').OrderManager} manager
+     * @param {import('../types.js').OrderManagerLike} manager
      * @param {Array<any>} partials
      * @param {'buy'|'sell'} side
      * @returns {Promise<boolean>}
@@ -3702,7 +3709,7 @@ export async function hasAnyDust(manager: OrderManagerLike, partials: ManagedOrd
     /**
      * Public dust helper that returns the subset of candidate partials currently below
      * the configured dust threshold for the requested side.
-     * @param {import('./types').OrderManager} manager
+     * @param {import('../types.js').OrderManagerLike} manager
      * @param {Array<any>} partials
      * @param {'buy'|'sell'} side
      * @returns {Promise<Array<any>>}
@@ -3715,10 +3722,10 @@ export async function getDustOrders(manager: OrderManagerLike, partials: Managed
 
     /**
      * Determine which side has more available funds for spread correction.
-     * @param {import('./types').OrderManager} manager - The manager instance.
+     * @param {import('../types.js').OrderManagerLike} manager - The manager instance.
      * @param {number} currentMarketPrice - Last traded price in B/A format (e.g. BTS/XRP), used to
      *   normalize sell-side funds into buy-side units for a fair cross-asset comparison.
-     * @returns {{ side: import('./types').OrderType|null, reason: string, code?: 'market-price-unavailable'|'no-free-funds' }} The side to correct on, or null with a structured cause.
+     * @returns {{ side: import('../types.js').OrderType|null, reason: string, code?: 'market-price-unavailable'|'no-free-funds' }} The side to correct on, or null with a structured cause.
      */
 export function determineOrderSideByFunds(manager: OrderManagerLike, currentMarketPrice: number): { side: OrderType | null; reason: string; code?: 'market-price-unavailable' | 'no-free-funds' } {
         const buyAvailable = Math.min(
@@ -3891,7 +3898,7 @@ export function determineOrderSideByFunds(manager: OrderManagerLike, currentMark
 
     /**
      * Prepares one or more orders to correct a wide spread.
-     * @param {import('./types').OrderManager} manager - The OrderManager instance.
+     * @param {import('../types.js').OrderManagerLike} manager - The OrderManager instance.
      * @param {string} preferredSide - The side to place the correction on (ORDER_TYPES.BUY/SELL).
      * @returns {Promise<any>}
      * @throws {Error} If preferredSide is invalid.

@@ -9,8 +9,8 @@
  * ===============================================================================
  *
  * SECTION 1: EXTERNAL DEPENDENCIES
- * SECTION 2: COW REBALANCE ENGINE
- * SECTION 3: ORDER MANAGER CLASS
+ * SECTION 2: COW REBALANCE ENGINE - COWRebalanceEngine class (exported)
+ * SECTION 3: ORDER MANAGER CLASS - OrderManager class (exported)
  * ===============================================================================
  */
 
@@ -1062,7 +1062,8 @@ class OrderManager implements OrderManagerLike {
      * `isPlacementLeaseCurrent()` before mutating.
      *
      * Lock hierarchy: acquire placement BEFORE `_gridLock`; never acquire it
-     * while holding `_gridLock` (Level 0.5 — see `manageLocks`).
+     * while holding `_gridLock` (Level 0.5 — see the constructor's canonical
+     * lock-hierarchy block in this file).
      *
      * @returns `null` when the region could not be acquired; the caller must
      *   defer/abort its broadcast.
@@ -1874,7 +1875,7 @@ class OrderManager implements OrderManagerLike {
     }
 
     /**
-     * @param {Array<import('./types').Order>} orders
+     * @param {Array<import('../types.js').Order>} orders
      * @param {Object} info
      * @returns {Promise<any>}
      */
@@ -2245,7 +2246,7 @@ class OrderManager implements OrderManagerLike {
     }
 
     /**
-     * @param {Array<import('./types').Order>} updates - Order updates to apply
+     * @param {Array<import('../types.js').Order>} updates - Order updates to apply
      * @param {string} [context] - Update context label
      * @param {unknown} [options]
      * @returns {Promise<boolean>}
@@ -2348,7 +2349,7 @@ class OrderManager implements OrderManagerLike {
     }
 
     /**
-     * @param {Array<import('./types').Order>} orders - Filled orders
+     * @param {Array<import('../types.js').Order>} orders - Filled orders
      * @param {Set<string>} [excl] - Order IDs to exclude
      * @param {Object} [options]
      * @returns {Promise<any>}
@@ -2401,7 +2402,7 @@ class OrderManager implements OrderManagerLike {
     }
 
     /**
-     * @returns {Array<import('./types').Order>}
+     * @returns {Array<import('../types.js').Order>}
      */
     getInitialOrdersToActivate() {
         // Apply coreOrders limit from config
@@ -2563,19 +2564,16 @@ class OrderManager implements OrderManagerLike {
      * Also used when the boundary is (re)anchored outside the fill path (grid
      * reset / recenter / rejected-snapshot rebuild): those records belong to
      * the previous generation, and applying their relative deltas onto a fresh
-     * anchor would double-count movement the anchor already contains.
+     * anchor would double-count movement the anchor already contains. That is
+     * the explicit allowed-loss path: the grid generation is being discarded
+     * (rebuild, rejected snapshot, restart replay), so the relative deltas no
+     * longer have a geometry to apply onto.
      *
      * Marks the grid dirty so the cleared array reaches disk even on paths
      * that do not otherwise persist.
      *
      * @param {string} reason - Log/debug label for the drop
-     */
-    /**
-     * Drop ALL owed fill-crawl records.
-     *
-     * This is the explicit allowed-loss path: the grid generation is being
-     * discarded (rebuild, rejected snapshot, restart replay), so the relative
-     * deltas no longer have a geometry to apply onto.
+     * @param {string} detail - Extra context appended to the drop log line
      */
     _clearPendingFillCrawls(reason: string = 'unspecified', detail: string = ''): void {
         if (!Array.isArray(this._pendingFillCrawls) || this._pendingFillCrawls.length === 0) return;
@@ -3020,7 +3018,7 @@ class OrderManager implements OrderManagerLike {
     }
 
     /**
-     * @param {Map<string, import('./types').Order>} targetGrid
+     * @param {Map<string, import('../types.js').Order>} targetGrid
      * @param {number} targetBoundary
      * @returns {Object}
      */

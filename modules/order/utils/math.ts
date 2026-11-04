@@ -4,10 +4,10 @@
  * Pure numeric calculations, blockchain conversions, fee math, and fund allocation.
  *
  * ===============================================================================
- * TABLE OF CONTENTS (78 exports)
+ * TABLE OF CONTENTS (80 exports + the GridGenesis and FeeCacheEntry types)
  * ===============================================================================
  *
- * SECTION 1: GENESIS LADDER & RAIL GEOMETRY (28 items)
+ * SECTION 1: GENESIS LADDER & RAIL GEOMETRY (29 exports + the GridGenesis type)
  *   - GridGenesis - Genesis ladder type: start price, increment, gap slots,
  *     price levels and their hash
  *   - priceLevelsForGenesis(genesis) - Extract the frozen price ladder from a genesis
@@ -36,6 +36,8 @@
  *   - isEvacuationSizeStillValid(...) - Re-proof a stamped evacuation size against live geometry
  *   - validateBoundaryCommit(...) - Validate a proposed boundary commit against geometry
  *   - validatePersistedBoundary(...) - Validate a boundary restored from disk
+ *   - boundaryMoveReducesStrands(...) - Whether a boundary move reduces stranded rail slots
+ *   - pricesWithinHalfStep(a, b, ...) - Same ladder level within half a grid step
  *   - isTransientInBandRejection(reason) - Whether a persisted-boundary rejection is transient
  *   - BOUNDARY_REJECT_PLACED_IN_BAND - Rejection reason: target slot holds an in-band order
  *
@@ -51,9 +53,10 @@
  *   - resolveRelativePrice(value, startPrice, mode) - Resolve relative price values
  *   - validateGridPriceBounds(min, max, center) - Reject bounds not bracketing center
  *
- * SECTION 3: FUND CALCULATIONS (8 functions)
+ * SECTION 3: FUND CALCULATIONS (9 functions)
  *   - computeChainFundTotals(accountTotals, committedChain) - Compute total funds
  *   - calculateAvailableFundsValue(side, accountTotals, funds, ...) - Calculate available funds
+ *   - deriveChainTruthFundBudget(...) - Side budget derived from chain-truth totals
  *   - adjustBudgetForBtsFees(budget, btsFeeData, ...) - Reserve BTS fees from a side budget
  *   - getGridBestPrices(manager) - Best (highest) buy and best (lowest) sell price
  *   - calculateSpreadFromOrders(activeBuys, activeSells) - Calculate spread percentage
@@ -89,6 +92,7 @@
  *   - getAssetFees(assetSymbol, assetAmount, isMaker) - Get fee info for asset
  *   - getAssetFeesSafe(assetSymbol, assetAmount, isMaker) - Fee info without throwing
  *   - _setFeeCache(cache) - Set internal fee cache (internal)
+ *   - FeeCacheEntry - Per-asset fee-cache row type consumed by _setFeeCache
  *
  * SECTION 8: FUND ALLOCATION (6 functions)
  *   - allocateFundsByWeights(available, targetCount) - Allocate funds by weight

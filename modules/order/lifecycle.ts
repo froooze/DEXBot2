@@ -1051,9 +1051,9 @@ export class LifecycleRegistry {
         record.revision += 1;
         // Dropping a pending entry means the CREATE resolved. If the record
         // still reads `broadcasting`, nothing was observed afterwards, so the
-        // slot is a clean intent again. (An ABANDONED entry goes through
-        // `expirePending`, which leaves `unknown` instead — the two cases must
-        // not collapse into one.)
+        // slot is a clean intent again. (A pending entry that expires in the
+        // manager's TTL sweep goes through `_expirePendingBroadcast`, which
+        // leaves `unknown` instead — the two cases must not collapse into one.)
         if (record.phase === 'broadcasting') record.phase = 'intent';
         if (!record.orderId && !record.slotId) this.dropRecord(record);
     }

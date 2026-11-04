@@ -74,6 +74,8 @@ modules/
 ├── node_health_cache.ts           shared node-health cache file I/O + ordering
 ├── socket_json_client.ts          newline-delimited JSON Unix-socket client
 ├── market_adapter_whitelist.ts    adapter whitelist I/O
+├── outcome.ts                     three-valued Outcome construction (applied/rejected/unknown)
+├── timing_policy.ts               timing-window audit: EXTERNAL/BOUND/POLICY/SELF_HEALING classification
 ├── types.ts                       shared type definitions
 │
 ├── crypto/                        cross-environment crypto providers

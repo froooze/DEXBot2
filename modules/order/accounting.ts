@@ -6,7 +6,7 @@
  * Exports a single Accountant class that manages all fund accounting operations.
  *
  * ===============================================================================
- * TABLE OF CONTENTS - Accountant Class (26 methods)
+ * TABLE OF CONTENTS - Accountant Class (27 methods)
  * ===============================================================================
  *
  * CORE INITIALIZATION & RECALCULATION (2 methods)
@@ -56,6 +56,7 @@
  *   25. _recalibrateTrackedFundsFromChain(mgr, openOrders) - Recalibrate tracked funds
  *       from a fresh chain snapshot
  *   26. _tryTrustChainFreeHeal(mgr, driftValidation) - Attempt a trust-chain-free heal
+ *   27. _getBtsFeeSchedule() - Resolve the BTS fee schedule (create/update/cancel + maker refund %)
  *
  * ===============================================================================
  * FUND STRUCTURE (managed by Accountant)

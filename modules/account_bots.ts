@@ -305,7 +305,7 @@ async function askRequiredString(promptText: string, defaultValue?: string): Pro
 
 /**
  * Prompts the user for a cron schedule using interval and time.
- * @param {string} promptText - The prompt text to display.
+ * @param {string} _promptText - Unused; the prompt text is built below.
  * @param {string} defaultValue - The default value to use if input is empty.
  * @returns {Promise<string>} The user input.
  */
@@ -422,10 +422,12 @@ async function askAssetB(promptText: string, defaultValue?: string, assetA?: str
 }
 
 /**
- * Prompts the user for a weight distribution value with a legend.
+ * Prompts the user for a weight distribution value, optionally printing the
+ * value legend above the prompt.
  * @param {string} promptText - The prompt text to display.
  * @param {number} [defaultValue] - The default value to use if input is empty.
- * @returns {Promise<number|string>} The numeric value or '\x1b' if ESC.
+ * @param {boolean} showLegend - Print the -1..2 legend line before prompting.
+ * @returns {Promise<number|string|undefined>} The numeric value, '\x1b' if ESC, or undefined.
  */
 async function askWeightDistributionValue(promptText: string, defaultValue: number | undefined, showLegend: boolean): Promise<number | string | undefined> {
     const MIN_WEIGHT = -1;
@@ -441,7 +443,7 @@ async function askWeightDistributionValue(promptText: string, defaultValue: numb
  * Prompts the user for a weight distribution value with a legend.
  * @param {string} promptText - The prompt text to display.
  * @param {number} [defaultValue] - The default value to use if input is empty.
- * @returns {Promise<number|string>} The numeric value or '\x1b' if ESC.
+ * @returns {Promise<number|string|undefined>} The numeric value, '\x1b' if ESC, or undefined.
  */
 async function askWeightDistribution(promptText: string, defaultValue?: number): Promise<number | string | undefined> {
     return askWeightDistributionValue(promptText, defaultValue, true);
@@ -451,7 +453,7 @@ async function askWeightDistribution(promptText: string, defaultValue?: number):
  * Prompts the user for a weight distribution value without a legend.
  * @param {string} promptText - The prompt text to display.
  * @param {number} [defaultValue] - The default value to use if input is empty.
- * @returns {Promise<number|string>} The numeric value or '\x1b' if ESC.
+ * @returns {Promise<number|string|undefined>} The numeric value, '\x1b' if ESC, or undefined.
  */
 async function askWeightDistributionNoLegend(promptText: string, defaultValue?: number): Promise<number | string | undefined> {
     return askWeightDistributionValue(promptText, defaultValue, false);

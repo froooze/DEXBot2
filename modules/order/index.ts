@@ -31,23 +31,23 @@
  *
  * SUBSYSTEM MODULES:
  * 1. manager.ts - OrderManager class (order lifecycle, fund tracking)
- * 2. grid.ts - Grid class (grid creation, synchronization, health)
+ * 2. grid.ts - Grid engine (grid creation, synchronization, health)
  * 3. utils/math.ts, utils/order.ts, utils/system.ts - Helper functions by concern
- * 4. format.ts - Numeric formatting (17 functions for consistent display)
+ * 4. format.ts - Numeric formatting (18 functions for consistent display)
  * 5. accounting.ts - Accountant class (fund calculations and reconciliation)
  * 6. logger.ts - Logger class (structured, color-coded output)
  * 7. async_lock.ts - AsyncLock class (race condition prevention)
  * 8. working_grid.ts - WorkingGrid class (copy-on-write grid state)
  * 9. export.ts - Trade history extraction and CSV export
  * 10. grid_reconcile.ts - Grid reconciliation against chain (startup + maintenance)
- * 11. strategy.ts - Strategy configuration and parsing
+ * 11. strategy.ts - StrategyEngine class (boundary-crawl rebalancing, target grid)
  * 12. sync_engine.ts - Real-time blockchain synchronization
  *
  * ===============================================================================
  */
 
-// Runner may contain I/O and larger logic; require lazily to avoid loading it
-// during small unit tests. Expose a lazy accessor instead.
+// The logger is required lazily: it pulls in console/formatting setup that small
+// unit tests do not need, and `logger` is exposed as a lazy getter below.
 
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);

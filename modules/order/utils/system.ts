@@ -4,7 +4,7 @@
  * Price derivation, persistence, grid correction, and UI/interactive utilities.
  *
  * ===============================================================================
- * TABLE OF CONTENTS (43 exported functions + 11 structural view types)
+ * TABLE OF CONTENTS (52 exported functions + 12 structural view types)
  * ===============================================================================
  *
  * SECTION 1: PRICE DERIVATION (9 functions + 1 internal)
@@ -50,7 +50,18 @@
  *   - resetLastFillPivot(manager) - Clear the pivot to cold state
  *   - restoreLastFillPivot(manager) - Restore the persisted pivot into the manager
  *
- * SECTION 7: UI & INTERACTIVE UTILITIES (6 functions)
+ * SECTION 7: FILL PIPELINE & LAST-FILL GUARD (9 functions)
+ *   - reanchorBoundaryFromLastFill(manager, ...) - Re-anchor a rebuilt boundary to the last fill
+ *   - rearmLastFillPivotFromMarketFill(manager) - Re-arm the pivot from the last market fill
+ *   - isLastFillGuardBlocked(price, type, lastPrice, lastType) - LAST-FILL-GUARD predicate
+ *   - isLastFillPlacementBlocked(manager, price, type) - Placement-side LAST-FILL-GUARD wrapper
+ *   - readFillPipelineState(source) - Projection of the fill-pipeline state
+ *   - resolveGridUpdateBlockers(source, options) - Blockers that forbid a grid update right now
+ *   - noteGridUpdateBlockers(...) - Log/record the blockers for one decision
+ *   - hasUnsettledFills(source) - Whether any fill is still unsettled (with a reason)
+ *   - getPipelineInFlightAgeMs(source, nowMs) - Age of the oldest in-flight pipeline work
+ *
+ * SECTION 8: UI & INTERACTIVE UTILITIES (6 functions)
  *   - ensureProfilesDirectory(profilesDir) - Ensure profiles directory exists
  *   - sleep(ms) - Pause execution for specified duration
  *   - readInput(prompt, options) - Read user input from stdin
@@ -59,7 +70,7 @@
  *   - withBlockchainRetry(fn, label, options) - Blockchain op with timeout + retry + node failover
  *   (withTimeout lives in ./timeout)
  *
- * SECTION 8: GENERAL UTILITIES (7 functions)
+ * SECTION 9: GENERAL UTILITIES (7 functions)
  *   - resolveAccountRef(manager, account) - Resolve best account reference
  *   - deepFreeze(obj) - Recursively freeze object for immutability
  *   - cloneMap(map) - Create shallow clone of Map
@@ -70,8 +81,8 @@
  *
  * STRUCTURAL VIEW TYPES:
  *   AssetMeta, PoolReserve, PoolEntry, BitSharesClient, AmaCenterSnapshot,
- *   FeeCacheEntryData, SpreadCorrectionRefusalReason, SpreadCorrectionReadiness,
- *   UnmatchedChainOrderLike, GridResizeResult, CowResult
+ *   FeeCacheEntryData, SpreadCorrectionReadiness, GridUpdateBlockerCode,
+ *   GridUpdateBlocker, FillPipelineState, GridResizeResult, CowResult
  *
  * ===============================================================================
  */
@@ -1016,7 +1027,10 @@ export async function initializeFeeCache(botsConfig: Array<{ assetA?: string; as
         }
     }
 
-    MathUtils._setFeeCache(cache as unknown as Record<string, import('./math.js').FeeCacheEntry>);
+    // The math-side fee-cache entry is a narrower structural view of the same
+    // row this module persists. Cast through the setter's own parameter type
+    // instead of naming a type that is not exported from utils/math.ts.
+    MathUtils._setFeeCache(cache as unknown as Parameters<typeof MathUtils._setFeeCache>[0]);
     _saveFeeCacheToDisk(cache);
     return cache;
 }
@@ -2589,7 +2603,7 @@ export async function retryPersistenceIfNeeded(manager: OrderManagerLike): Promi
  * 
  * @param {Object} manager - OrderManager instance
  * @param {Object} accountOrders - AccountOrders data accessor
- * @param {string} botKey - Bot identifier for persistence
+ * @param {string} _botKey - Unused; persistence is keyed off the manager.
  * @param {Function} updateOrdersOnChainBatchFn - Batch update function for blockchain operations
  * @param {Function} updateGridFromBlockchainSnapshotFn - Grid resize function (injected to avoid circular dependency with grid.ts)
  * @returns {Promise<void>}

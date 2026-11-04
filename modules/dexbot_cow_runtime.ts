@@ -1316,7 +1316,7 @@ async function resyncIfUnreconciled(bot: BotLike, err: unknown, pending: Pending
  * @param {import('./dexbot_class.js').DEXBot} bot
  * @param {BroadcastUncertainError} err
  * @param {Array<Object>} opContexts
- * @param {Object} options
+ * @param {Object} _options - Reserved; the implementation takes no options yet.
  * @returns {Promise<Object>}
  */
 async function reconcileAfterUncertainBroadcastImpl(bot: BotLike, err: unknown, opContexts: OpPhase[], _options: JsonObj) {
@@ -1433,7 +1433,7 @@ async function reconcileAfterUncertainBroadcastImpl(bot: BotLike, err: unknown, 
 
 /**
  * Check whether to execute creates in outside-in pair mode.
- * @param {import('./dexbot_class.js').DEXBot} bot
+ * @param {unknown} _bot - Unused; the decision depends only on opContexts.
  * @param {Array} opContexts
  * @returns {boolean}
  */
@@ -2008,7 +2008,7 @@ function validateOperationFunds(bot: BotLike, operations: JsonObj[], assetA: Ass
 
 /**
  * Resolve the ideal size from an order-like object with fallback.
- * @param {import('./dexbot_class.js').DEXBot} bot
+ * @param {unknown} _bot - Unused; the size comes from orderLike only.
  * @param {Object|null} orderLike
  * @param {number|null} [fallbackSize=null]
  * @returns {number|null}
@@ -2515,7 +2515,8 @@ function resolveLastFillGuardIncrement(bot: { manager?: BotLike["manager"]; conf
 
 /**
  * Build COW actions array from a simple plan object.
- * @param {import('./dexbot_class.js').DEXBot} bot
+ * @param {import('./dexbot_class.js').DEXBot} _bot - Bot whose manager supplies the frozen
+ *   boundary/gap geometry the plan stamp carries (plan values win when set).
  * @param {Object|Array} plan
  * @returns {Array}
  */
@@ -3735,13 +3736,6 @@ async function waitForCowBroadcastSingleFlight(bot: BotLike, label: string): Pro
     return false;
 }
 
-/**
- * COW broadcast: Execute blockchain operations and commit working grid on success.
- * @param {import('./dexbot_class.js').DEXBot} bot
- * @param {Object} cowResult
- * @param {Object} [options={}] - Internal execution options (replanDepth)
- * @returns {Promise<Object>}
- */
 /**
  * Derive an update action's planned target size (shared by the rotation and
  * plain size-update op builders).
@@ -6150,49 +6144,6 @@ async function requestStructuralResync(bot: BotLike, reason: string, details: Js
 }
 
 /**
- * Adopt a batch's placed orders from the chain after the commit was refused
- * or after a poll-confirmed uncertain commit. The batch ops are already on
- * chain but never reached master, so a full chain sync with accounting
- * enabled locks the placed orders' capital and releases any cancelled ones.
- * Returns true when the adoption sync ran; false when the chain state could
- * not be read (empty/lagging read, truncated read, or sync failure) — the
- * caller then keeps the pending-broadcast protection and defers adoption to
- * a structural resync.
- * @param {import('./dexbot_class.js').DEXBot} bot
- * @param {Object} chainOrders - Chain orders module
- * @param {string} logPrefix - Log prefix for sync failure messages
- * @returns {Promise<boolean>}
- */
-/**
- * Converge master with the chain after a COW commit was refused (master moved
- * during broadcast) or an uncertain broadcast was poll-confirmed.
- *
- * Preferred path (when the broadcast result is available): re-read the exact
- * on-chain orders BY ID — every id master already tracks plus the batch's
- * fresh CREATE ids. get_objects returns the complete, authoritative set
- * regardless of account size, so syncFromOpenOrders converges master instead
- * of dropping the freshest creates (which previously left permanent orphans
- * and tripped the fund invariant). This is fully immune to the
- * get_full_accounts window truncation that broke the old window-read path.
- *
- * Fallback (no broadcast result, e.g. uncertain paths, or by-id read
- * unavailable): window read. A truncated read is ambiguous — only the
- * freshest orders are dropped — so it MUST NOT drive adoption; we return false
- * and let the caller keep pending-broadcast protection + structural resync.
- *
- * @param {unknown} bot
- * @param {unknown} chainOrders - chain_orders module (has readOpenOrdersWithMetaSafe + batchReadOrders)
- * @param {string} logPrefix
- * @param {Object} [opts]
- * @param {unknown} [opts.placedResults] - broadcast result carrying operation_results
- * @param {unknown[]} [opts.placedContexts] - opContexts aligned with operation_results
- * @param {string[]} [opts.polledCreateIds] - fresh CREATE chain ids confirmed by
- *   the uncertain-broadcast poll (no broadcast result exists on that path);
- *   routes the poll call sites through the by-id path with its lagging-create
- *   retry instead of the unguarded window fallback
- * @returns {Promise<boolean>} true if master was adopted from the chain
- */
-/**
  * P1-atomic: after a refused/uncertain COW commit is recovered by adopting the
  * placed orders from the chain, re-apply the rotational boundary this batch had
  * already computed (workingBoundary) to master. The refused commit discarded
@@ -6222,6 +6173,35 @@ async function restoreBoundaryAfterAdoption(bot: BotLike, workingBoundary: numbe
     }
 }
 
+/**
+ * Converge master with the chain after a COW commit was refused (master moved
+ * during broadcast) or an uncertain broadcast was poll-confirmed.
+ *
+ * Preferred path (when the broadcast result is available): re-read the exact
+ * on-chain orders BY ID — every id master already tracks plus the batch's
+ * fresh CREATE ids. get_objects returns the complete, authoritative set
+ * regardless of account size, so syncFromOpenOrders converges master instead
+ * of dropping the freshest creates (which previously left permanent orphans
+ * and tripped the fund invariant). This is fully immune to the
+ * get_full_accounts window truncation that broke the old window-read path.
+ *
+ * Fallback (no broadcast result, e.g. uncertain paths, or by-id read
+ * unavailable): window read. A truncated read is ambiguous — only the
+ * freshest orders are dropped — so it MUST NOT drive adoption; we return false
+ * and let the caller keep pending-broadcast protection + structural resync.
+ *
+ * @param {unknown} bot
+ * @param {unknown} chainOrders - chain_orders module (has readOpenOrdersWithMetaSafe + batchReadOrders)
+ * @param {string} logPrefix
+ * @param {Object} [opts]
+ * @param {unknown} [opts.placedResults] - broadcast result carrying operation_results
+ * @param {unknown[]} [opts.placedContexts] - opContexts aligned with operation_results
+ * @param {string[]} [opts.polledCreateIds] - fresh CREATE chain ids confirmed by
+ *   the uncertain-broadcast poll (no broadcast result exists on that path);
+ *   routes the poll call sites through the by-id path with its lagging-create
+ *   retry instead of the unguarded window fallback
+ * @returns {Promise<boolean>} true if master was adopted from the chain
+ */
 async function adoptPlacedBatchFromChain(bot: BotLike, chainOrders: typeof chainOrdersModule, logPrefix: string, opts: JsonObj = {}): Promise<boolean> {
     const { placedResults = null, placedContexts = null, polledCreateIds = null } = opts || {};
     try {

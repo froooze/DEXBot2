@@ -2,7 +2,9 @@
  * modules/order/async_lock.ts - AsyncLock Engine
  *
  * Distributed mutual exclusion for async operations.
- * Exports a single AsyncLock class that prevents concurrent execution of critical sections.
+ * Exports the AsyncLock class (the lock itself) plus the `acquireIfNotHeld()`
+ * re-entrancy guard that call sites delegate through instead of inlining the
+ * `isReentrant()` check-and-acquire.
  *
  * Solves the Time-of-Check vs Time-of-Use (TOCTOU) race condition
  * where checking a flag and setting it are not atomic operations.
@@ -46,6 +48,10 @@
  * LOCK RELEASE (1 method)
  *   8. forceRelease() - Force-release the lock, rejecting every queued waiter
  *      (used by shutdown/cleanup paths; returns whether it was held)
+ *
+ * MODULE-LEVEL EXPORT:
+ *   acquireIfNotHeld(lock, fn) - Run `fn` under `lock` unless the current async
+ *      context already holds it (canonical re-entrancy guard)
  *
  * ===============================================================================
  *
