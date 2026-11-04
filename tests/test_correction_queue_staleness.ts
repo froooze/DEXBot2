@@ -50,6 +50,7 @@ function createManager(ordersList, queue = []) {
         assets: ASSETS,
         ordersNeedingPriceCorrection: queue.map((e) => ({ ...e })),
         _lastUnmatchedChainOrders: [] as any[],
+        _placedAt: new Map<string, number>(),
         _genesis: makeLadderFromPrices(fixturePrices),
         boundaryIdx: 0,
         _gapSlots: 0,
@@ -589,6 +590,78 @@ async function run() {
         await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
         assert.ok(logs.some((l: string) => l.includes('Backlog')), 'backlog threshold must warn');
         console.log('  - backlog threshold emits a warn');
+    }
+
+    // ---- 5. Type-mismatch cancels bypass the fresh-placement grace ----
+    // A live order on the WRONG side must not rest for SURPLUS_CANCEL_GRACE_MS
+    // (15 min): its next fill is classified against the slot's wrong side
+    // (2026-11-04 live incident: a sell on a slot retyped BUY produced a
+    // filledAmount=0 phantom fill and a re-buy at the fill level).
+    {
+        const freshChainId = '1.7.777001';
+        const wrongSideSlot = {
+            id: 'slot-80', orderId: freshChainId, type: ORDER_TYPES.BUY,
+            price: 0.312638, size: 850, state: ORDER_STATES.ACTIVE,
+        };
+        const { manager, logs } = createManager(
+            [wrongSideSlot],
+            [{
+                gridOrder: { id: 'slot-80', type: ORDER_TYPES.BUY, price: 0.312638, size: 850 },
+                chainOrderId: freshChainId,
+                expectedPrice: 0.312638,
+                actualPrice: 0.312638,
+                size: 850,
+                type: ORDER_TYPES.SELL,
+                sideUpdated: ORDER_TYPES.SELL,
+                typeMismatch: true,
+                isSurplus: true,
+                cancelOnly: false,
+                queuedAt: Date.now(),
+                queuedBy: 'sync-pass1-type-mismatch',
+            }]
+        );
+        // Freshly placed: inside the 15-minute surplus-cancel grace.
+        manager._placedAt = new Map([[freshChainId, Date.now()]]);
+        let cancels = 0; let updates = 0;
+        const accountOrders = {
+            updateOrder: async () => { updates++; return {}; },
+            cancelOrder: async () => { cancels++; return { success: true }; },
+        };
+        const out = await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
+        assert.strictEqual(cancels, 1, 'a fresh type-mismatch order must be cancelled, not deferred');
+        assert.strictEqual(updates, 0, 'a wrong-side order is cancelled, never price-updated');
+        assert.strictEqual(out.corrected, 1, 'the cancel must count as corrected');
+        assert.strictEqual(manager.ordersNeedingPriceCorrection.length, 0, 'the entry must leave the queue');
+        assert(!logs.some((l) => l.includes('inside grace window')), 'type mismatch must not hit the grace log');
+        console.log('  - fresh type-mismatch order is cancelled immediately');
+    }
+
+    // ---- 5b. Regular surplus keeps the grace (no churn on fresh placements) ----
+    {
+        const freshChainId = '1.7.777002';
+        const { manager, logs } = createManager(
+            [{ id: 'slot-81', orderId: freshChainId, type: ORDER_TYPES.BUY, price: 0.312638, size: 850, state: ORDER_STATES.ACTIVE }],
+            [{
+                gridOrder: { id: 'slot-81', type: ORDER_TYPES.BUY, price: 0.312638, size: 850 },
+                chainOrderId: freshChainId,
+                expectedPrice: 0.312638,
+                actualPrice: 0.312638,
+                size: 850,
+                type: ORDER_TYPES.BUY,
+                isSurplus: true,
+                cancelOnly: false,
+                queuedAt: Date.now(),
+                queuedBy: 'sync-surplus',
+            }]
+        );
+        manager._placedAt = new Map([[freshChainId, Date.now()]]);
+        let cancels = 0;
+        const accountOrders = { cancelOrder: async () => { cancels++; return { success: true }; } };
+        await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
+        assert.strictEqual(cancels, 0, 'a regular fresh surplus must still be held by the grace');
+        assert.strictEqual(manager.ordersNeedingPriceCorrection.length, 1, 'held entry stays queued');
+        assert(logs.some((l) => l.includes('inside grace window')), 'the grace deferral must still be logged');
+        console.log('  - regular fresh surplus still honours the grace window');
     }
 
     console.log('PASS test_correction_queue_staleness');

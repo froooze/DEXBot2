@@ -21,7 +21,7 @@ function makeFill(id: string, orderId: string | null = null, type: string = 'SEL
     return { id, orderId: orderId || `1.7.${id.replace(/\D/g, '')}`, type, price: 0.02, size: 100, isPartial: false, blockNum: 1000 + parseInt(id.replace(/\D/g, ''), 10) || 1 };
 }
 
-function makeBot() {
+function makeBot(configOverrides: Record<string, unknown> = {}) {
     const bot = new DEXBot({
         name: 'test-fill-batch-chunking',
         assetA: 'BTS',
@@ -33,6 +33,7 @@ function makeBot() {
         coreOrders: { buy: 2, sell: 2 },
         incrementPercent: 1,
         weightDistribution: { buy: 0.5, sell: 0.5 },
+        ...configOverrides,
     });
 
     bot.manager = {
@@ -67,6 +68,18 @@ function makeBot() {
             workingBoundary: 0,
             aborted: false,
         };
+    };
+
+    // Pivot-stamp spy: _processFillsWithBatching records the guard pivot once
+    // per planned chunk. Coalescing the backlog must stamp the WHOLE cycle in
+    // one call (so the pivot is the last fill, not the first chunk's).
+    bot.manager.recordLastFilledPrices = (fills: any[]) => {
+        callLog.push({
+            method: 'recordLastFilledPrices',
+            fillCount: fills.length,
+            lastId: fills[fills.length - 1]?.id,
+            lastPrice: fills[fills.length - 1]?.price,
+        });
     };
 
     bot._executeBatchIfNeeded = async (rebalanceResult: any, contextLabel: string) => {
@@ -404,6 +417,37 @@ async function runTests() {
         assert.strictEqual(pipelineCalls.length, 2, 'bootstrap fills should be processed in two chunks');
         assert.strictEqual(pipelineCalls[0].fillCount, MAX_BATCH, 'first chunk should have MAX_BATCH fills');
         assert.strictEqual(pipelineCalls[1].fillCount, totalFills - MAX_BATCH, 'second chunk should contain remaining fills');
+    }
+
+    // --- Test 14: coalesced backlog replay (2a) ---
+    // A backlog larger than the gap-slot batch is planned as ONE reconcile
+    // instead of a chunked replay that mutates the boundary between
+    // broadcasts (2026-11-04 incident: a deferred backlog replayed chunk by
+    // chunk placed new sells below levels that had already sold on chain).
+    {
+        const bot = makeBot({ fillProcessing: { COALESCE_BACKLOG_REPLAY: true } });
+        const totalFills = 16;
+        const fills = Array.from({ length: totalFills }, (_, n) => ({
+            ...makeFill(`sell${n + 1}`),
+            price: 1 + n * 0.01,
+        }));
+        const result = await bot._processFillsWithBatching(fills, null, 'test-coalesced');
+        assert.strictEqual(result.aborted, false, 'coalesced backlog should not abort');
+
+        const processCalls = bot._callLog.filter(c => c.method === 'processFilledOrders');
+        assert.strictEqual(processCalls.length, 1, 'coalesced backlog: 1 processFilledOrders call');
+        assert.strictEqual(processCalls[0].fillCount, totalFills, 'all fills must be in the single plan');
+        assert.strictEqual(processCalls[0].exclSize, 0, 'unified plan must not pre-exclude sibling fills');
+
+        const execCalls = bot._callLog.filter(c => c.method === '_executeBatchIfNeeded');
+        assert.strictEqual(execCalls.length, 1, 'coalesced backlog: 1 executeBatchIfNeeded call');
+
+        const recordCalls = bot._callLog.filter(c => c.method === 'recordLastFilledPrices');
+        assert.strictEqual(recordCalls.length, 1, 'the whole backlog must stamp the pivot once');
+        assert.strictEqual(recordCalls[0].fillCount, totalFills, 'the stamp must see every fill');
+        assert.strictEqual(recordCalls[0].lastId, `sell${totalFills}`, 'the pivot must be the LAST fill of the backlog');
+        assert.strictEqual(recordCalls[0].lastPrice, 1 + (totalFills - 1) * 0.01, 'pivot price must be the last fill price');
+        console.log(`  ✓ ${totalFills} fills coalesced into one plan (pivot from the last fill)`);
     }
 
     console.log('\nAll fill batch chunking tests passed.\n');

@@ -4388,6 +4388,26 @@ async function updateOrdersOnChainBatchCOWBody(
     let heldBroadcastSlot = false;
     let batchInFlightRaised = false;
     let ordersLocked = false;
+    // Broadcast-region ownership for THIS frame. startBroadcasting() runs
+    // before the action loop (fills must stay deferred while ops are built),
+    // but the inner broadcast try/finally only covers the broadcast section.
+    // Every early return in between — all CREATEs skipped by the last-fill /
+    // crossing / size guards (operations.length === 0), fund-validation
+    // refusal, stale-plan re-plan, single-flight/placement aborts — used to
+    // return with the refcount still held. The leaked flag then froze the
+    // fill consumer until the 120s stale-flag watchdog (2026-11-04 incident:
+    // three such returns parked 26 fills, the backlog was replayed against a
+    // stale boundary and the bot sold below levels it had already sold).
+    // One flag + one releaser: the inner finally, the catch and the outer
+    // finally all call it, and only the first call decrements — a second raw
+    // stopBroadcasting() in the outer finally would underflow another
+    // holder's region (grid reconcile / spread correction).
+    let broadcastRegionHeld = false;
+    const releaseBroadcastRegion = () => {
+        if (!broadcastRegionHeld) return;
+        broadcastRegionHeld = false;
+        bot.manager.stopBroadcasting();
+    };
     try {
 
     // Single-flight COW broadcast guard (entry check): never broadcast two
@@ -4565,6 +4585,7 @@ async function updateOrdersOnChainBatchCOWBody(
     bot._markGridActivity('batch start');
     bot.manager._setRebalanceState(REBALANCE_STATES.BROADCASTING);
     bot.manager.startBroadcasting();
+    broadcastRegionHeld = true;
 
         // P3 — freeze the guard pivot once per batch: per-action refreshes
         // mutated the pivot mid-batch (02:03 pivots drifted 0.001523→0.001529
@@ -5935,7 +5956,7 @@ async function updateOrdersOnChainBatchCOWBody(
         } finally {
             bot.manager._throwOnIllegalState = false;
             await bot.manager.resumeFundRecalc();
-            bot.manager.stopBroadcasting();
+            releaseBroadcastRegion();
             const createCount = actions.filter((a: { type?: unknown }) => a.type === COW_ACTIONS.CREATE).length;
             const cancelCount = actions.filter((a: { type?: unknown }) => a.type === COW_ACTIONS.CANCEL).length;
             bot.manager.logger.logFundsStatus(bot.manager, `AFTER COW batch (created=${createCount}, cancelled=${cancelCount})`);
@@ -5949,7 +5970,7 @@ async function updateOrdersOnChainBatchCOWBody(
                 'warn'
             );
         }
-        bot.manager.stopBroadcasting();
+        releaseBroadcastRegion();
 
         // Chain polling: for uncertain broadcasts (not partial), try to confirm
         // CREATE operations on chain before clearing the working grid. If all
@@ -6090,6 +6111,12 @@ async function updateOrdersOnChainBatchCOWBody(
         }
         if (heldBroadcastSlot) bot._cowBroadcastInFlight = false;
         releasePlacement();
+        // Release the region as early as the frame contract allows: after
+        // _batchInFlight-- and placement release (so region-end listeners see
+        // a torn-down frame), but BEFORE the remaining best-effort cleanup.
+        // A throw from _markGridActivity / unlockOrders / the fill-consumer
+        // restart must not strand the refcount for the next 120s watchdog.
+        releaseBroadcastRegion();
         if (batchInFlightRaised) bot._markGridActivity('batch end');
         if (ordersLocked) bot.manager.unlockOrders(idsToLock);
 

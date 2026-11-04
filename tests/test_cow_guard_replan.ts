@@ -149,7 +149,9 @@ function createGuardFixture(masterOrders = new Map()) {
         resyncCalls: 0,
         executeBatchCalls: 0,
         clearCalls: 0,
-        restoreCalls: 0
+        restoreCalls: 0,
+        broadcastStarts: 0,
+        broadcastStops: 0
     };
 
     const manager: any = {
@@ -169,8 +171,8 @@ function createGuardFixture(masterOrders = new Map()) {
         unlockOrders: () => {},
         _setRebalanceState: () => {},
         _resetRebalanceStateToDepth: () => {},
-        startBroadcasting: () => {},
-        stopBroadcasting: () => {},
+        startBroadcasting: () => { counters.broadcastStarts += 1; },
+        stopBroadcasting: () => { counters.broadcastStops += 1; },
         pauseFundRecalc: () => {},
         resumeFundRecalc: async () => {},
         _commitWorkingGrid: async (_wg: any, _idx: any, _boundary: any, options: any) => {
@@ -415,11 +417,59 @@ async function testReplanWithNoActionsSkipsStalePlan() {
         assert.strictEqual(manager._currentWorkingGridStack.length, 0, 'working grid stack must be balanced');
         assert.strictEqual(counters.clearCalls, 2, 'original pop + fresh-plan pop');
         assert.strictEqual(counters.restoreCalls, 0, 'no restore needed when re-plan succeeds');
+        assert.strictEqual(counters.broadcastStarts, 1, 'the frame must hold one broadcast region');
+        assert.strictEqual(counters.broadcastStops, 1, 'the skipped-plan return must release the broadcast region');
     } finally {
         restore();
     }
 
     console.log('✓ COW-GUARD-REPLAN-002 passed');
+}
+
+async function testZeroOperationBatchReleasesBroadcastRegion() {
+    console.log('\n[COW-GUARD-REPLAN-007] a zero-op batch must release its broadcast region...');
+
+    const masterOrders = new Map([
+        ['slot-1', createOrder('slot-1')]
+    ]);
+    const { bot, manager, counters, logs } = createGuardFixture(masterOrders);
+    const restore = installChainStubs(manager, counters);
+
+    // Arm the last-fill pivot ABOVE the planned BUY create. The direction
+    // rule then skips the only action, `operations.length === 0` returns
+    // through the pre-broadcast path, and the outer finally must release the
+    // region this frame started. Before the fix this path leaked the
+    // refcount and froze the fill consumer until the 120s watchdog.
+    manager._lastFilledPrice = 1.0;
+    manager._lastFilledType = ORDER_TYPES.SELL;
+    manager._lastFilledAt = Date.now();
+    manager.lastFillPivotSource = 'fill';
+
+    try {
+        const workingGrid = new WorkingGrid(manager.orders, { baseVersion: manager._gridVersion });
+        workingGrid.set('slot-2', createVirtualCreateAction('slot-2', 1.1).order);
+        manager._currentWorkingGridStack.push(workingGrid);
+        const result = await bot._updateOrdersOnChainBatchCOW({
+            workingGrid,
+            workingIndexes: workingGrid.getIndexes(),
+            workingBoundary: 0,
+            actions: [createVirtualCreateAction('slot-2', 1.1)],
+            fills: [],
+            _workingGridPushed: true
+        });
+
+        assert.strictEqual(result.executed, false, 'the zero-op batch must not execute');
+        assert.strictEqual(counters.executeBatchCalls, 0, 'nothing may be broadcast');
+        assert.strictEqual(counters.commitCalls, 0, 'nothing may be committed');
+        assert.strictEqual(counters.broadcastStarts, 1, 'the frame must hold exactly one broadcast region');
+        assert.strictEqual(counters.broadcastStops, 1, 'the zero-op return must release the region exactly once');
+        assert(logs.some((m: string) => m.toLowerCase().includes('last-fill-guard] skipping buy create')), 'the zero-op count must come from the last-fill guard');
+        assert.strictEqual(manager._currentWorkingGridStack.length, 0, 'working grid stack must be balanced');
+    } finally {
+        restore();
+    }
+
+    console.log('✓ COW-GUARD-REPLAN-007 passed');
 }
 
 async function testStaleAtReplanLimitProceedsWithResync() {
@@ -562,6 +612,7 @@ async function run() {
     await testStalePlanReplansOnceAndExecutes();
     await testReplanRestoresReanchorBudget();
     await testReplanWithNoActionsSkipsStalePlan();
+    await testZeroOperationBatchReleasesBroadcastRegion();
     await testStaleAtReplanLimitProceedsWithResync();
     await testReplanThrowProceedsWithResync();
     await testBatchAbortsWhenPlacementLeaseWasTornDown();

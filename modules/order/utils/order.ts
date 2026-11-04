@@ -340,6 +340,30 @@ function isFreshlyPlacedOrder(manager: OrderManagerLike, chainOrderId: string | 
 }
 
 /**
+ * Whether a cancel-class correction must be held back by the fresh-placement
+ * grace window.
+ *
+ * Type mismatches are deliberately EXEMPT. The grace exists so a fill landing
+ * between two controllers' count snapshots cannot get a seconds-old placement
+ * cancelled (surplus/duplicate churn). A live order on the WRONG side is not
+ * that race: it is a known-wrong order, and the next fill is classified from
+ * the slot's (wrong) side — a sell on a slot retyped BUY produced a
+ * `filledAmount=0` phantom fill, a dust cancel and a re-buy at the fill level
+ * (2026-11-04 live incident). The 15-minute SURPLUS_CANCEL_GRACE_MS is correct
+ * for surplus churn, not for a side that can corrupt fill accounting; the
+ * entry's own `_validatePriceCorrectionEntry` gate already drops it once the
+ * slot no longer owns the order or the side was repaired.
+ *
+ * @param {Object} manager - OrderManager instance
+ * @param {Object} entry - Queued correction entry
+ * @returns {boolean} True when the cancel should stay queued for this cycle
+ */
+function shouldDeferFreshCancel(manager: OrderManagerLike, entry: PendingPriceCorrection | null | undefined): boolean {
+    if (!entry || entry.typeMismatch === true) return false;
+    return isFreshlyPlacedOrder(manager, entry.chainOrderId);
+}
+
+/**
  * Remove a single correction entry by its full queue key
  * (chainOrderId + surplus flag). The queue's upsert key is
  * (chainOrderId, isSurplus), so a chain-order-only filter would silently
@@ -987,8 +1011,10 @@ async function correctOrderPriceOnChain(manager: OrderManagerLike, correctionInf
     if (cancelOnly) {
         // Surplus-cancel grace: a fill landing between two controllers' count
         // snapshots must not get a seconds-old placement cancelled. Skip
-        // quietly; the entry stays queued and re-evaluates next cycle.
-        if (isFreshlyPlacedOrder(manager, chainOrderId)) {
+        // quietly; the entry stays queued and re-evaluates next cycle. A
+        // type mismatch is exempt (see shouldDeferFreshCancel): a wrong-side
+        // order cannot wait out the grace, its next fill is misclassified.
+        if (shouldDeferFreshCancel(manager, correctionInfo)) {
             manager.logger?.log?.(`[CORRECTION] Skipping cancel-only for freshly placed ${chainOrderId} — inside grace window`, 'info');
             return { success: true, skipped: true };
         }
@@ -1018,7 +1044,10 @@ async function correctOrderPriceOnChain(manager: OrderManagerLike, correctionInf
 
     // Surplus/type-mismatch entries need cancellation, not a price update
     if (isSurplus) {
-        if (isFreshlyPlacedOrder(manager, chainOrderId)) {
+        // Type mismatches bypass the fresh-placement grace (see
+        // shouldDeferFreshCancel): their fill would be booked against the
+        // wrong slot side if the order is allowed to rest.
+        if (shouldDeferFreshCancel(manager, correctionInfo)) {
             manager.logger?.log?.(`[CORRECTION] Skipping surplus cancel for freshly placed ${chainOrderId} — inside grace window`, 'info');
             return { success: true, skipped: true };
         }
@@ -1530,9 +1559,11 @@ async function _correctAllPriceMismatchesLocked(manager: OrderManagerLike, accou
         // correctOrderPriceOnChain cannot protect the batch path, which
         // bypasses it. Held-back entries are simply left in
         // ordersNeedingPriceCorrection (never removed) and re-drain next cycle.
+        // Type mismatches are exempt from the hold (shouldDeferFreshCancel):
+        // letting a wrong-side order rest corrupts the next fill's accounting.
         const cancelEntries = liveEntries.filter((c) => {
             if (!(c.cancelOnly === true || c.isSurplus === true)) return false;
-            if (isFreshlyPlacedOrder(manager, c.chainOrderId)) {
+            if (shouldDeferFreshCancel(manager, c)) {
                 manager?.logger?.log?.(
                     `[CORRECTION] Deferring cancel of freshly placed ${c.chainOrderId} — inside grace window`,
                     'info'
