@@ -2439,10 +2439,10 @@ function refreshLastFillPivotFromQueue(bot: BotLike): boolean {
                     const recvAmt = Number(receives.amount);
                     if (Number.isFinite(paysAmt) && paysAmt > 0 && Number.isFinite(recvAmt) && recvAmt > 0) {
                         const paysFloat = (base: number, precision: number) => base / Math.pow(10, precision);
-                        if (paysId === assets.assetA.id) {
+                        if (paysId != null && paysId === assets.assetA.id) {
                             type = ORDER_TYPES.SELL;
                             price = paysFloat(recvAmt, assets.assetB.precision) / paysFloat(paysAmt, assets.assetA.precision);
-                        } else if (paysId === assets.assetB.id) {
+                        } else if (paysId != null && paysId === assets.assetB.id) {
                             type = ORDER_TYPES.BUY;
                             price = paysFloat(paysAmt, assets.assetB.precision) / paysFloat(recvAmt, assets.assetA.precision);
                         }

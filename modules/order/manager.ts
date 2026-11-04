@@ -343,6 +343,12 @@ class COWRebalanceEngine {
                 'info'
             );
         }
+        // Wrong-side (typeMismatch) orders are deliberately NOT exempted
+        // here: the correction queue owns that decision and its pre-batch
+        // drain (correctAllPriceMismatches) cancels them before this plan is
+        // broadcast. This guard only prevents churn on a plan-shaped
+        // CANCEL+CREATE pair; teaching it to guess the chain side here would
+        // re-introduce the churn for a legitimate retype.
         // Id-group drop is deliberate: dropping only the CANCEL would let
         // optimizeRebalanceActions below fold the paired CREATE back into an
         // UPDATE (cancelAction.id + newGridId) and re-materialize the

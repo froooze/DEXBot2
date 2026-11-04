@@ -636,8 +636,8 @@ function attributeUnmatchedFillToGrid(
     // fill event carries no pays asset (malformed/degraded), fall back to the
     // matched slot's rail type — the side must never be guessed from the price.
     let type: string | null = null;
-    if (input.paysAssetId === assets.assetB.id) type = ORDER_TYPES.BUY;
-    else if (input.paysAssetId === assets.assetA.id) type = ORDER_TYPES.SELL;
+    if (input.paysAssetId != null && input.paysAssetId === assets.assetB.id) type = ORDER_TYPES.BUY;
+    else if (input.paysAssetId != null && input.paysAssetId === assets.assetA.id) type = ORDER_TYPES.SELL;
     if (type !== ORDER_TYPES.BUY && type !== ORDER_TYPES.SELL && slot
         && (slot.type === ORDER_TYPES.BUY || slot.type === ORDER_TYPES.SELL)) {
         type = slot.type;

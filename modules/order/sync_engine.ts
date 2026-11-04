@@ -1765,27 +1765,34 @@ class SyncEngine {
     _computeFillContext(mgr: OrderManagerLike, matchedGridOrder: ManagedOrder, paysAssetId: string | null | undefined, paysAmountRaw: number, receivesAssetId: string | null | undefined = null, receivesAmountRaw: number | null = null) {
         const assets = mgr.assets;
         if (!assets?.assetA || !assets?.assetB) throw new Error('assets required for fill context');
-        // A SPREAD slot can carry an on-chain order (e.g. spread-correction
-        // activation). Resolve the real side from the fill's pays asset so the
-        // transition result is BUY/SELL — never SPREAD with an on-chain state,
-        // which validateOrder rejects as fatal ILLEGAL_SPREAD_STATE. When the
-        // pays asset matches neither side (malformed fill event), fall back to
-        // the price-vs-startPrice convention so the type can never leak SPREAD
-        // into a fill result (which would drop the boundary shift downstream).
+        // The fill's paid asset is the ground truth for the order side. The
+        // slot type is only a grid identity and can be retyped (BUY<->SELL)
+        // before the resting chain order is corrected; trusting it classified
+        // a real SELL fill as a BUY (filledAmount=0 because the paid asset did
+        // not match the slot's expected quote side) and the phantom fill was
+        // re-bought at the fill level. Resolving the side from `paysAssetId`
+        // also selects the correct size asset (BUY sizes are quote, SELL
+        // sizes are base), so `filledAmount`/`precision` stay dimensionally
+        // consistent with the resting order's size.
         let orderType: OrderType = matchedGridOrder.type;
-        if (orderType === ORDER_TYPES.SPREAD) {
-            if (paysAssetId === assets.assetB.id) orderType = ORDER_TYPES.BUY;
-            else if (paysAssetId === assets.assetA.id) orderType = ORDER_TYPES.SELL;
-            else orderType = resolveSpreadOrderSide(matchedGridOrder.price, mgr.config.startPrice) as OrderType;
+        if (paysAssetId != null && paysAssetId === assets.assetB.id) {
+            orderType = ORDER_TYPES.BUY;
+        } else if (paysAssetId != null && paysAssetId === assets.assetA.id) {
+            orderType = ORDER_TYPES.SELL;
+        } else if (orderType === ORDER_TYPES.SPREAD) {
+            // No usable pays asset (legacy/malformed fill): resolve SPREAD
+            // without leaking SPREAD into the transition (validateOrder treats
+            // an on-chain SPREAD state as fatal ILLEGAL_SPREAD_STATE).
+            orderType = resolveSpreadOrderSide(matchedGridOrder.price, mgr.config.startPrice) as OrderType;
         }
         const currentSize = toFiniteNumber(matchedGridOrder.size);
         const precision = (orderType === ORDER_TYPES.SELL) ? assets.assetA.precision : assets.assetB.precision;
 
         let filledAmount = 0;
         if (orderType === ORDER_TYPES.SELL) {
-            if (paysAssetId === assets.assetA.id) filledAmount = blockchainToFloat(paysAmountRaw, precision);
+            if (paysAssetId != null && paysAssetId === assets.assetA.id) filledAmount = blockchainToFloat(paysAmountRaw, precision);
         } else {
-            if (paysAssetId === assets.assetB.id) filledAmount = blockchainToFloat(paysAmountRaw, precision);
+            if (paysAssetId != null && paysAssetId === assets.assetB.id) filledAmount = blockchainToFloat(paysAmountRaw, precision);
         }
 
         const currentSizeIntFromGrid = floatToBlockchainInt(currentSize, precision);

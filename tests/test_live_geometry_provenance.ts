@@ -140,6 +140,77 @@ run('FILL-PRICE-3 unmatched assets yield null (slot price is used as fallback on
 });
 
 // ---------------------------------------------------------------------------
+// FILL-SIDE: the fill's paid asset is the side ground truth
+// ---------------------------------------------------------------------------
+run('FILL-SIDE-1 a SELL fill on a BUY-typed slot resolves SELL and a base size', () => {
+    const engine = new SyncEngine({ assets: ASSETS });
+    const ctx = engine._computeFillContext(
+        { assets: ASSETS },
+        slot('slot-118', ORDER_TYPES.BUY, 1267.307972, '1.7.119'),
+        ASSETS.assetA.id, 100000,          // pays 1.00000 base
+        ASSETS.assetB.id, 134573000        // receives 1345.73000 quote
+    );
+    assert.strictEqual(ctx.orderType, ORDER_TYPES.SELL, 'pays base means the resting order is a SELL');
+    assert.ok(Math.abs(ctx.filledAmount - 1) < 1e-9, `expected 1 base filled, got ${ctx.filledAmount}`);
+    assert.strictEqual(ctx.precision, ASSETS.assetA.precision, 'SELL size is base-precision');
+});
+
+run('FILL-SIDE-2 a BUY fill on a SELL-typed slot resolves BUY and a quote size', () => {
+    const engine = new SyncEngine({ assets: ASSETS });
+    const ctx = engine._computeFillContext(
+        { assets: ASSETS },
+        slot('slot-118', ORDER_TYPES.SELL, 1267.307972, '1.7.119'),
+        ASSETS.assetB.id, 134573000,       // pays 1345.73000 quote
+        ASSETS.assetA.id, 100000           // receives 1.00000 base
+    );
+    assert.strictEqual(ctx.orderType, ORDER_TYPES.BUY, 'pays quote means the resting order is a BUY');
+    assert.ok(Math.abs(ctx.filledAmount - 1345.73) < 1e-6, `expected 1345.73 quote filled, got ${ctx.filledAmount}`);
+    assert.strictEqual(ctx.precision, ASSETS.assetB.precision, 'BUY size is quote-precision');
+});
+
+run('FILL-SIDE-3 a fill without a recognizable pays asset falls back to the slot type', () => {
+    const engine = new SyncEngine({ assets: ASSETS });
+    const ctx = engine._computeFillContext(
+        { assets: ASSETS },
+        slot('slot-118', ORDER_TYPES.BUY, 1267.307972, '1.7.119'),
+        null, 100000,
+        null, 134573000
+    );
+    assert.strictEqual(ctx.orderType, ORDER_TYPES.BUY, 'slot type remains the fallback');
+    assert.strictEqual(ctx.filledAmount, 0, 'no side match means no size claim');
+});
+
+run('FILL-SIDE-3b missing pays AND missing asset ids must not collapse to BUY', () => {
+    // Degenerate harness shape: both sides of the identity comparison are
+    // undefined. A bare === would match and silently flip the fill side.
+    const bareAssets = { assetA: { precision: 5 }, assetB: { precision: 5 } };
+    const engine = new SyncEngine({ assets: bareAssets });
+    const ctx = engine._computeFillContext(
+        { assets: bareAssets },
+        slot('slot-118', ORDER_TYPES.SELL, 1267.307972, '1.7.119'),
+        undefined, 100000
+    );
+    assert.strictEqual(ctx.orderType, ORDER_TYPES.SELL, 'slot type remains the fallback');
+    assert.strictEqual(ctx.filledAmount, 0, 'a missing pays asset cannot claim a size');
+});
+
+run('FILL-SIDE-4 a SPREAD slot without a pays asset still resolves a BUY/SELL side', () => {
+    const engine = new SyncEngine({ assets: ASSETS });
+    const below = engine._computeFillContext(
+        { assets: ASSETS, config: { startPrice: 200 } },
+        slot('slot-118', ORDER_TYPES.SPREAD, 150, '1.7.119'),
+        null, 100000
+    );
+    const above = engine._computeFillContext(
+        { assets: ASSETS, config: { startPrice: 200 } },
+        slot('slot-118', ORDER_TYPES.SPREAD, 250, '1.7.119'),
+        null, 100000
+    );
+    assert.strictEqual(below.orderType, ORDER_TYPES.BUY, 'below startPrice resolves BUY');
+    assert.strictEqual(above.orderType, ORDER_TYPES.SELL, 'above startPrice resolves SELL');
+});
+
+// ---------------------------------------------------------------------------
 // GAP-PRICE
 // ---------------------------------------------------------------------------
 run('GAP-PRICE-1 live chain price (135) makes a stale slot-117 a gap-evacuation candidate', () => {

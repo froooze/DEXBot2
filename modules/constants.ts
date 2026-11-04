@@ -1074,7 +1074,8 @@ let FILL_PROCESSING = {
     // into gapSlots+1-op transactions, so this only removes the intermediate
     // plan/broadcast cycles (Stale-Restart #5). Default OFF: opt-in rollout
     // for the live boundary engine, overridable per bot via
-    // `fillProcessing.COALESCE_BACKLOG_REPLAY` in general settings.
+    // `fillProcessing.COALESCE_BACKLOG_REPLAY` in bots.json (or globally via
+    // FILL_PROCESSING in general.settings.json).
     COALESCE_BACKLOG_REPLAY: false,
 
     // MAX_CONSECUTIVE_CONSUMER_FAILURES: Threshold for the _consumeFillQueue
