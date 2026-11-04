@@ -626,6 +626,11 @@ class OrderManager implements OrderManagerLike {
     _pauseFundRecalc: number;
     _pauseFundRecalcWatchdog: ReturnType<typeof setTimeout> | null;
     _fillBatchInFlight: number;
+    // Consecutive blocked-cycle counter for the grid-update gate
+    // (`noteGridUpdateBlockers` in order/utils/system.ts is its only writer and
+    // reader). Cleared when the gate is evaluated healthy or not evaluated at
+    // all; a cycle count, never a timing window.
+    _gridUpdateBlockedCycles: number;
     _pauseRecalcLogging: boolean;
     _pauseRecalcLoggingWatchdog: ReturnType<typeof setTimeout> | null;
     _throwOnIllegalState: boolean;
@@ -837,6 +842,7 @@ class OrderManager implements OrderManagerLike {
         // window would report a spurious Total != Free + Committed by exactly the
         // fills' size. The check runs once the batch settles instead.
         this._fillBatchInFlight = 0;
+        this._gridUpdateBlockedCycles = 0;
         this._pauseRecalcLogging = false;
         this._pauseRecalcLoggingWatchdog = null;
         this._throwOnIllegalState = false;

@@ -23,6 +23,7 @@ const {
     readFillPipelineState,
     hasUnsettledFills,
 } = require('../modules/order/utils/system');
+const { getLivePendingBroadcasts } = require('../modules/order/utils/order');
 
 let failures = 0;
 function check(name: string, actual: unknown, expected: unknown) {
@@ -88,6 +89,26 @@ function testHostBlockers() {
         },
     };
     check('unresolved broadcast', codesOf(pending), ['broadcast-pending']);
+    // B3: a GC pass drops an entry once a sync has completed after it was
+    // recorded, but the read-only probe (the grid-blocker gate) keeps it. The
+    // asymmetry is deliberate fail-closed — "unknown" is never "gone" — and is
+    // pinned here so a future reader does not turn the predicate into a
+    // fail-open (docs/FILL_PIPELINE.md B3).
+    {
+        const ttl = TIMING.PENDING_BROADCAST_TTL_MS;
+        const recordedAt = 1_000_000;
+        const now = recordedAt + ttl * 3;
+        const manager = {
+            _pendingBroadcasts: new Map([['fp-expired', { recordedAt, slotId: 'slot-expired' }]]),
+            _lastSyncAt: recordedAt + ttl, // a caught-up read happened after the record
+        };
+        check('an expired pending broadcast still blocks the read-only probe',
+            codesOf({ manager }, now), ['broadcast-pending']);
+        check('the write-path GC pass drops the same entry',
+            getLivePendingBroadcasts(manager, { now, gc: true }).length, 0);
+        check('the write-path GC pass removes it from the map',
+            manager._pendingBroadcasts.size, 0);
+    }
     const throwingProbe = {
         manager: { get isPlacementActive(): never { throw new Error('probe exploded'); } },
     };

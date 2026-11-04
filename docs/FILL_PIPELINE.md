@@ -6,9 +6,17 @@
 > below with their gates and stop conditions. This is the single fill-pipeline document:
 > contract, decisions, remaining plan, regression canaries.
 >
-> **Baseline:** `bc20d574` (`test`, 2026-11-04), the last production-code commit. The
-> ratchet itself was introduced in `b2f43d8a`; the commits after the baseline are test and
-> documentation only.
+> **Verdict (2026-11-04 review):** P0–P2 are closed and re-verified; **P3–P5 are deferred
+> refactors, not bug fixes**, and must not be started as part of a bug-fix pass. What is
+> safe to do now is the four-item **bug-only queue** in §4 — see the
+> **Review verdict** table there for the reasoning per item. Status of that queue:
+> B1, B3 and B4 are fixed in this commit (no behaviour change beyond B1's reset),
+> and B2 is resolved as a comment correction (route a). No P3–P5 code was touched.
+>
+> **Baseline:** `71eb39ba` (`test`, 2026-11-04), the last production-code commit. The
+> ratchet was introduced in `b2f43d8a`; `e92b27da` is the doc integration that follows it,
+> and `8238e904` + `71eb39ba` are the grid-geometry/spread fixes from the same arc
+> (production code, not test/doc). The earlier baseline `bc20d574` predates all three.
 >
 > **Cross-links:** [ORDER_LIFECYCLE](ORDER_LIFECYCLE.md) (existence record),
 > [COW_INVARIANTS](COW_INVARIANTS.md) (broadcast/plan contract),
@@ -28,8 +36,8 @@ produced (or nearly produced) a live incident; the fix is an owner, not another 
 |---|---|---|---|
 | C1 | Fill dedupe had four layers, three granularities: booked key, chain-size delta, applied-amount boolean, time window | double-released trade size (`3.6604 → 3.3046 → 2.9488`), phantom residual | **closed**: store is the authority, marked at credit time; boolean channel deleted; window re-scoped as a claim lease |
 | C2 | The fill reference had two values and four clocks (`_lastFilledAt`, `_lastMarketFillAt`, persisted row clock, TTL at four sites) + `lastFillPivotSource` | market-row clock inheritance (REARM-6/7/8), edge-wick pivot teleport | **closed by decision (D10)**: the generation-scoped live pivot and the bot-scoped last fill are different facts; one owner each, TTL enforced at read. No event log. |
-| C3 | Two boundary authorities with budgets in mutable manager fields (re-anchor vs owed crawl), snapshot/restored at six sites | a nested fill cycle forks a budget; extremum-vs-last-processed anchor | open (P3): the base/current pair is a snapshot, not a second answer; the six save/restore sites are the coupling. |
-| C4 | Plan validity is a judgement over four signals, one of which **proceeds anyway** when still stale | stale plan shipped with a duplicate-order backlog on chain | open (P4): log-only "proceeded anyway" first; the fence lands only after P3. |
+| C3 | Two boundary authorities with budgets in mutable manager fields (re-anchor vs owed crawl), snapshot/restored at six sites | a nested fill cycle forks a budget; extremum-vs-last-processed anchor | open (P3) — **deferred by verdict (§4)**: the base/current pair is a snapshot, not a second answer; the six save/restore sites are the coupling. |
+| C4 | Plan validity is a judgement over four signals, one of which **proceeds anyway** when still stale | stale plan shipped with a duplicate-order backlog on chain | open (P4) — **deferred by verdict (§4)**: log-only "proceeded anyway" first; the fence lands only after P3. |
 | C5 | Deferral composed per site; `hasUnsettledFills` failed **open** on a read error | a swallowed exception made a grid update look safe | **closed**: closed code list, unreadable = `unknown-blocker` |
 | C6 | "The band" has four definitions (live orders, batch rails, analyzer buckets, `_spreadCountKnown`) | collapsed band reported on target while the chain disagreed | **closed by decision (D11)**: four consumers of one word, not four answers. Live geometry is the only gate; the others are named layers. |
 | C7 | An order's **side** is two facts with no owner: accounting side (`slot.type`, retagged by a partial fill) and rail side (`geometryTypeForSlotIndex`) | a fill-retagged wrong-rail order looked "repaired"; its residual cancel was dropped (`cb1041b6`) | **closed for the repair proof (D12)**: two facts, two owners; the `typeMismatch` validator uses geometry, accounting keeps the stored type (`INV-FILL-002/006`). |
@@ -184,8 +192,83 @@ requires editing the test — that edit is the review.
 Each phase ships independently and leaves the tree green. A phase is done when its gate
 passes — not when the code exists.
 
+### Review verdict (2026-11-04) — fix now vs. leave alone
+
+The P0–P2 surface was re-verified at `71eb39ba` (ratchet, blocker, ledger, store,
+rebuild-anchor, spread, sync-batch and correction-staleness suites all green); **no
+regression was found in the landed centralization**. The remaining work is therefore
+sorted by kind, not by age:
+
+| Work | Verdict | Why |
+|---|---|---|
+| **Bug-only queue** (B1–B4 below) | **do now** | Each item is a defect or a false statement in the P0–P2 surface, fixable without adding a path. No credit, order-count, sizing or boundary change. |
+| **P3 — one consumer** | **do not start** | A concurrency refactor across ten call sites and three retry triggers; its own stop condition is "any credit or order-count change → revert to enqueue-only". Nothing is broken today that it fixes. |
+| **D2 coalescing default flip** | **do not fold into a bug fix** | It changes live behaviour for every bot (`COALESCE_BACKLOG_REPLAY` is still `false` in `modules/constants.ts`). Needs the P3 soak first, then its own flip commit. |
+| **P4 — epoch fence** | **do not start** | Must not land before P3: it deletes `INV-COW-003`'s "proceed anyway" branch, which is only sound once P3 carries the invalidating fills forward. Its log-only pre-step is the only safe P4 piece — and that is instrumentation, not a bug fix. |
+| **P5 — watermark / retire timers** | **do not start** | Every removal needs live evidence first, and `FILL_DEDUPE_WINDOW_MS` needs a chain-evidence design (recompute a crash-restored claim from chain truth, not by age). |
+| **C3 — boundary-budget base/current + six save/restore sites** | **do not touch** | This *is* P3's work. Half-migrating the budget is the coupling the phase exists to remove. |
+| Older open items (duplicate-orphan cancel hard-error, full plan→broadcast mutex) | **leave out** | Each is a behaviour change with its own incident history; bundling them re-opens the regression class this arc closed. |
+
+### Bug-only queue (independent of P3–P5)
+
+**B1 — the escalation counter is not "consecutive".**
+`noteGridUpdateBlockers` (`modules/order/utils/system.ts`) resets
+`_gridUpdateBlockedCycles` only when it is *called* with a healthy state, but its only
+caller is the targeted-drift gate (`maybeRunTargetedDriftReconciliation`,
+`modules/dexbot_maintenance_runtime.ts`), which returns before the reset when
+`getTargetedSyncReason(bot)` is null. A counter parked at
+≥ `GRID_BLOCKED_ESCALATE_CYCLES` therefore survives an arbitrarily long trigger-less
+stretch, and the *first* unreadable cycle afterwards fires a structural resync instead of
+waiting for 12 consecutive cycles. Fix: reset on the `!trigger` early return (or stamp the
+evaluated cycle and treat a stale stamp as a new run).
+**Status:** fixed in this commit — `maybeRunTargetedDriftReconciliation` calls
+`noteGridUpdateBlockers(bot, [])` on the `!trigger` return (guarded on the manager), and
+`tests/test_targeted_drift_reconcile.ts` pins the reset. `test_grid_update_blockers` [6]
+stays the pure counter spec.
+
+**B2 — the reconcile's unsettled gate cannot see the queue.**
+`_reconcileStartupSide` (`modules/order/grid_reconcile_internal.ts`) calls
+`hasUnsettledFills(manager)`, but `readFillPipelineState`
+(`modules/order/utils/system.ts`) reads `_incomingFillQueue` and
+`_deferredFillsPending` from the **bot**; a bare manager exposes only
+`_pendingFillCrawls` and `_fillBatchInFlight`. The gate's comment ("while fills are
+queued…") therefore overstated what it could see: a subscription fill accepted during the
+reconcile's chain read was invisible to the top-up deferral. Impact is narrow because the
+startup and targeted-sync callers drain first (the bootstrap consumer /
+`_syncOpenOrdersAndProcessFills`), and the rebuild caller (`recalculateGrid`) has no bot
+at all and relies on the structural-rebuild bracket — so treat it as a race window, not a
+standing bug. Two routes: **(a)** trim the claim here and in the gate comment — doc-only,
+recommended now; **(b)** thread an optional pipeline source through
+`reconcileGridOrders` → `_reconcileStartupSide` for the three call sites that own a bot
+(the two startup reconciles, the targeted-sync reconcile). Route (b) cannot be symmetric
+— the `recalculateGrid` reconcile has no bot — so it buys a partial fence for a few extra
+beats of deferral; take it only if a soak shows the race.
+**Status:** route (a) applied — the gate comment now names its scope and points here.
+Route (b) stays open until a soak shows the race.
+
+**B3 — record the `gc:false` conservatism (doc only; do not "fix").**
+`getLivePendingBroadcasts(mgr, { gc: false })` returns entries that a GC pass would drop:
+the hard-TTL branch (`modules/order/utils/order.ts`) falls through to the return when
+`gc === false`, so those entries count as `broadcast-pending` and defer the targeted
+reconcile until another path GCs the map. This is the intended fail-closed answer
+(unknown ≠ gone); the risk is a future reader "fixing" it into a fail-open.
+**Status:** comment added at the `gc:false` branch and pinned in
+`tests/test_grid_update_blockers.ts` [4]; behaviour unchanged.
+
+**B4 — type the escalation field (zero risk).**
+`_gridUpdateBlockedCycles` is written and read through index casts in
+`modules/order/utils/system.ts` and is not declared on the manager's state
+(`modules/types.ts`). Declaring it makes the writer/reader pair reviewable.
+**Status:** declared on `OrderManager` and `OrderManagerLike` and initialised to 0;
+writer and reader unchanged.
+
 ### P3 — One consumer (5 d, highest risk)
 
+- **Current state (verified `71eb39ba`):** not started. No `requestFillDrain` exists; the
+  ratchet still pins ten direct `_processFillsWithBatching` calls; the deferral surface is
+  still `_deferredFillsPending` + `deferred` booleans + `_deferredFillRetryTimer` + prose
+  reasons. `COALESCE_BACKLOG_REPLAY` is `false` in `modules/constants.ts`, so D2's flip is
+  a live-behaviour change, not a no-op.
 - `requestFillDrain(bot, reason)` becomes the only entry point; the ten call sites
   enqueue instead of calling. One serialized consumer owns
   drain → accounting → pivot append → plan → lease → commit → observe.
@@ -193,7 +276,8 @@ passes — not when the code exists.
   policy; the three retry triggers (region-end hook, scheduled rebalance, maintenance
   tick) collapse into one idempotent schedule.
 - Coalescing exit (**D2=A**) is a **default flip** (`COALESCE_BACKLOG_REPLAY`) plus
-  deleting the false path; the behaviour is already live per bot (`6afa0c4b`).
+  deleting the false path; live bots opted in via `bots.json` (`6afa0c4b`), but the
+  shipped default is still OFF — the flip is a live-behaviour change for every bot.
 - New module (**D8=B**): `modules/dexbot_fill_pipeline.ts`; `fill_runtime` keeps ingest.
   Needs `"./dist/modules/dexbot_fill_pipeline.js": false` in the `browser` field; do not
   add it to the browser-safe entry list.
@@ -204,6 +288,10 @@ passes — not when the code exists.
 
 ### P4 — Epoch fence (5 d, depends on P3)
 
+- **Current state (verified `71eb39ba`):** not started. No `gridEpoch` exists, and even the
+  log-only pre-step is missing — `replanStaleBatch` (`modules/dexbot_cow_runtime.ts:3550`)
+  logs the reason string only, not the four signals; `recon_fuzz` has no
+  `mutate-before-commit` op.
 - Before the fence lands: log the "proceed anyway" branch once per batch with its four
   signals, so the refusal rate is measurable; the branch is deleted only when the log
   shows P3 carried the invalidating fills.
@@ -226,6 +314,9 @@ passes — not when the code exists.
 
 ### P5 — Chain watermark, retire timers (5–10 d, last)
 
+- **Current state (verified `71eb39ba`):** not started. No plan watermark; the four
+  fill-path windows are still live `TIMING` entries (`modules/timing_policy.ts:155, 172,
+  177, 192`) and `FILL_DEDUPE_WINDOW_MS` still resolves crash-restored claims by age.
 - Record `{ height, openOrderIdsHash, balancesHash }` per plan; commit requires a read at
   ≥ plan height. `getLivePendingBroadcasts`' TTL becomes "unknown until a watermark newer
   than the record".
@@ -286,6 +377,11 @@ key builder, the applied-amount boolean, the dead boolean wrapper.
 4. The historical incidents exist as replayable fixtures and pass.
 5. The `self-healing` windows reach the D6 scope.
 
+**Scope note (2026-11-04 review)** — the five conditions above close the P3–P5 plan. The
+[bug-only queue](#4-remaining-work) is a separate track: it neither closes this plan nor
+counts as a phase, and no B-item may change credit, order count, sizing or boundary
+semantics.
+
 **Stop conditions** — P2 fixtures change credit count → stop; P3 changes any credit or
 order count → revert to enqueue-only; P4 refuses a correct plan → widen the predicate,
 never the fence; P5 cannot name the replacing evidence → the window stays.
@@ -317,18 +413,39 @@ paid-asset side, booked membership), `tests/test_fill_store_authority.ts` (claim
 time, in-flight duplicate refused, rollback and retry, atomic credit, ingest store check),
 plus the behavioural canaries above.
 
+Bug-only queue: B1 is pinned in `tests/test_targeted_drift_reconcile.ts` (the reset lives
+at the call site) while `test_grid_update_blockers` [6] keeps the pure counter spec; B3 is
+pinned in `test_grid_update_blockers` [4]; B2 changes comments and this document only;
+B4 is a declaration.
+
 ## 9. Implementation log
 
 | Date | Commit | Landed |
 |---|---|---|
-| 2026-11-04 | `6afa0c4b` | Pre-P0: fill side from the paid asset in every call site; backlog coalescing rolled out. |
+| 2026-11-04 | `6afa0c4b` | Pre-P0: fill side from the paid asset in every call site; backlog coalescing opted in per bot via `bots.json` (code default still OFF). |
 | 2026-11-04 | `cb1041b6` | Pre-P0: a chain-observed wrong-side cancel is never parked; the repair proof compares rail geometry, not the stored type (C7). |
 | 2026-11-04 | `b2f43d8a` | P0 contract + ratchet; P1 eight-code blocker resolver, fail-closed accessor, cycle-counter escalation, targeted-drift gate defers on any blocker; P2 identity (`fill_ledger.ts`) wired into three call sites. `COW_INVARIANTS` refreshed (`INV-RECON-006` exemption, `INV-SYNC-008` accounting-side/rail-side). |
 | 2026-11-04 | `39675d8a` | P2 tail: store claimed at credit time with rollback, all-or-nothing credit, `_isNewFillKey` store check, applied-amount boolean deleted, dead wrapper deleted, ratchet fixed to include the accounting writer. Findings 3–5 above recorded. |
 | 2026-11-04 | `bc20d574` | Grace stamp has one writer (`_commitWorkingGrid`); ledger side in the export; one winner claims the fill key at credit time. |
-| 2026-11-04 | doc integration (this change) | C2/C6/C7 closed by decision (D10–D12); C3/C4 stay P3/P4; baseline re-set. No production copy deleted: the remaining same-fact duplicate (C4's "proceed anyway") is gated behind P3; the others are different facts. |
+| 2026-11-04 | doc integration (`e92b27da`) | C2/C6/C7 closed by decision (D10–D12); C3/C4 stay P3/P4; baseline re-set. No production copy deleted: the remaining same-fact duplicate (C4's "proceed anyway") is gated behind P3; the others are different facts. |
+| 2026-11-04 | grid arc (`8238e904`, `71eb39ba`) | Not fill-pipeline phases: rebuild/load boundary is anchored to the last fill, and the fund-constrained spread repair rotates any unfunded tightening candidate (orphaned rail slots included). The fill contract is unchanged; baseline moved past them. |
+| 2026-11-04 | review at `71eb39ba` (docs only) | Verdict recorded: P0–P2 stay closed; P3–P5 and the D2 flip are deferred refactors with their own stop conditions; the four-item bug-only queue is split out with file references. No production code touched. |
+| 2026-11-04 | bug-only queue (this commit) | B1: reset `noteGridUpdateBlockers` on the trigger-less path (+ `test_targeted_drift_reconcile` case); B3: read-only `gc:false` intent comment (+ `test_grid_update_blockers` [4] case); B4: `_gridUpdateBlockedCycles` declared/initialised; B2(a): the reconcile gate comment now names what a bare manager can see. No credit, order-count, sizing or boundary change; P3–P5 untouched. |
 
-Gates at this commit: `npm test` 357/357 non-live files, 14 live skipped; `npm run test:live`
+Gates at `e92b27da`: `npm test` 357/357 non-live files, 14 live skipped; `npm run test:live`
 executes the live set (366 pass, 5 diagnostics need a configured account in this
 environment); `typecheck`, `typecheck:analysis`, `check:any`, `verify:browser-bundle`
 green.
+
+Review re-verification at `71eb39ba` (docs-only change, no code delta): rebuild +
+build:tests, then `test_fill_pipeline_contract`, `test_grid_update_blockers`,
+`test_fill_ledger`, `test_fill_store_authority`, `test_rebuild_fill_anchor`,
+`test_spread_pure_fund_driven`, `test_sync_fill_history_batch` and
+`test_correction_queue_staleness` — all green.
+
+Bug-only queue gates (this commit): `npm test` (358 files, exit 0), `npm run check:any`,
+`npm run verify:browser-bundle` (44/44), plus `test_targeted_drift_reconcile`,
+`test_grid_update_blockers`, `test_fill_pipeline_contract`,
+`test_fill_transition_idempotency`, `test_cow_guard_replan`,
+`test_fresh_placement_cancel_grace_paths`, `test_snapshot_reject_gate`,
+`test_fill_store_authority` and `test_fill_ledger`.

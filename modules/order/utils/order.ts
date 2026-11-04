@@ -2183,6 +2183,14 @@ function getLivePendingBroadcasts(manager: OrderManagerLike | null | undefined, 
             }
             continue;
         }
+        // READ-ONLY CALLERS KEEP THE ENTRY. This branch is reached for an entry
+        // the write path would GC: either a caught-up sync has completed since
+        // it was recorded (age > ttl), or it is past the hard 2x cap. The
+        // grid-blocker predicate must not mutate the map to expire it, and
+        // "unknown" is never "gone" (INV-LIFE-001), so the entry stays a
+        // `broadcast-pending` blocker until a write-path GC retires it through
+        // the lifecycle. Deliberate fail-closed; do not turn this into a
+        // pass-through without replacing the evidence (docs/FILL_PIPELINE.md B3).
         if (!gc) continue;
         map.delete(fingerprint);
         // Abandoned, not resolved: the order may be live. Route through the

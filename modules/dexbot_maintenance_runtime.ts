@@ -800,7 +800,18 @@ function getTargetedSyncReason(bot: BotLike) {
 
 async function maybeRunTargetedDriftReconciliation(bot: BotLike, context: string) {
     const trigger = getTargetedSyncReason(bot);
-    if (!trigger) return false;
+    if (!trigger) {
+        // CONSECUTIVE means consecutive: a tick that never evaluates the gate
+        // must clear the counter. Without this reset a counter parked at
+        // GRID_BLOCKED_ESCALATE_CYCLES survives an arbitrarily long
+        // trigger-less stretch, and the first unreadable cycle afterwards fires
+        // a structural resync instead of waiting the full window.
+        // (docs/FILL_PIPELINE.md B1; pinned by test_targeted_drift_reconcile.)
+        // Guarded: without a manager there is no counter to clear, and the
+        // helper would otherwise park a stray field on the bot.
+        if (bot.manager) noteGridUpdateBlockers(bot, []);
+        return false;
+    }
 
     // UNSETTLED-FILL GATE: a startup-style reconcile derives its window from the
     // master grid. While fills are still queued / draining / in flight / owed a

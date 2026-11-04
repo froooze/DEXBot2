@@ -1115,6 +1115,10 @@ export interface OrderManagerLike {
   _pauseRecalcLogging: boolean;
   _throwOnIllegalState: boolean;
   _fillBatchInFlight: number;
+  // Consecutive blocked-cycle counter for the grid-update gate. Owned by
+  // `noteGridUpdateBlockers` (order/utils/system.ts); read/written only there.
+  // A cycle count, not a timing window — never a TIMING entry (INV-TIME-001).
+  _gridUpdateBlockedCycles?: number;
   _fillProcessingLock: ManagerLock;
   _syncLock: ManagerLock;
   _divergenceLock: ManagerLock;

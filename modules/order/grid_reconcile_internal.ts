@@ -2247,13 +2247,25 @@ async function _reconcileStartupSide({
     const createCount = Math.max(0, targetCount - chainCount);
     const remainingSlots = desiredSlots.slice(updateCount);
 
-    // UNSETTLED-FILL GATE: while fills are queued, draining, in flight, or
-    // owed a crawl, the master still treats filled slots as ACTIVE and the
-    // boundary has not crawled for them. Any window top-up derived from that
-    // geometry refills the EXPENSIVE end of the rail — the live incident
+    // UNSETTLED-FILL GATE: while fills are draining, in flight, or owed a
+    // crawl, the master still treats filled slots as ACTIVE and the boundary
+    // has not crawled for them. Any window top-up derived from that geometry
+    // refills the EXPENSIVE end of the rail — the live incident
     // (12s of buys at 1282.78 -> 1310.04 while the market was ~1280). Defer
     // the top-up to the cycle after the fills (and their crawl) are committed;
     // 1:1 repairs (cancelled-slot replacement, vacated-rail refill) still run.
+    //
+    // SCOPE: a bare manager exposes only MANAGER-level state here
+    // (`_pendingFillCrawls`, `_fillBatchInFlight`). The bot-level queue
+    // (`_incomingFillQueue`) and the deferred-drain flag
+    // (`_deferredFillsPending`) are invisible from this source, so "queued" is
+    // covered by the CALLER's gate, not by this one. The startup and
+    // targeted-sync callers drain fills before they reconcile (the bootstrap
+    // consumer / _syncOpenOrdersAndProcessFills); the rebuild caller
+    // (recalculateGrid) has no bot and relies on the structural-rebuild
+    // bracket. That leaves only a fill arriving during this reconcile's chain
+    // read. Widening it belongs at a caller that owns the bot
+    // (docs/FILL_PIPELINE.md B2) — not a second counter here.
     const unsettled = hasUnsettledFills(manager);
     if (unsettled.unsettled && createCount > 0) {
         logger?.log?.(

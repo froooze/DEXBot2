@@ -210,6 +210,30 @@ async function runTests() {
             'an aborted refresh must not stamp the cooldown (retry must not be locked out)');
     }
 
+    // The grid-blocked escalation counter is a CONSECUTIVE-cycle counter. A tick
+    // with no targeted trigger never evaluates the gate, so it must clear the
+    // counter — otherwise a counter parked at the escalation limit makes the
+    // first unreadable cycle later fire a structural resync immediately instead
+    // of waiting the full window (docs/FILL_PIPELINE.md B1).
+    console.log(' - Testing a trigger-less tick resets the blocked-cycle counter...');
+    {
+        const bot: any = {
+            config: { dryRun: false, coreOrders: { buy: 0, sell: 0 } },
+            manager: {
+                checkFundDriftAfterFills: () => ({ isValid: true, reason: 'ok' }),
+                _gridUpdateBlockedCycles: 12,
+            },
+            _spreadStallArmed: false,
+            _spreadCorrectionStall: null,
+            _log: () => {},
+            _warn: () => {},
+        };
+        const ran = await MaintenanceRuntime.maybeRunTargetedDriftReconciliation(bot, 'test');
+        assert.strictEqual(ran, false, 'a healthy bot must not run a reconcile');
+        assert.strictEqual(bot.manager._gridUpdateBlockedCycles, 0,
+            'a trigger-less tick must reset the consecutive blocked-cycle counter');
+    }
+
     console.log('✓ Targeted drift reconcile tests passed!');
 }
 
