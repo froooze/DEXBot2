@@ -259,7 +259,7 @@ All amounts use the shared 4-significant-figure formatter (compact `K`/`M`, sign
 
 ### LAST-FILL-GUARD Check (`grid_correction_check.ts`)
 
-Validates LAST-FILL-GUARD discipline from the same Kibana fill pipeline as `trade_profitability.ts`. The rule is **direction only** (v1.6.16+): with the previous fill at price `p`, the next order must satisfy `BUY < p` and `SELL > p` (equal price is blocked — a re-place at the just-filled level). There is no increment band: the older `pivot ± i/2` rule blocked a BUY below a SELL fill and a SELL one tick above our cost, i.e. it flagged the tightening placements the engine legitimately makes. A violation is a buy fill at/above its pivot or a sell fill at/below it.
+Validates LAST-FILL-GUARD discipline from the same Kibana fill pipeline as `trade_profitability.ts`. The rule is **direction only** (v1.6.17+) and comes from the runtime's own `isLastFillGuardBlocked` — the tool imports it instead of re-implementing it, so the offline verdict cannot drift from the live guard. With the previous fill at price `p`, the next order must satisfy `BUY < p` and `SELL > p` (equal price is blocked — a re-place at the just-filled level). There is no increment band: the older `pivot ± i/2` rule blocked a BUY below a SELL fill and a SELL one tick above our cost, i.e. it flagged the tightening placements the engine legitimately makes. A violation is a buy fill at/above its pivot or a sell fill at/below it.
 
 **Offline limits:** the tool reconstructs pivots from consecutive fills, so it cannot see the runtime's edge-pinned-fill exclusion (no slot identity per fill) nor the spread-correction bypass — expect rare false positives on wick/insurance fills.
 

@@ -5,7 +5,7 @@
  * LAST-FILL-GUARD CHECK
  *
  * Validates LAST-FILL-GUARD discipline — DIRECTION ONLY, relative to the last
- * fill price (v1.6.16+, retrospective §9.7):
+ * fill price (v1.6.17+, retrospective §9.7):
  *   BUY  blocked if price >= pivot
  *   SELL blocked if price <= pivot
  *   e.g. pivot 1000 => BUY must be < 1000, SELL must be > 1000.
@@ -28,7 +28,8 @@
  *     identity for a fill, so it cannot classify edge fills and will still
  *     judge the pair after one. Expect rare false positives on wick fills.
  *
- * Mirrors modules/order/utils/system.ts:isLastFillGuardBlocked 1:1.
+ * Uses the runtime's own predicate (`modules/order/utils/system.ts:`
+ * `isLastFillGuardBlocked`); the checker never re-implements it.
  *
  * Fetches fill_order operations from Kibana (same pipeline as
  * trade_profitability.ts) and checks for last-fill guard violations.
@@ -44,6 +45,7 @@
  */
 
 import { getErrorMessage, getErrorField } from '../modules/utils/errors.js';
+import { isLastFillGuardBlocked } from '../modules/order/utils/system.js';
 import fs from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import * as KC from '../market_adapter/core/kibana_client.js';
@@ -108,35 +110,13 @@ interface AggregatedOrder {
     isMaker: boolean;
 }
 
-// ─── LAST-FILL-GUARD helper (1:1 with modules/order/utils/system.ts) ────────────
-
-/**
- * LAST-FILL-GUARD helper — DIRECTION ONLY relative to the last fill price.
- *  BUY  blocked if price >= pivot
- *  SELL blocked if price <= pivot
- *  e.g. pivot 1000 => BUY must be < 1000, SELL must be > 1000
- * Cold (pivot null or lastType null) => disabled. Equal price stays blocked
- * (a re-place at the just-filled level).
- * @param {number} price - Target order price
- * @param {string} type - buy/sell
- * @param {number|null} lastPrice - Most recent fill price
- * @param {string|null} lastType - Most recent fill side (buy/sell)
- * @returns {{blocked: boolean, pivot: number|null, halfInc: number, threshold: number|null}}
- */
-function isLastFillGuardBlocked(
-    price: unknown,
-    type: unknown,
-    lastPrice: unknown,
-    lastType: unknown,
-): { blocked: boolean; pivot: number | null; halfInc?: number; threshold?: number | null } {
-    const numPrice = Number(price);
-    if (!Number.isFinite(numPrice)) return { blocked: false, pivot: null };
-    if (lastPrice == null || !Number.isFinite(Number(lastPrice)) || lastType == null) return { blocked: false, pivot: null };
-    const pivot = Number(lastPrice);
-    if (type === 'buy' && numPrice >= pivot) return { blocked: true, pivot, halfInc: 0, threshold: pivot };
-    if (type === 'sell' && numPrice <= pivot) return { blocked: true, pivot, halfInc: 0, threshold: pivot };
-    return { blocked: false, pivot: null, halfInc: 0, threshold: null };
-}
+// ─── LAST-FILL-GUARD (the runtime's own predicate) ──────────────────────────────
+//
+// `isLastFillGuardBlocked` is IMPORTED from modules/order/utils/system.ts, not
+// re-implemented. The old local copy was labelled "mirrors 1:1" and had already
+// kept the removed band term; a copy of a rule is a second rule waiting to drift
+// (retrospective R3.5 / §9.10/P5). The module returns `{blocked, pivot, threshold}`
+// — there is no `halfInc`, because the increment no longer participates.
 
 function resolveIncrementPercent(botMeta: { incrementPercent?: unknown } | null | undefined, override: number | null): number {
     if (override != null && Number.isFinite(override) && override > 0) return override;
@@ -155,7 +135,7 @@ Usage: node dist/analysis/grid_correction_check.js --bot-key <key> [options]
 Validates LAST-FILL-GUARD discipline (DIRECTION ONLY relative to the last fill):
   BUY must be < last fill price, SELL must be > last fill price.
   Equal price counts as blocked (a re-place at the just-filled level).
-  Mirrors modules/order/utils/system:isLastFillGuardBlocked 1:1.
+  Uses the runtime's own predicate (isLastFillGuardBlocked); not a copy.
   Cold start (no previous fill) is disabled.
 
 Required:
