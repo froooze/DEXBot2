@@ -7,6 +7,13 @@ set -e
 
 echo "🔄 Starting safe branch synchronization (test -> origin/test)..."
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/git_preflight.sh
+source "$SCRIPT_DIR/lib/git_preflight.sh"
+
+# 0. Fail fast when the remote cannot be read — before any branch is touched.
+require_origin_access origin || exit 1
+
 # 1. Ensure we are on 'test'
 CURRENT=$(git rev-parse --abbrev-ref HEAD)
 if [ "$CURRENT" != "test" ]; then

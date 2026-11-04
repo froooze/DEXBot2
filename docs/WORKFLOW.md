@@ -313,7 +313,13 @@ npm run pmain
 |--------|---------|-------------|-----------|
 | `npm run ptest` | Push test to origin | Checks out `test` (if not on it) and pushes local commits to `origin/test`. Does **not** touch `dev`/`main`. | Daily development; ensures `origin/test` is up-to-date |
 | `npm run pdev` | Mirror test onto dev | Pushes `origin/test`, then `git push origin test:dev --force` and updates the local `dev` pointer. No merge commit. | When test is stable and you want `dev` to exactly equal `test` |
-| `npm run pmain` | Mirror test onto dev and main | Pushes `origin/test`, then force-pushes `test` to both `dev` and `main` and updates local pointers. **No tagging.** | Full release where `test == dev == main` is intended. Tag manually afterward (see step 5) |
+| `npm run pmain` | Mirror test onto dev and main | Pushes `origin/test`, then force-pushes `test` to both `dev` and `main` in one `--atomic` push and updates local pointers. **No tagging.** | Full release where `test == dev == main` is intended. Tag manually afterward (see step 5) |
+
+All three scripts run a shared preflight before touching anything
+(`scripts/lib/git_preflight.sh`): a read-only `git ls-remote` against `origin`.
+An unreachable remote or a rejected SSH key now fails up front instead of
+mid-script, and `pmain`'s `--atomic` push keeps `dev`/`main` together — a
+refusal moves neither. Bypass the check with `DEXBOT_SKIP_GIT_PREFLIGHT=1`.
 
 Note: `pmain` does **not** create a release tag. Run `git tag -a v0.X.Y -m "..."` manually after `pmain` if you need a tagged release point.
 

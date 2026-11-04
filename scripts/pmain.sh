@@ -8,6 +8,13 @@ set -e
 
 echo "🔄 Starting safe branch synchronization..."
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/git_preflight.sh
+source "$SCRIPT_DIR/lib/git_preflight.sh"
+
+# 0. Fail fast when the remote cannot be read — before any branch is touched.
+require_origin_access origin || exit 1
+
 # 1. Ensure we are on 'test'
 CURRENT=$(git rev-parse --abbrev-ref HEAD)
 if [ "$CURRENT" != "test" ]; then
@@ -28,17 +35,25 @@ if ! git push origin test; then
   exit 1
 fi
 
-# 4. Force update 'dev' and 'main' on origin (Zero-Checkout)
-# This updates the server branches directly from your local test branch
-echo "🚀 Synchronizing 'dev' and 'main' on origin..."
-git push origin test:dev --force
-git push origin test:main --force
+# 4. Force update 'dev' and 'main' on origin in ONE atomic push (Zero-Checkout)
+# --atomic makes the mirror all-or-nothing: either both branches move or neither
+# does, so a refusal can never leave dev ahead of main.
+echo "🚀 Synchronizing 'dev' and 'main' with 'test' on origin (atomic)..."
+if ! git push --atomic origin test:dev test:main --force; then
+  echo "❌ Atomic push to dev/main failed — neither branch was moved."
+  echo "⚠️ Please check 'git status' or sync manually."
+  exit 1
+fi
 
 # 5. Update local branch pointers to match origin
-# This makes your local 'dev' and 'main' labels match without switching to them
+# Best-effort: the atomic push above already moved origin, so a failure here is
+# cosmetic (a stale local label) and self-heals on the next successful fetch.
 echo "📍 Updating local branch pointers..."
-git fetch origin dev:dev --force
-git fetch origin main:main --force
+if ! git fetch origin dev:dev main:main --force; then
+  echo "⚠️  Local 'dev'/'main' pointers were not refreshed — origin is already synced."
+  echo "    Re-run 'npm run pmain' once the remote is reachable again."
+  exit 1
+fi
 
 echo "✅ Everything is synchronized: test == dev == main"
 echo "✨ Your uncommitted changes on 'test' were never at risk."

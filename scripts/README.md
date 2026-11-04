@@ -310,6 +310,13 @@ npm run version:sync
 | `pdev.sh` | `npm run pdev` | sync `test` → `dev` |
 | `pmain.sh` | `npm run pmain` | sync `test` → `dev` → `main` |
 
+Before any push, all three scripts run a shared preflight
+(`scripts/lib/git_preflight.sh`): one read-only `git ls-remote` against `origin`,
+so an unreachable remote or a key the server no longer accepts fails **before** a
+branch moves. `pmain.sh` mirrors `dev` and `main` in a single `--atomic` push —
+either both move or neither does. Set `DEXBOT_SKIP_GIT_PREFLIGHT=1` to bypass
+the preflight.
+
 ---
 
 ## ⚡ CONVENIENCE WRAPPERS
