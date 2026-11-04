@@ -331,9 +331,27 @@ class COWRebalanceEngine {
         // the whole slot's action group (a type-mismatch CANCEL is paired with
         // a CREATE on the same id) for the grace window. The surplus is
         // re-derived next cycle once the order has had time to prove itself.
+        //
+        // EXEMPT: a chain-observed wrong-side order. Only the correction
+        // queue's `typeMismatch` entry proves the CHAIN side is wrong; a
+        // plan-shaped CANCEL with reason 'type-mismatch' only proves
+        // master !== target, which is exactly the stale-target lag this
+        // grace exists for and must keep waiting. The pre-batch drain
+        // (correctAllPriceMismatches) normally cancels the mismatch first;
+        // when it deferred (active region) or failed, the entry is still
+        // queued — parking this action would add a second, 15-minute wait.
+        const knownWrongSide = new Set<string>();
+        if (manager && Array.isArray(manager.ordersNeedingPriceCorrection)) {
+            for (const correction of manager.ordersNeedingPriceCorrection) {
+                if (correction?.typeMismatch === true && correction.chainOrderId) {
+                    knownWrongSide.add(String(correction.chainOrderId));
+                }
+            }
+        }
         const deferredFreshCancelSlots = new Set<string>();
         for (const action of reconcileResult.actions as CowAction[]) {
             if (action.type !== COW_ACTIONS.CANCEL || !action.orderId) continue;
+            if (knownWrongSide.has(String(action.orderId))) continue;
             if (!manager || !isFreshlyPlacedOrder(manager, action.orderId)) continue;
             const slotId = String(action.id);
             if (deferredFreshCancelSlots.has(slotId)) continue;
@@ -343,12 +361,6 @@ class COWRebalanceEngine {
                 'info'
             );
         }
-        // Wrong-side (typeMismatch) orders are deliberately NOT exempted
-        // here: the correction queue owns that decision and its pre-batch
-        // drain (correctAllPriceMismatches) cancels them before this plan is
-        // broadcast. This guard only prevents churn on a plan-shaped
-        // CANCEL+CREATE pair; teaching it to guess the chain side here would
-        // re-introduce the churn for a legitimate retype.
         // Id-group drop is deliberate: dropping only the CANCEL would let
         // optimizeRebalanceActions below fold the paired CREATE back into an
         // UPDATE (cancelAction.id + newGridId) and re-materialize the

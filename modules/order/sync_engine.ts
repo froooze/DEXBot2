@@ -1982,6 +1982,12 @@ class SyncEngine {
                 isMaker
             };
             const { btsFeeState, ...matchedWithoutDeferredFee } = matchedGridOrder;
+            // Store the TRADED side, not the slot's old label: `size` below is
+            // in that side's units, and accounting/recalculateFunds resolve
+            // dimensions from order.type. This does NOT launder a queued
+            // typeMismatch cancel — its drain-time validator compares the
+            // level's rail geometry, not just slot.type (see
+            // _validatePriceCorrectionEntry).
             let updatedOrder: ManagedOrder = { ...matchedWithoutDeferredFee, type: orderType, state: ORDER_STATES.PARTIAL };
 
             if (updatedOrder.rawOnChain && updatedOrder.rawOnChain.for_sale !== undefined) {

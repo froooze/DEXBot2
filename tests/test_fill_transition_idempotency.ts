@@ -223,6 +223,65 @@ async function runTests() {
         assert.strictEqual(result.isFull, true, 'a clamped remainder must never yield a 0-size PARTIAL slot');
     }
 
+    console.log(' - 9. a partial fill on a foreign-side slot stores the traded side...');
+    {
+        const result = await engine._computeFillTransitionResult(makeManager(), makeParams({
+            matchedGridOrder: {
+                id: 'slot-118',
+                orderId: '1.7.119',
+                // Stale rail label; the resting chain order is a SELL.
+                type: ORDER_TYPES.BUY,
+                state: ORDER_STATES.ACTIVE,
+                price: 100,
+                size: 1,
+                rawOnChain: { for_sale: '10000' },
+            },
+            orderType: ORDER_TYPES.SELL,
+            precision: 4,
+            filledAmount: 0.3,
+            filledAmountInt: 3000,
+            currentSizeIntFromGrid: 10000,
+            rawForSaleInt: 10000,
+            effectiveRawForSale: 10000,
+        }));
+        assert.strictEqual(result.isFull, false, 'the residual keeps the order partial');
+        assert.strictEqual(result.filledOrder.type, ORDER_TYPES.SELL, 'the fill event carries the traded side');
+        // The stored slot must carry the traded side: `size` is in that side's
+        // units, and accounting resolves dimensions from order.type. The
+        // typeMismatch cancel is protected by rail geometry at drain time
+        // (test_correction_queue_staleness 5c), not by the stored label.
+        assert.strictEqual(result.partialUpdate.type, ORDER_TYPES.SELL,
+            'the stored slot adopts the traded side (dimension consistency)');
+        assert.strictEqual(result.partialUpdate.orderId, '1.7.119', 'the slot keeps the residual id for the cancel');
+        assert.ok(Math.abs(Number(result.partialUpdate.size) - 0.7) < 1e-9,
+            `residual size 0.7, got ${result.partialUpdate.size}`);
+    }
+
+    console.log(' - 10. a SPREAD slot adopts the filled side (no illegal SPREAD+PARTIAL)...');
+    {
+        const result = await engine._computeFillTransitionResult(makeManager(), makeParams({
+            matchedGridOrder: {
+                id: 'slot-118',
+                orderId: '1.7.119',
+                type: ORDER_TYPES.SPREAD,
+                state: ORDER_STATES.ACTIVE,
+                price: 100,
+                size: 1,
+                rawOnChain: { for_sale: '10000' },
+            },
+            orderType: ORDER_TYPES.BUY,
+            precision: 4,
+            filledAmount: 0.3,
+            filledAmountInt: 3000,
+            currentSizeIntFromGrid: 10000,
+            rawForSaleInt: 10000,
+            effectiveRawForSale: 10000,
+        }));
+        assert.strictEqual(result.isFull, false, 'a residual BUY remains');
+        assert.strictEqual(result.partialUpdate.type, ORDER_TYPES.BUY,
+            'SPREAD must not survive into a PARTIAL on-chain slot');
+    }
+
     console.log('\n✓ fill-transition idempotency tests PASSED!');
 }
 

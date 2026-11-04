@@ -15,6 +15,10 @@
  *   2a. null update yields {success:true, skipped:true} (not failed).
  *   2b. correctAllPriceMismatches reports failed===0 for a no-op drain.
  * Fix 3 — provenance: stale-drop log names the queuing detector + time.
+ * Fix 4 — a fill-retagged slot is not a repaired mismatch:
+ *   4a. slot.type adopted the chain side but the rail geometry disagrees → cancel.
+ *   4b. slot.type AND the rail geometry agree with the chain side → drop.
+ *   4c. a gap-band level is never "repaired" by its label.
  */
 const assert = require('assert');
 const {
@@ -662,6 +666,123 @@ async function run() {
         assert.strictEqual(manager.ordersNeedingPriceCorrection.length, 1, 'held entry stays queued');
         assert(logs.some((l) => l.includes('inside grace window')), 'the grace deferral must still be logged');
         console.log('  - regular fresh surplus still honours the grace window');
+    }
+
+    // ---- 5c. A fill-retagged slot does not launder the mismatch ----
+    // A partial fill stores the TRADED side into the slot (size dimensions
+    // stay consistent for accounting). If the level is still on the opposite
+    // rail, that label must not be read as a repair: the residual order is
+    // known-wrong and must be cancelled. Geometry (index vs boundary), not
+    // the stored label, is the repair authority.
+    {
+        const chainId = '1.7.777003';
+        const adoptedSlot = {
+            id: 'slot-80', orderId: chainId, type: ORDER_TYPES.SELL,
+            price: 0.312638, size: 595, state: ORDER_STATES.PARTIAL,
+        };
+        const { manager, logs } = createManager(
+            [adoptedSlot],
+            [{
+                gridOrder: { id: 'slot-80', type: ORDER_TYPES.BUY, price: 0.312638, size: 850 },
+                chainOrderId: chainId,
+                expectedPrice: 0.312638,
+                actualPrice: 0.312638,
+                size: 595,
+                type: ORDER_TYPES.SELL,
+                sideUpdated: ORDER_TYPES.SELL,
+                typeMismatch: true,
+                isSurplus: true,
+                cancelOnly: false,
+                queuedAt: Date.now(),
+                queuedBy: 'sync-pass1-type-mismatch',
+            }]
+        );
+        // slot-80 <= boundary 99 => BUY rail; the chain order is a SELL.
+        manager.boundaryIdx = 99;
+        manager._placedAt = new Map([[chainId, Date.now()]]);
+        let cancels = 0;
+        const accountOrders = { cancelOrder: async () => { cancels++; return { success: true }; } };
+        await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
+        assert.strictEqual(cancels, 1, 'a retagged slot on the opposite rail must still be cancelled');
+        assert(!logs.some((l) => l.includes('was repaired')), 'the adopted label must not count as a repair');
+        console.log('  - a fill-retagged slot on the wrong rail is still cancelled');
+    }
+
+    // ---- 5d. A genuine rail repair drops the stale cancel ----
+    // The level flipped to the SELL rail and the slot already carries the
+    // chain's SELL: the order is correct, only the old queue entry is stale.
+    {
+        const chainId = '1.7.777004';
+        const repairedSlot = {
+            id: 'slot-80', orderId: chainId, type: ORDER_TYPES.SELL,
+            price: 0.312638, size: 850, state: ORDER_STATES.ACTIVE,
+        };
+        const { manager, logs } = createManager(
+            [repairedSlot],
+            [{
+                gridOrder: { id: 'slot-80', type: ORDER_TYPES.BUY, price: 0.312638, size: 850 },
+                chainOrderId: chainId,
+                expectedPrice: 0.312638,
+                actualPrice: 0.312638,
+                size: 850,
+                type: ORDER_TYPES.SELL,
+                sideUpdated: ORDER_TYPES.SELL,
+                typeMismatch: true,
+                isSurplus: true,
+                cancelOnly: false,
+                queuedAt: Date.now(),
+                queuedBy: 'sync-pass1-type-mismatch',
+            }]
+        );
+        // slot-80 > boundary 79 => SELL rail, matching the chain side.
+        manager.boundaryIdx = 79;
+        manager._placedAt = new Map([[chainId, Date.now()]]);
+        let cancels = 0;
+        const accountOrders = { cancelOrder: async () => { cancels++; return { success: true }; } };
+        await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
+        assert.strictEqual(cancels, 0, 'a repaired rail must not cancel the matching order');
+        assert.strictEqual(manager.ordersNeedingPriceCorrection.length, 0, 'the stale entry is dropped');
+        assert(logs.some((l) => l.includes('was repaired')), 'the drop must say the rail repaired it');
+        console.log('  - a genuinely repaired rail drops the stale cancel');
+    }
+
+    // ---- 5e. An in-band level is never "repaired" by its label ----
+    // A resolved SPREAD geometry contradicts a rail side: no order should
+    // rest inside the gap band, so the mismatch cancel must survive even when
+    // the stored type already carries the chain side.
+    {
+        const chainId = '1.7.777005';
+        const inBandSlot = {
+            id: 'slot-80', orderId: chainId, type: ORDER_TYPES.SELL,
+            price: 0.312638, size: 595, state: ORDER_STATES.PARTIAL,
+        };
+        const { manager, logs } = createManager(
+            [inBandSlot],
+            [{
+                gridOrder: { id: 'slot-80', type: ORDER_TYPES.BUY, price: 0.312638, size: 850 },
+                chainOrderId: chainId,
+                expectedPrice: 0.312638,
+                actualPrice: 0.312638,
+                size: 595,
+                type: ORDER_TYPES.SELL,
+                sideUpdated: ORDER_TYPES.SELL,
+                typeMismatch: true,
+                isSurplus: true,
+                cancelOnly: false,
+                queuedAt: Date.now(),
+                queuedBy: 'sync-pass1-type-mismatch',
+            }]
+        );
+        // slot-80 sits in the 2-slot band above boundary 79 (sellStart 82).
+        manager.boundaryIdx = 79;
+        manager._gapSlots = 2;
+        manager._placedAt = new Map([[chainId, Date.now()]]);
+        let cancels = 0;
+        const accountOrders = { cancelOrder: async () => { cancels++; return { success: true }; } };
+        await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
+        assert.strictEqual(cancels, 1, 'an in-band order must be cancelled even if its label matches');
+        assert(!logs.some((l) => l.includes('was repaired')), 'the band is not a repair');
+        console.log('  - an in-band level is not treated as repaired');
     }
 
     console.log('PASS test_correction_queue_staleness');

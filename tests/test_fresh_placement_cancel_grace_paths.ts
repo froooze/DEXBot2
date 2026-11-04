@@ -46,16 +46,16 @@ function makeEngine(targetGrid: Map<string, any>, boundaryIdx: number) {
 }
 
 /** A manager-shaped holder for the grace data only. */
-function makeGraceHolder(freshOrderId: string | null) {
+function makeGraceHolder(freshOrderId: string | null, corrections: any[] = []) {
     const placedAt = new Map<string, number>();
     if (freshOrderId) placedAt.set(freshOrderId, Date.now());
-    return { _placedAt: placedAt };
+    return { _placedAt: placedAt, ordersNeedingPriceCorrection: corrections };
 }
 
 // Grant generous funds so the working-grid fund check never aborts the plan.
 const FUNDS = { allocatedBuy: 1_000_000, allocatedSell: 1_000_000 };
 
-async function runReconcilePlan(fresh: boolean, mode: 'orphan' | 'type-mismatch' = 'orphan') {
+async function runReconcilePlan(fresh: boolean, mode: 'orphan' | 'type-mismatch' = 'orphan', corrections: any[] = []) {
     const masterGrid = new Map<string, any>();
     masterGrid.set('slot-0', {
         id: 'slot-0', type: ORDER_TYPES.BUY, state: ORDER_STATES.ACTIVE,
@@ -90,7 +90,7 @@ async function runReconcilePlan(fresh: boolean, mode: 'orphan' | 'type-mismatch'
         gridVersion: 1,
         boundaryIdx: 0,
         funds: FUNDS as any,
-        manager: makeGraceHolder(fresh ? '1.7.100' : null) as any,
+        manager: makeGraceHolder(fresh ? '1.7.100' : null, corrections) as any,
         gapSlots: 0
     });
 }
@@ -149,6 +149,36 @@ async function testPairedCreateNotRematerialized() {
     );
     check('aged pair: cancel emitted', hasCancel || hasFoldedUpdate, true);
     check('aged pair: create emitted', hasCreate || hasFoldedUpdate, true);
+}
+
+async function testQueuedTypeMismatchBypassesGrace() {
+    console.log(' - Queued typeMismatch entries bypass the COW grace...');
+
+    // A queued typeMismatch entry is the proof that the CHAIN side is wrong;
+    // the drain having deferred/failed must not park the order for 15 more
+    // minutes. The plan shape is identical to the deferred control below.
+    const queuedMismatch = [{
+        chainOrderId: '1.7.100',
+        type: ORDER_TYPES.SELL,
+        typeMismatch: true,
+        isSurplus: true,
+    }];
+    const exempted = await runReconcilePlan(true, 'type-mismatch', queuedMismatch);
+    const exemptedSlotActions = (exempted.actions || []).filter((a: any) => String(a.id) === 'slot-0');
+    const exemptedCancel = exemptedSlotActions.some((a: any) => a.type === COW_ACTIONS.CANCEL);
+    const exemptedFolded = exemptedSlotActions.some(
+        (a: any) => a.type === COW_ACTIONS.UPDATE && a.newGridId !== undefined
+    );
+    check('queued mismatch: the fresh cancel is not parked', exemptedCancel || exemptedFolded, true);
+    check('queued mismatch: the paired create is kept',
+        exemptedSlotActions.some((a: any) => a.type === COW_ACTIONS.CREATE) || exemptedFolded, true);
+
+    // Control: same plan shape, no chain-side proof — the stale-target lag
+    // protection must still defer it.
+    const surplusOnly = [{ chainOrderId: '1.7.100', type: ORDER_TYPES.BUY, isSurplus: true }];
+    const deferred = await runReconcilePlan(true, 'type-mismatch', surplusOnly);
+    const deferredSlotActions = (deferred.actions || []).filter((a: any) => String(a.id) === 'slot-0');
+    check('plain fresh surplus: still deferred', deferredSlotActions.length, 0);
 }
 
 async function testDivergencePath() {
@@ -246,6 +276,7 @@ async function main() {
     console.log('Running fresh-placement cancel grace path tests...');
     await testReconcilePath();
     await testPairedCreateNotRematerialized();
+    await testQueuedTypeMismatchBypassesGrace();
     await testDivergencePath();
     console.log(`\n✓ Fresh-placement cancel grace path tests passed! (${assertions} assertions)`);
 }

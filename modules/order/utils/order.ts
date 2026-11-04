@@ -759,11 +759,17 @@ function findLiveOrderOwnerByChainId(manager: OrderManagerLike, chainOrderId: st
  * replayed cancel would then destroy the freshly updated in-place order.
  *
  * Type-mismatch and gap-evacuation surplus decisions have their own source-
- * specific checks. A type mismatch is actionable only while the same live
- * slot still owns the id and still has the mismatched type. A gap evacuation
- * is actionable only while the same live slot remains in the current gap
- * band. Both otherwise use the old cancellation branch, so allowing either
- * decision to replay would recreate the same stale-replay regression.
+ * specific checks. A type mismatch is actionable while the same live slot
+ * still owns the id AND (its stored type OR its rail geometry — index vs
+ * boundary, including the gap band) still disagrees with the chain side. A
+ * stored type that a fill (or another in-place writer) retagged to the chain
+ * side is NOT a repair on its own: an order can carry the chain's side while
+ * sitting on the opposite rail or inside the band, and dropping the cancel
+ * there would let the residual rest on the wrong side (2026-11-04 incident).
+ * A gap evacuation is actionable only while the same live slot remains in the
+ * current gap band. Both otherwise use the old cancellation branch, so
+ * allowing either decision to replay would recreate the same stale-replay
+ * regression.
  *
  * @param {Object} manager - OrderManager instance (live grid + assets)
  * @param {Object} entry - Queued correction entry
@@ -788,10 +794,24 @@ function _validatePriceCorrectionEntry(manager: OrderManagerLike, entry: Pending
         if (!slot) {
             return { valid: false, reason: `type-mismatch target ${slotId || '?'} no longer owns ${entry.chainOrderId}` };
         }
-        if (!targetType || slot.type === targetType) {
-            return { valid: false, reason: `type-mismatch for ${entry.chainOrderId} was repaired (${slot.type} now matches ${targetType || 'chain type'})` };
+        // The stored type alone is not proof of a repair: a fill (or another
+        // in-place writer) may have retagged the slot to the CHAIN side while
+        // the level still belongs to the opposite rail. Only a level whose
+        // rail geometry also matches the chain side is genuinely repaired.
+        // A resolved SPREAD geometry (gap band) also contradicts a rail side:
+        // no order should rest there, so the cancel must survive. Geometry is
+        // index-vs-boundary, so an unknown boundary falls back to the
+        // stored-type check (fail-safe: never invent a rail).
+        const geometryType = geometryTypeForSlotIndex(
+            parseSlotIndex(slot.id),
+            manager?.boundaryIdx,
+            manager?._gapSlots
+        );
+        const geometryContradicts = geometryType !== null && geometryType !== targetType;
+        if (!targetType || (slot.type === targetType && !geometryContradicts)) {
+            return { valid: false, reason: `type-mismatch for ${entry.chainOrderId} was repaired (${slot.type} now matches ${targetType || 'chain type'} on the ${geometryType || 'unknown'} rail)` };
         }
-        return { valid: true, reason: 'type-mismatch-still-live' };
+        return { valid: true, reason: geometryContradicts ? 'type-mismatch-still-live-geometry' : 'type-mismatch-still-live' };
     }
     if (entry.gapEvacuation === true) {
         const slotId = entry?.gridOrder?.id;
