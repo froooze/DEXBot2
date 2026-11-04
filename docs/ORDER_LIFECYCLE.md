@@ -54,6 +54,30 @@ an unparseable chain entry all land there, and `mayExistOnChain` is `true` for
 it. Reading `unknown` as "gone" is the bug class this whole module exists to
 make unrepresentable.
 
+## Evidence is monotonic
+
+`evidence` records *how* we know the current phase, ranked weakest → strongest:
+`none` < `local` < `broadcast-receipt` < `adoption` < `chain-snapshot` <
+`fill-history`.
+
+Within one phase the rank can only go up. The write funnel only knows the LOCAL
+slot state ("this slot is ACTIVE"), so it reports `local`; that must not
+overwrite what a sync pass just observed (`chain-snapshot`), or the registry
+would claim a purely local basis for the strongest thing we know about the
+order. A PHASE CHANGE is new information, so it adopts its own evidence.
+
+## Clocks cannot be refreshed for free
+
+- `observedAt` advances only for chain-backed evidence (`chain-snapshot`,
+  `fill-history`, `adoption`). Local bookkeeping cannot move "when did the chain
+  last tell us anything".
+- `recordedAt` — the anchor of the unresolved bound — advances only when the
+  phase changes or chain-backed evidence arrives. Re-asserting the same
+  unresolved phase is not new information: refreshing the clock for it would
+  keep `isInFlight()` true forever, which is the opposite of the documented
+  escape hatch. A bot that mutates a slot every cycle (a re-plan, a size tweak)
+  re-asserts `unknown` on every write, so this rule is what makes the bound real.
+
 ## Legacy structures are views, not copies
 
 Six of the seven are now live `Map`/`Set` views onto the registry
@@ -99,29 +123,54 @@ view.appliedFillMatches(n);  // pass-1 resize dedupe
 `isInFlight()` is the single definition of the "absence is not trustworthy"
 guard. It is time-bounded (2× `PENDING_BROADCAST_TTL_MS`) so a lagging node
 cannot park the grid, matching the escape hatch each old per-site guard carried.
+All three absence-decision sites ask it, through `readSlotLifecycle`: the sync
+pass-1 phantom cleanup, the startup reconcile, and the fund recalibration sweep.
+Asking a *subset* of it is what re-opened the bug class: the sync engine used to
+consult the committed window and the fresh-assignment window separately and
+never the unresolved phases, so it could virtualize an order whose CREATE
+receipt was merely lost.
 
 `readLifecycle(manager, id)` reads through `getLifecycle` and falls back to
 synthesizing a record from the raw maps, so partial test doubles keep working
-while the *vocabulary* stays unified.
+while the *vocabulary* stays unified. `readSlotLifecycle(manager, slot)` is the
+preferred form wherever the slot object is at hand: a slot can carry evidence
+the registry does not (the persisted `createUncertain` marker), and an
+orderId-keyed read would silently ignore it.
 
 Two read rules:
 
 - **Reads do not write.** `getSlotLifecycle` reports `unknown` for a slot that
   carries `createUncertain` via `withPhase`, which never touches the record.
   Recording it on read would refresh `recordedAt` every call and keep the
-  unresolved bound alive forever.
-- **Unresolved evidence is sticky.** A slot mutation that clears the chain id
-  uses `markIntentIfResolved`: it will not downgrade an `unknown`/`broadcasting`
-  record to `intent`. Only an explicit decision (`markIntent`, i.e. the
-  sanitizer clearing the marker) or an answer from the chain can do that.
+  unresolved bound alive forever. A `withPhase` view over a slot that was never
+  recorded has no clock at all (`recordedAt: 0`), so an aged marker cannot look
+  fresh on every read.
+- **Unresolved evidence is sticky — but not eternal.** A slot mutation that
+  clears the chain id uses `markIntentIfResolved`: it will not downgrade an
+  `unknown`/`broadcasting` record to `intent` while the uncertainty is inside the
+  bound. Past the bound the release has already happened for every decision
+  (`isInFlight()` is false), so the same call resolves the phase to `intent`
+  instead of leaving a suppression nothing honours and `mayExistOnChain` true
+  forever. Only an explicit decision (`markIntent`) or the chain can resolve it
+  sooner.
 
 ## Writes are funnelled
 
 Every order mutation goes through `_applyOrderUpdate`, which calls
-`_syncLifecycleFromMutation(previous, next, context)`. No call site has to
-remember which structure to touch. A `createUncertain` write (including the
-persisted marker restored at startup and the load-time sanitizer) is folded into
-`phase: 'unknown'` automatically.
+`_syncLifecycleFromMutation(previous, next, context)`. That funnel is the ONLY
+writer of phase, `assignedAt` and `placedAt` — the stamps used to be written a
+second time at the call site, which is how two copies of every clock appear. A
+`createUncertain` write (including the persisted marker restored at startup and
+the load-time sanitizer) is folded into `phase: 'unknown'` automatically.
+
+One mutation does not go through `_applyOrderUpdate`: the COW commit replaces the
+master map wholesale (`_commitWorkingGrid`). It projects every slot of the
+committed map through the same funnel *before* swapping, for the same reason —
+the primary placement path must stamp `assignedAt`/`placedAt`, or the
+fresh-placement grace is inert for every COW-created order and a competing sweep
+may cancel a seconds-old order. The committed-set publish then stamps
+`committedAt` for the whole map in one call (`markCommittedSnapshot`); a second
+per-id stamp would only re-date the same ids.
 
 Two distinct pending-CREATE outcomes are kept distinct:
 
@@ -146,18 +195,28 @@ it, so `placedAt` can never be stranded on an unreachable record.
 - `INV-LIFE-002` One record per slot. A chain-id change (rotation, re-place)
   updates the existing record; it never starts a parallel one.
 - `INV-LIFE-003` No site invents its own evidence set. Absence decisions use
-  `isInFlight()`; the committed guard uses `isRecentlyCommitted()`; the fresh-id
-  guard uses `isRecentlyAssigned()`.
-- `INV-LIFE-004` Unresolved records are never evicted. Registry pruning skips
-  `unknown` and `broadcasting`.
+  `isInFlight()` (read through the slot: `readSlotLifecycle`); the committed
+  guard uses `isRecentlyCommitted()`; the fresh-id guard uses
+  `isRecentlyAssigned()`.
+- `INV-LIFE-004` A LIVE unresolved record is never evicted. Registry pruning
+  skips `unknown` and `broadcasting` records while their uncertainty is inside
+  the bound; past it they are no less settled than anything else (no decision
+  consults them any more), so they become evictable and the registry keeps a
+  ceiling even on a bot that keeps losing CREATE receipts.
 - `INV-LIFE-005` A chain entry that cannot be parsed makes its slot's absence
   UNKNOWN, never absent (`sync_engine` guard 0, mirroring the accounting
   recovery sweep's `malformedOrderIds`).
+- `INV-LIFE-006` Evidence never downgrades within a phase, and `observedAt`
+  advances only for chain-backed evidence.
+- `INV-LIFE-007` The unresolved bound is measured from when the uncertainty was
+  RECORDED. Re-asserting the same phase without new evidence does not move it.
 
 ## Tests
 
 - `tests/test_order_lifecycle.ts` — the record model, `unknown ≠ gone`, resolved
-  vs abandoned pending, the committed snapshot stamp, facade equivalence,
-  eviction policy, and the `readLifecycle` fallback.
+  vs abandoned pending, the committed snapshot stamp, the COW commit
+  projection, evidence monotonicity, the unresolved bound against
+  re-assertions, expired-unknown resolution, eviction policy, the unified
+  absence guard at the sync site, and the `readLifecycle` fallback.
 - `tests/recon_fuzz.ts` — the interleaving fuzzer; asserts `INV-LIFE-004`
   coverage (`I3`/`I4`) after every event.

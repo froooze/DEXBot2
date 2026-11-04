@@ -1020,6 +1020,8 @@ export interface OrderLifecycleViewLike {
   placedAt: number;
   committedAt: number;
   isUnknown: boolean;
+  /** Phase is `unknown` or `broadcasting`: unresolved evidence, not absence. */
+  isUnresolved: boolean;
   mayExistOnChain: boolean;
   isConfirmedGone: boolean;
   isIntentOnly: boolean;
@@ -1030,6 +1032,8 @@ export interface OrderLifecycleViewLike {
   isInFlight(windowMs?: number, now?: number): boolean;
   isUnresolvedFresh(now?: number): boolean;
   appliedFillMatches(filledInt: number): boolean;
+  /** True when the phase was recorded by evidence from outside the process. */
+  isChainBacked(): boolean;
 }
 
 /** Minimal surface of the credit runtime consumed by the bot/manager layer. */

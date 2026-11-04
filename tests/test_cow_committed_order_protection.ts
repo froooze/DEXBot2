@@ -2,7 +2,7 @@ const assert = require('assert');
 const { OrderManager } = require('../modules/order/index').default;
 const { ORDER_TYPES, ORDER_STATES, TIMING } = require('../modules/constants');
 const { createSilentLogger } = require('./helpers/silent_logger');
-const { makeLadderFromPrices } = require('./helpers/order_test_helpers');
+const { makeLadderFromPrices, ageChainIdAssignment } = require('./helpers/order_test_helpers');
 
 // Compiled ESM namespaces are frozen: seed the fee cache via the _setFeeCache
 // seam instead of patching OrderUtils.getAssetFees (createFee=0.1, updateFee=0.001).
@@ -68,6 +68,9 @@ async function runTests() {
             id: 'slot-2', state: ORDER_STATES.ACTIVE, type: ORDER_TYPES.BUY,
             size: 100, price: 50, orderId: '1.7.101'
         });
+        // This scenario is about the COMMITTED window; the assignment stamp must
+        // be settled or the in-flight guard defers for its own reason.
+        ageChainIdAssignment(manager, '1.7.101');
         // Suspect-empty-read guard: pump until the empty account is confirmed.
         const result = await syncEmptyUntilConfirmed(manager);
         const order = manager.orders.get('slot-2');
@@ -83,6 +86,7 @@ async function runTests() {
             id: 'slot-3', state: ORDER_STATES.ACTIVE, type: ORDER_TYPES.BUY,
             size: 100, price: 50, orderId: '1.7.102'
         });
+        ageChainIdAssignment(manager, '1.7.102');
         manager._committedOrderIds.add('1.7.102');
         manager._committedOrderIds.delete('1.7.102');
         const result = await syncEmptyUntilConfirmed(manager);
@@ -144,6 +148,7 @@ async function runTests() {
             id: 'old-committed', state: ORDER_STATES.ACTIVE, type: ORDER_TYPES.BUY,
             size: 100, price: 50, orderId: '1.7.201'
         });
+        ageChainIdAssignment(manager, '1.7.201');
         manager._committedOrderIds.add('1.7.201');
         manager._committedOrderIdsBuiltAt = 1;
         const result = await syncEmptyUntilConfirmed(manager);

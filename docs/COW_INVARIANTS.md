@@ -154,17 +154,24 @@ not by the seven per-site structures that used to disagree
 
 - `INV-LIFE-002` One record per slot
   - A slot is the identity across its order incarnations. A chain-id change (rotation, re-place, adoption) updates the existing record; it must not start a parallel one.
-  - Writers funnel through `_applyOrderUpdate` → `_syncLifecycleFromMutation`; no call site maintains its own chain-existence bookkeeping.
+  - Writers funnel through `_applyOrderUpdate` → `_syncLifecycleFromMutation`; no call site maintains its own chain-existence bookkeeping (that includes the stamps: `assignedAt`/`placedAt` are written by the funnel only).
+  - The one mutation that does not call `_applyOrderUpdate` is the COW whole-map commit (`_commitWorkingGrid`): it projects every slot of the committed map through the same funnel before swapping, so the primary placement path stamps `placedAt`/`assignedAt` too. Without it the surplus-cancel grace is inert for every COW-created order.
 
 - `INV-LIFE-003` One definition per guard
-  - Absence decisions ("is this order's absence trustworthy yet?") use `isInFlight()`.
+  - Absence decisions ("is this order's absence trustworthy yet?") use `isInFlight()`, read through the slot (`readSlotLifecycle`) so a persisted `createUncertain` marker participates.
   - The committed-but-missing guard uses `isRecentlyCommitted()`.
   - The fresh-id guard uses `isRecentlyAssigned()`.
-  - A read site must not re-derive a window from a raw map; that is how four sites ended up with four answers.
+  - A read site must not re-derive a window from a raw map, and must not consult a subset of `isInFlight()`: that is how four sites ended up with four answers.
 
-- `INV-LIFE-004` Unresolved records are never evicted or downgraded
-  - Registry pruning skips `unknown` and `broadcasting`.
+- `INV-LIFE-004` A LIVE unresolved record is never evicted or downgraded
+  - Registry pruning skips `unknown` and `broadcasting` while their uncertainty is inside the bound; past it no decision consults them, so they become evictable (the registry keeps a ceiling).
+  - `markIntentIfResolved` likewise refuses to downgrade a live uncertainty, and resolves one whose bound has expired instead of leaving an un-honoured suppression behind.
   - A pending CREATE has two distinct exits: *resolved* (`deletePending` → `intent`) and *abandoned* (`_expirePendingBroadcast` → `unknown`). Collapsing them turns a lost receipt into a clean hole that gets re-CREATEd.
+
+- `INV-LIFE-006` Evidence is monotonic; clocks cannot be refreshed for free
+  - Within a phase the evidence rank may only rise (`local` < `broadcast-receipt` < `adoption` < `chain-snapshot` < `fill-history`), so a local write cannot overwrite what the chain said.
+  - `observedAt` advances only for chain-backed evidence.
+  - `recordedAt` (the anchor of the unresolved bound) advances only on a phase change or chain-backed evidence: re-asserting `unknown` is not new information.
 
 - `INV-LIFE-005` Unparseable chain entries make absence unknown, not absent
   - A chain order that was returned but could not be decoded puts its slot's absence in the UNKNOWN bucket (`sync_engine` pass-1 guard 0, mirroring the accounting recovery sweep's `malformedOrderIds`); the slot is not virtualized.
@@ -295,7 +302,7 @@ not by the seven per-site structures that used to disagree
   - SELL placements must use nearest available free slots first (ascending price).
 
 - `INV-RECON-006` Fresh-placement cancels are deferred for a grace window
-  - A CANCEL action targeting an `orderId` placed within `TIMING.SURPLUS_CANCEL_GRACE_MS` (15 min) is deferred. The timestamp is written by `recordOrderPlacement` into `manager._placedAt` and tested by `isFreshlyPlacedOrder`.
+  - A CANCEL action targeting an `orderId` placed within `TIMING.SURPLUS_CANCEL_GRACE_MS` (15 min) is deferred. The timestamp is written by the lifecycle write funnel (and by `recordOrderPlacement` for manager-shaped callers) into `manager._placedAt`, and tested by `isFreshlyPlacedOrder`.
   - `COWRebalanceEngine.execute` drops the whole slot's action group for a deferred cancel (dropping only the CANCEL would let a paired CREATE fold back into an UPDATE and re-materialize the placement), then re-syncs the deferred slots from master via `workingGrid.syncFromMaster` so the commit does not virtualize a still-live order.
   - Divergence correction (`applyGridDivergenceCorrections`) applies the same guard after dropping any queued committed-size UPDATE for the not-desired/size-0 slot.
   - `grid-load`/`grid-init` load contexts are excluded so restarts do not suppress the sweep.

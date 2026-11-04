@@ -93,7 +93,7 @@ import { ORDER_TYPES, ORDER_STATES, PIPELINE_TIMING, TIMING, FEE_PARAMETERS, GRI
 import { resolveAccountRef } from './utils/system.js';
 import { resolveSpreadOrderSide, parseChainOrder, applyChainSizeToGridOrder, convertToSpreadPlaceholder, resolveEdgeCount } from './utils/order.js';
 import { parseSlotIndex } from './utils/slot.js';
-import { readLifecycle } from './lifecycle.js';
+import { readSlotLifecycle } from './lifecycle.js';
 import { isSlotInRail, resolveGapSlots, floatToBlockchainInt } from './utils/math.js';
 import * as Format from './format.js';
 import * as fundRegistry from '../fund_registry.js';
@@ -1018,8 +1018,9 @@ class Accountant {
                     // Single in-flight guard (modules/order/lifecycle.ts).
                     // This site used to OR together `_committedOrderIds` and
                     // `_orderIdAssignedAt` while the startup reconcile OR'd
-                    // neither-or-one; same order, different answer.
-                    if (readLifecycle(mgr, gridOrder.orderId).isInFlight()) continue;
+                    // neither-or-one; same order, different answer. Read through the
+                    // SLOT so the persisted create-uncertain marker participates.
+                    if (readSlotLifecycle(mgr, gridOrder).isInFlight()) continue;
                     result.attempted++;
                     const spreadOrder = convertToSpreadPlaceholder(gridOrder);
                     if (await applyUpdate(spreadOrder, 'recovery-fund-recalibration')) result.virtualized++;
@@ -1923,7 +1924,7 @@ class Accountant {
          // duplicate and its dedup key is queued. Partial consumption: pass 1
          // may have absorbed only part of this fill (A+B observed, fill A
          // drained now); the transition subtracts only the remainder.
-         const consumeApplied = (mgr as unknown as { consumeChainSizeAppliedFillAmount?: (id: string, filledInt: number) => number }).consumeChainSizeAppliedFillAmount;
+         const consumeApplied = mgr.consumeChainSizeAppliedFillAmount;
          if (Number.isFinite(filledBaseInt) && typeof consumeApplied === 'function') {
              appliedInt = Math.max(0, Math.min(
                  Math.round(Number(consumeApplied.call(mgr, String(fillOp.order_id), filledBaseInt)) || 0),
@@ -1961,9 +1962,8 @@ class Accountant {
                   processedFillStore.discard(fillKey, processedAt || Date.now());
                   // The marker was consumed for this attempt; the rolled-back
                   // fill must be able to skip the pass-1 size release on retry.
-                  if (appliedInt > 0 && typeof (mgr as unknown as { noteChainSizeAppliedFill?: (id: string, n: number) => void }).noteChainSizeAppliedFill === 'function') {
-                      (mgr as unknown as { noteChainSizeAppliedFill: (id: string, n: number) => void })
-                          .noteChainSizeAppliedFill(String(fillOp.order_id), appliedInt);
+                  if (appliedInt > 0 && typeof mgr.noteChainSizeAppliedFill === 'function') {
+                      mgr.noteChainSizeAppliedFill(String(fillOp.order_id), appliedInt);
                   }
                   throw err;
               }

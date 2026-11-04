@@ -117,6 +117,8 @@ export interface LifecycleView {
     committedAt: number;
     /** Phase is `unknown`: the order may or may not exist on chain. */
     isUnknown: boolean;
+    /** Phase is `unknown` or `broadcasting`: unresolved evidence, not absence. */
+    isUnresolved: boolean;
     /** Phase is `broadcasting`, `landed`, `filling` or `unknown`. */
     mayExistOnChain: boolean;
     /** The chain confirmed the order is absent. */
@@ -152,6 +154,8 @@ export interface LifecycleView {
     isUnresolvedFresh(now?: number): boolean;
     /** True when sync pass 1 already absorbed this chain filled amount. */
     appliedFillMatches(filledInt: number): boolean;
+    /** True when the phase was recorded by evidence from outside the process. */
+    isChainBacked(): boolean;
 }
 
 interface ObserveInput {
@@ -164,23 +168,86 @@ interface ObserveInput {
     at?: number;
 }
 
-// ===============================================================================
-// SECTION 2: DEFAULT WINDOWS
-// ===============================================================================
-//
-// These two windows are read here instead of at each call site so the grace /
-// commit semantics have exactly one definition. Both are SELF-HEALING windows
-// (they compensate for our own uncertainty) and are on the deletion path in
-// the timing inventory; until they are gone, they are defined once.
+/**
+ * How much a piece of evidence proves, weakest first.
+ *
+ * Evidence is MONOTONIC within a phase: a local re-assertion of the same phase
+ * (the write funnel runs after a sync pass already recorded what the chain said)
+ * must not overwrite `chain-snapshot` with `local`. The rank makes that rule
+ * mechanical instead of a convention every writer has to remember.
+ */
+const EVIDENCE_RANK: Record<LifecycleEvidence, number> = {
+    none: 0,
+    local: 1,
+    'broadcast-receipt': 2,
+    adoption: 3,
+    'chain-snapshot': 4,
+    'fill-history': 5,
+};
 
-function surplusCancelGraceMs(): number {
-    const raw = Number((TIMING as { SURPLUS_CANCEL_GRACE_MS?: number }).SURPLUS_CANCEL_GRACE_MS);
-    return Number.isFinite(raw) && raw > 0 ? raw : 15 * 60 * 1000;
+/** True for the phases where the engine has evidence of a problem, not an answer. */
+function isUnresolvedPhase(phase: LifecyclePhase): boolean {
+    return phase === 'unknown' || phase === 'broadcasting';
 }
 
+/** True when the evidence came from outside the process. */
+function isChainBacked(evidence: LifecycleEvidence): boolean {
+    return evidence === 'chain-snapshot' || evidence === 'fill-history' || evidence === 'adoption';
+}
+
+/**
+ * When the current uncertainty was recorded (0 = no clock).
+ *
+ * The newer of the two clocks: a chain answer that already told us "unreadable"
+ * is the latest thing we know, and the local re-recording that followed it must
+ * not restart the bound. Every consumer of the unresolved bound (isInFlight,
+ * markIntentIfResolved, pruning) measures from here, so they cannot drift.
+ */
+function unresolvedAnchor(record: OrderLifecycleRecord | null | undefined): number {
+    const recorded = Number(record?.recordedAt) || 0;
+    const observed = Number(record?.observedAt) || 0;
+    return Math.max(recorded, observed);
+}
+
+// ===============================================================================
+// SECTION 2: WINDOWS
+// ===============================================================================
+//
+// Every window the registry consults is read here, once, through
+// `timingWindowMs`. The old shape — `Number(TIMING.X) > 0 ? Number(TIMING.X) :
+// <literal>` copy-pasted per site — is how a window's value and its fallback
+// drift apart from the constant they claim to describe.
+
+/**
+ * Read a timing window in milliseconds with a fallback for a missing constant.
+ *
+ * The fallback exists for fixtures that stub `TIMING` with a partial object. It
+ * must never be a SECOND definition of the window: it is the value the constant
+ * already carries (see modules/constants.ts), applied only when the constant is
+ * absent or unusable.
+ *
+ * @param key - TIMING key
+ * @param fallback - Value to use when the constant is missing/unusable
+ * @returns {number} Positive window length in milliseconds
+ */
+export function timingWindowMs(key: string, fallback: number): number {
+    const raw = Number((TIMING as Record<string, unknown>)[key]);
+    return Number.isFinite(raw) && raw > 0 ? raw : fallback;
+}
+
+/** Fresh-placement grace (surplus-cancel protection). */
+function surplusCancelGraceMs(): number {
+    return timingWindowMs('SURPLUS_CANCEL_GRACE_MS', 15 * 60 * 1000);
+}
+
+/** Post-commit protection window (a lagging snapshot must not virtualize). */
 function commitProtectionWindowMs(): number {
-    const raw = Number((TIMING as { SYNC_LOCK_TIMEOUT_MS?: number }).SYNC_LOCK_TIMEOUT_MS);
-    return Number.isFinite(raw) && raw > 0 ? raw : 20_000;
+    return timingWindowMs('SYNC_LOCK_TIMEOUT_MS', 20_000);
+}
+
+/** Retention of an unresolved pending-CREATE entry. */
+export function pendingBroadcastTtlMs(): number {
+    return timingWindowMs('PENDING_BROADCAST_TTL_MS', 30 * 60 * 1000);
 }
 
 /**
@@ -192,11 +259,13 @@ function commitProtectionWindowMs(): number {
  * drop that hatch, so the same bound (2× the pending-broadcast TTL, which is
  * the longest existing unblock window) applies to every unresolved phase.
  * Past it the order is presumed gone and normal cleanup proceeds.
+ *
+ * The bound is only honest if it is measured from when the uncertainty was
+ * RECORDED: a caller re-asserting `unknown` without new evidence must not push
+ * the deadline out (see `observe`).
  */
 function unresolvedBoundMs(): number {
-    const raw = Number((TIMING as { PENDING_BROADCAST_TTL_MS?: number }).PENDING_BROADCAST_TTL_MS);
-    const ttl = Number.isFinite(raw) && raw > 0 ? raw : 30 * 60 * 1000;
-    return ttl * 2;
+    return pendingBroadcastTtlMs() * 2;
 }
 
 // ===============================================================================
@@ -231,6 +300,7 @@ class LifecycleViewImpl implements LifecycleView {
     get pending(): PendingBroadcastLike | null { return this.record?.pending ?? null; }
 
     get isUnknown(): boolean { return this.phase === 'unknown'; }
+    get isUnresolved(): boolean { return isUnresolvedPhase(this.phase); }
     get isConfirmedGone(): boolean { return this.phase === 'gone'; }
     get isIntentOnly(): boolean { return this.phase === 'intent'; }
     get isOnChain(): boolean { return this.phase === 'landed' || this.phase === 'filling'; }
@@ -282,9 +352,13 @@ class LifecycleViewImpl implements LifecycleView {
 
     isUnresolvedFresh(now?: number): boolean {
         const clock = Number.isFinite(Number(now)) ? Number(now) : this.now();
-        const since = this.recordedAt > 0 ? this.recordedAt : this.observedAt;
-        if (!Number.isFinite(since) || since <= 0) return false;
-        return clock - since < unresolvedBoundMs();
+        const from = unresolvedAnchor(this.record);
+        if (!(from > 0)) return false;
+        return clock - from < unresolvedBoundMs();
+    }
+
+    isChainBacked(): boolean {
+        return isChainBacked(this.evidence);
     }
 
     appliedFillMatches(filledInt: number): boolean {
@@ -636,13 +710,18 @@ export class LifecycleRegistry {
     private prune(exceptKey?: string): void {
         if (this.records.size <= this.maxRecords) return;
         // Evict settled records oldest-first. `unknown`/`broadcasting` records
-        // are never evicted implicitly: they are the ones that must not be
-        // forgotten. `exceptKey` is the record just created — it must survive its
-        // own insertion even when it shares a millisecond with older records.
+        // are never evicted while their uncertainty is live: they are the ones
+        // that must not be forgotten. Past the unresolved bound they are no
+        // longer consulted by any decision (isInFlight() released them), so they
+        // become evictable like any other settled record — otherwise a bot that
+        // keeps losing CREATE receipts grows this registry without a ceiling.
+        // `exceptKey` is the record just created — it must survive its own
+        // insertion even when it shares a millisecond with older records.
+        const clock = this.now();
         const evictable: OrderLifecycleRecord[] = [];
         for (const record of this.records.values()) {
             if (record.key === exceptKey) continue;
-            if (record.phase === 'unknown' || record.phase === 'broadcasting') continue;
+            if (!this.isEvictable(record, clock)) continue;
             evictable.push(record);
         }
         evictable.sort((a, b) => a.recordedAt - b.recordedAt);
@@ -650,6 +729,14 @@ export class LifecycleRegistry {
         for (let i = 0; i < overflow && i < evictable.length; i += 1) {
             this.dropRecord(evictable[i]);
         }
+    }
+
+    /** True when a record carries no live uncertainty and may be evicted. */
+    private isEvictable(record: OrderLifecycleRecord, clock: number): boolean {
+        if (!isUnresolvedPhase(record.phase)) return true;
+        const since = unresolvedAnchor(record);
+        if (!(since > 0)) return true;
+        return clock - since >= unresolvedBoundMs();
     }
 
     private dropRecord(record: OrderLifecycleRecord): void {
@@ -700,7 +787,10 @@ export class LifecycleRegistry {
                 fingerprint: null,
                 phase,
                 evidence,
-                recordedAt: this.now(),
+                // No recorded clock: a synthesized record has no evidence time,
+                // and stamping `now` here would make an aged marker look fresh on
+                // every read (the suppression bound would never expire).
+                recordedAt: 0,
                 observedAt: 0,
                 assignedAt: 0,
                 placedAt: 0,
@@ -727,7 +817,9 @@ export class LifecycleRegistry {
         record.phase = 'intent';
         record.evidence = 'local';
         record.recordedAt = this.clock(at);
-        record.pending = null;
+        // Explicit resolution: drop the pending payload AND its index entry, so
+        // the facade the engine reads and `pendingSize()` cannot disagree.
+        this.dropPending(record);
         record.revision += 1;
         return this.view(identity.slotId ?? identity.orderId ?? null);
     }
@@ -749,8 +841,17 @@ export class LifecycleRegistry {
         const identity = asKey(slotId);
         if (!identity) return this.view(null);
         const existing = this.findByIdentity(identity);
-        if (existing && (existing.phase === 'unknown' || existing.phase === 'broadcasting')) {
-            return new LifecycleViewImpl(existing, this.now);
+        if (existing && isUnresolvedPhase(existing.phase)) {
+            // Inside the bound the uncertainty still speaks. Past it the bound has
+            // already released every absence decision (isInFlight()), so leaving
+            // the phase at `unknown` would persist a suppression the engine no
+            // longer honours — `mayExistOnChain` true forever, and the record
+            // un-evictable. Resolve it here, where the caller is explicitly
+            // re-declaring the slot as a clean intent.
+            const clock = this.clock(at);
+            const since = unresolvedAnchor(existing);
+            const expired = !(since > 0) || clock - since >= unresolvedBoundMs();
+            if (!expired) return new LifecycleViewImpl(existing, this.now);
         }
         return this.markIntent({ slotId: identity }, at);
     }
@@ -758,8 +859,18 @@ export class LifecycleRegistry {
     /**
      * Record a state transition observed from an external source.
      *
-     * `observedAt` is only advanced for chain-backed evidence, so "when did we
-     * last hear the truth" cannot be advanced by local bookkeeping.
+     * Two rules make the clocks trustworthy:
+     *
+     * - `observedAt` only advances for chain-backed evidence, so "when did we
+     *   last hear the truth" cannot be advanced by local bookkeeping.
+     * - `recordedAt` (the anchor of the unresolved bound) only advances when the
+     *   phase actually changes or chain-backed evidence arrives. Re-asserting the
+     *   same unresolved phase is not new information; refreshing the clock for it
+     *   would keep `isInFlight()` true forever, which is the opposite of the
+     *   documented 2× TTL escape hatch.
+     *
+     * Evidence is monotonic within a phase (see EVIDENCE_RANK): a local write
+     * that follows a chain observation keeps the stronger evidence.
      */
     observe(orderId: string | null | undefined, input: ObserveInput = {}): LifecycleView {
         const slotId = input.slotId ?? null;
@@ -767,14 +878,31 @@ export class LifecycleRegistry {
         if (!id) return this.view(null);
         const record = this.recordForSlot(slotId, orderId ?? null);
         const at = this.clock(input.at);
+        const phaseChanged = input.phase != null && input.phase !== record.phase;
+        const nextEvidence = input.evidence;
+        const chainBacked = nextEvidence != null && isChainBacked(nextEvidence);
+        const keepsStrongerEvidence = nextEvidence != null
+            && !phaseChanged
+            && EVIDENCE_RANK[nextEvidence] < EVIDENCE_RANK[record.evidence];
         if (input.phase) record.phase = input.phase;
-        if (input.evidence) record.evidence = input.evidence;
-        record.recordedAt = at;
-        if (input.evidence === 'chain-snapshot' || input.evidence === 'fill-history' || input.evidence === 'adoption') {
+        if (nextEvidence && !keepsStrongerEvidence) record.evidence = nextEvidence;
+        // `recordedAt` doubles as the retention ordering used by `prune`, so a
+        // settled record may refresh it freely. The one case that must NOT is a
+        // repeated re-assertion of an unresolved phase: that clock is also the
+        // anchor of the suppression bound, and refreshing it would make the
+        // bound infinite.
+        const reassertsUnresolved = !phaseChanged && isUnresolvedPhase(record.phase);
+        if (!reassertsUnresolved || chainBacked) record.recordedAt = at;
+        if (chainBacked) {
             const observed = Number(input.observedAt);
             record.observedAt = Number.isFinite(observed) && observed > 0 ? observed : at;
         }
-        if (input.phase !== 'broadcasting' && input.phase !== 'unknown') record.pending = null;
+        if (input.phase !== 'broadcasting' && input.phase !== 'unknown') {
+            // The pending CREATE resolved (or was superseded): drop the entry AND
+            // its index, so `pendingSize()`/`getPending()` cannot disagree with
+            // the facade the rest of the engine reads.
+            if (record.pending) this.dropPending(record);
+        }
         record.revision += 1;
         return this.view(record.slotId ?? record.orderId);
     }
@@ -807,16 +935,6 @@ export class LifecycleRegistry {
         record.placedAt = this.clock(at);
         record.revision += 1;
         return this.view(record.slotId ?? id);
-    }
-
-    /** Record a COW commit for a chain id. */
-    markCommitted(orderId: string | null | undefined, at?: number): LifecycleView {
-        const id = asKey(orderId);
-        if (!id) return this.view(null);
-        const record = this.recordForSlot(null, id);
-        record.committedAt = this.clock(at);
-        record.revision += 1;
-        return this.view(id);
     }
 
     /**
@@ -877,7 +995,7 @@ export class LifecycleRegistry {
     forget(id: string | null | undefined): void {
         const record = this.findByIdentity(id);
         if (!record) return;
-        if (record.fingerprint) this.pendingDeleteByFingerprint(record.fingerprint);
+        this.dropPending(record);
         this.dropRecord(record);
     }
 
@@ -897,6 +1015,12 @@ export class LifecycleRegistry {
             ? this.records.get(existingKey)
             : (slotId ? this.recordForSlot(slotId, null) : this.recordForFingerprint(fp));
         if (!record) return;
+        // A record owns at most ONE fingerprint. Re-recording under a new one
+        // (a rebuilt CREATE for the same slot) must retire the previous index
+        // entry, or the stale key keeps yielding this record's pending payload.
+        if (record.fingerprint && record.fingerprint !== fp) {
+            this.byFingerprint.delete(record.fingerprint);
+        }
         record.fingerprint = fp;
         record.pending = entry;
         record.phase = 'broadcasting';
@@ -923,8 +1047,7 @@ export class LifecycleRegistry {
         const record = this.records.get(key);
         this.byFingerprint.delete(fp);
         if (!record) return;
-        record.pending = null;
-        record.fingerprint = null;
+        this.dropPending(record);
         record.revision += 1;
         // Dropping a pending entry means the CREATE resolved. If the record
         // still reads `broadcasting`, nothing was observed afterwards, so the
@@ -935,8 +1058,11 @@ export class LifecycleRegistry {
         if (!record.orderId && !record.slotId) this.dropRecord(record);
     }
 
-    private pendingDeleteByFingerprint(fingerprint: string): void {
-        this.byFingerprint.delete(fingerprint);
+    /** Drop a record's pending-CREATE payload and its fingerprint index entry. */
+    private dropPending(record: OrderLifecycleRecord): void {
+        if (record.fingerprint) this.byFingerprint.delete(record.fingerprint);
+        record.pending = null;
+        record.fingerprint = null;
     }
 
     clearPending(): void {
@@ -1107,9 +1233,10 @@ export function readLifecycle(manager: unknown, identity: string | null | undefi
     const placedAt = Number(candidate._placedAt instanceof Map ? candidate._placedAt.get(key) : 0) || 0;
     const assignedAt = Number(candidate._orderIdAssignedAt instanceof Map ? candidate._orderIdAssignedAt.get(key) : 0) || 0;
     const committed = !!candidate._committedOrderIds?.has?.(key);
-    const committedAt = committed
-        ? (Number(candidate._committedOrderIdsBuiltAt) || Date.now())
-        : 0;
+    // Mirror the registry: the protection window is measured from the PUBLISHED
+    // stamp, and a missing stamp is not a fresh one. Substituting `Date.now()`
+    // here would invent a commit window production never had.
+    const committedAt = committed ? (Number(candidate._committedOrderIdsBuiltAt) || 0) : 0;
     const synthesized: OrderLifecycleRecord = {
         key: `legacy:${key}`,
         slotId: null,
@@ -1119,7 +1246,7 @@ export function readLifecycle(manager: unknown, identity: string | null | undefi
         // predicates (isInFlight / isRecentlyAssigned / isRecentlyCommitted)
         // behave exactly as they did before the registry existed; only those are
         // meaningful on a synthesized record.
-        phase: committed ? 'landed' : (assignedAt > 0 || placedAt > 0 ? 'landed' : 'intent'),
+        phase: committed || assignedAt > 0 || placedAt > 0 ? 'landed' : 'intent',
         evidence: committed || assignedAt > 0 || placedAt > 0 ? 'chain-snapshot' : 'none',
         recordedAt: Math.max(placedAt, assignedAt, committedAt),
         observedAt: committed || assignedAt > 0 ? Math.max(assignedAt, committedAt) : 0,
@@ -1133,4 +1260,33 @@ export function readLifecycle(manager: unknown, identity: string | null | undefi
         revision: 1,
     };
     return new LifecycleViewImpl(synthesized, () => Date.now());
+}
+
+/**
+ * Read an order's lifecycle from a SLOT (preferred over an identity lookup).
+ *
+ * A slot is the stable identity (intent → chain id → partial → gone) and can
+ * carry evidence the registry does not: the persisted `createUncertain` marker,
+ * which must report `unknown` (may exist on chain) rather than a clean intent.
+ * Every absence decision that has the slot object in hand must go through this
+ * helper, not `readLifecycle(manager, slot.orderId)` — an orderId-keyed read
+ * silently ignores the marker and can virtualize an order whose CREATE landed.
+ *
+ * Falls back to the identity read for partial test doubles.
+ *
+ * @param manager - OrderManager, its interface, or a partial test double
+ * @param slot - Grid slot the decision is about
+ * @returns {LifecycleView} Unified read surface (never null)
+ */
+export function readSlotLifecycle(
+    manager: unknown,
+    slot: { id?: string; orderId?: string | null; createUncertain?: boolean } | null | undefined
+): LifecycleView {
+    const candidate = manager as {
+        getSlotLifecycle?: (slot: unknown) => LifecycleView;
+    } | null | undefined;
+    if (candidate && typeof candidate.getSlotLifecycle === 'function') {
+        return candidate.getSlotLifecycle(slot);
+    }
+    return readLifecycle(manager, slot?.orderId ?? slot?.id ?? null);
 }

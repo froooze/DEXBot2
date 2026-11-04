@@ -170,7 +170,7 @@ import {
     resolveExecutionPrice
 } from './utils/order.js';
 import { parseSlotIndex } from './utils/slot.js';
-import { readLifecycle } from './lifecycle.js';
+import { readSlotLifecycle } from './lifecycle.js';
 import {
     resolveProcessedFillPersistenceMode
 } from './processed_fill_store.js';
@@ -621,6 +621,19 @@ async function adoptChainOrderIntoSlot(mgr: OrderManagerLike, slot: ManagedOrder
         matchedGridOrderIds.delete(bestMatch.id);
         return false;
     }
+    // ADOPTION IS CHAIN EVIDENCE: a chain order was matched into this slot by
+    // this very snapshot, so record it as such. The write funnel can only speak
+    // for the LOCAL slot state ('local'); without this the registry would claim a
+    // purely local basis for the strongest thing we know about the order, and
+    // `observedAt` ("when did the chain last tell us anything") would never
+    // advance for adoptions.
+    try {
+        mgr._lifecycle?.markLanded?.(chainOrderId, {
+            slotId: String(bestMatch.id),
+            evidence: 'adoption',
+            phase: bestMatch.state === ORDER_STATES.PARTIAL ? 'filling' : 'landed',
+        });
+    } catch { /* lifecycle bookkeeping must never break adoption */ }
     updatedOrders.push(bestMatch);
     chainOrderIdsOnGrid.add(chainOrderId);
     // Adopted means matched: drop any deferred-orphan record so fund counting
@@ -1408,8 +1421,7 @@ class SyncEngine {
                             // Mark the fill's size/fund delta as already absorbed:
                             // the fill-history batch that follows must not shrink
                             // (or credit) it a second time.
-                            (mgr as unknown as { noteChainSizeAppliedFill?: (id: string, filledInt: number) => void })
-                                .noteChainSizeAppliedFill?.(String(gridOrder.orderId), currentSizeInt - chainSizeInt);
+                            mgr.noteChainSizeAppliedFill?.(String(gridOrder.orderId), currentSizeInt - chainSizeInt);
                             // The marker is persisted with the grid snapshot
                             // (debugInputs). Force the snapshot dirty AFTER
                             // recording it: a flush already queued by
@@ -1452,38 +1464,36 @@ class SyncEngine {
                 //     genuine fill on the other side.
                 // Don't virtualize orders placed by a successful COW commit.
                 // The chain snapshot may lag behind confirmed transactions,
-                // causing correctly-placed orders to appear missing. _committedOrderIds
-                // is atomically rebuilt from every successful COW commit
+                // causing correctly-placed orders to appear missing. The committed
+                // snapshot is published by every successful COW commit
                 // (manager.ts:_commitWorkingGrid) and is always active for all sync
-                // paths.
-                // filled/virtualized orders are absent from the next commit's
-                // finalMap, so their IDs drop out on the next atomic rebuild.
-                //
-                // SAFETY: _committedOrderIds is replaced atomically (reference swap)
-                // by _commitWorkingGrid. The sync reads has(gridOrder.orderId) against the
-                // current reference. If a concurrent COW commit replaces the set mid-sync,
-                // the new set is a superset (only adds entries for newly committed orders).
-                // An order in the superset was just committed, so it is genuinely on-chain
-                // and should not be virtualized. An order removed from the old set was
-                // filled/virtualized, which the sync will detect independently via the
-                // chain snapshot. Superset behavior is safe for this guard.
+                // paths. Filled/virtualized orders are absent from the next commit's
+                // finalMap, so their IDs drop out on the next atomic publish.
                 //
                 // ESCAPE HATCH 1 — Ghost orders (PARTIAL + size=0): These preserve the
                 // original orderId only to block duplicate CREATEs after a full fill
-                // that the chain hasn't closed yet. The orderId is in _committedOrderIds
-                // because the original order was COW-placed, but the slot is already a
-                // known fill. Allow phantom detection to proceed so the ghost is cleaned
-                // up on the next sync cycle after the chain cancel succeeds.
+                // that the chain hasn't closed yet. The orderId is in the committed
+                // snapshot because the original order was COW-placed, but the slot is
+                // already a known fill. Allow phantom detection to proceed so the ghost
+                // is cleaned up on the next sync cycle after the chain cancel succeeds.
                 //
-                // ESCAPE HATCH 2 — Time-based: If the most recent COW commit is older
-                // than SYNC_LOCK_TIMEOUT_MS, the committed-but-missing order is
-                // presumed genuinely filled. The chain should have confirmed or
-                // rejected the transaction within the sync timeout window (~7 blocks
-                // at 3s each). Prevents permanent stall when a fill event was missed
-                // (reconnect gap, lossy subscription) and the only detection path is
-                // this open-orders sync.
+                // ESCAPE HATCH 2 — Time-based: the lifecycle in-flight window is
+                // bounded (2× the pending-broadcast TTL), so a permanently lagging
+                // node cannot park cleanup forever; past it the committed-but-missing
+                // order is presumed genuinely filled. This is what keeps a missed fill
+                // event (reconnect gap, lossy subscription) from stalling the grid.
+                //
+                // ONE GUARD: the absence decision asks `isInFlight()` — the single
+                // definition of "absence is not trustworthy yet". This site used to
+                // consult the committed window and the fresh-assignment window
+                // separately, while the startup reconcile and the fund recalibration
+                // sweep asked `isInFlight()`: same order, three different answers for
+                // the `unknown`/`broadcasting` phases (an abandoned CREATE receipt, an
+                // unreadable chain entry). Those phases are exactly what the guard is
+                // for, so reading a subset here re-opened the bug class it exists to
+                // close.
                 if (gridOrder.orderId != null) {
-                    const committedView = readLifecycle(mgr, gridOrder.orderId);
+                    const slotLifecycle = readSlotLifecycle(mgr, gridOrder);
                     const isGhost = gridOrder.size <= 0 && gridOrder.state === ORDER_STATES.PARTIAL;
                     // Guard 0: the order was returned but could not be decoded.
                     // Absence is UNKNOWN — keep the id and let a later, readable
@@ -1501,33 +1511,29 @@ class SyncEngine {
                         );
                         continue;
                     }
-                    // Guard 1: committed-but-missing. Asked with the same
-                    // vocabulary as every other site (`isRecentlyCommitted`)
-                    // instead of re-deriving the window from the raw set.
-                    if (!isGhost && committedView.isRecentlyCommitted()) {
+                    // Ghosts are known fills: they must pass so the cleanup runs.
+                    if (!isGhost && slotLifecycle.isInFlight()) {
+                        if (gridOrder.state === ORDER_STATES.ACTIVE || gridOrder.state === ORDER_STATES.PARTIAL) {
+                            mgr.logger?.log?.(
+                                `[SYNC] ${gridOrder.id}: chain order ${gridOrder.orderId} is absent from the snapshot but ` +
+                                `${slotLifecycle.isUnresolved
+                                    ? 'its lifecycle phase is unresolved'
+                                    : 'it was assigned/committed recently'} — absence not yet trustworthy`,
+                                'debug'
+                            );
+                        } else {
+                            mgr.logger?.log?.(
+                                `[SYNC] Stale-id check for ${gridOrder.id} deferred: chain id ${gridOrder.orderId} was ` +
+                                `assigned recently and is not in the snapshot — absence not yet trustworthy`,
+                                'debug'
+                            );
+                        }
                         continue;
                     }
                 }
                 const currentGridOrder = mgr.orders.get(gridOrder.id) || gridOrder;
                 const hadOrderId = Boolean(currentGridOrder?.orderId);
                 const wasPlaced = isOrderPlaced(currentGridOrder);
-                // A freshly assigned id on a NON-placed slot is not trustworthy
-                // evidence of absence yet (an in-flight create/cancel whose
-                // broadcast has not landed, or a lagging read). Mirrors the
-                // reconcile's _orderIdAssignedAt deferral: keep the id, re-check
-                // next sync. A PLACED slot keeps the existing behaviour.
-                if (!wasPlaced && hadOrderId) {
-                    // Guard 2: fresh id on a slot that is not placed. Same
-                    // predicate as the startup reconcile's deferral.
-                    if (readLifecycle(mgr, String(currentGridOrder.orderId)).isRecentlyAssigned()) {
-                        mgr.logger?.log?.(
-                            `[SYNC] Stale-id check for ${gridOrder.id} deferred: chain id ${currentGridOrder.orderId} was ` +
-                            `assigned recently and is not in the snapshot — absence not yet trustworthy`,
-                            'debug'
-                        );
-                        continue;
-                    }
-                }
                 const spreadOrder = convertToSpreadPlaceholder(currentGridOrder);
                 const cleanupContext = wasPlaced ? 'sync-cleanup-phantom' : 'sync-clear-stale-id';
                 const phantomApplied = await mgr._applyOrderUpdate(spreadOrder, cleanupContext, { skipAccounting: skipAccounting, fee: 0 });

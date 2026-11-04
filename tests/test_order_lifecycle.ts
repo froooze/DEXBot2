@@ -55,6 +55,7 @@ function testSingleRecordPerSlot() {
     reg.setPending('fp-a', { slotId: 'slot-1', order: { id: 'slot-1' }, fingerprint: 'fp-a' });
     check('pending create is broadcasting', reg.view('slot-1').phase, 'broadcasting');
     check('broadcasting may exist on chain', reg.view('slot-1').mayExistOnChain, true);
+    check('broadcasting is unresolved but not unknown', [reg.view('slot-1').isUnresolved, reg.view('slot-1').isUnknown], [true, false]);
 
     // The receipt arrives: an id is assigned and the chain confirms it.
     reg.markAssigned('slot-1', '1.7.100', now.at);
@@ -84,6 +85,7 @@ function testUnknownNeverGone() {
     const view = reg.view('slot-2');
     check('phase is unknown', view.phase, 'unknown');
     check('isUnknown', view.isUnknown, true);
+    check('isUnresolved', view.isUnresolved, true);
     check('is NOT confirmed gone', view.isConfirmedGone, false);
     check('may exist on chain', view.mayExistOnChain, true);
     check('suppresses absence decisions while fresh', view.isInFlight(undefined, now.at), true);
@@ -237,6 +239,13 @@ function testReadLifecycleFallback() {
     const stranger = readLifecycle(legacy, '1.7.999');
     check('unknown identity is not gone', stranger.isConfirmedGone, false);
     check('unknown identity may not exist', stranger.mayExistOnChain, false);
+
+    // A committed id with NO published stamp is not freshly committed: the
+    // registry measures the window from the stamp, and the fallback must not
+    // invent one.
+    const unstamped = { _committedOrderIds: new Set(['1.7.501']) };
+    check('unstamped commit is not protected',
+        readLifecycle(unstamped, '1.7.501').isRecentlyCommitted(undefined, T0), false);
 }
 
 // ---------------------------------------------------------------------------
@@ -374,6 +383,239 @@ async function testRotationDoesNotLeak() {
     check('a retired chain id is unknown, not a stale record', manager.getLifecycle('1.7.5000').orderId, null);
 }
 
+// ---------------------------------------------------------------------------
+// 10b. The unresolved bound is measured from when the uncertainty was RECORDED
+// ---------------------------------------------------------------------------
+async function testUnresolvedBoundIsNotRefreshedByReAssertion() {
+    console.log('\n[10b] Re-asserting an unresolved phase does not extend its bound');
+    const { reg, now } = registry();
+    const ttl = Number(TIMING.PENDING_BROADCAST_TTL_MS) || 30 * 60 * 1000;
+    const bound = ttl * 2;
+
+    reg.markUnknown(null, { slotId: 'slot-bound', evidence: 'local' });
+    // A later, unrelated mutation re-asserts the same unresolved phase without
+    // new evidence (the write funnel does this on every size tweak).
+    now.at += Math.floor(bound / 2);
+    reg.markUnknown(null, { slotId: 'slot-bound', evidence: 'local' });
+
+    check('still in flight before the bound', reg.view('slot-bound').isInFlight(undefined, T0 + bound - 1), true);
+    check('released after the bound even though it was re-asserted',
+        reg.view('slot-bound').isInFlight(undefined, T0 + bound + 1), false);
+
+    // Chain-backed evidence IS new information and may move the clock.
+    const { reg: reg2, now: now2 } = registry();
+    reg2.markUnknown(null, { slotId: 'slot-bound-2', evidence: 'local' });
+    now2.at += Math.floor(bound * 0.75);
+    reg2.markUnknown('9.9.9', { slotId: 'slot-bound-2', evidence: 'chain-snapshot' });
+    check('a fresh chain reading restarts the bound',
+        reg2.view('slot-bound-2').isInFlight(undefined, T0 + bound + 1), true);
+}
+
+// ---------------------------------------------------------------------------
+// 10c. An expired unknown resolves instead of sticking forever
+// ---------------------------------------------------------------------------
+async function testExpiredUnknownResolves() {
+    console.log('\n[10c] Expired unknown resolves on an explicit intent write');
+    const { reg, now } = registry();
+    const ttl = Number(TIMING.PENDING_BROADCAST_TTL_MS) || 30 * 60 * 1000;
+
+    reg.markUnknown(null, { slotId: 'slot-exp', evidence: 'local' });
+    const fresh = reg.markIntentIfResolved('slot-exp');
+    check('inside the bound the unknown still speaks', fresh.phase, 'unknown');
+    check('inside the bound it may still exist', fresh.mayExistOnChain, true);
+
+    now.at += ttl * 2 + 1;
+    check('past the bound the absence decision was already released',
+        reg.view('slot-exp').isInFlight(undefined, now.at), false);
+    const resolved = reg.markIntentIfResolved('slot-exp');
+    check('past the bound an explicit intent write resolves the phase', resolved.phase, 'intent');
+    check('a resolved slot may not exist on chain', resolved.mayExistOnChain, false);
+}
+
+// ---------------------------------------------------------------------------
+// 10d. Evidence is monotonic within a phase
+// ---------------------------------------------------------------------------
+async function testEvidenceMonotonicity() {
+    console.log('\n[10d] Evidence never downgrades within a phase');
+    const { reg, now } = registry();
+
+    reg.markLanded('1.7.700', { slotId: 'slot-ev', evidence: 'chain-snapshot' });
+    const afterChain = reg.view('1.7.700');
+    check('chain snapshot recorded', afterChain.evidence, 'chain-snapshot');
+    check('observedAt advanced by the chain read', afterChain.observedAt, now.at);
+
+    now.at += 1000;
+    // The write funnel only knows the LOCAL slot state; it must not overwrite
+    // what the chain just told us.
+    reg.observe('1.7.700', { slotId: 'slot-ev', phase: 'landed', evidence: 'local' });
+    const afterLocal = reg.view('1.7.700');
+    check('local bookkeeping does not downgrade the evidence', afterLocal.evidence, 'chain-snapshot');
+    check('local bookkeeping does not move observedAt', afterLocal.observedAt, afterChain.observedAt);
+    check('isChainBacked reports the strongest basis', afterLocal.isChainBacked(), true);
+
+    // A PHASE CHANGE is new information, so the new record's evidence wins.
+    reg.observe('1.7.700', { slotId: 'slot-ev', phase: 'filling', evidence: 'local' });
+    check('phase change adopts its own evidence', reg.view('1.7.700').evidence, 'local');
+}
+
+// ---------------------------------------------------------------------------
+// 10e. Pending resolution keeps the index and the facade in step
+// ---------------------------------------------------------------------------
+async function testPendingIndexConsistency() {
+    console.log('\n[10e] Resolving a pending CREATE clears its index');
+    const { reg } = registry();
+    reg.setPending('fp-c', { slotId: 'slot-p', order: { id: 'slot-p' }, fingerprint: 'fp-c' });
+    check('pending visible through the facade', reg.pendingBroadcasts.size, 1);
+    check('pending counted', reg.pendingSize(), 1);
+
+    // An observation of the landed order resolves the pending entry.
+    reg.markLanded('1.7.701', { slotId: 'slot-p', evidence: 'adoption' });
+    check('resolved pending leaves the facade', reg.pendingBroadcasts.size, 0);
+    check('resolved pending leaves the index', reg.pendingSize(), 0);
+    check('resolved pending is null on the view', reg.view('slot-p').pending, null);
+}
+
+// ---------------------------------------------------------------------------
+// 10f. Retention: expired unknowns become evictable, live ones never
+// ---------------------------------------------------------------------------
+async function testPruneEvictsOnlyExpiredUnresolved() {
+    console.log('\n[10f] Prune evicts expired unresolved records only');
+    const ttl = Number(TIMING.PENDING_BROADCAST_TTL_MS) || 30 * 60 * 1000;
+    const now = { at: T0 };
+    const reg = new LifecycleRegistry({ now: () => now.at, maxRecords: 2 });
+
+    reg.markUnknown(null, { slotId: 'unknown-live' });
+    now.at += ttl * 2 + 1;
+    reg.markIntent({ slotId: 'settled-a' });
+    reg.markIntent({ slotId: 'settled-b' });
+    check('expired unknown does not pin the registry', reg.size() <= 2, true);
+
+    const live = new LifecycleRegistry({ now: () => now.at, maxRecords: 1 });
+    live.markUnknown(null, { slotId: 'unknown-fresh' });
+    live.markIntent({ slotId: 'settled-c' });
+    check('a fresh unknown is never evicted', live.view('unknown-fresh').isUnknown, true);
+}
+
+// ---------------------------------------------------------------------------
+// 10g. A synthesized view has no clock, so its bound cannot be eternal
+// ---------------------------------------------------------------------------
+async function testSynthesizedViewHasNoClock() {
+    console.log('\n[10g] An unrecorded unknown is not eternally "in flight"');
+    const { reg } = registry();
+    const view = reg.withPhase('slot-never-recorded', 'unknown', 'broadcast-receipt');
+    check('phase still reads unknown', view.phase, 'unknown');
+    check('it still may exist on chain', view.mayExistOnChain, true);
+    check('but it has no clock, so it does not suppress forever', view.isInFlight(undefined, T0), false);
+}
+
+// ---------------------------------------------------------------------------
+// 11. The COW whole-map commit goes through the same write funnel
+// ---------------------------------------------------------------------------
+async function testCowCommitProjectsThroughFunnel() {
+    console.log('\n[11] COW commit projects placements through the funnel');
+    const { WorkingGrid } = require('../modules/order/working_grid');
+    const manager: any = new OrderManager({ market: 'TEST/BTS', assetA: 'TEST', assetB: 'BTS' });
+    manager.logger = createSilentLogger();
+    manager.assets = { assetA: { id: '1.3.0', precision: 8 }, assetB: { id: '1.3.1', precision: 5 } };
+    manager._genesis = makeLadderFromPrices([50]);
+    manager.accountant = {
+        updateOptimisticFreeBalance: async () => { },
+        recalculateFunds: async () => { },
+        tryDeductFromChainFree: async () => ({ ok: true }),
+        addToChainFree: async () => true,
+    };
+    const master = new Map<string, any>([
+        ['slot-0', {
+            id: 'slot-0', type: ORDER_TYPES.BUY, state: ORDER_STATES.VIRTUAL,
+            price: 50, size: 10, orderId: null, rawOnChain: null,
+        }],
+    ]);
+    manager.orders = Object.freeze(master);
+    manager._gridVersion = 1;
+    manager.boundaryIdx = 0;
+
+    const workingGrid = new WorkingGrid(manager.orders, { baseVersion: manager._gridVersion });
+    workingGrid.set('slot-0', {
+        ...master.get('slot-0'),
+        state: ORDER_STATES.ACTIVE,
+        orderId: '1.7.900',
+        rawOnChain: { id: '1.7.900' },
+    });
+    const pushed = manager._pushWorkingGridRef(workingGrid, {});
+    check('working grid pushed', pushed !== undefined, true);
+
+    const committed = await manager._commitWorkingGrid(workingGrid, workingGrid.getIndexes(), 0, { skipRecalc: true });
+    check('commit accepted', committed, true);
+    check('master carries the new chain id', manager.orders.get('slot-0')?.orderId, '1.7.900');
+
+    // The whole-map swap is the PRIMARY placement path: before the funnel
+    // projection it stamped nothing, so the fresh-placement grace was inert for
+    // every COW-created order.
+    const view = manager.getLifecycle('1.7.900');
+    check('placement stamped by the commit', view.placedAt > 0, true);
+    check('within the surplus-cancel grace', view.isFreshlyPlaced(), true);
+    check('assignment stamped by the commit', view.assignedAt > 0, true);
+    check('commit published for recovery protection', manager._committedOrderIds.has('1.7.900'), true);
+    check('commit window active', view.isRecentlyCommitted(), true);
+    check('one record for the slot', manager.getLifecycle('slot-0').orderId, '1.7.900');
+}
+
+// ---------------------------------------------------------------------------
+// 12. Sync pass 1 asks the unified guard (not a subset of it)
+// ---------------------------------------------------------------------------
+async function testSyncPassOneHonoursUnresolvedEvidence() {
+    console.log('\n[12] Sync pass 1 defers absence while the phase is unresolved');
+
+    const build = async () => {
+        const manager: any = new OrderManager({ market: 'TEST/BTS', assetA: 'TEST', assetB: 'BTS' });
+        manager._readSingleOrderFn = async () => null;
+        manager._batchReadOrdersFn = async () => new Map();
+        manager.logger = createSilentLogger();
+        manager.assets = { assetA: { id: '1.3.0', precision: 8 }, assetB: { id: '1.3.1', precision: 5 } };
+        manager._genesis = makeLadderFromPrices([50]);
+        await manager.setAccountTotals({ buy: 10000, sell: 100, buyFree: 10000, sellFree: 100 });
+        manager._suspectEmptyReads = {
+            count: Math.max(1, Number(TIMING.SYNC_SUSPECT_EMPTY_READ_LIMIT) || 3) - 1,
+            firstAt: 1,
+        };
+        await manager._updateOrder({
+            id: 'slot-1', state: ORDER_STATES.ACTIVE, type: ORDER_TYPES.BUY,
+            size: 100, price: 50, orderId: '1.7.950',
+        });
+        // Settle the assignment clock so ONLY the unresolved phase can defer.
+        manager._orderIdAssignedAt.set('1.7.950', Date.now() - TIMING.SYNC_LOCK_TIMEOUT_MS * 3);
+        return manager;
+    };
+
+    // (a) An abandoned pending CREATE (lost receipt) leaves the slot `unknown`.
+    {
+        const manager = await build();
+        manager._lifecycle.markUnknown('1.7.950', { slotId: 'slot-1', evidence: 'broadcast-receipt' });
+        const result = await manager.sync.syncFromOpenOrders([]);
+        check('unknown phase keeps the order', manager.orders.get('slot-1').state, ORDER_STATES.ACTIVE);
+        check('no fill is booked for an unknown phase', result.filledOrders.length, 0);
+    }
+
+    // (b) A persisted create-uncertain marker is visible through the SLOT read.
+    {
+        const manager = await build();
+        await manager.applyGridUpdateBatch([
+            { ...manager.orders.get('slot-1'), createUncertain: true },
+        ], 'test-create-uncertain-active');
+        const result = await manager.sync.syncFromOpenOrders([]);
+        check('createUncertain marker keeps the order', manager.orders.get('slot-1').state, ORDER_STATES.ACTIVE);
+        check('no fill is booked for createUncertain', result.filledOrders.length, 0);
+    }
+
+    // (c) A settled record with no unresolved evidence still cleans up.
+    {
+        const manager = await build();
+        const settled = await manager.sync.syncFromOpenOrders([]);
+        check('settled absent order is virtualized', manager.orders.get('slot-1').state, ORDER_STATES.VIRTUAL);
+        check('settled absent order books a fill', settled.filledOrders.length, 1);
+    }
+}
+
 async function run() {
     console.log('Order lifecycle registry tests');
     testSingleRecordPerSlot();
@@ -387,6 +629,14 @@ async function run() {
     await testManagerAgreement();
     await testReadPurityAndEvidenceRetention();
     await testRotationDoesNotLeak();
+    await testUnresolvedBoundIsNotRefreshedByReAssertion();
+    await testExpiredUnknownResolves();
+    await testEvidenceMonotonicity();
+    await testPendingIndexConsistency();
+    await testPruneEvictsOnlyExpiredUnresolved();
+    await testSynthesizedViewHasNoClock();
+    await testCowCommitProjectsThroughFunnel();
+    await testSyncPassOneHonoursUnresolvedEvidence();
 
     if (failures > 0) {
         console.error(`\n❌ ${failures} lifecycle assertion(s) failed`);

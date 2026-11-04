@@ -123,6 +123,7 @@ import { sleep } from './system.js';
 import { getErrorMessage, getErrorCode, getErrorName } from '../../utils/errors.js';
 import { hasGenesisLadder } from '../genesis_policy.js';
 import { parseSlotIndex } from './slot.js';
+import { pendingBroadcastTtlMs } from '../lifecycle.js';
 import type { PlacementLease } from '../placement_lock.js';
 import type { OrderManagerLike, PendingPriceCorrection, ChainOrder, ParsedChainOrder, AssetPair, AssetInfo, OrderType, ManagedOrder, UnmatchedChainOrder, CowAction, ProjectedFunds } from '../../types.js';
 import type { GridGenesis } from './math.js';
@@ -278,8 +279,15 @@ function _filterUnmatchedChainOrders(manager: OrderManagerLike, chainOrderId: st
 
 /**
  * Record a fresh on-chain placement timestamp for surplus-cancel grace.
- * Called when a slot gains a chain orderId it did not have before (create,
- * adopt, rotation target). Powers isFreshlyPlacedOrder below.
+ * Powers isFreshlyPlacedOrder below.
+ *
+ * NOTE: in production the placement stamp is written by the lifecycle write
+ * funnel (`OrderManager._syncLifecycleFromMutation` -> `markPlaced`) for every
+ * mutation, including the COW whole-map commit. This helper remains for callers
+ * that hold only a manager-shaped object (tests, fixtures) and for the `_placedAt`
+ * retention bound; it writes through the same facade, so there is still one copy
+ * of the stamp.
+ *
  * @param {unknown} manager - OrderManager instance (owns `_placedAt`)
  * @param {string} chainOrderId - Chain order id that was just placed
  */
@@ -2130,9 +2138,8 @@ function isCrossingCheckCandidate(o: CrossingCandidate | null | undefined, exclu
 function getLivePendingBroadcasts(manager: OrderManagerLike | null | undefined, options: { now?: number } = {}): unknown[] {
     const map = (manager as unknown as { _pendingBroadcasts?: unknown } | null | undefined)?._pendingBroadcasts;
     if (!(map instanceof Map)) return [];
-    const ttl = Number(TIMING.PENDING_BROADCAST_TTL_MS) > 0
-        ? Number(TIMING.PENDING_BROADCAST_TTL_MS)
-        : 30 * 60 * 1000;
+    // Single definition of the TTL and its fixture fallback (lifecycle.ts).
+    const ttl = pendingBroadcastTtlMs();
     const now = Number.isFinite(Number(options?.now)) ? Number(options.now) : Date.now();
     const lastSyncAt = Number((manager as unknown as { _lastSyncAt?: unknown })?._lastSyncAt) || 0;
     const log = (manager as unknown as { logger?: { log?: (message: string, level?: string) => void } } | null | undefined)?.logger?.log;

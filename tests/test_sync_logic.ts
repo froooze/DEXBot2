@@ -24,7 +24,7 @@ setCachedModule(
 const { OrderManager } = require('../modules/order/index').default;
 const { ORDER_TYPES, ORDER_STATES, TIMING } = require('../modules/constants');
 const { createSilentLogger } = require('./helpers/silent_logger');
-const { makeLadderFromPrices } = require('./helpers/order_test_helpers');
+const { makeLadderFromPrices, ageChainIdAssignment } = require('./helpers/order_test_helpers');
 
 // Seed the fee cache so getAssetFees resolves deterministically (frozen ESM
 // namespace — patching OrderUtils.getAssetFees is no longer possible).
@@ -61,6 +61,17 @@ async function runTests() {
         // empty-chain fill-detection scenarios keep their original single-sync
         // semantics (the guard itself is covered by test_orphan_cascade_fixes).
         mgr._suspectEmptyReads = { count: Math.max(1, Number(TIMING.SYNC_SUSPECT_EMPTY_READ_LIMIT) || 3) - 1, firstAt: 1 };
+        // Every placement in this file stands for a SETTLED one. The absence
+        // guard (LifecycleView.isInFlight) defers while a chain id is younger
+        // than SYNC_LOCK_TIMEOUT_MS — that window exists for a broadcast the
+        // snapshot may not show yet, which none of these fixtures emulate. Age
+        // the stamp so the empty-read scenarios keep testing fill detection.
+        const baseUpdateOrder = mgr._updateOrder.bind(mgr);
+        mgr._updateOrder = async (order: any, context?: string, options?: any) => {
+            const applied = await baseUpdateOrder(order, context, options);
+            if (order?.orderId) ageChainIdAssignment(mgr, String(order.orderId));
+            return applied;
+        };
         return mgr;
     };
 

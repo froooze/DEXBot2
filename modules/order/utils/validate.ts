@@ -61,6 +61,7 @@ import {
     sameGridPrice
 } from './math.js';
 import { parseSlotIndex } from './slot.js';
+import { isSlotCreateUncertain } from '../lifecycle.js';
 import {
     isOrderOnChain,
     isPhantomOrder,
@@ -936,7 +937,9 @@ function validateCreateTargetSlots(
         // sync pass 1 (`sync-clear-stale-id`), which turns the slot back into a
         // plain hole on the next cycle — so this gate cannot strand a level.
         const currentOwnsChainId = Boolean(current?.orderId);
-        const currentCreateUncertain = (current as { createUncertain?: boolean } | null | undefined)?.createUncertain === true;
+        // Single definition of the durable "CREATE result lost" marker
+        // (modules/order/lifecycle.ts) — this site used to read the raw flag.
+        const currentCreateUncertain = isSlotCreateUncertain(current);
         if (current && (isOrderOnChain(current) || currentOwnsChainId)) {
             violations.push({
                 targetId,

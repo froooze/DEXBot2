@@ -27,7 +27,7 @@ import AsyncLock from './async_lock.js';
 import Accountant from './accounting.js';
 import StrategyEngine from './strategy.js';
 import SyncEngine from './sync_engine.js';
-import { LifecycleRegistry, isSlotCreateUncertain } from './lifecycle.js';
+import { LifecycleRegistry, isSlotCreateUncertain, timingWindowMs } from './lifecycle.js';
 import type { LifecycleView } from './lifecycle.js';
 import { calculateCurrentSpread, checkSpreadCondition, checkGridHealth } from './grid.js';
 import * as Format from './format.js';
@@ -68,7 +68,7 @@ import {
     buildSuccessResult,
     evaluateCommit
 } from './utils/validate.js';
-import { resolveSpreadOrderSide, resolveLiveOrderLadderPosition, parseChainOrder, geometryTypeForSlotIndex, isOrderOnChain, resolveEdgeCount, resolveLiveEdgeAnchorPrice, compareEdge, collectRefillSlotIds, recordOrderPlacement, isFreshlyPlacedOrder, collectEdgePinnedFillIds, isStructuralRebuildStaleReason } from './utils/order.js';
+import { resolveSpreadOrderSide, resolveLiveOrderLadderPosition, parseChainOrder, geometryTypeForSlotIndex, isOrderOnChain, resolveEdgeCount, resolveLiveEdgeAnchorPrice, compareEdge, collectRefillSlotIds, isFreshlyPlacedOrder, collectEdgePinnedFillIds, isStructuralRebuildStaleReason } from './utils/order.js';
 import { parseSlotIndex } from './utils/slot.js';
 import PlacementLock, { withPlacement as runWithPlacement } from './placement_lock.js';
 import type { PlacementLease } from './placement_lock.js';
@@ -1247,9 +1247,7 @@ class OrderManager implements OrderManagerLike {
         const out: Record<string, { filledInt: number; at: number }> = {};
         if (!(this._chainSizeAppliedFills instanceof Map)) return out;
         const now = Date.now();
-        const ttl = Number(TIMING.CHAIN_SIZE_APPLIED_MARKER_TTL_MS) > 0
-            ? Number(TIMING.CHAIN_SIZE_APPLIED_MARKER_TTL_MS)
-            : 5 * 60 * 1000;
+        const ttl = timingWindowMs('CHAIN_SIZE_APPLIED_MARKER_TTL_MS', 5 * 60 * 1000);
         for (const [id, entry] of this._chainSizeAppliedFills) {
             const filledInt = Math.round(Number(entry?.filledInt));
             const at = Number(entry?.at);
@@ -2095,46 +2093,11 @@ class OrderManager implements OrderManagerLike {
         const updatedOrder = deepFreeze({ ...nextOrder }) as ManagedOrder;
         const id = order.id;
 
-        // Project the mutation into the lifecycle registry FIRST, so the stamps
-        // written below (assignedAt, placedAt) resolve to the slot's record
-        // instead of creating a parallel order-keyed one.
+        // Project the mutation into the lifecycle registry. This is the ONLY
+        // writer of the chain-existence facts (phase, assignedAt, placedAt): the
+        // stamps used to be written a second time right here, which meant two
+        // copies of every clock and an O(records) prune loop per order update.
         this._syncLifecycleFromMutation(oldOrder, updatedOrder, context);
-
-        // Track when an orderId is first assigned to a slot. A freshly assigned
-        // orderId (create/adopt broadcast still in flight, or not yet visible to
-        // a lagging/truncated chain read) must not be treated as "absent from
-        // chain" by phantom cleanup — that would virtualize a real live order
-        // and re-create a duplicate. Absence decisions defer while the stamp is
-        // younger than SYNC_LOCK_TIMEOUT_MS.
-        if (updatedOrder.orderId && (!oldOrder?.orderId || oldOrder.orderId !== updatedOrder.orderId)) {
-            // Prune stamps older than the guard window — they can never be
-            // consulted again (the consumer defers only while the stamp is
-            // younger than SYNC_LOCK_TIMEOUT_MS), so keeping them would leak one
-            // entry per orderId on a perpetual-turnover bot.
-            for (const [orderId, assignedAt] of this._orderIdAssignedAt) {
-                if (Date.now() - assignedAt >= TIMING.SYNC_LOCK_TIMEOUT_MS) {
-                    this._orderIdAssignedAt.delete(orderId);
-                }
-            }
-            this._orderIdAssignedAt.set(updatedOrder.orderId, Date.now());
-        }
-
-        // Fresh-placement timestamp for the surplus-cancel grace window: a
-        // slot gaining an orderId it did not have is a new placement (create,
-        // adopt, rotation target), and surplus sweeps must not cancel it
-        // before it has had time to prove itself. Same-id updates do not
-        // refresh the stamp, so grace cannot extend forever. Snapshot/grid
-        // load paths are excluded: reloaded orders are old by definition, and
-        // stamping them would neuter surplus sweeps for 15 minutes after every
-        // restart.
-        try {
-            const prevId = oldOrder?.orderId != null ? String(oldOrder.orderId) : '';
-            const nextId = updatedOrder.orderId != null ? String(updatedOrder.orderId) : '';
-            const isLoadContext = context === 'grid-load' || context === 'grid-init';
-            if (nextId && nextId !== prevId && !isLoadContext) {
-                recordOrderPlacement(this, nextId);
-            }
-        } catch { /* bookkeeping must never break order updates */ }
 
         const newMap = cloneMap(this.orders);
         newMap.set(id, updatedOrder);
@@ -2195,7 +2158,19 @@ class OrderManager implements OrderManagerLike {
             }
 
             if (nextId !== prevId) {
+                // A freshly assigned chain id (create/adopt broadcast in flight, or
+                // not yet visible to a lagging read) must not read as "absent from
+                // chain": absence decisions defer while it is younger than
+                // SYNC_LOCK_TIMEOUT_MS (isRecentlyAssigned).
                 this._lifecycle.markAssigned(slotId, nextId);
+                // Fresh-placement timestamp for the surplus-cancel grace window: a
+                // slot gaining an orderId it did not have is a new placement
+                // (create, adopt, rotation target), and surplus sweeps must not
+                // cancel it before it has had time to prove itself. Same-id updates
+                // do not refresh the stamp, so grace cannot extend forever.
+                // Snapshot/grid load paths are excluded: reloaded orders are old by
+                // definition, and stamping them would neuter surplus sweeps for 15
+                // minutes after every restart.
                 const isLoadContext = context === 'grid-load' || context === 'grid-init';
                 if (!isLoadContext) this._lifecycle.markPlaced(nextId, undefined, slotId);
             }
@@ -3244,9 +3219,7 @@ class OrderManager implements OrderManagerLike {
                 const rebuildAgeMs = this._structuralRebuildStartedAt > 0
                     ? Date.now() - this._structuralRebuildStartedAt
                     : 0;
-                const deferBoundMs = Number(TIMING.STRUCTURAL_REBUILD_DEFER_MAX_MS) > 0
-                    ? Number(TIMING.STRUCTURAL_REBUILD_DEFER_MAX_MS)
-                    : 3 * 60 * 1000;
+                const deferBoundMs = timingWindowMs('STRUCTURAL_REBUILD_DEFER_MAX_MS', 3 * 60 * 1000);
                 const overBound = rebuildAgeMs > deferBoundMs;
                 const lastWarnAt = Number(this._structuralRebuildDeferWarnAt) || 0;
                 const shouldWarn = overBound && Date.now() - lastWarnAt > 60000;
@@ -3505,8 +3478,24 @@ class OrderManager implements OrderManagerLike {
                     }
                 }
 
+                // LIFE-CYCLE PROJECTION OF THE WHOLE-MAP SWAP.
+                // The COW commit replaces `this.orders` wholesale instead of
+                // calling _applyOrderUpdate per slot, so it used to bypass the
+                // single write funnel entirely: an order the batch just PLACED got
+                // no `assignedAt` and — worse — no `placedAt`, leaving the 15-minute
+                // surplus-cancel grace inert for the primary placement path (a
+                // competing sweep could cancel a seconds-old order). Projecting each
+                // slot through the same funnel closes that hole; the funnel only
+                // records bookkeeping, it does not change what is committed.
+                // Runs BEFORE the swap so each projection sees the previous slot.
+                for (const [slotId, nextOrder] of finalMap.entries()) {
+                    if (!nextOrder) continue;
+                    this._syncLifecycleFromMutation(this.orders.get(slotId), nextOrder, 'cow-commit');
+                }
+
                 this.orders = Object.freeze(finalMap);
                 this._setBoundary(commitBoundary);
+
                 // Pending-crawl bookkeeping: an accepted non-null commit
                 // incorporates (incremental derivation) or subsumes (absolute
                 // recovery anchor) every fill recorded so far, so all pending
@@ -3539,15 +3528,14 @@ class OrderManager implements OrderManagerLike {
                 committed = true;
 
                 // Track orderIds from successful COW commits for recovery sync protection.
-                // Build a new set from the committed finalMap and atomically swap to
-                // avoid the intermediate empty state that clear() creates — a crash
-                // during clear()+repopulate would lose all committed IDs.
+                // ONE publish: the snapshot setter stamps every id AND moves the
+                // built-at window, so a second `_committedOrderIdsBuiltAt` write
+                // would only re-stamp the same ids with a later clock.
                 const newCommittedIds = new Set<string>();
                 for (const [, order] of finalMap.entries()) {
                     if (order.orderId) newCommittedIds.add(order.orderId);
                 }
                 this._committedOrderIds = newCommittedIds;
-                this._committedOrderIdsBuiltAt = Date.now();
 
                 // Index caches invalidated by _gridVersion bump above — lazy getters recompute from this.orders
             });

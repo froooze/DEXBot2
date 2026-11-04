@@ -33,7 +33,7 @@ claw/tests/         # Claw integration tests (same conventions, run by npm test)
 - `bitshares_client_stub.ts` — mock blockchain client
 - `chain_orders_stub.ts` — order lifecycle test doubles
 - `fee_cache_init.ts` — fee cache seeding for tests
-- `order_test_helpers.ts` — order construction utilities
+- `order_test_helpers.ts` — order construction utilities + genesis ladders (`ageChainIdAssignment` settles a fixture's fresh chain id so absence scenarios test the decision, not the in-flight guard)
 - `silent_logger.ts` — suppresses log output during tests
 - `module_cache_stub.ts` — isolates module state per test
 - `vault_fixture.ts` — chain-key vault fixtures
@@ -79,6 +79,10 @@ Research/analysis tools: chart generators, backtests, and the grid-reset replay 
 ### Order Management & Execution
 Order lifecycle, fill processing, trade history, batch execution.
 *Examples:* `test_open_orders.ts`, `test_fills.ts`, `test_fill_batch_chunking.ts`, `test_fill_replay_guards.ts`, `test_uncertain_broadcast.ts`
+
+### Order Lifecycle Registry
+The single answer to "does this order exist on chain, and how sure are we" ([ORDER_LIFECYCLE.md](../docs/ORDER_LIFECYCLE.md)): phases (`unknown ≠ gone`), evidence monotonicity, the unresolved bound, the write funnel (including the COW whole-map commit), and the unified absence guard the sync/reconcile/recovery sites share.
+*Files:* `test_order_lifecycle.ts` (registry + manager integration), `recon_fuzz.ts` (interleaving fuzzer; `RECON_FUZZ_SCENARIOS`/`RECON_FUZZ_STEPS` scale it)
 
 ### Strategy & Grid Logic
 Grid generation, sizing, rotation, divergence detection, reconciliation.

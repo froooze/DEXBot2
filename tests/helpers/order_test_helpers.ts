@@ -76,3 +76,29 @@ export function makeLadderFromPrices(prices: number[], opts: { gapSlots?: number
     genesis.levelAt = (idx: number) => math.priceForSlot(idx, genesis);
     return genesis;
 }
+
+/**
+ * Age a chain-id assignment so the absence guard no longer defers.
+ *
+ * The engine treats a chain id learned within `SYNC_LOCK_TIMEOUT_MS` as "the
+ * snapshot may not be able to show it yet", so an absence decision defers for
+ * that window (`LifecycleView.isInFlight()` — the single guard shared by the sync
+ * pass-1 phantom cleanup, the startup reconcile and the fund recalibration
+ * sweep). A fixture that places an order by calling `_updateOrder` and then
+ * asserts the very next sync VIRTUALIZES it must therefore age the stamp: in
+ * production that state ("placed, never committed, absent from the book") is
+ * only reached once the placement is old enough for a read to have caught up.
+ *
+ * @param manager - Test manager (OrderManager or a shaped double)
+ * @param orderId - Chain order id whose assignment should look settled
+ * @param [ageMs] - Age to apply (defaults to just past twice the guard window)
+ */
+export function ageChainIdAssignment(manager: any, orderId: string, ageMs?: number): void {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const timing = require('../../modules/constants.js').TIMING;
+    const guard = Number(timing.SYNC_LOCK_TIMEOUT_MS) || 20000;
+    const age = Number.isFinite(Number(ageMs)) ? Number(ageMs) : guard * 2 + 1000;
+    if (manager?._orderIdAssignedAt instanceof Map && orderId) {
+        manager._orderIdAssignedAt.set(String(orderId), Date.now() - age);
+    }
+}

@@ -9,7 +9,7 @@
 
 import { ORDER_TYPES, ORDER_STATES, TIMING, BTS_PRECISION } from '../constants.js';
 import { readOpenOrdersGuarded } from '../chain_orders.js';
-import { getMinOrderSize, getSingleDustThreshold, getAssetFees, getAssetFeesSafe, blockchainToFloat, findCrossedOrder, resolveGapBand, isSlotInRail, pricesOnSameLevel, pricesWithinHalfStep, sameGridLevel } from './utils/math.js';
+import { getMinOrderSize, getSingleDustThreshold, getAssetFees, getAssetFeesSafe, blockchainToFloat, findCrossedOrder, resolveGapBand, resolveGapSlots, isSlotInRail, pricesOnSameLevel, pricesWithinHalfStep, sameGridLevel } from './utils/math.js';
 import { isOrderPlaced, parseChainOrder, buildCreateOrderArgs, buildOutsideInPairGroups, extractBatchOperationResults, chainOrderMatchesSlotWithTolerance, buildCrossingCheckCandidates, isCrossingCheckCandidate, getSideBudget, calculateBudgetedSizes, getCoreOrdersTotal, convertToSpreadPlaceholder, isOrderGoneErrorMessage, clearDuplicateOrphanDetection, resolveEdgeCount, resolveLiveEdgeAnchorPrice, edgeOrderIdSet, compareEdge, reportGridPriceInvariant, liveWindowIdSet, getLivePendingBroadcasts } from './utils/order.js';
 import { parseSlotIndex } from './utils/slot.js';
 import { resolveAccountRef, isLastFillPlacementBlocked, hasUnsettledFills } from './utils/system.js';
@@ -2042,14 +2042,16 @@ async function _reconcileStartupSide({
 
     const planVacatedRailRefill = (chainOrder: ChainOrder, parsedChain: ParsedChainOrder | null) => {
         const boundary = manager.boundaryIdx;
-        const gapSlots = manager._gapSlots;
+        // Geometry comes from the single source of truth (resolveGapSlots:
+        // `_gapSlots` when published, config-derived otherwise). Reading the raw
+        // field here made an unpublished `_gapSlots` silently disable the refill
+        // while every other classify site derived a valid band.
+        const gapSlots = resolveGapSlots(manager);
         // Explicit null/undefined/'' guard BEFORE Number(): Number(null) === 0
         // is finite and would defeat this bail-out, running the refill scan on
-        // a bogus boundary 0 (and a null gapSlots would default to 0 through
-        // getSellStartIdx).
+        // a bogus boundary 0.
         if (boundary === null || boundary === undefined || (boundary as unknown) === '') return;
-        if (gapSlots === null || gapSlots === undefined || (gapSlots as unknown) === '') return;
-        if (!Number.isFinite(Number(boundary)) || !Number.isFinite(Number(gapSlots))) return;
+        if (!Number.isFinite(Number(boundary))) return;
         const chainPrice = parsedChain?.price;
         if (!Number.isFinite(Number(chainPrice))) return;
         const chainPriceNum = Number(chainPrice);
@@ -2107,7 +2109,7 @@ async function _reconcileStartupSide({
                     releaseUntrackedFunds: true,
                     orderType,
                     boundaryIdx: manager?.boundaryIdx,
-                    gapSlots: manager?._gapSlots,
+                    gapSlots: resolveGapSlots(manager),
                 });
             }
         }
@@ -2208,7 +2210,7 @@ async function _reconcileStartupSide({
                 releaseUntrackedFunds: true,
                 orderType,
                 boundaryIdx: manager?.boundaryIdx,
-                gapSlots: manager?._gapSlots,
+                gapSlots: resolveGapSlots(manager),
             });
             dustCancelledCount++;
             logger?.log?.(
@@ -2346,92 +2348,87 @@ async function _reconcileStartupSide({
             });
         }
 
+        // ONE SELECTION, TWO SINKS. The planOnly and inline branches used to walk
+        // the same two ordered lists with duplicated (and drifting) conditions —
+        // the "plan/execute parity" bug class. Selection happens once here; a
+        // planOnly call records the list for Phase 2, an inline call executes it.
+        // Priority is identical either way: unmatched orphans first (untracked
+        // funds), then matched surplus (funds stay tracked on the grid slot), and
+        // edge order slots last (static insurance, already sorted above).
+        const excessGapSlots = resolveGapSlots(manager);
+        const excessPlans: StartupCancelPlan[] = [];
+        for (const x of parsedUnmatched) {
+            if (excessPlans.length >= cancelCount) break;
+            excessPlans.push({
+                chainOrderId: x.chain.id,
+                chainOrderObj: x.chain,
+                releaseUntrackedFunds: true,
+                orderType,
+                boundaryIdx: manager?.boundaryIdx,
+                gapSlots: excessGapSlots,
+            });
+        }
+        // Matched excess must be PLANNED too, not only executed (issue #27
+        // follow-up): startup reconcile always runs planOnly, and on a
+        // fully-placed grid every chain order is matched — parsedUnmatched is
+        // empty, so the surplus lived entirely on matched slots and was silently
+        // dropped while the inline branch kept cancelling it. Nothing ever
+        // created the vacancy, and a fully-placed grid could never converge to
+        // its additive window+edge target (live 12 vs target 8 across restarts).
+        for (const o of matchedExcess) {
+            if (excessPlans.length >= cancelCount) break;
+            if (!o.orderId) continue;
+            excessPlans.push({
+                chainOrderId: o.orderId,
+                chainOrderObj: o,
+                gridOrderId: o.id,
+                gridOrder: { ...o },
+                orderType,
+                boundaryIdx: manager?.boundaryIdx,
+                gapSlots: excessGapSlots,
+                // Matched-slot funds are tracked on the grid slot; only unmatched
+                // orphans release untracked funds.
+            });
+        }
+
         if (planOnly) {
-            // In planOnly mode, record the cancellations for Phase 2 execution.
-            // This prevents blockchain I/O inside _gridLock (Level 3).
-            if (cancelCount > 0) {
+            // Phase-1 contract: record the cancellations for Phase 2 execution so
+            // no blockchain I/O runs inside _gridLock (Level 3).
+            if (excessPlans.length > 0) {
                 logger?.log?.(
-                    `Startup: ${sideUpper} excess ${cancelCount} order(s) queued for cancellation (Phase 2)`,
+                    `Startup: ${sideUpper} excess ${excessPlans.length} order(s) queued for cancellation (Phase 2)`,
                     'info'
                 );
-                for (const x of parsedUnmatched) {
-                    if (cancelCount <= 0) break;
-                    plannedCancels.push({
-                        chainOrderId: x.chain.id,
-                        chainOrderObj: x.chain,
-                        releaseUntrackedFunds: true,
-                        orderType,
-                        boundaryIdx: manager?.boundaryIdx,
-                        gapSlots: manager?._gapSlots,
-                    });
-                    cancelCount--;
-                }
             }
-            // Matched excess must be PLANNED too, not only executed (issue #27
-            // follow-up): startup reconcile always runs planOnly, and on a
-            // fully-placed grid every chain order is matched — parsedUnmatched
-            // is empty, so the surplus lived entirely on matched slots and was
-            // silently dropped here while the execute branch kept cancelling
-            // it. Nothing ever created the vacancy, and a fully-placed grid
-            // could never converge to its additive window+edge target (live
-            // 12 vs target 8 sat static across every restart). Same priority
-            // as the execute branch: unmatched first (above), matched after,
-            // edge order last (matchedExcess ordering).
-            for (const o of matchedExcess) {
-                if (cancelCount <= 0) break;
-                if (!o.orderId) continue;
-                logger?.log?.(
-                    `Startup: ${sideUpper} excess matched ${o.orderId} (grid ${o.id}) queued for cancellation (Phase 2)`,
-                    'warn'
-                );
-                plannedCancels.push({
-                    chainOrderId: o.orderId,
-                    chainOrderObj: o,
-                    gridOrderId: o.id,
-                    gridOrder: { ...o },
-                    orderType,
-                    boundaryIdx: manager?.boundaryIdx,
-                    gapSlots: manager?._gapSlots,
-                    // Matched-slot funds are tracked on the grid slot; only
-                    // unmatched orphans release untracked funds (mirrors the
-                    // execute branch, which passes no release flag here).
-                });
-                cancelCount--;
+            for (const plan of excessPlans) {
+                if (plan.gridOrderId) {
+                    logger?.log?.(
+                        `Startup: ${sideUpper} excess matched ${plan.chainOrderId} (grid ${plan.gridOrderId}) queued for cancellation (Phase 2)`,
+                        'warn'
+                    );
+                }
+                plannedCancels.push(plan);
             }
         } else {
-            for (const x of parsedUnmatched) {
-                if (cancelCount <= 0) break;
-                logger?.log?.(`Startup: Cancelling excess ${sideUpper} chain order ${x.chain.id}`, 'info');
+            for (const plan of excessPlans) {
+                const label = plan.gridOrderId
+                    ? `excess matched ${sideUpper} ${plan.chainOrderId} (grid ${plan.gridOrderId})`
+                    : `excess ${sideUpper} chain order ${plan.chainOrderId}`;
+                logger?.log?.(`Startup: Cancelling ${label}`, plan.gridOrderId ? 'warn' : 'info');
                 try {
                     await _cancelChainOrder({
                         chainOrders,
                         account,
                         privateKey,
                         manager,
-                        chainOrderId: x.chain.id,
-                        chainOrderObj: x.chain,
-                        releaseUntrackedFunds: true,
+                        chainOrderId: plan.chainOrderId,
+                        chainOrderObj: plan.chainOrderObj,
+                        releaseUntrackedFunds: plan.releaseUntrackedFunds === true,
                         dryRun,
                     });
-                    logger?.log?.(`Startup: Successfully cancelled excess ${sideUpper} order ${x.chain.id}`, 'info');
-                    cancelCount--;
+                    logger?.log?.(`Startup: Successfully cancelled ${label}`, 'info');
                 } catch (err) {
-                    logger?.log?.(`Startup: Failed to cancel ${sideUpper} ${x.chain.id}: ${getErrorMessage(err)}`, 'error');
-                }
-            }
-
-            if (cancelCount > 0) {
-                for (const o of matchedExcess) {
-                    if (cancelCount <= 0) break;
-                    if (!o.orderId) continue;
-                    logger?.log?.(`Startup: Cancelling excess matched ${sideUpper} ${o.orderId} (grid ${o.id})`, 'warn');
-                    try {
-                        await _cancelChainOrder({ chainOrders, account, privateKey, manager, chainOrderId: o.orderId, dryRun, chainOrderObj: null });
-                        logger?.log?.(`Startup: Successfully cancelled excess matched ${sideUpper} order ${o.orderId} (grid ${o.id})`, 'info');
-                        cancelCount--;
-                    } catch (err) {
-                        logger?.log?.(`Startup: Failed to cancel matched ${sideUpper} ${o.orderId}: ${getErrorMessage(err)}`, 'error');
-                    }
+                    logger?.log?.(`Startup: Failed to cancel ${label}: ${getErrorMessage(err)}`, 'error');
                 }
             }
         }

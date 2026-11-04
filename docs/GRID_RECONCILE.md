@@ -82,8 +82,8 @@ Phase 2 and 3 both respect the `dryRun` flag: when true, no on-chain mutations a
 
 **Source:** `reconcileGridOrders()` Phase 1 in `grid_reconcile.ts`.
 
-1. **Phantom order sanitization** (the `isOrderPlaced()` absence pass in `reconcileGridOrders()`): For each `isOrderPlaced()` order whose `orderId` is not in the chain snapshot, reset it to VIRTUAL with `skipAccounting` to prevent fund inflation. Two absence-decision guards make this safe:
-   - **Freshly-assigned deferral** (the `_orderIdAssignedAt` freshness guard): an `orderId` assigned within `TIMING.SYNC_LOCK_TIMEOUT_MS` may be an in-flight create/adopt whose broadcast has not landed or is not yet visible to a lagging/truncated read — virtualizing it and re-creating would duplicate a real live order (the reconcile-timeout death-spiral root cause). It is skipped (deferred) rather than virtualized.
+1. **Phantom order sanitization** (the `isOrderPlaced()` absence pass in `reconcileGridOrders()`): For each `isOrderPlaced()` order whose `orderId` is not in the chain snapshot, reset it to VIRTUAL with `skipAccounting` to prevent fund inflation. One absence-decision guard makes this safe:
+   - **In-flight deferral** (`LifecycleView.isInFlight()`, read through the slot with `readSlotLifecycle`): an order whose chain id was assigned/committed within the guard window, or whose lifecycle phase is still unresolved (`unknown`/`broadcasting` — a lost CREATE receipt, an ambiguous or unparseable read), may be live and merely missing from a lagging/truncated read — virtualizing it and re-creating would duplicate a real live order (the reconcile-timeout death-spiral root cause). It is skipped (deferred) rather than virtualized. The same predicate is the only absence guard in the sync pass-1 phantom cleanup and the fund recalibration sweep; asking a per-site subset is the bug class [ORDER_LIFECYCLE.md](ORDER_LIFECYCLE.md) exists to remove.
    - **Ghost heuristic** (same absence pass): an order with `size <= 0` && `PARTIAL` (a known filled ghost) still passes through so known fills get cleaned up.
    - Virtualization always uses `{ skipAccounting: true }` so startup cleanup never inflates `ChainFree`.
 
@@ -95,7 +95,7 @@ Phase 2 and 3 both respect the `dryRun` flag: when true, no on-chain mutations a
    - Match sorted unmatched chain orders to virtual slots → `plannedUpdates`
    - Detect grid-edge lock and plan a largest-order cancel
    - Plan creates for remaining slots
-   - Plan excess cancellations (guarded by `matchedOnGrid > 0`): orphans first, then **matched surplus** (`chainCount - targetCount`, edge slots last) — the matched-excess selection is shared by the planOnly and execute branches so planning can never drift from execution; planOnly omits `releaseUntrackedFunds` for matched slots (their funds are tracked on the grid slot)
+   - Plan excess cancellations (guarded by `matchedOnGrid > 0`): orphans first, then **matched surplus** (`chainCount - targetCount`, edge slots last) — ONE selection feeds both the planOnly and the inline sink (the `excessPlans` list), so planning can never drift from execution; matched slots omit `releaseUntrackedFunds` (their funds are tracked on the grid slot). Every plan stamps the gap geometry from `resolveGapSlots` (never the raw `_gapSlots` field), which is also what the Phase-2 plan validator compares against
    - Fork-kept **shelf orders** (live non-slot-N ids below the rail, e.g. `deep-*`) are never cancel candidates or reserve members — see [Shelf Orders](#shelf-orders-fork-kept-manual-orders)
    - **Vacated-rail refill**: each PROCEEDING update whose vacated price exactly matches (`priceSlotEqual`) an empty, sized, in-rail slot of the same side queues a refill CREATE in the same plan (`source startupVacatedRailRefill`) — skipped updates, ghost prices (lattice moved), in-band slots, and already-desired slots never refill; refill targets require VIRTUAL state with no `orderId`
 
@@ -117,7 +117,9 @@ snapshots. For every plan, `_startupCancelPlanStillCurrent()` requires:
 
 - the target chain order still exists with its exact Phase-1 signature;
 - a matched plan still owns the same chain order in the same live grid slot;
-- planned type, slot price, boundary, and gap geometry still match; and
+- planned type, slot price, boundary, and gap geometry still match (both sides
+  read the geometry through `resolveGapSlots`, so an unpublished `_gapSlots`
+  field cannot make every plan look stale); and
 - an originally unmatched surplus is still not owned by any live slot.
 
 Validation is per-plan: an earlier cancellation or unrelated order change does
@@ -129,7 +131,8 @@ remain unchanged.
 
 **Fresh-placement grace (`TIMING.SURPLUS_CANCEL_GRACE_MS`, 15 min):** surplus
 and cancel-only cancellations also skip any order whose `orderId` was placed
-inside the grace window. The timestamp is written by `recordOrderPlacement` into
+inside the grace window. The timestamp is written by the lifecycle write funnel
+(and by `recordOrderPlacement` for manager-shaped callers) into
 `manager._placedAt` and tested with `isFreshlyPlacedOrder`; the reconciler's CANCEL
 actions are filtered by `COWRebalanceEngine.execute`, which drops the whole slot's
 action group (a paired CANCEL+CREATE must not lose only its CANCEL, or the CREATE
@@ -209,7 +212,7 @@ Up to 3 batch attempts (`maxBatchAttempts = 3`). Each failure triggers a recover
 
 ### Phantom Orders via Reconcile
 
-Reconcile's role in the defense-in-depth: during Phase 1, any ACTIVE/PARTIAL order whose `orderId` is not found on-chain is reset to VIRTUAL with `skipAccounting`. The freshly-assigned deferral protects in-flight broadcasts, and the ghost heuristic lets known fills pass. See [`developer_guide.md`](developer_guide.md#phantom-orders-prevention-defense-in-depth) for the full 3-layer defense.
+Reconcile's role in the defense-in-depth: during Phase 1, any ACTIVE/PARTIAL order whose `orderId` is not found on-chain is reset to VIRTUAL with `skipAccounting`. The in-flight deferral (`LifecycleView.isInFlight()`) protects in-flight broadcasts and unresolved receipts, and the ghost heuristic lets known fills pass. See [`developer_guide.md`](developer_guide.md#phantom-orders-prevention-defense-in-depth) for the full 3-layer defense.
 
 ### Shelf Orders (Fork-Kept Manual Orders)
 

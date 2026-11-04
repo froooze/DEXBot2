@@ -23,7 +23,7 @@ setCachedModule(
 const { OrderManager } = require('../modules/order/index').default;
 const { ORDER_TYPES, ORDER_STATES, TIMING } = require('../modules/constants');
 const { createSilentLogger } = require('./helpers/silent_logger');
-const { makeLadderFromPrices } = require('./helpers/order_test_helpers');
+const { makeLadderFromPrices, ageChainIdAssignment } = require('./helpers/order_test_helpers');
 
 const { _setFeeCache } = require('../modules/order/utils/math');
 _setFeeCache({
@@ -55,6 +55,10 @@ const createManager = async () => {
         id: 'slot-1', state: ORDER_STATES.ACTIVE, type: ORDER_TYPES.SELL,
         size: 10, price: 100, orderId: '1.7.100'
     });
+    // The fixture is a SETTLED placement (old enough that a read must be able
+    // to show it); a fresh chain id would legitimately defer the absence
+    // decision for SYNC_LOCK_TIMEOUT_MS (LifecycleView.isInFlight).
+    ageChainIdAssignment(mgr, '1.7.100');
     return mgr;
 };
 

@@ -8,9 +8,9 @@ import {
     _executeStartupSequentialUpdateFallback,
     _executePlannedStartupCreates, _reconcileStartupSide,
 } from './grid_reconcile_internal.js';
-import { ORDER_TYPES, ORDER_STATES, TIMING } from '../constants.js';
+import { ORDER_TYPES, ORDER_STATES } from '../constants.js';
 import { readOpenOrdersGuarded } from '../chain_orders.js';
-import { getAssetFeesSafe, pricesOnSameLevel } from './utils/math.js';
+import { getAssetFeesSafe, pricesOnSameLevel, resolveGapSlots } from './utils/math.js';
 import {
     isOrderPlaced, parseChainOrder, isOrderOnChain, findLiveOrderOwnerByChainId,
     chainOrderMatchesSlotWithTolerance,
@@ -20,7 +20,7 @@ import {
 import * as Format from './format.js';
 import { getErrorMessage } from '../utils/errors.js';
 import type { OrderManagerLike, ChainOrder, ChainOrdersLike, ManagedOrder, ParsedChainEntry, PendingPriceCorrection, GridConfig, LoggerLike, StartupCancelPlan, StartupUpdatePlan, StartupCreatePlan } from '../types.js';
-import { readLifecycle } from './lifecycle.js';
+import { readSlotLifecycle } from './lifecycle.js';
 import type { PlacementLease } from '../order/placement_lock.js';
 
 function _startupChainSnapshotSignature(orders: ChainOrder[], manager: OrderManagerLike): Map<string, string> {
@@ -51,8 +51,12 @@ function _startupCancelPlanStillCurrent(
     if (currentChainSignature.get(chainOrderId) !== initialChainSignature.get(chainOrderId)) return false;
 
     if (plan.gridOrderId) {
+        // Geometry identity is compared through the same resolver the PLAN used
+        // (resolveGapSlots), never the raw `_gapSlots` field: an unpublished field
+        // would compare `undefined` against the plan's derived band and skip every
+        // cancellation as "stale".
         if (plan.boundaryIdx !== undefined && (
-            plan.boundaryIdx !== manager?.boundaryIdx || plan.gapSlots !== manager?._gapSlots
+            plan.boundaryIdx !== manager?.boundaryIdx || plan.gapSlots !== resolveGapSlots(manager)
         )) return false;
         const slot = manager?.orders instanceof Map ? manager.orders.get(plan.gridOrderId) : null;
         if (!slot || !isOrderOnChain(slot) || slot.orderId !== plan.chainOrderId) return false;
@@ -374,22 +378,19 @@ export async function reconcileGridOrders({
                     // broadcast has not landed or is not yet visible to a
                     // lagging/truncated read. Virtualizing it here and
                     // re-creating would duplicate a real live order (the
-                    // reconcile-timeout death-spiral root cause). Mirror the
-                    // sync_engine committed-order guard; ghost orders (PARTIAL +
-                    // size=0) still pass through so known fills get cleaned up.
-                    const lifecycle = readLifecycle(manager, order.orderId ?? null);
-                    const assignedAt = lifecycle.assignedAt;
+                    // reconcile-timeout death-spiral root cause). Same unified
+                    // guard as the sync engine and the fund recalibration sweep,
+                    // read through the slot so the persisted create-uncertain
+                    // marker participates too. Ghost orders (PARTIAL + size=0)
+                    // still pass through so known fills get cleaned up.
+                    const lifecycle = readSlotLifecycle(manager, order);
                     const isGhost = order.size <= 0 && order.state === ORDER_STATES.PARTIAL;
-                    // Unified in-flight guard: this site used to consult ONLY
-                    // `_orderIdAssignedAt`, so a recently COMMITTED order could
-                    // be virtualized here as a phantom and re-created — the
-                    // duplicate-live-order death spiral.
                     if (!isGhost && lifecycle.isInFlight()) {
-                        const recentlyAssigned = assignedAt > 0
-                            && Date.now() - assignedAt < TIMING.SYNC_LOCK_TIMEOUT_MS;
-                        const reason = recentlyAssigned
-                            ? `freshly assigned ${Date.now() - assignedAt}ms ago`
-                            : 'recently committed (or has an unresolved lifecycle phase)';
+                        const reason = lifecycle.isRecentlyAssigned()
+                            ? `freshly assigned ${Date.now() - lifecycle.assignedAt}ms ago`
+                            : lifecycle.isUnresolved
+                                ? 'its lifecycle phase is unresolved (a lost CREATE receipt or an ambiguous read)'
+                                : 'recently committed';
                         logger?.log?.(
                             `Startup: Order ${order.id} (ID ${order.orderId}) absent from snapshot but ${reason}; ` +
                             `deferring phantom cleanup (duplicate-order protection).`,
