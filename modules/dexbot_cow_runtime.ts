@@ -238,6 +238,7 @@ import * as workingGridModule from './order/working_grid.js';
 const { WorkingGrid } = workingGridModule;
 import { getErrorMessage, resolveSeamMs, resolveSeamMsOrNull, getErrorField } from './utils/errors.js';
 import type { BotLike, OrderManagerLike, ManagedOrder, ChainOrder, UnknownRecord, AssetInfo, AssetPair, CowAction, PendingPriceCorrection } from './types.js';
+import { unknownCowOutcome } from './outcome.js';
 
 /**
  * Post-commit gap-evacuation sweep (lazy: dexbot_state_recovery pulls the
@@ -792,7 +793,7 @@ async function deferUncertainBroadcastRead(bot: BotLike, detail: string, suffix:
             'debug'
         );
     }
-    return { executed: false, hadRotation: false, uncertain: true, ambiguousRead: true };
+    return unknownCowOutcome('ambiguous-read');
 }
 
 /**
@@ -1341,7 +1342,7 @@ async function reconcileAfterUncertainBroadcastImpl(bot: BotLike, err: unknown, 
             { batchId: (err as JsonObj | undefined)?.batchId || null }
         );
         clearPendingBroadcasts(bot.manager?._pendingBroadcasts);
-        return { executed: false, hadRotation: false, uncertain: true };
+        return unknownCowOutcome('unavailable', { detail: 'readOpenOrdersWithMeta unavailable' });
     }
 
     // 1. Read the chain
@@ -1364,7 +1365,7 @@ async function reconcileAfterUncertainBroadcastImpl(bot: BotLike, err: unknown, 
             { batchId: (err as JsonObj | undefined)?.batchId || null, error: getErrorMessage(readErr) || String(readErr) }
         );
         clearPendingBroadcasts(bot.manager?._pendingBroadcasts);
-        return { executed: false, hadRotation: false, uncertain: true };
+        return unknownCowOutcome('unavailable', { detail: 'readOpenOrders failed' });
     }
 
     // 1.5. Empty/truncated-read guard: an empty snapshot is ambiguous — the
@@ -1426,7 +1427,7 @@ async function reconcileAfterUncertainBroadcastImpl(bot: BotLike, err: unknown, 
     // chain snapshot.
     await resyncIfUnreconciled(bot, err, pending, chainSnapshot, adopted, adoptedCount, discardedCount);
 
-    return { executed: false, hadRotation: false, uncertain: true, adoptedCount, discardedCount };
+    return unknownCowOutcome('lost-receipt', { adoptedCount, discardedCount });
 }
 
 /**
