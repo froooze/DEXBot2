@@ -13,7 +13,8 @@
  *   - these lists may SHRINK when a phase removes a duplicate,
  *   - they may only GROW by editing this file, which is the review.
  *
- * Baseline: `cb1041b6` (2026-11-04).
+ * Baseline: `bc20d574` (2026-11-04), the last production-code commit before the
+ * documentation integration. The ratchet itself was introduced in `b2f43d8a`.
  */
 
 const assert = require('assert');
@@ -164,6 +165,15 @@ function testBlockerProjection() {
     })(), true);
 }
 
+function testRepairProof() {
+    console.log('\n[7] The type-mismatch repair proof reads rail geometry, not only the label');
+    const order = sources.get('modules/order/utils/order.ts') || '';
+    check('the repair proof derives geometry from the live ladder position',
+        /resolveLiveOrderLadderPosition\(slot[\s\S]{0,200}geometryTypeForSlotIndex\(/.test(order), true);
+    check('the accept condition consults the rail contradiction',
+        /geometryContradicts = geometryType !== null && geometryType !== targetType/.test(order), true);
+}
+
 function run() {
     console.log('Fill pipeline contract (ratchet) tests');
     testFillBatchCallSites();
@@ -172,6 +182,7 @@ function run() {
     testDedupeLayers();
     testFillIdentityOwner();
     testBlockerProjection();
+    testRepairProof();
     if (failures > 0) {
         console.error(`\n❌ ${failures} fill-pipeline contract assertion(s) failed`);
         console.error('   A new caller/writer/duplicate appeared. Edit this ratchet deliberately or remove the duplicate.');

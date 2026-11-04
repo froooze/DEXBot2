@@ -4,13 +4,13 @@
 > misbehaving (Part I) and the preserved **incident & fix ledger** (Part II), formerly
 > `CONSOLIDATED_ORPHAN_FIX_SUMMARY.md`.
 >
-> **Sources:** `CHANGELOG.md` v1.0.0 → v1.7.0 (plus the unreleased post-1.7.0 arc);
+> **Sources:** `CHANGELOG.md` v1.0.0 → v1.7.1 (plus the post-1.7.1 arc);
 > `docs/GRID_PRICE_INVARIANT.md`; `docs/COW_INVARIANTS.md`; `docs/ORDER_LIFECYCLE.md`.
 > Generic terms only — no live markets, accounts, or order ids.
 >
-> **Scope / snapshot:** v1.0.0 → v1.7.0 (`5644aa3a`, 2026-11-02), extended through the
-> unreleased post-1.7.0 work at `84b935d9` (2026-11-04). §9 is the v1.6.4 → v1.6.17
-> addendum; §9.10 closes the v1.6.18 review pass and §9.11 carries v1.6.18 → unreleased.
+> **Scope / snapshot:** v1.0.0 → v1.7.1 (`2a85a501`, 2026-11-04), extended through the
+> post-1.7.1 work at `bc20d574` (2026-11-04). §9 is the v1.6.4 → v1.6.17
+> addendum; §9.10 closes the v1.6.18 review pass and §9.11 carries v1.6.18 → v1.7.1.
 >
 > **Section numbering:** Part II deliberately keeps its original `§0`–`§8` numbers because
 > source-code comments and tests cite them (e.g. `… §2 fix #1`, `… §3 lineage`); §9 is a
@@ -49,7 +49,7 @@
 - 8. Provenance & supersession record
 - 9. COW Broadcast, Resync & Geometry Safety (v1.6.4 → v1.6.17) — addendum
   - 9.10 Review pass over v1.6.12 → v1.6.17 (findings P1–P5), released in v1.6.18
-  - 9.11 v1.6.18 → unreleased: fill identity, absence and the geometry budget
+  - 9.11 v1.6.18 → v1.7.1: fill identity, absence and the geometry budget
 - A. Grid-Price Invariant — former failure trace (appendix)
 
 ---
@@ -568,17 +568,17 @@ Original doc regression excerpts preserved: GAP P6 A/B/C; LADDER §2.8 checks (1
 - [x] No other doc/index lists the four (verified 2026-08-31); `analysis/README.md` documents the `grid_correction_check` tool.
 - [x] Stale `*.md` filename references in code comments/tests updated to the consolidated doc (9 module files, 6 test files), then re-pointed to this hub when it absorbed the summary.
 
-*Generated 2026-08-31 from the 4 test-only docs at their HEAD contents; statuses corrected against `test` HEAD `a54863ca` the same day, then refreshed against `1382f267` (2026-09-13), extended through v1.6.14 at `f6c0df32` (2026-10-12), through v1.6.17 at `78ccbb8e`, through the v1.6.18 review pass (`§9.10`: `f4d6da8c`, `a2bf6ba5`, `56481b16`, `3d16f9e4`), and through v1.7.0 + the unreleased post-1.7.0 arc (`§9.11`, HEAD `84b935d9`). Landed/reverted/superseded annotations carry commit hashes where known; **line references in §§1-4 were re-verified at `a54863ca` and are subject to drift** — treat them as pointers, not assertions. The GRID-PRICE-INVARIANT guard is **BLOCKING** at all six emission sites (CREATE / UPDATE / CREATE-FALLBACK in `modules/dexbot_cow_runtime.ts`, RECONCILE-CREATE / RECONCILE-UPDATE / STARTUP-CREATE in `modules/order/grid_reconcile_internal.ts`): an off-grid emission is skipped, not merely counted, so a `violated>0` line means an emission was *prevented* rather than a writer merely *pinned*. Counters are still reported (`site=`, `checked=`, `violated=`, `unchecked=`) for observability — see `docs/GRID_PRICE_INVARIANT.md`.*
+*Generated 2026-08-31 from the 4 test-only docs at their HEAD contents; statuses corrected against `test` HEAD `a54863ca` the same day, then refreshed against `1382f267` (2026-09-13), extended through v1.6.14 at `f6c0df32` (2026-10-12), through v1.6.17 at `78ccbb8e`, through the v1.6.18 review pass (`§9.10`: `f4d6da8c`, `a2bf6ba5`, `56481b16`, `3d16f9e4`), and through v1.7.1 at `2a85a501` plus the post-1.7.1 arc (`§9.11`, HEAD `bc20d574`). Landed/reverted/superseded annotations carry commit hashes where known; **line references in §§1-4 were re-verified at `a54863ca` and are subject to drift** — treat them as pointers, not assertions. The GRID-PRICE-INVARIANT guard is **BLOCKING** at all six emission sites (CREATE / UPDATE / CREATE-FALLBACK in `modules/dexbot_cow_runtime.ts`, RECONCILE-CREATE / RECONCILE-UPDATE / STARTUP-CREATE in `modules/order/grid_reconcile_internal.ts`): an off-grid emission is skipped, not merely counted, so a `violated>0` line means an emission was *prevented* rather than a writer merely *pinned*. Counters are still reported (`site=`, `checked=`, `violated=`, `unchecked=`) for observability — see `docs/GRID_PRICE_INVARIANT.md`.*
 
 ---
 
 ### 9. COW Broadcast, Resync & Geometry Safety (v1.6.4 → v1.6.17)
 
 > **Source:** `CHANGELOG.md` v1.6.4 → v1.6.17 · **Snapshot:** `78ccbb8e` (v1.6.17 tag);
-> §9.10 and §9.11 extend past it — §9.10 released in v1.6.18, §9.11 unreleased to HEAD
-> `84b935d9`.
+> §9.10 and §9.11 extend past it — §9.10 released in v1.6.18; §9.11 released in v1.7.1,
+> with the post-1.7.1 additions at HEAD `bc20d574`.
 > Extends the §§1–8 ledger; the `§0`–`§8` numbers are unchanged (code and tests cite them).
-> The ledger labels each row with its release; `unreleased` means "in no tag yet".
+> The ledger labels each row with its release; `post-1.7.1` means after the v1.7.1 tag.
 
 Sections 1–4 end with the prevention sweeps reverted: a cancel sweep on ambiguous evidence
 proved worse than the orphan it targets. The post-1.6.3 arc is the constructive inverse —
@@ -668,7 +668,7 @@ fail-closed behind `_assertGenesisInvariant`. This is R4's "removing writers and
 truth" carried to its end: the no-ladder state that Appendix A's `slot.price` corruption
 required is no longer reachable at runtime.
 
-#### 9.5 Ledger (order-engine commits, v1.6.4 → v1.7.0 + unreleased)
+#### 9.5 Ledger (order-engine commits, v1.6.4 → v1.7.1 + post-1.7.1)
 
 | Commit | Release | Change |
 |---|---|---|
@@ -713,18 +713,24 @@ required is no longer reachable at runtime.
 | `a93f7eef` | 1.7.0 | Stale-grid re-buys: unsettled-fill gate, attribution, same-level refusal (§9.11.1) |
 | `8705381b` | 1.7.0 | Orphan-fill attribution by price; dark-level revive (§9.11.1) |
 | `8aff50bb` | 1.7.0 | Anchor-aware residual allow-list, pivot clock provenance, read-time TTL (§9.11.2) |
-| `c493a604` | unreleased | Stranded-boundary repair without re-arming on replays (§9.11.3) |
-| `ed52f9ef` | unreleased | Exclusive placement region; no create-only re-plan after a rebuild (§9.11.3) |
-| `970fedfd` | unreleased | Remaining placement races; fill-accounting double-apply |
-| `ad081e3d` | unreleased | Placement lifecycle + fill-marker idempotency |
-| `7a3571a4` | unreleased | Follow-up gaps: one teardown, one lease check, one pending-broadcast policy |
-| `94223d19` | unreleased | Re-verify the placement lease before a region holder broadcasts |
-| `8bab9881` | unreleased | Unknown gap geometry is not gap 0 |
-| `4d5e3d81` | unreleased | Forced retreats evacuate, then re-plan the committed band |
-| `7618f299` | unreleased | Cancel teeth may not destroy the rotation that evacuates |
-| `826d84a3` | unreleased | Chain existence unified behind the lifecycle registry (§9.11.3) |
-| `7252d7d3` | unreleased | Broadcast uncertainty as a typed three-valued outcome (§9.11.3) |
-| `84b935d9` | unreleased | One writer per life-cycle clock, one guard per absence decision (§9.11.3) |
+| `c493a604` | 1.7.1 | Stranded-boundary repair without re-arming on replays (§9.11.3) |
+| `ed52f9ef` | 1.7.1 | Exclusive placement region; no create-only re-plan after a rebuild (§9.11.3) |
+| `970fedfd` | 1.7.1 | Remaining placement races; fill-accounting double-apply |
+| `ad081e3d` | 1.7.1 | Placement lifecycle + fill-marker idempotency |
+| `7a3571a4` | 1.7.1 | Follow-up gaps: one teardown, one lease check, one pending-broadcast policy |
+| `94223d19` | 1.7.1 | Re-verify the placement lease before a region holder broadcasts |
+| `8bab9881` | 1.7.1 | Unknown gap geometry is not gap 0 |
+| `4d5e3d81` | 1.7.1 | Forced retreats evacuate, then re-plan the committed band |
+| `7618f299` | 1.7.1 | Cancel teeth may not destroy the rotation that evacuates |
+| `826d84a3` | 1.7.1 | Chain existence unified behind the lifecycle registry (§9.11.3) |
+| `7252d7d3` | 1.7.1 | Broadcast uncertainty as a typed three-valued outcome (§9.11.3) |
+| `84b935d9` | 1.7.1 | One writer per life-cycle clock, one guard per absence decision (§9.11.3) |
+| `3edf8cb3` | post-1.7.1 | Release leaked broadcast regions; cancel wrong-side fills |
+| `6afa0c4b` | post-1.7.1 | Fill side from the paid asset at every call site; backlog coalescing |
+| `cb1041b6` | post-1.7.1 | Never park a chain-observed wrong-side cancel; the repair proof checks rail geometry |
+| `b2f43d8a` | post-1.7.1 | One fill contract, fail-closed grid blockers, one fill identity (P0–P2) |
+| `39675d8a` | post-1.7.1 | Claim the fill key at credit time; drop the duplicate amount channel (P2 tail) |
+| `bc20d574` | post-1.7.1 | One grace-stamp writer, ledger side in export, single-winner fill claim |
 
 #### 9.6 Invariants added
 
@@ -905,7 +911,7 @@ extraction) · `56481b16` (P5) · `3d16f9e4` (this document, the doc-level invar
 and the log rows it cites). **Released in v1.6.18:** the review pass itself carried no
 version bump, but every commit above is an ancestor of the `v1.6.18` tag (2026-11-01).
 
-#### 9.11 v1.6.18 → unreleased: fill identity, absence and the geometry budget
+#### 9.11 v1.6.18 → v1.7.1: fill identity, absence and the geometry budget
 
 The post-1.6.17 work stopped asking "which guard is missing?" and started asking
 "which *identity* is the code using?". Three answers landed: a fill is identified
@@ -962,7 +968,7 @@ Three defects of the same shape:
 Price, side and clock now travel as one row, and the TTL is enforced where the reference
 is **read**; an unknown age never expires.
 
-##### 9.11.3 Absence gets one record; repairs must reduce the violation (unreleased)
+##### 9.11.3 Absence gets one record; repairs must reduce the violation (v1.7.1)
 
 Chain existence used to be answered by seven structures with seven clocks
 (`_pendingBroadcasts`, `createUncertain`, `_committedOrderIds`,
@@ -973,12 +979,14 @@ the bug reappeared at the next.
 
 `modules/order/lifecycle.ts` (`826d84a3`, `7252d7d3`, `84b935d9`) now owns one
 record per slot: a six-phase vocabulary in which `unknown` is a real state (a
-lost receipt is *not* an absence), a monotonic evidence rank, and every clock
-recorded once. The legacy maps survive as live views, so no call site had to be
-rewritten to get one truth. Three rules fall out of it: one absence guard
-(`isInFlight()`, time-bounded), one teardown authority for a hung region
-(`_clearStalePlacementRegion`, `7a3571a4`), and one pending-broadcast liveness
-policy (`getLivePendingBroadcasts`).
+lost receipt is *not* an absence), a monotonic evidence rank, and every existence
+clock recorded once. The legacy maps survive as live views, so no call site had
+to be rewritten to get one truth. The persisted `createUncertain` flag is still
+read as evidence; `_lastUnmatchedChainOrders` remains a chain-diff cache for
+orphan diagnostics, not an existence answer. Three rules fall out of it: one
+absence guard (`isInFlight()`, time-bounded), one teardown authority for a hung
+region (`_clearStalePlacementRegion`, `7a3571a4`), and one pending-broadcast
+liveness policy (`getLivePendingBroadcasts`).
 
 Geometry gained the matching rule. A boundary writer may move the boundary only
 when the move strands **strictly fewer** placed orders than the committed value

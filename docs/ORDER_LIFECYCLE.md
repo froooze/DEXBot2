@@ -3,7 +3,14 @@
 > How the engine answers one question — *does this order exist on chain, and how
 > sure are we?* — from one record instead of seven.
 >
+> **Status:** shipped in v1.7.1 (`84b935d9`). The registry is the single read surface for
+> chain existence; the five legacy structures (`_placedAt`, `_orderIdAssignedAt`,
+> `_committedOrderIds`, `_pendingBroadcasts`, `_chainSizeAppliedFills`) are facade views.
+> The persisted `createUncertain` flag is still read as evidence; `_lastUnmatchedChainOrders`
+> remains a chain-diff cache for orphan diagnostics, not an existence answer.
+>
 > **See also:** [ORDER_ENGINE_POST_1.0_RETROSPECTIVE.md](ORDER_ENGINE_POST_1.0_RETROSPECTIVE.md) (§9.11.3) ·
+> [FILL_PIPELINE.md](FILL_PIPELINE.md) (the fill contract that consumes this record) ·
 > [COW_INVARIANTS.md](COW_INVARIANTS.md#order-lifecycle-order_lifecyclemd) ·
 > [TIMING_INVENTORY.md](TIMING_INVENTORY.md).
 

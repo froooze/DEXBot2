@@ -1,11 +1,14 @@
 # Fill Pipeline
 
 > **Status:** P0 (contract + ratchet), P1 (fail-closed grid blockers) and P2 (one fill
-> identity + the dedupe authority) are **implemented** — `b2f43d8a` and the P2-tail commit.
-> P3–P5 are sequenced below with their gates and stop conditions. This is the single
-> fill-pipeline document: contract, decisions, remaining plan, regression canaries.
+> identity + the dedupe authority) are **implemented** — `b2f43d8a`, P2 tail `39675d8a`,
+> plus the post-1.7.1 fill fixes (`6afa0c4b`, `cb1041b6`, `bc20d574`). P3–P5 are sequenced
+> below with their gates and stop conditions. This is the single fill-pipeline document:
+> contract, decisions, remaining plan, regression canaries.
 >
-> **Baseline:** `cb1041b6` (`test`, 2026-11-04). The ratchet pins that tree.
+> **Baseline:** `bc20d574` (`test`, 2026-11-04), the last production-code commit. The
+> ratchet itself was introduced in `b2f43d8a`; the commits after the baseline are test and
+> documentation only.
 >
 > **Cross-links:** [ORDER_LIFECYCLE](ORDER_LIFECYCLE.md) (existence record),
 > [COW_INVARIANTS](COW_INVARIANTS.md) (broadcast/plan contract),
@@ -24,16 +27,19 @@ produced (or nearly produced) a live incident; the fix is an owner, not another 
 | # | Conflict | What it already produced | State |
 |---|---|---|---|
 | C1 | Fill dedupe had four layers, three granularities: booked key, chain-size delta, applied-amount boolean, time window | double-released trade size (`3.6604 → 3.3046 → 2.9488`), phantom residual | **closed**: store is the authority, marked at credit time; boolean channel deleted; window re-scoped as a claim lease |
-| C2 | The fill reference had two values and four clocks (`_lastFilledAt`, `_lastMarketFillAt`, persisted row clock, TTL at four sites) + `lastFillPivotSource` | market-row clock inheritance (REARM-6/7/8), edge-wick pivot teleport | open (pivot event log) |
-| C3 | Two boundary authorities with budgets in mutable manager fields (re-anchor vs owed crawl), snapshot/restored at six sites | a nested fill cycle forks a budget; extremum-vs-last-processed anchor | open (P3) |
-| C4 | Plan validity is a judgement over four signals, one of which **proceeds anyway** when still stale | stale plan shipped with a duplicate-order backlog on chain | open (P4) |
+| C2 | The fill reference had two values and four clocks (`_lastFilledAt`, `_lastMarketFillAt`, persisted row clock, TTL at four sites) + `lastFillPivotSource` | market-row clock inheritance (REARM-6/7/8), edge-wick pivot teleport | **closed by decision (D10)**: the generation-scoped live pivot and the bot-scoped last fill are different facts; one owner each, TTL enforced at read. No event log. |
+| C3 | Two boundary authorities with budgets in mutable manager fields (re-anchor vs owed crawl), snapshot/restored at six sites | a nested fill cycle forks a budget; extremum-vs-last-processed anchor | open (P3): the base/current pair is a snapshot, not a second answer; the six save/restore sites are the coupling. |
+| C4 | Plan validity is a judgement over four signals, one of which **proceeds anyway** when still stale | stale plan shipped with a duplicate-order backlog on chain | open (P4): log-only "proceeded anyway" first; the fence lands only after P3. |
 | C5 | Deferral composed per site; `hasUnsettledFills` failed **open** on a read error | a swallowed exception made a grid update look safe | **closed**: closed code list, unreadable = `unknown-blocker` |
-| C6 | "The band" has four definitions (live orders, batch rails, analyzer buckets, `_spreadCountKnown`) | collapsed band reported on target while the chain disagreed | open (no phase claimed) |
-| C7 | An order's **side** is two facts with no owner: accounting side (`slot.type`, retagged by a partial fill) and rail side (`geometryTypeForSlotIndex`) | a fill-retagged wrong-rail order looked "repaired"; its residual cancel was dropped (`cb1041b6`) | **named**: one owner per fact, never conflated |
+| C6 | "The band" has four definitions (live orders, batch rails, analyzer buckets, `_spreadCountKnown`) | collapsed band reported on target while the chain disagreed | **closed by decision (D11)**: four consumers of one word, not four answers. Live geometry is the only gate; the others are named layers. |
+| C7 | An order's **side** is two facts with no owner: accounting side (`slot.type`, retagged by a partial fill) and rail side (`geometryTypeForSlotIndex`) | a fill-retagged wrong-rail order looked "repaired"; its residual cancel was dropped (`cb1041b6`) | **closed for the repair proof (D12)**: two facts, two owners; the `typeMismatch` validator uses geometry, accounting keeps the stored type (`INV-FILL-002/006`). |
 
 The unifying shape is the one the life-cycle registry already fixed for existence: **one
 question answered in several places**, and a "wait, then guess" added wherever they
-disagreed.
+disagreed. The rule is narrower than "merge everything": a same-fact second answer is
+deleted (C1, C5); two different facts get two named owners and a forbidden conflation
+(C2, C7); a genuine multi-signal judgement is replaced by one fence only after the
+consumer that carries the invalidating evidence exists (C4 → P3/P4).
 
 ---
 
@@ -76,6 +82,8 @@ Rails, not conventions: `tests/test_fill_pipeline_contract.ts` fails on a new wr
 | chain identity of a fill | `fill_ledger.fillKeyOf` | any other key builder (`buildFillKey` is an alias) |
 | which side a fill **traded** | `fill_ledger.resolveTradedSide` | reading `slot.type` as the traded side |
 | which side a **level** is on | `geometryTypeForSlotIndex` | rail identity from `slot.type` (accounting side after a partial fill) |
+| which band may gate a mutation | live geometry (`geometryTypeForSlotIndex` + the `_spreadCountKnown` measurement) | batch rails, analyzer buckets, or a collapsed count (D11) |
+| which fill reference is authoritative | `setLastFillPivot` + read-time TTL (`resolveLastFillGuardReference`) | a second pivot clock or an event log (D10) |
 | already booked | `processed_fill_store.tracker` (claimed at credit time) | a second time-window dedupe — the lease is not the horizon |
 | may the grid mutate | `resolveGridUpdateBlockers` | per-site predicate composition |
 | plan validity | *(open — P4 `gridEpoch`)* | the four-signal staleness judgement |
@@ -134,7 +142,7 @@ requires editing the test — that edit is the review.
   and its own watchdogs bound it. That gate now defers on **any** blocker (it is
   chain-mutating), which is a deliberate behaviour change.
 
-**P2 — one fill identity, one dedupe authority** (`b2f43d8a`, P2 tail)
+**P2 — one fill identity, one dedupe authority** (`b2f43d8a`, `39675d8a`)
 - `order/fill_ledger.ts` owns `fillKeyOf` (with `buildFillKey` as an alias) and
   `resolveTradedSide`; wired into `_computeFillContext`, `attributeUnmatchedFillToGrid`
   and the queued pivot refresh. The SPREAD price fallback stays with
@@ -196,6 +204,9 @@ passes — not when the code exists.
 
 ### P4 — Epoch fence (5 d, depends on P3)
 
+- Before the fence lands: log the "proceed anyway" branch once per batch with its four
+  signals, so the refusal rate is measurable; the branch is deleted only when the log
+  shows P3 carried the invalidating fills.
 - `gridEpoch` is the **structural** counterpart to `_gridVersion` (which keeps its
   per-mutation cache-invalidation job; **D3=B**). One funnel bumps it behind
   `isPlanInvalidatingMutation(oldSlot, newSlot, context)` — state, type, price, chain id,
@@ -237,11 +248,11 @@ key builder, the applied-amount boolean, the dead boolean wrapper.
 
 | Today | After |
 |---|---|
-| 2 budget manager fields + 6 save/restore sites | 1 per-cycle context object (P3) |
-| 3 remaining bookkeeping layers (marker, persisted marker, claim lease) | 1 ledger + assertions (P2 tail/P3) |
-| 4 staleness signals + "proceed anyway" | 1 epoch (P4) |
+| 2 budget manager fields + 6 save/restore sites (base/current is a snapshot, not a second answer) | 1 per-cycle context object (P3) |
+| marker map + per-fill amount channel + claim lease (three different facts) | marker + amount channel kept; claim lease retired by chain evidence (P5) |
+| 4 staleness signals + "proceed anyway" | 1 epoch (P4, after P3; log-only first) |
 | 10 direct call sites of the batch processor | 1 queue, 1 consumer (P3) |
-| 4 fill-reference clocks + `lastFillPivotSource` | 1 event log (pivot P0/P1) |
+| live pivot + bot-scoped last fill (two lifetimes) | two representations with read-time TTL, no event log (D10) |
 | ≥5 deferral booleans/strings | 1 enum (P3) |
 
 ---
@@ -259,6 +270,9 @@ key builder, the applied-amount boolean, the dead boolean wrapper.
 | **D7** epoch scope | **A** — grid only | no evidence a second number is needed; P4's fuzz op will say | adds a second fence before the first is proven |
 | **D8** single consumer location | **B** — new `dexbot_fill_pipeline.ts` | `fill_runtime` is already ~1,700 lines; the boundary stays review-visible | the runtime becomes the pipeline and ingest loses its name |
 | **D9** contract strictness | **A** — ratchet test | the tree proves review discipline alone does not hold (C1, C5) | the contract becomes prose again |
+| **D10** pivot representation | **B** — keep two representations | the generation-scoped live pivot (`_lastFilled*` + `lastFillPivotSource`) is authoritative in memory and may be book-seeded, in which case it must not persist; the bot-scoped last fill (`_lastMarketFill*`) must survive a grid regeneration and feeds the spread floor | an event log replaces two explicit representations with replay/prune state and re-opens the clock-inheritance class |
+| **D11** "the band" | **B** — one live gate, three named layers | live orders/geometry decides; batch rails, analyzer buckets and `_spreadCountKnown` describe different layers | collapsing them makes at least one consumer wrong; the defect is the shared word |
+| **D12** slot side | **B** — two facts, two owners | `slot.type` is the accounting side (retagged by a partial fill); `geometryTypeForSlotIndex` is the rail side | merging re-creates the dimensional inconsistency `6afa0c4b` fixed |
 
 ---
 
@@ -297,7 +311,7 @@ P2/P4 touch its inputs, not its matching.
 ## 8. Tests this document is held to
 
 `tests/test_fill_pipeline_contract.ts` (ratchet: call sites, writers, dedupe layers,
-identity owner, closed code list), `tests/test_grid_update_blockers.ts` (fail-closed
+identity owner, closed code list, the rail-geometry repair proof), `tests/test_grid_update_blockers.ts` (fail-closed
 projection, each code, escalation semantics), `tests/test_fill_ledger.ts` (key shape,
 paid-asset side, booked membership), `tests/test_fill_store_authority.ts` (claim at credit
 time, in-flight duplicate refused, rollback and retry, atomic credit, ingest store check),
@@ -307,9 +321,14 @@ plus the behavioural canaries above.
 
 | Date | Commit | Landed |
 |---|---|---|
+| 2026-11-04 | `6afa0c4b` | Pre-P0: fill side from the paid asset in every call site; backlog coalescing rolled out. |
+| 2026-11-04 | `cb1041b6` | Pre-P0: a chain-observed wrong-side cancel is never parked; the repair proof compares rail geometry, not the stored type (C7). |
 | 2026-11-04 | `b2f43d8a` | P0 contract + ratchet; P1 eight-code blocker resolver, fail-closed accessor, cycle-counter escalation, targeted-drift gate defers on any blocker; P2 identity (`fill_ledger.ts`) wired into three call sites. `COW_INVARIANTS` refreshed (`INV-RECON-006` exemption, `INV-SYNC-008` accounting-side/rail-side). |
-| 2026-11-04 | P2 tail (this commit) | store claimed at credit time with rollback, all-or-nothing credit, `_isNewFillKey` store check, applied-amount boolean deleted, dead wrapper deleted, ratchet fixed to include the accounting writer. Findings 3–5 above recorded. |
+| 2026-11-04 | `39675d8a` | P2 tail: store claimed at credit time with rollback, all-or-nothing credit, `_isNewFillKey` store check, applied-amount boolean deleted, dead wrapper deleted, ratchet fixed to include the accounting writer. Findings 3–5 above recorded. |
+| 2026-11-04 | `bc20d574` | Grace stamp has one writer (`_commitWorkingGrid`); ledger side in the export; one winner claims the fill key at credit time. |
+| 2026-11-04 | doc integration (this change) | C2/C6/C7 closed by decision (D10–D12); C3/C4 stay P3/P4; baseline re-set. No production copy deleted: the remaining same-fact duplicate (C4's "proceed anyway") is gated behind P3; the others are different facts. |
 
-Gates at this commit: `npm test` 357/357 files, 14 live skipped, 0 failed; `typecheck`,
-`typecheck:analysis`, `check:any`, `verify:browser-bundle` (44/44), timing-policy audit
+Gates at this commit: `npm test` 357/357 non-live files, 14 live skipped; `npm run test:live`
+executes the live set (366 pass, 5 diagnostics need a configured account in this
+environment); `typecheck`, `typecheck:analysis`, `check:any`, `verify:browser-bundle`
 green.
