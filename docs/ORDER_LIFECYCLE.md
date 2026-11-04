@@ -2,6 +2,10 @@
 
 > How the engine answers one question — *does this order exist on chain, and how
 > sure are we?* — from one record instead of seven.
+>
+> **See also:** [ORDER_ENGINE_POST_1.0_RETROSPECTIVE.md](ORDER_ENGINE_POST_1.0_RETROSPECTIVE.md) (§9.11.3) ·
+> [COW_INVARIANTS.md](COW_INVARIANTS.md#order-lifecycle-order_lifecyclemd) ·
+> [TIMING_INVENTORY.md](TIMING_INVENTORY.md).
 
 ## The problem this replaces
 

@@ -99,9 +99,11 @@ modules/
 │   ├── strategy.ts                grid rebalancing, consolidation, rotation
 │   ├── accounting.ts              fund tracking, fee accounting
 │   ├── sync_engine.ts             blockchain sync, fill detection, reconciliation
+│   ├── lifecycle.ts               one record per slot: chain existence, phase, evidence, clocks (docs/ORDER_LIFECYCLE.md)
 │   ├── genesis_policy.ts          missing-ladder refusal + rebuild policy (docs/GRID_PRICE_INVARIANT.md)
 │   ├── grid_reconcile.ts          startup grid reconciliation (docs/GRID_RECONCILE.md)
 │   ├── grid_reconcile_internal.ts internal grid reconciliation helpers
+│   ├── placement_lock.ts          exclusive chain-mutating region: FIFO lease, non-reentrant, bounded wait
 │   ├── index.ts                   barrel export
 │   ├── logger.ts                  order-scoped logging
 │   ├── logger_state.ts            logger state management

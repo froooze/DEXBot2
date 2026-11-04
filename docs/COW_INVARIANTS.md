@@ -168,13 +168,17 @@ not by the seven per-site structures that used to disagree
   - `markIntentIfResolved` likewise refuses to downgrade a live uncertainty, and resolves one whose bound has expired instead of leaving an un-honoured suppression behind.
   - A pending CREATE has two distinct exits: *resolved* (`deletePending` → `intent`) and *abandoned* (`_expirePendingBroadcast` → `unknown`). Collapsing them turns a lost receipt into a clean hole that gets re-CREATEd.
 
+- `INV-LIFE-005` Unparseable chain entries make absence unknown, not absent
+  - A chain order that was returned but could not be decoded puts its slot's absence in the UNKNOWN bucket (`sync_engine` pass-1 guard 0, mirroring the accounting recovery sweep's `malformedOrderIds`); the slot is not virtualized.
+
 - `INV-LIFE-006` Evidence is monotonic; clocks cannot be refreshed for free
   - Within a phase the evidence rank may only rise (`local` < `broadcast-receipt` < `adoption` < `chain-snapshot` < `fill-history`), so a local write cannot overwrite what the chain said.
   - `observedAt` advances only for chain-backed evidence.
   - `recordedAt` (the anchor of the unresolved bound) advances only on a phase change or chain-backed evidence: re-asserting `unknown` is not new information.
 
-- `INV-LIFE-005` Unparseable chain entries make absence unknown, not absent
-  - A chain order that was returned but could not be decoded puts its slot's absence in the UNKNOWN bucket (`sync_engine` pass-1 guard 0, mirroring the accounting recovery sweep's `malformedOrderIds`); the slot is not virtualized.
+- `INV-LIFE-007` The unresolved bound is measured from when the uncertainty was RECORDED
+  - `isInFlight()` is bounded (2× `PENDING_BROADCAST_TTL_MS`) from `recordedAt`, so a lagging node cannot park the grid and a bot that re-asserts `unknown` every cycle cannot extend its own suppression.
+  - An explicit decision (`markIntent`) or chain evidence resolves the phase sooner; age alone never extends it.
 
 ## Sync Engine
 
@@ -193,8 +197,9 @@ not by the seven per-site structures that used to disagree
   - The sync engine must treat this as a chain-confirmed empty, not a connection failure.
 
 - `INV-SYNC-004` Orphan adoption rejects duplicate price levels
-  - Pass-2 fallback adoption must check whether an active grid order of the same type already exists at the same price (within `calculatePriceTolerance` using `Math.max(size)`).
-  - If a duplicate exists, the orphan is NOT adopted; it is pushed to `unmatchedChainOrders` for chain cancel.
+  - Pass-2 adoption must check whether an active grid order of the same type already maps to the same ladder level (`chainPriceOnSameLevel` → `pricesOnSameLevel`: the chain price and the grid level resolve to one slot, so equality is by level, not by a tuned band).
+  - `calculatePriceTolerance` is NOT the duplicate rule; it survives only inside helpers that need a representable-price tolerance, and the old `findMatchingGridOrderByOpenOrder` matcher is gone (see [GRID_PRICE_INVARIANT.md](GRID_PRICE_INVARIANT.md#the-tolerance-matcher-is-gone)).
+  - If a duplicate exists, the orphan is NOT adopted; it is pushed to `unmatchedChainOrders` as `duplicate-price-level` for chain cancel.
   - Size is irrelevant — any duplicate violates the one-order-per-price-level invariant.
 
 - `INV-SYNC-005` Fill queue back-pressure
