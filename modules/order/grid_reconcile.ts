@@ -20,6 +20,7 @@ import {
 import * as Format from './format.js';
 import { getErrorMessage } from '../utils/errors.js';
 import type { OrderManagerLike, ChainOrder, ChainOrdersLike, ManagedOrder, ParsedChainEntry, PendingPriceCorrection, GridConfig, LoggerLike, StartupCancelPlan, StartupUpdatePlan, StartupCreatePlan } from '../types.js';
+import { readLifecycle } from './lifecycle.js';
 import type { PlacementLease } from '../order/placement_lock.js';
 
 function _startupChainSnapshotSignature(orders: ChainOrder[], manager: OrderManagerLike): Map<string, string> {
@@ -376,12 +377,22 @@ export async function reconcileGridOrders({
                     // reconcile-timeout death-spiral root cause). Mirror the
                     // sync_engine committed-order guard; ghost orders (PARTIAL +
                     // size=0) still pass through so known fills get cleaned up.
-                    const assignedAt = manager._orderIdAssignedAt?.get(order.orderId ?? '') || 0;
+                    const lifecycle = readLifecycle(manager, order.orderId ?? null);
+                    const assignedAt = lifecycle.assignedAt;
                     const isGhost = order.size <= 0 && order.state === ORDER_STATES.PARTIAL;
-                    if (!isGhost && assignedAt > 0 && Date.now() - assignedAt < TIMING.SYNC_LOCK_TIMEOUT_MS) {
+                    // Unified in-flight guard: this site used to consult ONLY
+                    // `_orderIdAssignedAt`, so a recently COMMITTED order could
+                    // be virtualized here as a phantom and re-created — the
+                    // duplicate-live-order death spiral.
+                    if (!isGhost && lifecycle.isInFlight()) {
+                        const recentlyAssigned = assignedAt > 0
+                            && Date.now() - assignedAt < TIMING.SYNC_LOCK_TIMEOUT_MS;
+                        const reason = recentlyAssigned
+                            ? `freshly assigned ${Date.now() - assignedAt}ms ago`
+                            : 'recently committed (or has an unresolved lifecycle phase)';
                         logger?.log?.(
-                            `Startup: Order ${order.id} (ID ${order.orderId}) absent from snapshot but freshly assigned ` +
-                            `(${Date.now() - assignedAt}ms ago); deferring phantom cleanup (duplicate-order protection).`,
+                            `Startup: Order ${order.id} (ID ${order.orderId}) absent from snapshot but ${reason}; ` +
+                            `deferring phantom cleanup (duplicate-order protection).`,
                             'warn'
                         );
                         continue;

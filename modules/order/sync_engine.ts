@@ -170,6 +170,7 @@ import {
     resolveExecutionPrice
 } from './utils/order.js';
 import { parseSlotIndex } from './utils/slot.js';
+import { readLifecycle } from './lifecycle.js';
 import {
     resolveProcessedFillPersistenceMode
 } from './processed_fill_store.js';
@@ -928,17 +929,29 @@ class SyncEngine {
         // This eliminates type confusion - each map has a single, clear purpose
         const parsedChainOrders = new Map<string, ParsedChainOrder>();
         const rawChainOrders = new Map<string, Record<string, unknown>>();
+        // Unparseable chain orders are UNKNOWN, not absent. A live order the
+        // node returned but we could not decode must never make its slot look
+        // empty: that virtualizes a real order and re-CREATEs on top of it.
+        // The id set is threaded into pass 1 so the absence decision can consult
+        // it (mirrors the accounting recovery sweep's `malformedOrderIds`).
+        const malformedChainOrderIds = new Set<string>();
 
         for (const order of chainOrders) {
             try {
                 const parsed = parseChainOrder(order as ChainOrder, mgr.assets);
-                if (!parsed) continue;
+                if (!parsed) {
+                    const rawId = (order as { id?: string }).id;
+                    if (rawId != null) malformedChainOrderIds.add(String(rawId));
+                    continue;
+                }
 
                 // Store parsed (converted) data in parsedChainOrders
                 parsedChainOrders.set((order as { id: string }).id, parsed);
                 // Store raw blockchain data in separate map - clean separation of concerns
                 rawChainOrders.set((order as { id: string }).id, order as Record<string, unknown>);
             } catch (e) {
+                const rawId = (order as { id?: string }).id;
+                if (rawId != null) malformedChainOrderIds.add(String(rawId));
                 mgr.logger?.log?.(`Warning: Error parsing chain order ${(order as { id?: string }).id}: ${getErrorMessage(e)}`, 'warn');
                 continue;
             }
@@ -1073,6 +1086,7 @@ class SyncEngine {
                         assetBPrecision,
                         parsedChainOrders,
                         rawChainOrders,
+                        malformedChainOrderIds,
                         chainOrderIdsOnGrid,
                         matchedGridOrderIds,
                         filledOrders,
@@ -1103,6 +1117,7 @@ class SyncEngine {
      * @param {number} assetBPrecision - Asset B precision
      * @param {Map<string, any>} parsedChainOrders - Parsed chain orders by ID
      * @param {Map<string, Object>} rawChainOrders - Raw blockchain order objects by ID
+     * @param {Set<string>} malformedChainOrderIds - Chain order IDs that were returned but could not be parsed (UNKNOWN, not absent)
      * @param {Set<string>} chainOrderIdsOnGrid - Output set: chain order IDs matched to grid
      * @param {Set<string>} matchedGridOrderIds - Output set: grid order IDs matched to chain
      * @param {Array<Object>} filledOrders - Output array: orders detected as filled
@@ -1113,7 +1128,7 @@ class SyncEngine {
      * @returns {Promise<any>}
      */
     async _performSyncFromOpenOrders(mgr: OrderManagerLike, assetAPrecision: number, assetBPrecision: number, parsedChainOrders: Map<string, ParsedChainOrder>, rawChainOrders: Map<string, Record<string, unknown>>,
-        chainOrderIdsOnGrid: Set<string>, matchedGridOrderIds: Set<string>, filledOrders: ManagedOrder[], updatedOrders: ManagedOrder[], ordersNeedingCorrection: PendingPriceCorrection[], unmatchedChainOrders: UnmatchedChainOrder[], options: Record<string, unknown>) {
+        malformedChainOrderIds: Set<string>, chainOrderIdsOnGrid: Set<string>, matchedGridOrderIds: Set<string>, filledOrders: ManagedOrder[], updatedOrders: ManagedOrder[], ordersNeedingCorrection: PendingPriceCorrection[], unmatchedChainOrders: UnmatchedChainOrder[], options: Record<string, unknown>) {
         const skipAccounting = (options?.skipAccounting ?? true) as boolean;
 
         const queueCorrection = (entry: PendingPriceCorrection) => {
@@ -1156,6 +1171,14 @@ class SyncEngine {
                 if (!chainOrder) continue;
                 let updatedOrder = { ...gridOrder };
                 chainOrderIdsOnGrid.add(gridOrder.orderId);
+                // A grid order matched against this snapshot IS a chain
+                // observation: record it with the only evidence kind that
+                // advances `observedAt` (when did the chain last tell us).
+                mgr._lifecycle?.markLanded?.(String(gridOrder.orderId), {
+                    slotId: String(gridOrder.id),
+                    evidence: 'chain-snapshot',
+                    phase: gridOrder.state === ORDER_STATES.PARTIAL ? 'filling' : 'landed',
+                });
                 // REVIVE BEFORE ANYTHING ELSE: this slot is not placed but its
                 // chain order is still live. Leaving it VIRTUAL is the "dark
                 // level" state — invisible to window accounting
@@ -1459,10 +1482,29 @@ class SyncEngine {
                 // at 3s each). Prevents permanent stall when a fill event was missed
                 // (reconnect gap, lossy subscription) and the only detection path is
                 // this open-orders sync.
-                if (gridOrder.orderId != null && mgr._committedOrderIds?.has(gridOrder.orderId)) {
-                    const commitAge = Date.now() - (mgr._committedOrderIdsBuiltAt || 0);
+                if (gridOrder.orderId != null) {
+                    const committedView = readLifecycle(mgr, gridOrder.orderId);
                     const isGhost = gridOrder.size <= 0 && gridOrder.state === ORDER_STATES.PARTIAL;
-                    if (!isGhost && commitAge < TIMING.SYNC_LOCK_TIMEOUT_MS) {
+                    // Guard 0: the order was returned but could not be decoded.
+                    // Absence is UNKNOWN — keep the id and let a later, readable
+                    // snapshot decide. Reading an unparseable entry as absent
+                    // virtualizes a live order and duplicates it on re-create.
+                    if (malformedChainOrderIds.has(String(gridOrder.orderId))) {
+                        mgr._lifecycle?.markUnknown?.(String(gridOrder.orderId), {
+                            slotId: String(gridOrder.id),
+                            evidence: 'chain-snapshot',
+                        });
+                        mgr.logger?.log?.(
+                            `[SYNC] ${gridOrder.id}: chain order ${gridOrder.orderId} is present but unparseable — ` +
+                            `absence is UNKNOWN (not virtualizing)`,
+                            'warn'
+                        );
+                        continue;
+                    }
+                    // Guard 1: committed-but-missing. Asked with the same
+                    // vocabulary as every other site (`isRecentlyCommitted`)
+                    // instead of re-deriving the window from the raw set.
+                    if (!isGhost && committedView.isRecentlyCommitted()) {
                         continue;
                     }
                 }
@@ -1475,11 +1517,12 @@ class SyncEngine {
                 // reconcile's _orderIdAssignedAt deferral: keep the id, re-check
                 // next sync. A PLACED slot keeps the existing behaviour.
                 if (!wasPlaced && hadOrderId) {
-                    const assignedAt = Number((mgr as unknown as { _orderIdAssignedAt?: Map<string, number> })._orderIdAssignedAt?.get(String(currentGridOrder.orderId)) || 0);
-                    if (assignedAt > 0 && Date.now() - assignedAt < TIMING.SYNC_LOCK_TIMEOUT_MS) {
+                    // Guard 2: fresh id on a slot that is not placed. Same
+                    // predicate as the startup reconcile's deferral.
+                    if (readLifecycle(mgr, String(currentGridOrder.orderId)).isRecentlyAssigned()) {
                         mgr.logger?.log?.(
                             `[SYNC] Stale-id check for ${gridOrder.id} deferred: chain id ${currentGridOrder.orderId} was ` +
-                            `assigned ${Date.now() - assignedAt}ms ago and is not in the snapshot — absence not yet trustworthy`,
+                            `assigned recently and is not in the snapshot — absence not yet trustworthy`,
                             'debug'
                         );
                         continue;

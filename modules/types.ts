@@ -971,6 +971,67 @@ interface ManagerRecoveryState {
  * (e.g. `requestStructuralGridResync`, `notifyBoundaryUpdate`) or read only
  * defensively; keep them optional so partial test doubles still type-check.
  */
+/**
+ * Three-valued result of an operation whose outcome is not always knowable.
+ *
+ * The engine used to encode this as an ad-hoc `uncertain: true` property next
+ * to a second ad-hoc flag (`ambiguousRead`), so the two could disagree and no
+ * consumer was forced to handle the third case. `unknown` is now a real
+ * alternative in the type: code that branches on "applied or not" fails to
+ * compile until it says what it does when it does not know.
+ */
+export type OutcomeKind = 'applied' | 'rejected' | 'unknown';
+
+/** Why the outcome is unknown. Every `unknown` must say which one it is. */
+export type UnknownCause = 'timeout' | 'ambiguous-read' | 'lost-receipt' | 'unavailable';
+
+export interface AppliedOutcome<T> {
+  kind: 'applied';
+  value: T;
+}
+
+export interface RejectedOutcome {
+  kind: 'rejected';
+  reason: string;
+}
+
+export interface UnknownOutcome {
+  kind: 'unknown';
+  cause: UnknownCause;
+  detail?: string;
+}
+
+export type Outcome<T = unknown> = AppliedOutcome<T> | RejectedOutcome | UnknownOutcome;
+
+/**
+ * Structural mirror of `LifecycleView` (modules/order/lifecycle.ts).
+ *
+ * Declared here rather than imported so `types.ts` stays dependency-free; the
+ * registry's own view type is structurally assignable to it.
+ */
+export interface OrderLifecycleViewLike {
+  slotId: string | null;
+  orderId: string | null;
+  phase: 'intent' | 'broadcasting' | 'landed' | 'filling' | 'gone' | 'unknown';
+  evidence: 'none' | 'local' | 'broadcast-receipt' | 'chain-snapshot' | 'fill-history' | 'adoption';
+  recordedAt: number;
+  observedAt: number;
+  assignedAt: number;
+  placedAt: number;
+  committedAt: number;
+  isUnknown: boolean;
+  mayExistOnChain: boolean;
+  isConfirmedGone: boolean;
+  isIntentOnly: boolean;
+  isOnChain: boolean;
+  isFreshlyPlaced(graceMs?: number, now?: number): boolean;
+  isRecentlyAssigned(windowMs?: number, now?: number): boolean;
+  isRecentlyCommitted(windowMs?: number, now?: number): boolean;
+  isInFlight(windowMs?: number, now?: number): boolean;
+  isUnresolvedFresh(now?: number): boolean;
+  appliedFillMatches(filledInt: number): boolean;
+}
+
 /** Minimal surface of the credit runtime consumed by the bot/manager layer. */
 export interface CreditRuntimeLike {
   config: GridConfig;
@@ -982,6 +1043,18 @@ export interface CreditRuntimeLike {
 }
 
 export interface OrderManagerLike {
+  /**
+   * Unified order-lifecycle read surface (see modules/order/lifecycle.ts).
+   * Answers "does this order exist on chain, and how sure are we" from ONE
+   * record instead of the per-site subsets the engine used to consult.
+   */
+  _lifecycle?: {
+    view(identity: string | null | undefined): OrderLifecycleViewLike;
+    markUnknown?(orderId: string | null | undefined, input?: { slotId?: string | null; evidence?: OrderLifecycleViewLike['evidence'] }): OrderLifecycleViewLike;
+    markLanded?(orderId: string | null | undefined, input?: { slotId?: string | null; evidence?: OrderLifecycleViewLike['evidence']; phase?: OrderLifecycleViewLike['phase'] }): OrderLifecycleViewLike;
+  };
+  getLifecycle(identity: string | null | undefined): OrderLifecycleViewLike;
+  getSlotLifecycle(slot: { id?: string; orderId?: string | null; createUncertain?: boolean } | null | undefined): OrderLifecycleViewLike;
   _consecutiveBoundaryHolds?: number;
   /**
    * Set by the spread-correction planner when the corrected side's rail reserves

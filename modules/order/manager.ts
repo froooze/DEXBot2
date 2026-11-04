@@ -27,6 +27,8 @@ import AsyncLock from './async_lock.js';
 import Accountant from './accounting.js';
 import StrategyEngine from './strategy.js';
 import SyncEngine from './sync_engine.js';
+import { LifecycleRegistry, isSlotCreateUncertain } from './lifecycle.js';
+import type { LifecycleView } from './lifecycle.js';
 import { calculateCurrentSpread, checkSpreadCondition, checkGridHealth } from './grid.js';
 import * as Format from './format.js';
 import {
@@ -614,11 +616,36 @@ class OrderManager implements OrderManagerLike {
     _syncGeneration: number;
     _gridVersion: number;
     _gridPersistenceSuspendedReason: string | null;
-    _pendingBroadcasts: Map<string, PendingBroadcast>;
-    _committedOrderIds: Set<string>;
-    _committedOrderIdsBuiltAt: number;
-    _orderIdAssignedAt: Map<string, number>;
-    _placedAt: Map<string, number>;
+    /**
+     * Single owner of "does this order exist on chain, and how sure are we".
+     * The legacy maps below are live views onto it — see modules/order/lifecycle.ts.
+     */
+    readonly _lifecycle: LifecycleRegistry;
+    /** Live view onto `_lifecycle`. Assigned as a whole by the COW commit path. */
+    get _committedOrderIds(): Set<string> { return this._lifecycle.committedIds; }
+    set _committedOrderIds(value: Iterable<string>) {
+        const ids = value ? [...value] : [];
+        this._lifecycle.markCommittedSnapshot(ids);
+    }
+    get _committedOrderIdsBuiltAt(): number { return this._lifecycle.committedBuiltAt; }
+    set _committedOrderIdsBuiltAt(value: number) { this._lifecycle.committedBuiltAt = value; }
+    get _orderIdAssignedAt(): Map<string, number> { return this._lifecycle.assignedAt; }
+    set _orderIdAssignedAt(value: Map<string, number>) {
+        this._lifecycle.assignedAt.clear();
+        if (value instanceof Map) for (const [id, ts] of value) this._lifecycle.assignedAt.set(id, ts);
+    }
+    get _placedAt(): Map<string, number> { return this._lifecycle.placedAt; }
+    set _placedAt(value: Map<string, number>) {
+        this._lifecycle.placedAt.clear();
+        if (value instanceof Map) for (const [id, ts] of value) this._lifecycle.placedAt.set(id, ts);
+    }
+    get _pendingBroadcasts(): Map<string, PendingBroadcast> {
+        return this._lifecycle.pendingBroadcasts as Map<string, PendingBroadcast>;
+    }
+    set _pendingBroadcasts(value: Map<string, PendingBroadcast>) {
+        this._lifecycle.pendingBroadcasts.clear();
+        if (value instanceof Map) for (const [fp, entry] of value) this._lifecycle.pendingBroadcasts.set(fp, entry);
+    }
     _gapSlots: number;
     _genesis: GridGenesis | null;
     _missingGenesis: unknown;
@@ -634,9 +661,15 @@ class OrderManager implements OrderManagerLike {
      * Chain-size resizes already absorbed by sync pass 1 (partial fill seen in
      * an open-orders snapshot). The fill-history batch that follows the same
      * fill must not subtract / credit the same amount a second time.
-     * key = chain orderId, value = base filled int + observation time.
+     * Live view onto `_lifecycle`; key = chain orderId.
      */
-    _chainSizeAppliedFills: Map<string, { filledInt: number; at: number }>;
+    get _chainSizeAppliedFills(): Map<string, { filledInt: number; at: number }> {
+        return this._lifecycle.appliedFills;
+    }
+    set _chainSizeAppliedFills(value: Map<string, { filledInt: number; at: number }>) {
+        this._lifecycle.appliedFills.clear();
+        if (value instanceof Map) for (const [id, entry] of value) this._lifecycle.appliedFills.set(id, entry);
+    }
     _recentFillKeysSnapshot: Record<string, number> | null;
     _lastFilledBuyPrice: number | null;
     _lastFilledSellPrice: number | null;
@@ -681,6 +714,9 @@ class OrderManager implements OrderManagerLike {
      * @param {Object} [config] - Configuration overrides
      */
     constructor(config: Record<string, unknown> = {}) {
+        // The lifecycle registry MUST exist before anything below touches the
+        // legacy chain-existence structures: they are views onto it.
+        this._lifecycle = new LifecycleRegistry();
         this.config = seedBotRuntimeConfig(config);
         this.marketName = this.config.market || (this.config.assetA && this.config.assetB ? `${this.config.assetA}/${this.config.assetB}` : null);
         const logFile = (config.logFile as string | undefined) || undefined;
@@ -1938,6 +1974,43 @@ class OrderManager implements OrderManagerLike {
         }
     }
 
+    /**
+     * The single answer to "does this order exist on chain, and how sure are we".
+     *
+     * Every consumer that used to infer this from one of the legacy maps must
+     * read it here instead — that is the whole point of the lifecycle registry:
+     * four sites consulting four different structures is how the engine ended up
+     * with four different answers for the same order.
+     *
+     * A `createUncertain` slot flag (persisted across restarts) is folded into
+     * `phase === 'unknown'` here, so no caller has to remember to check it.
+     *
+     * @param identity - Slot id, chain order id, or pending-broadcast fingerprint
+     * @returns {LifecycleView} Unified read surface (never null)
+     */
+    getLifecycle(identity: string | null | undefined): LifecycleView {
+        return this._lifecycle.view(identity);
+    }
+
+    /**
+     * Lifecycle view for a slot, folding in the slot's own persisted flags.
+     * Prefer this over `getLifecycle(slotId)` wherever a slot object is at hand.
+     * @param slot - Grid slot (ManagedOrder) or null
+     * @returns {LifecycleView}
+     */
+    getSlotLifecycle(slot: { id?: string; orderId?: string | null; createUncertain?: boolean } | null | undefined): LifecycleView {
+        if (!slot) return this._lifecycle.view(null);
+        const identity = slot.orderId || slot.id || null;
+        if (isSlotCreateUncertain(slot)) {
+            // The persisted marker outranks an older registry phase: a CREATE
+            // whose receipt was lost must never read as "nothing there".
+            // Read-only: `withPhase` reports `unknown` without recording it, so a
+            // read cannot keep the unresolved bound alive by refreshing its clock.
+            return this._lifecycle.withPhase(identity, 'unknown', 'broadcast-receipt');
+        }
+        return this._lifecycle.view(identity);
+    }
+
     _normalizeOrderUpdateOptions(options: UnknownRecord = {}): { skipAccounting: boolean; fee: number } {
         if (options === null || typeof options !== 'object' || Array.isArray(options)) {
             throw new TypeError('Order update options must be an object');
@@ -2022,6 +2095,11 @@ class OrderManager implements OrderManagerLike {
         const updatedOrder = deepFreeze({ ...nextOrder }) as ManagedOrder;
         const id = order.id;
 
+        // Project the mutation into the lifecycle registry FIRST, so the stamps
+        // written below (assignedAt, placedAt) resolve to the slot's record
+        // instead of creating a parallel order-keyed one.
+        this._syncLifecycleFromMutation(oldOrder, updatedOrder, context);
+
         // Track when an orderId is first assigned to a slot. A freshly assigned
         // orderId (create/adopt broadcast still in flight, or not yet visible to
         // a lagging/truncated chain read) must not be treated as "absent from
@@ -2072,6 +2150,87 @@ class OrderManager implements OrderManagerLike {
         this._markGridDirty();
 
         return true;
+    }
+
+    /**
+     * Project one order mutation into the lifecycle registry.
+     *
+     * This is the single write funnel for chain existence: every mutation goes
+     * through `_applyOrderUpdate`, so no call site has to remember which of the
+     * seven legacy structures to touch. A slot is the record's identity, so a
+     * chain-id change (rotation / re-place) updates the same record instead of
+     * starting a parallel one.
+     *
+     * @param previous - Slot before the mutation (absent on create)
+     * @param next - Slot after the mutation
+     * @param context - Mutation context label
+     * @returns {void}
+     */
+    _syncLifecycleFromMutation(previous: ManagedOrder | null | undefined, next: ManagedOrder, context: string): void {
+        try {
+            const slotId = String(next.id);
+            const nextId = next.orderId != null && String(next.orderId).length > 0 ? String(next.orderId) : '';
+            const prevId = previous?.orderId != null && String(previous.orderId).length > 0 ? String(previous.orderId) : '';
+
+            // Persisted "the CREATE result was lost" marker outranks everything:
+            // the order may be live, so the phase must never read as absent.
+            if (isSlotCreateUncertain(next)) {
+                this._lifecycle.markUnknown(nextId || null, { slotId, evidence: 'broadcast-receipt' });
+                return;
+            }
+
+            if (!nextId) {
+                // The slot holds no chain id. Marking it `intent` would claim
+                // "nothing is out there", which we may only say when nothing
+                // unresolved is on record — unless this very mutation is the
+                // explicit clear of the create-uncertain marker (the load-time
+                // sanitizer does exactly that after neutralising the slot).
+                const clearedUncertainMarker = isSlotCreateUncertain(previous) && !isSlotCreateUncertain(next);
+                if (clearedUncertainMarker) {
+                    this._lifecycle.markIntent({ slotId });
+                } else {
+                    this._lifecycle.markIntentIfResolved(slotId);
+                }
+                return;
+            }
+
+            if (nextId !== prevId) {
+                this._lifecycle.markAssigned(slotId, nextId);
+                const isLoadContext = context === 'grid-load' || context === 'grid-init';
+                if (!isLoadContext) this._lifecycle.markPlaced(nextId, undefined, slotId);
+            }
+
+            // This funnel only knows the LOCAL slot state, not where that state
+            // came from, so the evidence is 'local': it must not advance
+            // `observedAt` ("when did the CHAIN last tell us"). The chain-backed
+            // sites (sync pass 1 match, pass 2 adoption) call markLanded with
+            // 'chain-snapshot' / 'adoption' themselves.
+            if (next.state === ORDER_STATES.PARTIAL) {
+                this._lifecycle.observe(nextId, { slotId, phase: 'filling', evidence: 'local' });
+            } else if (next.state === ORDER_STATES.ACTIVE) {
+                this._lifecycle.observe(nextId, { slotId, phase: 'landed', evidence: 'local' });
+            }
+        } catch { /* lifecycle bookkeeping must never break an order update */ }
+    }
+
+    /**
+     * Abandon an unresolved pending CREATE (TTL sweep / give-up).
+     *
+     * Distinct from `_pendingBroadcasts.delete()`: dropping an entry because the
+     * create RESOLVED leaves the slot free, while dropping it because we ran out
+     * of patience means the order may still be live. Collapsing both into one
+     * delete is how a lost receipt turned into a clean hole that got re-CREATEd.
+     *
+     * @param fingerprint - Pending-broadcast fingerprint being abandoned
+     * @param entry - The abandoned entry (carries the slot id)
+     * @returns {void}
+     */
+    _expirePendingBroadcast(fingerprint: string, entry: PendingBroadcast | null | undefined): void {
+        const slotId = entry?.slotId != null ? String(entry.slotId) : null;
+        try {
+            this._lifecycle.deletePending(fingerprint);
+            if (slotId) this._lifecycle.markUnknown(null, { slotId, evidence: 'local' });
+        } catch { /* bookkeeping only */ }
     }
 
     _peekWorkingGrid(): WorkingGrid | null {

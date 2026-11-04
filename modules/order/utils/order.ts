@@ -286,6 +286,8 @@ function _filterUnmatchedChainOrders(manager: OrderManagerLike, chainOrderId: st
 function recordOrderPlacement(manager: OrderManagerLike, chainOrderId: string | null | undefined): void {
     try {
         if (!manager || chainOrderId == null || String(chainOrderId).length === 0) return;
+        // Writing through the facade records `placedAt` on the lifecycle record
+        // (one clock, one owner) — no separate grace bookkeeping to keep in sync.
         if (!(manager._placedAt instanceof Map)) manager._placedAt = new Map();
         manager._placedAt.set(String(chainOrderId), Date.now());
         // Lazy GC: placement timestamps only matter inside the grace window.
@@ -311,6 +313,11 @@ function recordOrderPlacement(manager: OrderManagerLike, chainOrderId: string | 
 function isFreshlyPlacedOrder(manager: OrderManagerLike, chainOrderId: string | null | undefined, graceMs?: number): boolean {
     try {
         if (chainOrderId == null || String(chainOrderId).length === 0) return false;
+        // Single definition of the grace window lives on the lifecycle view.
+        const lifecycle = manager?.getLifecycle;
+        if (typeof lifecycle === 'function') {
+            return lifecycle.call(manager, String(chainOrderId)).isFreshlyPlaced(graceMs);
+        }
         const placedAt = manager?._placedAt instanceof Map
             ? manager._placedAt.get(String(chainOrderId))
             : null;
@@ -2144,6 +2151,14 @@ function getLivePendingBroadcasts(manager: OrderManagerLike | null | undefined, 
             continue;
         }
         map.delete(fingerprint);
+        // Abandoned, not resolved: the order may be live. Route through the
+        // lifecycle so the slot records `unknown` instead of becoming a clean
+        // hole the next cycle re-CREATEs.
+        try {
+            const expire = (manager as unknown as { _expirePendingBroadcast?: (fp: string, entry: unknown) => void })
+                ?._expirePendingBroadcast;
+            if (typeof expire === 'function') expire.call(manager, String(fingerprint), entry);
+        } catch { /* bookkeeping only */ }
         log?.(
             `[COW] Dropped expired pending-broadcast entry ${String(fingerprint)} (slot ${entry?.slotId ?? '?'}, age ${Math.round(age / 1000)}s, ` +
             `${syncedSinceRecord ? 'sync completed since record' : 'hard TTL cap'})`,

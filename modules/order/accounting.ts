@@ -93,6 +93,7 @@ import { ORDER_TYPES, ORDER_STATES, PIPELINE_TIMING, TIMING, FEE_PARAMETERS, GRI
 import { resolveAccountRef } from './utils/system.js';
 import { resolveSpreadOrderSide, parseChainOrder, applyChainSizeToGridOrder, convertToSpreadPlaceholder, resolveEdgeCount } from './utils/order.js';
 import { parseSlotIndex } from './utils/slot.js';
+import { readLifecycle } from './lifecycle.js';
 import { isSlotInRail, resolveGapSlots, floatToBlockchainInt } from './utils/math.js';
 import * as Format from './format.js';
 import * as fundRegistry from '../fund_registry.js';
@@ -1014,11 +1015,11 @@ class Accountant {
                         mgr.logger?.log?.(`[RECOVERY] Skipping recalibration for ${gridOrder.id}: live order ${gridOrder.orderId} is unparseable (unknown, not absent)`, 'debug');
                         continue;
                     }
-                    const commitAge = Date.now() - (mgr._committedOrderIdsBuiltAt || 0);
-                    const recentCommit = mgr._committedOrderIds?.has?.(gridOrder.orderId) && commitAge < TIMING.SYNC_LOCK_TIMEOUT_MS;
-                    const assignedAt = mgr._orderIdAssignedAt?.get?.(gridOrder.orderId) || 0;
-                    const recentAssign = assignedAt > 0 && (Date.now() - assignedAt) < TIMING.SYNC_LOCK_TIMEOUT_MS;
-                    if (recentCommit || recentAssign) continue;
+                    // Single in-flight guard (modules/order/lifecycle.ts).
+                    // This site used to OR together `_committedOrderIds` and
+                    // `_orderIdAssignedAt` while the startup reconcile OR'd
+                    // neither-or-one; same order, different answer.
+                    if (readLifecycle(mgr, gridOrder.orderId).isInFlight()) continue;
                     result.attempted++;
                     const spreadOrder = convertToSpreadPlaceholder(gridOrder);
                     if (await applyUpdate(spreadOrder, 'recovery-fund-recalibration')) result.virtualized++;
