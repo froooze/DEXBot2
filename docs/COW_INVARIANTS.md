@@ -20,6 +20,7 @@ This document defines the non-negotiable behavioral invariants for the DEXBot2 s
 | `INV-COW` | COW pipeline |
 | `INV-PROJ` | Projection |
 | `INV-ID` | Order identity |
+| `INV-LIFE` | Order lifecycle (chain existence) |
 | `INV-ACC` | Accounting / fund tracking |
 | `INV-SYNC` | Sync engine |
 | `INV-MAINT` | Maintenance runtime |
@@ -30,6 +31,7 @@ This document defines the non-negotiable behavioral invariants for the DEXBot2 s
 | `INV-REG` | Fund registry |
 | `INV-SUB` | Subscriptions |
 | `INV-BROADCAST` | Broadcast |
+| `INV-TIME` | Timing windows |
 
 ---
 
@@ -137,6 +139,35 @@ This document defines the non-negotiable behavioral invariants for the DEXBot2 s
   - Registry failure logs an error (`order/accounting.ts`, cross-bot registry invariant block), not a silent skip.
 
 ---
+
+## Order Lifecycle ([ORDER_LIFECYCLE.md](ORDER_LIFECYCLE.md))
+
+Chain existence is answered by ONE record per slot (`modules/order/lifecycle.ts`),
+not by the seven per-site structures that used to disagree
+(`_pendingBroadcasts`, `createUncertain`, `_committedOrderIds`,
+`_orderIdAssignedAt`, `_placedAt`, `_chainSizeAppliedFills`,
+`_lastUnmatchedChainOrders`). Those now exist only as live views onto the record.
+
+- `INV-LIFE-001` Unknown is never gone
+  - `phase === 'unknown'` (lost receipt, ambiguous read, unparseable chain entry) implies `mayExistOnChain === true` and `isConfirmedGone === false`.
+  - Only a chain-observed absence sets `phase === 'gone'`. A consumer must never coerce `unknown` into "absent" via a default.
+
+- `INV-LIFE-002` One record per slot
+  - A slot is the identity across its order incarnations. A chain-id change (rotation, re-place, adoption) updates the existing record; it must not start a parallel one.
+  - Writers funnel through `_applyOrderUpdate` → `_syncLifecycleFromMutation`; no call site maintains its own chain-existence bookkeeping.
+
+- `INV-LIFE-003` One definition per guard
+  - Absence decisions ("is this order's absence trustworthy yet?") use `isInFlight()`.
+  - The committed-but-missing guard uses `isRecentlyCommitted()`.
+  - The fresh-id guard uses `isRecentlyAssigned()`.
+  - A read site must not re-derive a window from a raw map; that is how four sites ended up with four answers.
+
+- `INV-LIFE-004` Unresolved records are never evicted or downgraded
+  - Registry pruning skips `unknown` and `broadcasting`.
+  - A pending CREATE has two distinct exits: *resolved* (`deletePending` → `intent`) and *abandoned* (`_expirePendingBroadcast` → `unknown`). Collapsing them turns a lost receipt into a clean hole that gets re-CREATEd.
+
+- `INV-LIFE-005` Unparseable chain entries make absence unknown, not absent
+  - A chain order that was returned but could not be decoded puts its slot's absence in the UNKNOWN bucket (`sync_engine` pass-1 guard 0, mirroring the accounting recovery sweep's `malformedOrderIds`); the slot is not virtualized.
 
 ## Sync Engine
 
@@ -372,6 +403,12 @@ This document defines the non-negotiable behavioral invariants for the DEXBot2 s
   - Pending-broadcast liveness has ONE policy (`getLivePendingBroadcasts`): TTL, or TTL + a sync completed after the record, or 2× TTL hard cap. Every reader (COW guard, reconcile CREATE, reconcile surplus sweep, crossing candidates, maintenance lightweight-sync gate) uses it.
   - A PLACEMENT-BACKED hung region is torn down by ONE authority: `_clearStalePlacementRegion()` after `PLACEMENT_STALE_CLEAR_MS`, and it also clears that region's stale broadcast refcount atomically. The teardown's refcount clear is sound only because a refcount raised by a placement holder belongs to that same region; a refcount raised OUTSIDE any placement region (the spread-correction pre-broadcast hold in `order/grid.ts`) is not touched by it and is still cleared by its own watchdog. The broadcast watchdog refuses to act while a placement lease is held (so it only clears a refcount leaked without a lease), and the placement watchdog refuses a teardown while a bot-level pipeline counter younger than the bound proves progress.
   - The owner of a region must re-verify its own lease (`isPlacementLeaseCurrent`) before it BROADCASTS a CREATE/UPDATE batch: a watchdog teardown turns the lease into a stale token, and a resumed holder must abort instead of broadcasting unprotected (COW body: `PLACEMENT_LEASE_LOST`; reconcile Phase 1+2: the plan is discarded and the cycle defers). Pure cancel paths are exempt — a cancel carries its own order id and cannot duplicate a CREATE.
+
+
+- `INV-TIME-001` Every timing window is classified, and self-healing windows are removal targets
+  - `modules/timing_policy.ts` classifies every `TIMING` window as `external`, `bound`, `policy` or `self-healing`, each with a rationale; a `self-healing` window must also name the evidence that replaces it.
+  - `tests/test_timing_policy.ts` fails on an unclassified window, so the inventory can only shrink by decision.
+  - A wait that compensates for our own lost state is a bug with a timer attached; the fix is a lifecycle phase, not patience. See [TIMING_INVENTORY.md](TIMING_INVENTORY.md).
 
 ## Change Policy
 

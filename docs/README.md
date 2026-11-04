@@ -131,8 +131,21 @@ This directory contains the comprehensive technical documentation for the DEXBot
 ### 🔒 [COW Invariants](COW_INVARIANTS.md)
 *Stable theory contract for COW pipeline.*
 - **Non-negotiable invariants**: Master immutability, commit atomicity, projection rules, accounting separation
-- **Subsystem Scope**: 13 `INV-*` prefix groups mapping each invariant to its runtime subsystem
+- **Subsystem Scope**: 15 `INV-*` prefix groups mapping each invariant to its runtime subsystem
 - **Change Policy**: Required steps for an intentional invariant change — same-PR doc update, rationale, and regression tests
+
+### 🧭 [Order Lifecycle Registry](ORDER_LIFECYCLE.md)
+*How the engine answers one question from one record: does this order exist on chain, and how sure are we?*
+- **The problem**: seven structures with seven clocks, four read sites consulting four different subsets of them
+- **The model**: one record per slot, six phases, `unknown` as a real state that never reads as "gone"
+- **The wiring**: legacy maps are live views onto the record; every mutation funnels through `_applyOrderUpdate`
+- **Invariants**: `INV-LIFE-001…005` in [COW_INVARIANTS.md](COW_INVARIANTS.md#order-lifecycle-order_lifecyclemd)
+
+### ⏱ [Timing Window Inventory](TIMING_INVENTORY.md)
+*Every timing knob classified, with the self-healing ones marked as removal targets.*
+- **The audit**: `external` / `bound` / `policy` / `self-healing`, each with a rationale
+- **The gate**: `tests/test_timing_policy.ts` fails on an unclassified window, so the inventory can only shrink by decision
+- **Removal targets**: the six windows that compensate for our own lost state, and the evidence that replaces each
 
 ### 📐 [Grid-Price Invariant](GRID_PRICE_INVARIANT.md)
 *Why a slot's emitted price must equal its genesis level — and how that failed.*
