@@ -557,7 +557,7 @@ import {
     getOrderTypeFromUpdatedFlags
 } from './utils/order.js';
 import { parseSlotIndex } from './utils/slot.js';
-import { loadAmaCenterPrice, loadAmaCenterSnapshot, withBlockchainRetry, restoreLastFillPivot, resetLastFillPivot, rearmLastFillPivotFromMarketFill, evaluateSpreadCorrectionReadiness, maybeRefreshLiveMarketPrice, resolveLastFillGuardReference, isLastFillPlacementBlocked } from './utils/system.js';
+import { loadAmaCenterPrice, loadAmaCenterSnapshot, withBlockchainRetry, restoreLastFillPivot, resetLastFillPivot, rearmLastFillPivotFromMarketFill, reanchorBoundaryFromLastFill, evaluateSpreadCorrectionReadiness, maybeRefreshLiveMarketPrice, resolveLastFillGuardReference, isLastFillPlacementBlocked } from './utils/system.js';
 import * as MathUtils from './utils/math.js';
 import { derivePriceWithPoolRef, resolveStartPriceMode } from './utils/withPoolRef.js';
 import { getWhitelistFlags } from '../market_adapter_whitelist.js';
@@ -1228,27 +1228,48 @@ export async function loadGrid(manager: OrderManagerLike, grid: ManagedOrder[], 
                 }
             }
 
-            // Restore boundary index for StrategyEngine
-            if (restoredBoundary !== null) {
-                manager._restoreBoundary(restoredBoundary);
-                manager.logger?.log?.(`Restored boundary index: ${restoredBoundary}`, 'info');
-            }
-
             // Restart resilience: restore the persisted LAST-FILL-GUARD pivot
-            // WITH the boundary — after the persisted genesis is applied and
-            // the grid re-typed, before the first reconcile/broadcast — so a
-            // restart cannot re-open the cold window where the guard is
-            // disabled and evacuation stamps get applied against a boundary
-            // that is still being rebuilt. restoreLastFillPivot validates the
-            // row against the manager's live genesis (refuses on mismatch —
-            // a regenerated grid drops it) and onto the price ladder with the
-            // same one-increment drift rule the runtime guard applies.
+            // from the persisted genesis (refuses on mismatch — a regenerated
+            // grid drops it) onto the price ladder with the same one-increment
+            // drift rule the runtime guard applies. The boundary is restored
+            // AFTER the pivot because the fill anchor below needs it: the
+            // persisted boundary is disk state, while the fill is the geometry
+            // fact. This also closes the cold window where the guard is
+            // disabled during the restart.
             if (restoredBoundary !== null) {
                 try {
                     restoreLastFillPivot(manager, manager.accountOrders?.loadLastFillPivot?.() ?? null);
                 } catch (pivotErr) {
                     manager.logger?.log?.(`[LAST-FILL-GUARD] Persisted pivot restore failed (${getErrorMessage(pivotErr)}); book seed takes over`, 'warn');
                 }
+            }
+
+            // FILL-DERIVED GEOMETRY ON LOAD: a persisted boundary is still
+            // disk state. When the last real fill sits inside the implied band
+            // (a rebuild centered the band on the market while the pivot fell
+            // behind it), the startup picker will skip the levels at/through
+            // the fill and the realized spread stays two steps wide. Re-anchor
+            // the restored boundary to the fill BEFORE re-typing, using the
+            // same predicate the fill cycle uses. Cold/unsafe/anchor-less
+            // states keep the persisted value.
+            if (restoredBoundary !== null) {
+                const anchoredBoundary = anchorRebuildBoundaryToLastFill(
+                    manager,
+                    restoredBoundary,
+                    grid,
+                    loadGapSlots
+                );
+                if (anchoredBoundary !== restoredBoundary) {
+                    restoredBoundary = anchoredBoundary;
+                }
+            }
+
+            // Restore boundary index for StrategyEngine AFTER the fill anchor:
+            // the re-type pass below and every runtime consumer must see the
+            // anchored value, not the persisted one the anchor just corrected.
+            if (restoredBoundary !== null) {
+                manager._restoreBoundary(restoredBoundary);
+                manager.logger?.log?.(`Restored boundary index: ${restoredBoundary}`, 'info');
             }
 
             // Reassign slot types based on current boundary.
@@ -1443,6 +1464,130 @@ function resolveMinScaleSlots(primary: unknown, secondary: unknown): number {
     const s = Number(secondary);
     if (Number.isFinite(s)) return Math.max(0, Math.floor(s));
     return MARKET_ADAPTER.ASYMMETRIC_BOUNDS_MIN_SCALE_SLOTS;
+}
+
+/**
+ * Anchor a rebuilt or reloaded boundary to the last real fill.
+ *
+ * A fresh grid generation derives its band from the current market center, but
+ * the last execution is the geometry fact the fill cycle already honors:
+ *
+ *   BUY  fill at slot f -> boundary <= f - 1   (buy window ends below the fill)
+ *   SELL fill at slot f -> boundary >= f - gapSlots (sell window starts above it)
+ *
+ * Without this clamp, a generation centered ABOVE the pivot leaves the top
+ * buy levels at/through the fill. The startup picker then correctly skips them
+ * (the LAST-FILL-GUARD refuses the re-placement), fills the buy window lower,
+ * and the first ask stays at the old sellStart — a realized spread two grid
+ * steps wider than target with no order-fill reason for the extra width.
+ *
+ * The decision is delegated to `reanchorBoundaryFromLastFill` (single source:
+ * fill-provenanced pivot, on-ladder price, TTL, shared boundary validator), so
+ * this helper only fixes the array indexing (price-sorted ladder) and keeps a
+ * refusal fail-closed. Returns the original boundary when no safe anchor
+ * applies (cold pivot, already outside, off-ladder, unsafe geometry).
+ *
+ * @param manager - OrderManager holding the new generation + re-armed pivot
+ * @param boundaryIdx - Derived/restored boundary for that generation
+ * @param slots - Generation slots (any order; sorted by price here)
+ * @param gapSlots - Generation gap width
+ * @returns The fill-anchored boundary, or the original when no safe move exists
+ */
+export function anchorRebuildBoundaryToLastFill(
+    manager: OrderManagerLike,
+    boundaryIdx: number | null,
+    slots: Iterable<ManagedOrder> | null | undefined,
+    gapSlots: number | null | undefined
+): number | null {
+    if (boundaryIdx === null || (boundaryIdx as unknown) === '' || (boundaryIdx as unknown) === undefined) return boundaryIdx;
+    const boundary = Number(boundaryIdx);
+    if (!Number.isFinite(boundary)) return boundaryIdx;
+    const gap = Number(gapSlots);
+    if (!Number.isFinite(gap) || gap < 0) return boundaryIdx;
+    const ladder = Array.from(slots ?? [])
+        .filter((slot): slot is ManagedOrder => !!slot && Number.isFinite(Number(slot.price)))
+        .sort((a, b) => Number(a.price) - Number(b.price));
+    if (ladder.length === 0) return boundaryIdx;
+    let anchor: ReturnType<typeof reanchorBoundaryFromLastFill>;
+    try {
+        anchor = reanchorBoundaryFromLastFill(manager, boundary, ladder, gap, null);
+    } catch (err) {
+        manager.logger?.log?.(
+            `[BOUNDARY] Last-fill anchor failed during rebuild/load: ${getErrorMessage(err)}; keeping ${boundary}`,
+            'warn'
+        );
+        return boundaryIdx;
+    }
+    if (!anchor?.reanchored) {
+        // Only the actionable refusals are worth a line: a cold/already-outside
+        // state is the normal case on every boot.
+        if (anchor?.reason && anchor.reason !== 'already-outside' && anchor.reason !== 'cold-pivot'
+            && anchor.reason !== 'no-fill-side' && anchor.reason !== 'no-genesis') {
+            manager.logger?.log?.(
+                `[BOUNDARY] Last-fill anchor not applied (${anchor.reason}); keeping ${boundary}`,
+                'debug'
+            );
+        }
+        return boundaryIdx;
+    }
+    const next = Number(anchor.boundaryIdx);
+    if (!Number.isFinite(next) || !Number.isInteger(next) || next < 0) {
+        manager.logger?.log?.(
+            `[BOUNDARY] Last-fill anchor returned an invalid index (${String(anchor.boundaryIdx)}); keeping ${boundary}`,
+            'warn'
+        );
+        return boundaryIdx;
+    }
+    return next;
+}
+
+/**
+ * Apply the rebuild fill anchor AND re-type the rails for the anchored
+ * boundary.
+ *
+ * The split matters: `anchorRebuildBoundaryToLastFill` moves the band, but the
+ * slot roles still belong to createOrderGrid's structural boundary. Persisting
+ * those roles with the anchored boundary would leave the two counter levels
+ * typed as the old side (slot-158/159 BUY and 162/163 SPREAD for the incident)
+ * while every geometry consumer reads boundary 157. This helper keeps the
+ * boundary and the role assignment atomic, using the same `assignGridRoles`
+ * pass as a fresh build.
+ *
+ * @param manager - OrderManager holding the new generation + re-armed pivot
+ * @param boundaryIdx - Structural boundary from createOrderGrid
+ * @param slots - Slots from createOrderGrid
+ * @param gapSlots - Generation gap width
+ * @returns Anchored boundary and slots re-typed for it
+ */
+export function applyRebuildFillAnchor(
+    manager: OrderManagerLike,
+    boundaryIdx: number | null,
+    slots: Iterable<ManagedOrder> | null | undefined,
+    gapSlots: number | null | undefined
+): { boundaryIdx: number | null; slots: ManagedOrder[] } {
+    // assignGridRoles classifies by array position for non-empty slots, so the
+    // returned array must be the price-sorted ladder the boundary indexes.
+    const list = Array.from(slots ?? [])
+        .filter((slot): slot is ManagedOrder => !!slot && Number.isFinite(Number(slot.price)))
+        .sort((a, b) => Number(a.price) - Number(b.price));
+    const anchoredBoundary = anchorRebuildBoundaryToLastFill(manager, boundaryIdx, list, gapSlots);
+    const gap = Number(gapSlots);
+    if (anchoredBoundary === null
+        || !Number.isFinite(Number(anchoredBoundary))
+        || !Number.isFinite(gap)
+        || Number(anchoredBoundary) === Number(boundaryIdx)) {
+        return { boundaryIdx: anchoredBoundary, slots: list };
+    }
+    return {
+        boundaryIdx: anchoredBoundary,
+        slots: assignGridRoles(
+            list,
+            Number(anchoredBoundary),
+            gap,
+            ORDER_TYPES,
+            ORDER_STATES
+        ) as ManagedOrder[],
+    };
 }
 
 /**
@@ -1783,12 +1928,16 @@ export async function initializeGrid(manager: OrderManagerLike): Promise<void> {
             throw new Error(`Cannot initialize grid without account totals: ${getErrorMessage(e)}`);
         }
 
-        const { orders, boundaryIdx, initialSpreadCount, gapSlots, genesis } = createOrderGrid({
+        const { orders: derivedOrders, boundaryIdx, initialSpreadCount, gapSlots, genesis } = createOrderGrid({
             ...manager.config,
             startPrice: gridStartPrice,
             minPrice: resolvedMinP,
             maxPrice: resolvedMaxP,
         });
+        // Re-typed below if the fill anchor moves the boundary off the
+        // structural center; the derived array's roles are only valid for
+        // `boundaryIdx`.
+        let orders = derivedOrders;
         manager._gapSlots = gapSlots;
         if (genesis) {
             manager._genesis = genesis;
@@ -1825,14 +1974,33 @@ export async function initializeGrid(manager: OrderManagerLike): Promise<void> {
             rearmLastFillPivotFromMarketFill(manager);
         } catch {}
 
+        // FILL-DERIVED GEOMETRY ON REBUILD: a fresh generation centers the
+        // band on the current market, but the last real fill is still the
+        // geometry fact. If the derived boundary sits ahead of that fill, the
+        // startup picker will skip the levels at/through the fill (the
+        // LAST-FILL-GUARD correctly refuses same-side re-placement) and the
+        // realized spread ends up two steps wider than target. Anchor the
+        // boundary to the fill BEFORE the reconcile builds its windows:
+        // BUY fill at f => boundary <= f-1, SELL fill at f => boundary >= f-gap.
+        // This is a no-op for a cold pivot and for a fill already outside the
+        // window; unsafe candidates are refused by the shared validator.
+        const anchoredGeometry = applyRebuildFillAnchor(
+            manager,
+            boundaryIdx,
+            orders as ManagedOrder[],
+            gapSlots
+        );
+        const anchoredBoundary = anchoredGeometry.boundaryIdx;
+        orders = anchoredGeometry.slots as typeof orders;
+
         // RC-8: Update boundary with notification to dependent systems
         // Persist master boundary for StrategyEngine
-        if (manager.boundaryIdx !== boundaryIdx) {
-            manager._restoreBoundary(boundaryIdx);
+        if (manager.boundaryIdx !== anchoredBoundary) {
+            manager._restoreBoundary(anchoredBoundary);
             // RC-8: Notify StrategyEngine of boundary change (if method exists)
             if (typeof manager.notifyBoundaryUpdate === 'function') {
                 try {
-                    manager.notifyBoundaryUpdate(boundaryIdx);
+                    manager.notifyBoundaryUpdate(anchoredBoundary);
                 } catch (err) {
                     manager.logger?.log?.(`Error notifying boundary update: ${getErrorMessage(err)}`, 'warn');
                 }

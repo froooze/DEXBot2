@@ -664,6 +664,20 @@ anchoring on it leaves the furthest fill's counter order inside the implied
 band. `calculateTargetGrid` passes the batch into
 `reanchorBoundaryFromLastFill`.
 
+**Rebuild and load apply the same anchor.** A fresh generation derives its band
+from the current market center, but the last fill is still geometry fact. If
+that center puts the pivot inside the band, the startup picker correctly skips
+the levels at/through the fill (LAST-FILL-GUARD), fills the same-side window
+lower, and the first ask stays at the old `sellStart` — a realized spread two
+steps wider than target with no fill reason for the extra width (live
+2026‑11‑04: boundary 159 after a BUY at new-ladder slot 158, realized 2.123% vs
+the 1.5% target). `initializeGrid` and `loadGrid` therefore call
+`anchorRebuildBoundaryToLastFill` after the pivot is re-armed/restored and
+before reconcile/re-type; `applyRebuildFillAnchor` moves the boundary and
+re-types the rails atomically (`BUY fill at 158 => boundary 157`, counter SELL
+at 162). A cold/off-ladder/unsafe fill keeps the derived boundary, so this is a
+no-op on a healthy restart.
+
 ### Rail-Derived Commit Boundary (counter orders are the fact)
 
 A plan built at a re-anchored boundary places **counter orders** on the promoted

@@ -49,7 +49,7 @@ const NAMES = {
         'maybeRefreshLiveMarketPrice', 'refreshLiveMarketPrice',
         'resolveSpreadFreshnessMs', 'resolveSpreadCrossingFloor',
         'setLastFillPivot', 'normalizeLastFillPivot',
-        'rearmLastFillPivotFromMarketFill',
+        'rearmLastFillPivotFromMarketFill', 'reanchorBoundaryFromLastFill',
         'fireStructuralResync',
         // Fill-discipline predicates (grid_reconcile_internal / maintenance
         // runtime): stubbed settled here so the resync stages below exercise
