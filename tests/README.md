@@ -204,3 +204,28 @@ Shared utility functions, precision handling, chain helpers.
 ---
 
 **Note:** Interactive/diagnostic scripts (`connection_test.ts`, `diag_*`, `benchmark_cow.ts`, `sim_batching.ts`, `repro_phantom_orders.ts`) require network access or real state and are **not** run by `npm test` — the runner only globs `test_*.js`. Run these manually when debugging.
+
+## Harnesses (not run by `npm test`)
+
+Two files are investigative harnesses rather than assertions about production
+code, so they are deliberately *not* `test_*.ts`:
+
+- `recon_fuzz.ts` — the interleaving fuzzer for the reconciliation engine. Drives
+  the real `SyncEngine` against a scripted chain (landed / vanished / partially
+  filled / orphaned / duplicated / lagging / unparseable reads), asserts
+  policy-free invariants after **every** event, and shrinks a failing sequence to
+  a seed + step count.
+
+  ```bash
+  npm run build:tests
+  node dist/tests/recon_fuzz.js                          # 40 scenarios × 25 steps
+  RECON_FUZZ_SCENARIOS=120 RECON_FUZZ_STEPS=40 node dist/tests/recon_fuzz.js
+  RECON_FUZZ_TRACE=1 RECON_FUZZ_DEBUG=1 node dist/tests/recon_fuzz.js
+  ```
+
+  `RECON_FUZZ_SEED=<n> RECON_FUZZ_STEPS=<n>` replays a reported failure. The run
+  fails if the scenarios are vacuous (coverage floors on placed-slot
+  observations and on un-adoptable orphans), so a green run means the engine was
+  actually exercised.
+
+- `sim_batching.ts` — arithmetic mirror of the gap-slot batch sizing rule.
