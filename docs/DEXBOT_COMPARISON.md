@@ -1,7 +1,7 @@
 # DEXBot vs DEXBot2 — Detailed Comparison Report
 
 > **Date:** 2026-09-02 *(metrics refreshed against local source trees)*
-> **Scope:** Full architectural, functional, and operational comparison between the original [DEXBot](https://github.com/Codaone/DEXBot) (Python, v1.0.0) and DEXBot2 (TypeScript, v1.7.1).
+> **Scope:** Full architectural, functional, and operational comparison between the original [DEXBot](https://github.com/Codaone/DEXBot) (Python, v1.0.0) and DEXBot2 (TypeScript, v1.7.2).
 > **Audience:** Developers, contributors, and operators evaluating or migrating between the two projects.
 
 ---
@@ -36,7 +36,7 @@
 
 | Attribute | DEXBot (original) | DEXBot2 |
 |---|---|---|
-| **Release Track** | 1.0.0 | v1.7.1 |
+| **Release Track** | 1.0.0 | v1.7.2 |
 | **Language** | Python 3.6+ | TypeScript 5.x |
 | **Status** | Released 1.0.0, unmaintained | Active development |
 | **Last Repo Activity** | May 23, 2020 | 2026-09-02 |
@@ -776,10 +776,10 @@ Where:
 
 | Metric | DEXBot | DEXBot2 |
 |---|---|---|
-| **Release Track** | 1.0.0 | v1.7.1 |
+| **Release Track** | 1.0.0 | v1.7.2 |
 | **Active Since** | ~2018 | December 2025 |
 | **Last Commit** | May 23, 2020 | 2026-11-04 |
-| **Total Commits** | 2281 | 2,492 (current HEAD, v1.7.1 line) |
+| **Total Commits** | 2281 | 2,506 (current HEAD, v1.7.2 line) |
 | **Lines of Code** | ~10,846 Python LOC in `dexbot/` | Large TypeScript runtime + adapter + Claw + analysis + tests |
 | **Source Files** | 72 Python files in `dexbot/` | ~656 TS files across the repo |
 | **Test Files** | 16 Python test files | 367 `test_*.ts` files (350 `tests/` + 17 `claw/tests/`, auto-discovered via `globSync`) |

@@ -2,14 +2,14 @@
 
 ## Executive Summary
 
-DEXBot2 is a sophisticated decentralized exchange trading bot for the BitShares blockchain. This report documents the complete evolution of the project from its inception in December 2025 through the current 1.7.1 release.
+DEXBot2 is a sophisticated decentralized exchange trading bot for the BitShares blockchain. This report documents the complete evolution of the project from its inception in December 2025 through the current 1.7.2 stable release.
 
 ### Key Milestones
 - **Project Inception**: December 2, 2025
-- **Growth Phase**: 2,492 commits over ~9 active months
+- **Growth Phase**: 2,506 commits over ~9 active months
 - **Code Maturity**: Evolution from basic utilities to a ~100,000+ LoC intelligent TypeScript system
-- **Stability**: Progression from manual testing to a suite of 353 automated test files (14 live tests skipped)
-- **Releases**: 152 version entries in the changelog (v0.1.0 to v1.7.1)
+- **Stability**: Progression from manual testing to a suite of 358 automated test files (live tests included in `test:live`)
+- **Releases**: 153 changelog entries (v0.1.0 to v1.7.2)
 
 > **Post-1.0.0 "why":** the thematic story behind the hardening releases — root cause, recurring
 > bug families, and lessons — lives in
@@ -177,12 +177,13 @@ Compact, era-level view; commit counts are `git rev-list --count <tag>..<tag>` o
 | v1.6.16 → v1.6.17 | 11 | Last-fill direction guard, placeable-slot spread planning with named stalls, chain-truth funding + fill-anchored boundary re-anchor, owed-crawl consumption, restart auth-before-stop with cleared vault secret, pool-priced LP-share collateral, AMA slowPeriod/slope retune, BTS & per-token supply distribution analyzers |
 | v1.6.17 → v1.6.18 | 19 | Partial-fill re-anchor recovery (stale-evac skip, residual allow-list, crawl subsumption, rotation-only repair), rail-derived boundary + live fill/chain prices, edge-fill pivot exclusion, guard arity pinning with explicit re-arm, per-slot last-fill exclusion count, CLI `--flag=value` walker, `__test` seam guard, export-surface cleanup |
 | v1.6.18 → v1.7.0 | 11 | Liquidity depth chart + `dexbot liquid`/`liq`/`liqu`, `dexbot asset` supply distribution shortcut, pool id/pool-token chart targets + shared spawn runner, case-insensitive asset lookup, asset-report chain-request cuts, shared CLI terminal output, orphan-fill attribution + dark-level revive, stale-grid re-buy discipline, pivot clock provenance & read-time TTL |
+| v1.7.1 → v1.7.2 | 13 | One fill contract + fill-pipeline ratchet, fail-closed grid-update blockers with bounded escalation, single fill identity (`fill_ledger`), credit-time fill-key claim with all-or-nothing balance credits, single-winner concurrent claim, removal of the duplicate applied-amount channel and the second grace-stamp writer, COW broadcast-region leak repair, chain-observed wrong-side cancel exemptions, fill side derived from the paid asset + rail-geometry repair check, fill-anchored rebuild/load boundary, spread rotation into orphaned rail slots, consecutive grid-blocked escalation counter, live-suite env fix |
 | v1.7.0 → v1.7.1 | 22 | One existence record per slot (life-cycle registry, unknown-is-never-gone), typed three-valued broadcast outcome, timing-window policy inventory, reconciliation interleaving fuzzer, one writer per life-cycle clock, serialized placement region with lease re-verification, fill-marker idempotency, forced-retreat gap evacuation + committed-geometry sweep, unknown-gap-geometry fix, replay-safe stranded-boundary repair, stability-ranked node selection + flap scoring, chain-account `<bot>` targets for `credit`/`order`, fee-adjusted pool depth chart with both spreads, atomic branch promotion preflight |
 
 ---
 
 **Report Originally Generated**: February 19, 2026
 **Last Updated**: November 4, 2026
-**Total Commits**: 2,492
+**Total Commits**: 2,506
 **Date Range**: December 2, 2025 – November 4, 2026
 **Repository**: DEXBot2 (BitShares DEX Trading Bot)
