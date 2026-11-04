@@ -11,15 +11,14 @@
  * cancellation until the grace window expires.
  *
  * Covered:
- *  - recordOrderPlacement / isFreshlyPlacedOrder semantics (unknown, null,
- *    fresh, custom grace, aged-out, empty id, missing manager) + lazy GC;
+ *  - isFreshlyPlacedOrder semantics (unknown, null, empty id, fresh, custom
+ *    grace, aged-out, missing manager);
  *  - the correction drain holds fresh cancels back from BOTH the batched
  *    (correctAllPriceMismatches -> _batchCancelCorrections) and the serial
  *    (correctOrderPriceOnChain) paths, and older placements cancel normally.
  */
 const assert = require('assert');
 const {
-    recordOrderPlacement,
     isFreshlyPlacedOrder,
     correctAllPriceMismatches,
 } = require('../modules/order/utils/order');
@@ -41,24 +40,17 @@ console.log(' - Surplus-cancel grace...');
     check('unknown id not fresh', isFreshlyPlacedOrder(mgr, '1.7.1'), false);
     check('null id not fresh', isFreshlyPlacedOrder(mgr, null), false);
 
-    recordOrderPlacement(mgr, '1.7.1');
+    // The stamp writer is the lifecycle funnel; this manager-shaped double keeps
+    // the fallback map the production facade also exposes.
+    mgr._placedAt.set('1.7.1', Date.now());
     check('just placed is fresh', isFreshlyPlacedOrder(mgr, '1.7.1'), true);
     check('custom grace honored (5s)', isFreshlyPlacedOrder(mgr, '1.7.1', 5000), true);
 
     mgr._placedAt.set('1.7.1', Date.now() - 20 * 60 * 1000);
     check('aged out not fresh', isFreshlyPlacedOrder(mgr, '1.7.1'), false);
 
-    recordOrderPlacement(mgr, '');
-    check('record ignores empty id', mgr._placedAt.has(''), false);
-    check('record on missing manager safe', recordOrderPlacement(null, '1.7.1'), undefined);
+    check('empty id not fresh', isFreshlyPlacedOrder(mgr, ''), false);
     check('fresh test on missing manager safe', isFreshlyPlacedOrder(null, '1.7.1'), false);
-
-    // Lazy GC: aged stamps are trimmed when the map grows past its bound.
-    const big = fakeManager();
-    for (let i = 0; i < 600; i++) big._placedAt.set(`old-${i}`, Date.now() - 60 * 60 * 1000);
-    recordOrderPlacement(big, 'fresh');
-    check('lazy GC trims aged stamps', big._placedAt.size < 600, true);
-    check('fresh stamp survives GC', big._placedAt.has('fresh'), true);
 
     // Default grace is 15 minutes: a 10-minute-old stamp is still fresh.
     const live = fakeManager();
@@ -103,8 +95,8 @@ async function runDrainGraceTests() {
 
     {
         const mgr = createManager([cancelEntry('1.7.111'), cancelEntry('1.7.112')], new Map());
-        recordOrderPlacement(mgr, '1.7.111');
-        recordOrderPlacement(mgr, '1.7.112');
+        mgr._placedAt.set('1.7.111', Date.now());
+        mgr._placedAt.set('1.7.112', Date.now());
         let opBuilds = 0;
         let serialCancels = 0;
         const accountOrders = {

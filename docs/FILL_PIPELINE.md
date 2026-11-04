@@ -156,8 +156,9 @@ requires editing the test — that edit is the review.
    mark synchronous at credit time) now holds, but the window has a second role: claims
    restored from `_recentFillKeysSnapshot` after a crash are the one case where nobody
    knows whether the credit happened. Blocking them forever loses a fill; dropping them
-   retries a possible credit. The **dedupe horizon** is `FILL_RECORD_RETENTION_MS` in the
-   store (a booked key is refused at any age). Documented in `constants.ts`,
+   retries a possible credit. A booked key is refused **while it is retained**, regardless of age;
+   `FILL_RECORD_RETENTION_MS` bounds retention (memory and startup load), it is
+   not an expiry that re-allows a credit. Documented in `constants.ts`,
    `timing_policy.ts`, `TIMING_INVENTORY.md`.
 4. **`_chainSizeAppliedFills` cannot become a store assertion.** It carries pass-1
    *size-application* evidence, a different fact from "this key was booked". Only its

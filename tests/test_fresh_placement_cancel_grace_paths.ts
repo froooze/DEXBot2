@@ -18,7 +18,6 @@ const { COWRebalanceEngine, OrderManager } = require('../modules/order/manager')
 const { applyGridDivergenceCorrections } = require('../modules/order/utils/system');
 const { updateGridFromBlockchainSnapshot } = require('../modules/order/grid');
 const { ORDER_STATES, ORDER_TYPES, COW_ACTIONS } = require('../modules/constants');
-const { recordOrderPlacement } = require('../modules/order/utils/order');
 
 let assertions = 0;
 function check(name: string, actual: unknown, expected: unknown) {
@@ -231,7 +230,7 @@ async function testDivergencePath() {
         // under test. This mirrors a real sweep where the target has since
         // aged past the grace window.
         manager._placedAt.clear();
-        if (fresh) recordOrderPlacement(manager, 'chain-0');
+        if (fresh) manager._placedAt.set('chain-0', Date.now());
 
         manager._gridSidesUpdated = new Set([ORDER_TYPES.BUY]);
         manager.outOfSpread = 1;

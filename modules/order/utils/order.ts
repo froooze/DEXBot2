@@ -106,10 +106,10 @@
  *   - checkGridPriceInvariant(...) - The price emitted for a slot must equal its genesis price
  *   - reportGridPriceInvariant(...) - Report one GRID-PRICE-INVARIANT check
  *
- * SECTION 14: PERSISTED CRAWL & PLACEMENT GRACE (3 functions)
+ * SECTION 14: PERSISTED CRAWL & PLACEMENT GRACE (2 functions)
  *   - consumePendingFillCrawls(...) - Apply recorded-but-uncommitted fill crawls to the boundary
- *   - recordOrderPlacement(...) - Record a fresh on-chain placement timestamp
  *   - isFreshlyPlacedOrder(...) - Chain order placed within the surplus-cancel grace
+ *     (the stamp itself is written only by the lifecycle funnel)
  *
  * ===============================================================================
  */
@@ -276,37 +276,6 @@ function _filterUnmatchedChainOrders(manager: OrderManagerLike, chainOrderId: st
             (u) => (u?.id || u?.orderId || u?.chainOrderId) !== chainOrderId
         );
     }
-}
-
-/**
- * Record a fresh on-chain placement timestamp for surplus-cancel grace.
- * Powers isFreshlyPlacedOrder below.
- *
- * NOTE: in production the placement stamp is written by the lifecycle write
- * funnel (`OrderManager._syncLifecycleFromMutation` -> `markPlaced`) for every
- * mutation, including the COW whole-map commit. This helper remains for callers
- * that hold only a manager-shaped object (tests, fixtures) and for the `_placedAt`
- * retention bound; it writes through the same facade, so there is still one copy
- * of the stamp.
- *
- * @param {unknown} manager - OrderManager instance (owns `_placedAt`)
- * @param {string} chainOrderId - Chain order id that was just placed
- */
-function recordOrderPlacement(manager: OrderManagerLike, chainOrderId: string | null | undefined): void {
-    try {
-        if (!manager || chainOrderId == null || String(chainOrderId).length === 0) return;
-        // Writing through the facade records `placedAt` on the lifecycle record
-        // (one clock, one owner) — no separate grace bookkeeping to keep in sync.
-        if (!(manager._placedAt instanceof Map)) manager._placedAt = new Map();
-        manager._placedAt.set(String(chainOrderId), Date.now());
-        // Lazy GC: placement timestamps only matter inside the grace window.
-        if (manager._placedAt.size > 500) {
-            const cutoff = Date.now() - TIMING.SURPLUS_CANCEL_GRACE_MS * 2;
-            for (const [id, ts] of manager._placedAt) {
-                if (Number(ts) < cutoff) manager._placedAt.delete(id);
-            }
-        }
-    } catch { /* bookkeeping must never break placement */ }
 }
 
 /**
@@ -4177,5 +4146,5 @@ function collectKnownOnChainOrderIds(mgr: OrderManagerLike, placedResults: unkno
 
 export { parseChainOrder, resolveLiveOrderLadderPosition, applyChainSizeToGridOrder, resolveExecutionPrice, resolveSlotIdForFillPrice, reviveVirtualSlotFromChain, attributeUnmatchedFillToGrid, getLivePendingBroadcasts,  buildFillKey, correctOrderPriceOnChain, correctAllPriceMismatches, _validatePriceCorrectionEntry, _stampCorrectionProvenance, findLiveOrderOwnerByChainId, buildCreateOrderArgs, getOrderTypeFromUpdatedFlags, resolveConfiguredPriceBound, virtualizeOrder, convertToSpreadPlaceholder, toRailHolePlaceholder, geometryTypeForSlotIndex, detectGapEvacuationCandidates, updateGapEvacuationStreaks, resolveSpreadOrderSide, chainOrderMatchesSlot, chainOrderMatchesSlotWithTolerance, crossingCandidateChainId, isCrossingCheckCandidate, buildCrossingCheckCandidates, filterOrdersByType, buildOutsideInPairGroups, extractBatchOperationResults, formatUnmatchedChainOrder, isNonBlockingUnmatchedOrder, isStrandedHoldOrder, isOrderOnChain, isOrderVirtual, hasOnChainId, isOrderPlaced, isPhantomOrder, isSlotAvailable, isEmptyGridSlot, isOrderHealthy, checkSizeThreshold, checkSizesBeforeMinimum, calculateIdealBoundary, assignGridRoles, resolveOnChainRetypeType, shouldFlagOutOfSpread, buildIndexes, validateIndexes, ordersEqual, buildDelta, deriveTargetBoundary, isShiftEligibleFill, resolveEdgeCount, resolveEdgeOrders, selectEdgeSlots, getCoreOrdersTotal, getSideBudget, calculateBudgetedSizes, buildCreateOpFingerprint, isOrderGoneErrorMessage, isStructuralRebuildStaleReason, recordDuplicateOrphanDetection, clearDuplicateOrphanDetection, duplicateOrphanLogInfo, chainOrderUnchangedFromCache, detectCrossedBookPlan, collectKnownOnChainOrderIds, collectEdgePinnedFillIds, edgeOrderIdSet, liveWindowIdSet, checkGridPriceInvariant, reportGridPriceInvariant };
 export type { CrawlEntry }
-export { resolveEdgeAnchorPrice, resolveLiveEdgeAnchorPrice, compareEdge, collectRefillSlotIds, recordOrderPlacement, isFreshlyPlacedOrder, _filterUnmatchedChainOrders };
+export { resolveEdgeAnchorPrice, resolveLiveEdgeAnchorPrice, compareEdge, collectRefillSlotIds, isFreshlyPlacedOrder, _filterUnmatchedChainOrders };
 

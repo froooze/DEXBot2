@@ -1918,6 +1918,15 @@ class Accountant {
          }
 
           const processedFillStore = this.manager.processedFillStore;
+          // The claim, the duplicate gate and the rollback must all touch ONE map.
+          // In a wired bot `processedFillTracker` IS `processedFillStore.tracker`
+          // (dexbot_fill_runtime assigns the store map to the manager), but a
+          // split fixture or a host that wiring never reached would otherwise
+          // claim a key the ingest check cannot see. Prefer the store's map when
+          // it exists; the in-memory tracker is the fallback.
+          const claimTracker = processedFillStore?.tracker instanceof Map
+              ? processedFillStore.tracker
+              : tracker;
 
           // Queue the dedup key before applying balance adjustments. This ensures
           // persist failures are caught before any balance mutation. The queue entry
@@ -1943,8 +1952,16 @@ class Accountant {
           // claim lease in the bot only covers that when its window has not
           // expired. Rolled back on every failure path below, so the invariant is
           // "booked ⇒ tracker has the key" with no half-claimed keys.
+          //
+          // The check and the set are ONE synchronous step: the duplicate check
+          // above happens before `persist()` awaits, so two concurrent callers can
+          // both pass it and then both credit. Re-checking here (no await in
+          // between) makes the claim the actual single-winner gate. The loser must
+          // NOT discard the queued write: the pending entry is keyed by fill key
+          // and belongs to the winner's booking.
           if (fillKey) {
-              tracker.set(fillKey, processedAt || Date.now());
+              if (claimTracker.has(fillKey)) return false;
+              claimTracker.set(fillKey, processedAt || Date.now());
           }
 
           try {
@@ -1977,7 +1994,7 @@ class Accountant {
               // existing key) and no credit was committed, so release it — otherwise
               // the fill could never be retried.
               if (fillKey) {
-                  tracker.delete(fillKey);
+                  claimTracker.delete(fillKey);
                   processedFillStore?.discard(fillKey, processedAt || Date.now());
               }
               if (appliedInt > 0 && typeof mgr.noteChainSizeAppliedFill === 'function') {
@@ -2001,7 +2018,7 @@ class Accountant {
                       await this.adjustTotalBalance(adj.orderType, -adj.delta, 'rollback-' + adj.operation);
                   }
                   processedFillStore.discard(fillKey, processedAt || Date.now());
-                  tracker.delete(fillKey);
+                  claimTracker.delete(fillKey);
                   // The marker was consumed for this attempt; the rolled-back
                   // fill must be able to skip the pass-1 size release on retry.
                   if (appliedInt > 0 && typeof mgr.noteChainSizeAppliedFill === 'function') {
@@ -2014,10 +2031,10 @@ class Accountant {
           if (fillKey) {
               // Already claimed before the credit; prune beyond the retention
               // horizon so the tracker cannot grow without bound.
-              if (tracker.size > 500) {
+              if (claimTracker.size > 500) {
                   const cutoff = (processedAt || Date.now()) - TIMING.FILL_RECORD_RETENTION_MS;
-                  for (const [k, ts] of tracker) {
-                      if (ts < cutoff) tracker.delete(k);
+                  for (const [k, ts] of claimTracker) {
+                      if (ts < cutoff) claimTracker.delete(k);
                   }
               }
           }

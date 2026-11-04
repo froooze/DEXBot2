@@ -850,7 +850,7 @@ class OrderManager implements OrderManagerLike {
         this._committedOrderIdsBuiltAt = 0;
         this._orderIdAssignedAt = new Map();
         // Fresh-placement timestamps (chainOrderId -> Date.now) for the
-        // surplus-cancel grace window. See recordOrderPlacement.
+        // surplus-cancel grace window. Written by this lifecycle funnel only.
         this._placedAt = new Map();
         this._gapSlots = 0;
         // Genesis (price-ladder) state. `_genesis` is established by

@@ -676,7 +676,7 @@ class DEXBot implements BotLike {
      *      churn and a FILL DETECTED log.
      *   2. **The claim lease** — fills accepted but not yet booked (deferral,
      *      crash). Its TTL (`FILL_DEDUPE_WINDOW_MS`) is a lease, not the dedupe
-     *      horizon; the store is the dedupe horizon (`FILL_RECORD_RETENTION_MS`).
+     *      authority; the store refuses a booked key while retained, at any age.
      *
      * Claims are released on every path that does not book (requeue, orphan
      * adoption, stale-totals deferral), so a held claim means "in flight".

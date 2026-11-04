@@ -191,7 +191,7 @@ export const TIMING_CLASSIFICATIONS: Readonly<Record<string, TimingClassificatio
     },
     FILL_DEDUPE_WINDOW_MS: {
         kind: 'self-healing',
-        rationale: 'Lease on a fill CLAIM accepted but not yet booked (deferral/crash). The dedupe horizon is the processed-fill store (FILL_RECORD_RETENTION_MS); a booked key is refused at any age.',
+        rationale: 'Lease on a fill CLAIM accepted but not yet booked (deferral/crash). The processed-fill store refuses a booked key while retained, at any age; FILL_RECORD_RETENTION_MS bounds retention, not an expiry.',
         removal: 'Delete once startup recovery reconciles a restored claim against chain-balance evidence (recomputing the credit from chain truth) instead of bounding it by age.',
     },
 });

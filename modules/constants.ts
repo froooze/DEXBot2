@@ -257,9 +257,10 @@ let TIMING = {
 
     // Fill processing timing
     // Claim LEASE for a fill accepted into the queue but not yet booked
-    // (deferral, crash). It is NOT the dedupe horizon: that is
-    // FILL_RECORD_RETENTION_MS in the processed-fill store, which refuses a
-    // booked key regardless of age (docs/FILL_PIPELINE.md stage 2).
+    // (deferral, crash). It is NOT the dedupe authority: the processed-fill
+    // store refuses a booked key while it is retained, regardless of age;
+    // FILL_RECORD_RETENTION_MS bounds that retention, it is not an expiry
+    // (docs/FILL_PIPELINE.md stage 2).
     FILL_DEDUPE_WINDOW_MS: 5000,
     FILL_RECORD_RETENTION_MS: 7 * 24 * 60 * 60 * 1000, // 7 days - how long to keep persisted fill records (was 1h, increased to close double-credit window on restarts >1h apart)
     PROCESSED_FILL_PERSIST_BATCH_MS: 250, // 250ms - coalesce processed-fill persistence writes under burst load

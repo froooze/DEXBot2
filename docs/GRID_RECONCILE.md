@@ -131,9 +131,9 @@ remain unchanged.
 
 **Fresh-placement grace (`TIMING.SURPLUS_CANCEL_GRACE_MS`, 15 min):** surplus
 and cancel-only cancellations also skip any order whose `orderId` was placed
-inside the grace window. The timestamp is written by the lifecycle write funnel
-(and by `recordOrderPlacement` for manager-shaped callers) into
-`manager._placedAt` and tested with `isFreshlyPlacedOrder`; the reconciler's CANCEL
+inside the grace window. The timestamp is written only by the lifecycle write
+funnel (`_syncLifecycleFromMutation` -> `markPlaced`) into `manager._placedAt`
+and tested with `isFreshlyPlacedOrder`; the reconciler's CANCEL
 actions are filtered by `COWRebalanceEngine.execute`, which drops the whole slot's
 action group (a paired CANCEL+CREATE must not lose only its CANCEL, or the CREATE
 folds back into an UPDATE and re-materializes the placement) and re-syncs the

@@ -76,12 +76,13 @@ import { getStorage } from '../storage/index.js';
 import { createRequire } from 'node:module';
 import { path } from '../path_api.js';
 import * as Format from './format.js';
-import { TIMING, DEFAULT_CONFIG } from '../constants.js';
+import { TIMING, DEFAULT_CONFIG, ORDER_TYPES } from '../constants.js';
 import { PATHS } from '../paths.js';
 import Logger from '../order/logger.js';
 import { getErrorMessage } from '../utils/errors.js';
 import type { GridConfig, UnknownRecord } from '../types.js';
 import { nowIso } from './utils/system.js';
+import { resolveTradedSide } from './fill_ledger.js';
 const _require = createRequire(import.meta.url);
 const storage = getStorage();
 interface ReadlineModule {
@@ -250,25 +251,32 @@ function deriveTradeFromFillBlock(block: FillBlock, ctx: ExportAssetContext | nu
 
     let hypothesis: FillCore | null = null;
 
+    const isOwnAsset = (id: string | undefined): boolean =>
+        id === ctx.assetA.id || id === ctx.assetB.id;
+
     if (block.paysAssetId && block.receivesAssetId) {
-        const sellOrientation = block.paysAssetId === ctx.assetA.id && block.receivesAssetId === ctx.assetB.id;
-        const buyOrientation = block.paysAssetId === ctx.assetB.id && block.receivesAssetId === ctx.assetA.id;
-        if (!sellOrientation && !buyOrientation) return null;  // foreign-market fill, not ours
-        hypothesis = buildOrientationHypothesis(block.paysRaw, block.receivesRaw, sellOrientation, ctx);
+        // Both sides must be this pair: a block that paid our asset and received
+        // a third one is a foreign-market fill, not ours.
+        if (!isOwnAsset(block.paysAssetId) || !isOwnAsset(block.receivesAssetId)) return null;
+        if (block.paysAssetId === block.receivesAssetId) return null;
+        // Side comes from the ledger's one mapping (paid asset => side), never a
+        // local copy of it.
+        const tradedSide = resolveTradedSide(block.paysAssetId, ctx, null);
+        if (tradedSide == null) return null;
+        hypothesis = buildOrientationHypothesis(block.paysRaw, block.receivesRaw, tradedSide === ORDER_TYPES.SELL, ctx);
     } else if (block.paysAssetId || block.receivesAssetId) {
         // Half-present block (truncated log line): exactly one side survived.
         // Pays present orients directly; receives present inverts
         // (receives A => pays B => BUY; receives B => pays A => SELL).
         // A present side matching neither local asset is a foreign-market fill.
-        let paysIsA: boolean;
-        if (block.paysAssetId) {
-            if (block.paysAssetId !== ctx.assetA.id && block.paysAssetId !== ctx.assetB.id) return null;
-            paysIsA = block.paysAssetId === ctx.assetA.id;
-        } else {
-            if (block.receivesAssetId !== ctx.assetA.id && block.receivesAssetId !== ctx.assetB.id) return null;
-            paysIsA = block.receivesAssetId === ctx.assetB.id;
-        }
-        hypothesis = buildOrientationHypothesis(block.paysRaw, block.receivesRaw, paysIsA, ctx);
+        const present = block.paysAssetId || block.receivesAssetId;
+        if (!isOwnAsset(present)) return null;
+        const paidAssetId = block.paysAssetId
+            ? block.paysAssetId
+            : (block.receivesAssetId === ctx.assetA.id ? ctx.assetB.id : ctx.assetA.id);
+        const tradedSide = resolveTradedSide(paidAssetId, ctx, null);
+        if (tradedSide == null) return null;
+        hypothesis = buildOrientationHypothesis(block.paysRaw, block.receivesRaw, tradedSide === ORDER_TYPES.SELL, ctx);
     } else {
         // Bare pre-#22 block: no asset orientation logged.
         const sellHyp = buildOrientationHypothesis(block.paysRaw, block.receivesRaw, true, ctx);

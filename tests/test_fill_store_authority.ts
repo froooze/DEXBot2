@@ -148,7 +148,9 @@ async function testRollbackOnPersistFailure() {
     mgr.processedFillStore = {
         tracker: mgr.processedFillTracker,
         pendingWrites: new Map(),
-        persist: async (key: string, ts: number) => { mgr.processedFillTracker.set(key, ts); },
+        // The real store queues the write; it does not mark the tracker (that is
+        // the accounting claim) and a failed flush must not leave a booked key.
+        persist: async () => {},
         flush: async () => { throw new Error('injected persist failure'); },
         discard: (key: string) => { discarded.push(key); },
         flushKeys: async () => {},
@@ -170,8 +172,67 @@ async function testRollbackOnPersistFailure() {
     check('balances rolled back', mgr.accountTotals.sell, 1000);
 }
 
+async function testConcurrentEntryCreditsOnce() {
+    console.log('\n[6] Two concurrent callers: the synchronous claim picks one winner');
+    const mgr = makeManager();
+    mgr.processedFillStore = {
+        tracker: mgr.processedFillTracker,
+        pendingWrites: new Map(),
+        // The duplicate check runs before this await, so without the
+        // check-and-set at the claim point both callers would pass it.
+        persist: async () => { await new Promise((resolve) => setTimeout(resolve, 5)); },
+        flush: async () => {},
+        discard: () => {},
+        flushKeys: async () => {},
+        configure: () => {},
+        setShuttingDown: () => {},
+        loadPersisted: () => 0,
+        mergeTracker: () => {},
+    };
+    const accountant = new Accountant(mgr);
+    const results = await Promise.all([
+        accountant.processFillAccounting(makeFill(), FILL_KEY, {}),
+        accountant.processFillAccounting(makeFill(), FILL_KEY, {}),
+    ]);
+    check('exactly one caller credits', results.sort(), [false, true]);
+    check('base credited once', mgr.accountTotals.sell, 999);
+    check('quote credited once', mgr.accountTotals.buy, 100000 + 2.5);
+    check('key booked', mgr.processedFillTracker.has(FILL_KEY), true);
+}
+
+async function testSplitTrackerMaps() {
+    console.log('\n[7] A split store/manager tracker still refuses a booked key and shares the claim');
+    const mgr = makeManager();
+    const storeTracker = new Map<string, number>();
+    mgr.processedFillStore = {
+        tracker: storeTracker,
+        pendingWrites: new Map(),
+        persist: async () => {},
+        flush: async () => {},
+        discard: () => {},
+        flushKeys: async () => {},
+        configure: () => {},
+        setShuttingDown: () => {},
+        loadPersisted: () => 0,
+        mergeTracker: () => {},
+    };
+    const accountant = new Accountant(mgr);
+
+    // Booked in the store only: the retention check (manager map) misses it,
+    // the claim gate must not.
+    storeTracker.set(FILL_KEY, Date.now());
+    check('store-booked key refused', await accountant.processFillAccounting(makeFill(), FILL_KEY, {}), false);
+    check('no credit for the booked key', mgr.accountTotals.sell, 1000);
+
+    // Unbooked key: the claim lands on the store map, so the ingest check
+    // (which reads the store) sees it immediately.
+    const other = '1.7.151:901:1.11.701';
+    check('unbooked key credited', await accountant.processFillAccounting(makeFill(), other, {}), true);
+    check('claim visible to the store', storeTracker.has(other), true);
+}
+
 function testIngestConsultsTheStore() {
-    console.log('\n[6] A booked key is refused at ingest, regardless of its age');
+    console.log('\n[8] A booked key is refused at ingest, regardless of its age');
     const DEXBot = require('../modules/dexbot_class').default;
     const bot: any = Object.create(DEXBot.prototype);
     bot._processedFillStore = { tracker: new Map() };
@@ -206,6 +267,8 @@ async function run() {
     await testRollbackOnAdjustmentFailure();
     await testAtomicCredit();
     await testRollbackOnPersistFailure();
+    await testConcurrentEntryCreditsOnce();
+    await testSplitTrackerMaps();
     testIngestConsultsTheStore();
     if (failures > 0) {
         console.error(`\n❌ ${failures} store-authority assertion(s) failed`);
