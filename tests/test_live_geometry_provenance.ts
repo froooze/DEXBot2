@@ -194,6 +194,19 @@ run('FILL-SIDE-3b missing pays AND missing asset ids must not collapse to BUY', 
     assert.strictEqual(ctx.filledAmount, 0, 'a missing pays asset cannot claim a size');
 });
 
+run('FILL-SIDE-3c a foreign pays asset never claims a side or a size', () => {
+    const engine = new SyncEngine({ assets: ASSETS });
+    const ctx = engine._computeFillContext(
+        { assets: ASSETS },
+        slot('slot-118', ORDER_TYPES.SELL, 1267.307972, '1.7.119'),
+        '1.3.999', 100000,          // neither leg of this pair
+        ASSETS.assetB.id, 134573000
+    );
+    assert.strictEqual(ctx.orderType, ORDER_TYPES.SELL, 'slot type remains the fallback');
+    assert.strictEqual(ctx.filledAmount, 0, 'a foreign paid asset cannot claim a size');
+    assert.strictEqual(ctx.fillPrice, null, 'a foreign paid asset cannot price the fill');
+});
+
 run('FILL-SIDE-4 a SPREAD slot without a pays asset still resolves a BUY/SELL side', () => {
     const engine = new SyncEngine({ assets: ASSETS });
     const below = engine._computeFillContext(

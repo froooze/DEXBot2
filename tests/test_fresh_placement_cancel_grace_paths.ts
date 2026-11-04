@@ -11,11 +11,14 @@
  * the planner (COWRebalanceEngine.execute) and the divergence correction path
  * (applyGridDivergenceCorrections) and assert that:
  *   - a freshly placed on-chain order is NOT cancelled and stays active;
- *   - an aged on-chain order with the same shape IS cancelled as before.
+ *   - an aged on-chain order with the same shape IS cancelled as before;
+ *   - a queued chain-observed typeMismatch bypasses the grace even when the
+ *     pre-batch drain deferred it (active broadcast/placement region).
  */
 const assert = require('assert');
 const { COWRebalanceEngine, OrderManager } = require('../modules/order/manager');
 const { applyGridDivergenceCorrections } = require('../modules/order/utils/system');
+const { correctAllPriceMismatches } = require('../modules/order/utils/order');
 const { updateGridFromBlockchainSnapshot } = require('../modules/order/grid');
 const { ORDER_STATES, ORDER_TYPES, COW_ACTIONS } = require('../modules/constants');
 
@@ -54,7 +57,7 @@ function makeGraceHolder(freshOrderId: string | null, corrections: any[] = []) {
 // Grant generous funds so the working-grid fund check never aborts the plan.
 const FUNDS = { allocatedBuy: 1_000_000, allocatedSell: 1_000_000 };
 
-async function runReconcilePlan(fresh: boolean, mode: 'orphan' | 'type-mismatch' = 'orphan', corrections: any[] = []) {
+async function runReconcilePlan(fresh: boolean, mode: 'orphan' | 'type-mismatch' = 'orphan', corrections: any[] = [], holderOverride: any = null) {
     const masterGrid = new Map<string, any>();
     masterGrid.set('slot-0', {
         id: 'slot-0', type: ORDER_TYPES.BUY, state: ORDER_STATES.ACTIVE,
@@ -89,7 +92,7 @@ async function runReconcilePlan(fresh: boolean, mode: 'orphan' | 'type-mismatch'
         gridVersion: 1,
         boundaryIdx: 0,
         funds: FUNDS as any,
-        manager: makeGraceHolder(fresh ? '1.7.100' : null, corrections) as any,
+        manager: (holderOverride || makeGraceHolder(fresh ? '1.7.100' : null, corrections)) as any,
         gapSlots: 0
     });
 }
@@ -178,6 +181,42 @@ async function testQueuedTypeMismatchBypassesGrace() {
     const deferred = await runReconcilePlan(true, 'type-mismatch', surplusOnly);
     const deferredSlotActions = (deferred.actions || []).filter((a: any) => String(a.id) === 'slot-0');
     check('plain fresh surplus: still deferred', deferredSlotActions.length, 0);
+}
+
+async function testDeferredDrainStillBypassesGrace() {
+    console.log(' - A drain deferred by an active region still bypasses the grace...');
+
+    // End-to-end of the incident sequence: the mismatch sits in the correction
+    // queue, the pre-batch drain defers because a broadcast/placement region is
+    // active, and the COW plan must NOT park the fresh cancel for 15 minutes.
+    const queuedMismatch = [{
+        chainOrderId: '1.7.100',
+        type: ORDER_TYPES.SELL,
+        typeMismatch: true,
+        isSurplus: true,
+    }];
+    const holder = {
+        ...makeGraceHolder('1.7.100', queuedMismatch),
+        isBroadcastingActive: () => true,
+        logger: { log: () => {} },
+        // The public drain entrypoint requires the grid lock before it reaches
+        // the broadcast-active check this test exercises.
+        _gridLock: { acquire: async (fn: () => Promise<unknown>) => fn() },
+    };
+    let cancels = 0;
+    const drain = await correctAllPriceMismatches(holder as any, 'acct', 'key', {
+        cancelOrder: async () => { cancels++; return { success: true }; },
+    } as any);
+    check('drain reports the active region', drain.deferred, true);
+    check('drain reason is broadcast-active', drain.reason, 'broadcast-active');
+    check('drain leaves the mismatch queued', holder.ordersNeedingPriceCorrection.length, 1);
+    check('drain sends no cancel', cancels, 0);
+
+    const exempted = await runReconcilePlan(true, 'type-mismatch', queuedMismatch, holder);
+    const slotActions = (exempted.actions || []).filter((a: any) => String(a.id) === 'slot-0');
+    const hasCancel = slotActions.some((a: any) => a.type === COW_ACTIONS.CANCEL);
+    const folded = slotActions.some((a: any) => a.type === COW_ACTIONS.UPDATE && a.newGridId !== undefined);
+    check('deferred drain: the plan keeps the cancel', hasCancel || folded, true);
 }
 
 async function testDivergencePath() {
@@ -276,6 +315,7 @@ async function main() {
     await testReconcilePath();
     await testPairedCreateNotRematerialized();
     await testQueuedTypeMismatchBypassesGrace();
+    await testDeferredDrainStillBypassesGrace();
     await testDivergencePath();
     console.log(`\n✓ Fresh-placement cancel grace path tests passed! (${assertions} assertions)`);
 }

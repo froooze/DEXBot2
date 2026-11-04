@@ -20,6 +20,8 @@
  *  11. Same-order multi-fill in one batch aggregates to a single cumulative
  *      transition (no phantom residual / fund-invariant CRITICAL).
  *  12. Same-order 3-fill partial batch keeps the exact cumulative remainder.
+ *  13. A batch fill on a retyped rail slot books the traded (paid-asset) side,
+ *      not the stale slot label, and stores the residual on that side.
  */
 
 const assert = require('assert');
@@ -581,6 +583,39 @@ async function testSpreadSlotPartialFillResolvesBuySide() {
     console.log('  PASS');
 }
 
+async function testWrongSideRailSlotBatchResolvesTradedSide() {
+    console.log('\n - Batch fill on a retyped rail slot books the traded (SELL) side...');
+    const mgr = createManager();
+    const orderId = '1.7.900013';
+    const price = 1041.273399444015;
+    await mgr._updateOrder({
+        id: 'slot-0', state: ORDER_STATES.ACTIVE,
+        // Stale rail label: the resting chain order is a SELL of 5 XRP.
+        type: ORDER_TYPES.BUY,
+        size: 5.0, price, orderId,
+        rawOnChain: { for_sale: String(Math.round(5.0 * 10000)), fetchedAt: Date.now() }
+    });
+
+    const fill = makeSellFillEvent(orderId, 1.0, 902, '1.11.9003');
+    const result = await mgr.syncFromFillHistoryBatch([fill], { persistenceMode: 'batched' });
+
+    assert.strictEqual(result.filledOrders.length, 1, 'the fill must be attributed');
+    const filledOrder = result.filledOrders[0];
+    assert.strictEqual(filledOrder.type, ORDER_TYPES.SELL,
+        `the fill side comes from the paid asset, got ${filledOrder.type}`);
+    assert.strictEqual(filledOrder.isPartial, true, 'fill must be marked partial');
+    assert.ok(Math.abs(Number(filledOrder.size) - 1.0) < 1e-9,
+        `filled size 1.0, got ${filledOrder.size}`);
+
+    const slot = mgr.orders.get('slot-0');
+    assert.strictEqual(slot.state, ORDER_STATES.PARTIAL, 'the slot keeps the residual as PARTIAL');
+    assert.ok(Math.abs(Number(slot.size) - 4.0) < 1e-9,
+        `residual 4.0 XRP, got ${slot.size}`);
+    assert.strictEqual(slot.type, ORDER_TYPES.SELL,
+        'the stored slot adopts the traded side so size/accounting dimensions agree');
+    console.log('  PASS');
+}
+
 async function testPostBatchReanchorAndInvariantGuard() {
     console.log('\n - Post-batch accountTotals re-anchor + in-flight invariant guard...');
     const mgr = createManager();
@@ -754,6 +789,7 @@ async function runTests() {
         await testSameOrderThreeFillBatchPartialRemainder();
         await testSpreadSlotFullFillResolvesBuySide();
         await testSpreadSlotPartialFillResolvesBuySide();
+        await testWrongSideRailSlotBatchResolvesTradedSide();
         await testPostBatchReanchorAndInvariantGuard();
         await testResidualCancelRequestedWhenChainStillHoldsOrder();
         await testFillGuardSingleDecrementOnDeferral();

@@ -785,6 +785,122 @@ async function run() {
         console.log('  - an in-band level is not treated as repaired');
     }
 
+    // ---- 5f. Unknown geometry falls back to the stored-type check ----
+    // The fail-safe: never invent a rail. A missing boundary, a missing gap
+    // width, or a non-slot id (shelf/manual order) keeps the pre-geometry
+    // behaviour — the stored type decides whether the entry is stale.
+    {
+        const chainId = '1.7.777006';
+        const { manager } = createManager(
+            [{ id: 'slot-80', orderId: chainId, type: ORDER_TYPES.SELL, price: 0.312638, size: 850, state: ORDER_STATES.ACTIVE }],
+            [{
+                gridOrder: { id: 'slot-80', type: ORDER_TYPES.BUY, price: 0.312638, size: 850 },
+                chainOrderId: chainId,
+                expectedPrice: 0.312638,
+                actualPrice: 0.312638,
+                size: 850,
+                type: ORDER_TYPES.SELL,
+                sideUpdated: ORDER_TYPES.SELL,
+                typeMismatch: true,
+                isSurplus: true,
+                cancelOnly: false,
+                queuedAt: Date.now(),
+                queuedBy: 'sync-pass1-type-mismatch',
+            }]
+        );
+        (manager as any).boundaryIdx = null; // unknown boundary
+        let cancels = 0;
+        const accountOrders = { cancelOrder: async () => { cancels++; return { success: true }; } };
+        await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
+        assert.strictEqual(cancels, 0, 'unknown boundary + matching stored type => stale entry dropped');
+        assert.strictEqual(manager.ordersNeedingPriceCorrection.length, 0, 'the stale entry is dropped');
+        console.log('  - unknown boundary falls back to the stored type');
+    }
+
+    {
+        const chainId = '1.7.777007';
+        const { manager } = createManager(
+            [{ id: 'slot-80', orderId: chainId, type: ORDER_TYPES.BUY, price: 0.312638, size: 850, state: ORDER_STATES.ACTIVE }],
+            [{
+                gridOrder: { id: 'slot-80', type: ORDER_TYPES.BUY, price: 0.312638, size: 850 },
+                chainOrderId: chainId,
+                expectedPrice: 0.312638,
+                actualPrice: 0.312638,
+                size: 850,
+                type: ORDER_TYPES.SELL,
+                sideUpdated: ORDER_TYPES.SELL,
+                typeMismatch: true,
+                isSurplus: true,
+                cancelOnly: false,
+                queuedAt: Date.now(),
+                queuedBy: 'sync-pass1-type-mismatch',
+            }]
+        );
+        (manager as any).boundaryIdx = null;
+        let cancels = 0;
+        const accountOrders = { cancelOrder: async () => { cancels++; return { success: true }; } };
+        await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
+        assert.strictEqual(cancels, 1, 'unknown boundary + disagreeing stored type => still cancelled');
+        assert.strictEqual(manager.ordersNeedingPriceCorrection.length, 0, 'the cancelled entry leaves the queue');
+        console.log('  - unknown boundary keeps a stored-type mismatch actionable');
+    }
+
+    {
+        // Non-slot id (shelf/manual order): parseSlotIndex is null => no rail.
+        const chainId = '1.7.777008';
+        const { manager } = createManager(
+            [{ id: 'deep-1', orderId: chainId, type: ORDER_TYPES.SELL, price: 0.312638, size: 850, state: ORDER_STATES.ACTIVE }],
+            [{
+                gridOrder: { id: 'deep-1', type: ORDER_TYPES.BUY, price: 0.312638, size: 850 },
+                chainOrderId: chainId,
+                expectedPrice: 0.312638,
+                actualPrice: 0.312638,
+                size: 850,
+                type: ORDER_TYPES.SELL,
+                sideUpdated: ORDER_TYPES.SELL,
+                typeMismatch: true,
+                isSurplus: true,
+                cancelOnly: false,
+                queuedAt: Date.now(),
+                queuedBy: 'sync-pass1-type-mismatch',
+            }]
+        );
+        let cancels = 0;
+        const accountOrders = { cancelOrder: async () => { cancels++; return { success: true }; } };
+        await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
+        assert.strictEqual(cancels, 0, 'a non-slot id has no rail => stored-type fallback drops');
+        console.log('  - non-slot ids fall back to the stored type');
+    }
+
+    {
+        // Missing gap width: geometryTypeForSlotIndex fails closed on null.
+        const chainId = '1.7.777009';
+        const { manager } = createManager(
+            [{ id: 'slot-80', orderId: chainId, type: ORDER_TYPES.SELL, price: 0.312638, size: 850, state: ORDER_STATES.ACTIVE }],
+            [{
+                gridOrder: { id: 'slot-80', type: ORDER_TYPES.BUY, price: 0.312638, size: 850 },
+                chainOrderId: chainId,
+                expectedPrice: 0.312638,
+                actualPrice: 0.312638,
+                size: 850,
+                type: ORDER_TYPES.SELL,
+                sideUpdated: ORDER_TYPES.SELL,
+                typeMismatch: true,
+                isSurplus: true,
+                cancelOnly: false,
+                queuedAt: Date.now(),
+                queuedBy: 'sync-pass1-type-mismatch',
+            }]
+        );
+        manager.boundaryIdx = 79;
+        (manager as any)._gapSlots = null;
+        let cancels = 0;
+        const accountOrders = { cancelOrder: async () => { cancels++; return { success: true }; } };
+        await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
+        assert.strictEqual(cancels, 0, 'unknown gap width => stored-type fallback drops');
+        console.log('  - unknown gap width falls back to the stored type');
+    }
+
     console.log('PASS test_correction_queue_staleness');
 }
 
