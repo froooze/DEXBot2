@@ -8,7 +8,8 @@
  * and the generic redistribution donor loops were removed because they moved
  * inventory within a rail and were gamed by stale-size snapshots. When free
  * funds are zero, side selection returns null, but a no-new-commitment
- * rotation into a promoted gap slot is still allowed (PF-025/026/027).
+ * rotation into a promoted gap slot or an orphaned rail slot is still allowed
+ * (PF-025/026/027 and PF-031/032/033).
  *
  * PF-010: zero free funds (committed inventory present) -> side null.
  * PF-020: zero free funds -> no create AND no resting-order shrink.
@@ -19,6 +20,12 @@
  * PF-029: checkSpreadCondition reaches rotation with zero free funds.
  * PF-030: partial free funds -> placement stays within the free budget and
  *         every update is a top-up, never a shrink.
+ * PF-031: zero free funds -> rotate into an ORPHANED rail slot (not only a
+ *         boundary-promoted gap slot); a fully reserved virtual tail must not
+ *         block the tightening move.
+ * PF-032: fund-selected BUY blocked by the last fill -> checkSpreadCondition
+ *         falls back to the SELL orphan rotation.
+ * PF-033: the BUY-side orphan rotation mirrors PF-031.
  * PF-040: free funds on one side still selects that side.
  */
 const assert = require('assert');
@@ -198,6 +205,180 @@ async function run() {
         assert.strictEqual(correction.plannedCount, 2,
             'PF-026: rotation-only plan reports its tightening candidates');
         console.log('  - PF-026 zero free funds: SELL rotation mirrors BUY (no new commitment)');
+    }
+
+    // ---- PF-031: zero free funds -> rotate into an ORPHANED rail slot ----
+    {
+        const mgr = new OrderManager({
+            assetA: 'BASE',
+            assetB: 'QUOTE',
+            startPrice: 1,
+            botFunds: { buy: 100, sell: 1000 },
+            coreOrders: { buy: 4, sell: 4 },
+            incrementPercent: 1,
+            targetSpreadPercent: 3
+        });
+        mgr.assets = {
+            assetA: { id: '1.3.1', symbol: 'BASE', precision: 5 },
+            assetB: { id: '1.3.2', symbol: 'QUOTE', precision: 5 }
+        };
+        mgr.btsBalance = { free: 1e9, total: 1e9, locked: 0 };
+        // 16 levels: BUY 0-3 ACTIVE, gap 4-5 (gapSlots=2), sellStart 6.
+        // Sells 6-7 are the refreshed/anchored slots but lost their orders;
+        // 8-11 are the old live window. 12-15 are a virtual tail whose booked
+        // size reserves ALL free sell inventory (the live "availableFund=0,
+        // virtual=free" shape).
+        for (let i = 0; i < 16; i++) {
+            const isBuy = i <= 3;
+            const isSell = i >= 6;
+            const isOrphan = i === 6 || i === 7;
+            const isTail = i >= 12;
+            await mgr._updateOrder({
+                id: `slot-${i}`,
+                price: 1 + i * 0.01,
+                type: isBuy ? ORDER_TYPES.BUY : (isSell ? ORDER_TYPES.SELL : ORDER_TYPES.SPREAD),
+                state: (isBuy || (isSell && !isOrphan && !isTail)) ? ORDER_STATES.ACTIVE : ORDER_STATES.VIRTUAL,
+                size: isBuy ? 100 : (isTail ? 15 : (isSell && !isOrphan ? 10 : 0)),
+                orderId: (isBuy || (isSell && !isOrphan && !isTail)) ? `1.7.${700 + i}` : ''
+            });
+        }
+        mgr.boundaryIdx = 3;
+        mgr._gapSlots = 2;
+        // Free sell = virtual tail reservation: available reads 0, but the
+        // tightening move commits no new inventory.
+        await mgr.setAccountTotals({ buy: 100, sell: 100, buyFree: 0, sellFree: 60 });
+        await mgr.recalculateFunds();
+        assert.strictEqual(mgr.funds.available.sell, 0,
+            'PF-031 precondition: the virtual tail must reserve all free sell inventory');
+
+        const correction = await Grid.prepareSpreadCorrectionOrders(mgr, ORDER_TYPES.SELL, 2);
+        assert.strictEqual(correction.ordersToPlace.length, 0, 'PF-031: no create without free funds');
+        assert.strictEqual((correction.ordersToRotate || []).length, 2,
+            'PF-031: two resting sells must rotate into the orphaned rail slots');
+        assert.deepStrictEqual(
+            (correction.ordersToRotate || []).map((r: any) => `${r.id}->${r.newGridId}`),
+            ['slot-11->slot-7', 'slot-10->slot-6'],
+            'PF-031: farthest resting sells move to the orphaned window-edge slots'
+        );
+        for (const r of correction.ordersToRotate || []) {
+            assert.strictEqual(Number(r.newSize), Number(r.oldOrder.size),
+                'PF-031: the rotation reuses the booked size');
+        }
+        assert.strictEqual(correction.boundaryIdx, undefined,
+            'PF-031: an in-rail orphan rotation must not invent a boundary move');
+        console.log('  - PF-031 zero free funds: rotation repairs an orphaned rail slot');
+    }
+
+    // ---- PF-032: blocked BUY -> SELL orphan rotation through checkSpreadCondition ----
+    {
+        const mgr = new OrderManager({
+            assetA: 'BASE',
+            assetB: 'QUOTE',
+            startPrice: 1,
+            botFunds: { buy: 100, sell: 1000 },
+            coreOrders: { buy: 4, sell: 4 },
+            incrementPercent: 1,
+            targetSpreadPercent: 3
+        });
+        mgr.assets = {
+            assetA: { id: '1.3.1', symbol: 'BASE', precision: 5 },
+            assetB: { id: '1.3.2', symbol: 'QUOTE', precision: 5 }
+        };
+        mgr.btsBalance = { free: 1e9, total: 1e9, locked: 0 };
+        for (let i = 0; i < 16; i++) {
+            const isBuy = i <= 3;
+            const isSell = i >= 6;
+            const isOrphan = i === 6 || i === 7;
+            const isTail = i >= 12;
+            await mgr._updateOrder({
+                id: `slot-${i}`,
+                price: 1 + i * 0.01,
+                type: isBuy ? ORDER_TYPES.BUY : (isSell ? ORDER_TYPES.SELL : ORDER_TYPES.SPREAD),
+                state: (isBuy || (isSell && !isOrphan && !isTail)) ? ORDER_STATES.ACTIVE : ORDER_STATES.VIRTUAL,
+                size: isBuy ? 100 : (isTail ? 15 : (isSell && !isOrphan ? 10 : 0)),
+                orderId: (isBuy || (isSell && !isOrphan && !isTail)) ? `1.7.${800 + i}` : ''
+            });
+        }
+        mgr.boundaryIdx = 3;
+        mgr._gapSlots = 2;
+        mgr.outOfSpread = 2;
+        // The fund-selected BUY side is real (100 free) but every tightening
+        // slot is at/through the buy fill at 1.03, so BUY cannot act.
+        mgr._lastFilledPrice = 1.03;
+        mgr._lastFilledType = ORDER_TYPES.BUY;
+        mgr._lastFilledAt = Date.now();
+        mgr.lastFillPivotSource = 'fill';
+        await mgr.setAccountTotals({ buy: 500, sell: 100, buyFree: 100, sellFree: 60 });
+        await mgr.recalculateFunds();
+        assert.strictEqual(Grid.determineOrderSideByFunds(mgr, 1).side, ORDER_TYPES.BUY,
+            'PF-032: fixture must fund-select BUY');
+
+        let seen: any = null;
+        const result = await Grid.checkSpreadCondition(mgr, {}, async (correction: any) => {
+            seen = correction;
+            return { executed: true };
+        });
+        assert.strictEqual(result.ordersPlaced, 2,
+            'PF-032: checkSpreadCondition reports the SELL rotations as placed');
+        assert.deepStrictEqual(
+            (seen?.ordersToRotate || []).map((r: any) => `${r.id}->${r.newGridId}`),
+            ['slot-11->slot-7', 'slot-10->slot-6'],
+            'PF-032: the blocked BUY falls back to the SELL orphan rotation'
+        );
+        console.log('  - PF-032 blocked BUY: checkSpreadCondition broadcasts SELL orphan rotations');
+    }
+
+    // ---- PF-033: zero free funds -> BUY-side orphan rotation mirrors SELL ----
+    {
+        const mgr = new OrderManager({
+            assetA: 'BASE',
+            assetB: 'QUOTE',
+            startPrice: 1,
+            botFunds: { buy: 1000, sell: 100 },
+            coreOrders: { buy: 4, sell: 2 },
+            incrementPercent: 1,
+            targetSpreadPercent: 3
+        });
+        mgr.assets = {
+            assetA: { id: '1.3.1', symbol: 'BASE', precision: 5 },
+            assetB: { id: '1.3.2', symbol: 'QUOTE', precision: 5 }
+        };
+        mgr.btsBalance = { free: 1e9, total: 1e9, locked: 0 };
+        // 16 levels: BUY 4-7 ACTIVE, empty buy window 8-11, gap 12-13
+        // (gapSlots=2), SELL 14-15. BUY 0-3 is a virtual tail reserving all
+        // free buy inventory. The two nearest empty buys (8,9) tighten the
+        // spread; the virtual tail must not block moving 4/5 into them.
+        for (let i = 0; i < 16; i++) {
+            const isBuy = i <= 11;
+            const isSell = i >= 14;
+            const isActiveBuy = i >= 4 && i <= 7;
+            const isTail = i <= 3;
+            await mgr._updateOrder({
+                id: `slot-${i}`,
+                price: 1 + i * 0.01,
+                type: isBuy ? ORDER_TYPES.BUY : ORDER_TYPES.SELL,
+                state: (isActiveBuy || isSell) ? ORDER_STATES.ACTIVE : ORDER_STATES.VIRTUAL,
+                size: isTail ? 15 : (isActiveBuy || isSell ? 10 : 0),
+                orderId: (isActiveBuy || isSell) ? `1.7.${900 + i}` : ''
+            });
+        }
+        mgr.boundaryIdx = 11;
+        mgr._gapSlots = 2;
+        await mgr.setAccountTotals({ buy: 100, sell: 20, buyFree: 60, sellFree: 1e9 });
+        await mgr.recalculateFunds();
+        assert.strictEqual(mgr.funds.available.buy, 0,
+            'PF-033 precondition: the virtual tail must reserve all free buy inventory');
+
+        const correction = await Grid.prepareSpreadCorrectionOrders(mgr, ORDER_TYPES.BUY, 2);
+        assert.strictEqual(correction.ordersToPlace.length, 0, 'PF-033: no create without free funds');
+        assert.deepStrictEqual(
+            (correction.ordersToRotate || []).map((r: any) => `${r.id}->${r.newGridId}`),
+            ['slot-4->slot-8', 'slot-5->slot-9'],
+            'PF-033: farthest resting buys move to the orphaned buy window edge'
+        );
+        assert.strictEqual(correction.boundaryIdx, undefined,
+            'PF-033: an in-rail orphan rotation must not invent a boundary move');
+        console.log('  - PF-033 zero free funds: BUY-side orphan rotation mirrors SELL');
     }
 
     // ---- PF-027: zero free funds still reaches rotation through replan ----

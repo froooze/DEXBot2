@@ -513,14 +513,18 @@ The correction path is fund-only and never manufactures budget by shrinking a re
    member); the walk steps over it and promotes only the next empty slot, so a
    placed edge never becomes a duplicate CREATE target.
 5. If free funds cannot cover every target, place the affordable prefix, then
-   **rotate a resting same-side order** into each unfunded promoted gap slot
-   (same booked size, never a new commitment). A fully allocated rail has ~0
-   free forever, so create-only repair can never close the spread; the rotation
-   is the repair path and is bounded by the same promotion, crossing, last-fill,
-   dedupe/duplicate-price and edge-order guards as a create. It never shrinks or
-   grows the moved order. Exactly-zero free on both sides is covered by a
-   rotation-only fallback around side selection (an unavailable market price is
-   still a hard skip: cross-asset comparison is unsafe).
+   **rotate a resting same-side order** into each unfunded tightening slot —
+   whether it is a promoted gap slot or an orphaned rail slot left by a
+   fill-anchored boundary move (same booked size, never a new commitment). A
+   fully allocated rail has ~0 free forever, so create-only repair can never
+   close the spread. A virtual tail that reserves the whole free balance is not
+   a hard stop: moving a far resting order into the window edge frees no new
+   inventory but tightens the spread. The rotation is bounded by the same
+   promotion, crossing, last-fill, dedupe/duplicate-price and edge-order guards
+   as a create. It never shrinks or grows the moved order. Exactly-zero free on
+   both sides is covered by a rotation-only fallback around side selection (an
+   unavailable market price is still a hard skip: cross-asset comparison is
+   unsafe).
 6. If neither side places an effective order, `checkSpreadCondition` reports a
    `stall` cause (`no-free-funds` / `unfunded` / `no-candidates` / `cold-book` /
    `unmatched-orders` / `readiness-gate` / `last-fill-blocked` /

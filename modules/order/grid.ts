@@ -138,12 +138,14 @@ interface SpreadCorrection {
     // cannot be grown in place — clampPostFillUpdateSize). Kept as an explicit
     // empty array because updateOrdersOnChainBatch expects the field.
     ordersToUpdate: Array<{ partialOrder: ManagedOrder; newSize: number }>;
-    // Fund-constrained promotion: when free funds cannot fund a tightening
-    // create, move a resting same-side order into the promoted slot instead
-    // (same booked size or smaller, never a new commitment). This is the only
-    // repair path for a fully allocated rail; a plain CREATE would read 0 free
-    // forever. Produced by prepareSpreadCorrectionOrders, consumed by
-    // buildActionsFromPlan as an UPDATE rotation.
+    // Fund-constrained repair: when free funds cannot fund a tightening
+    // create, move a resting same-side order into the unfunded slot instead
+    // (same booked size, never a new commitment). The destination may be a
+    // boundary-promoted gap slot or an orphaned rail slot left by a
+    // fill-anchored boundary move. This is the only repair path for a fully
+    // allocated rail; a plain CREATE would read 0 free forever. Produced by
+    // prepareSpreadCorrectionOrders, consumed by buildActionsFromPlan as an
+    // UPDATE rotation.
     ordersToRotate?: SpreadCorrectionRotation[];
     // Number of spread-tightening create targets found before the funding loop
     // ran. Lets the caller distinguish "no actionable candidate exists" from
@@ -376,7 +378,8 @@ function getSpreadCorrectionActionCount(correction: SpreadCorrection | null | un
  * `determineOrderSideByFunds` is still pure-fund-driven, so a rail with
  * exactly zero free on both sides returns null. Rotations, however, need no
  * new commitment: a fully allocated rail can still be repaired by moving a
- * resting order into a promoted gap slot. Try both sides and accept the first
+ * resting order into an unfunded tightening slot (promoted gap or orphaned
+ * rail slot). Try both sides and accept the first
  * executable plan (create or rotation). Callers must only use this when the
  * side decision failed for INSUFFICIENT FREE FUNDS, not for an unavailable
  * market price where cross-asset side comparison is unsafe.
@@ -3240,7 +3243,7 @@ export async function checkSpreadCondition(manager: OrderManagerLike, _BitShares
             let chosenSide = decision.side;
             if (!chosenSide) {
                 // Exact-zero free funds still allow a no-new-commitment repair:
-                // rotate a resting order into the promoted gap slot.
+                // rotate a resting order into an unfunded tightening slot.
                 if (decision.code === 'no-free-funds') {
                     const fallback = await prepareZeroFreeRotationFallback(manager);
                     if (fallback) {
@@ -4623,13 +4626,14 @@ export function determineOrderSideByFunds(manager: OrderManagerLike, currentMark
             remainingBudget -= createSize;
         }
 
-        // FUND-CONSTRAINED PROMOTION: free funds could not fund every
-        // tightening slot. A fully allocated rail (botFunds 100%, every slot
-        // resting) has ~0 free forever, so create-only repair can never close
-        // the spread (live 2026-10-30: "planned 4, placing 1"). Rotate a
-        // resting same-side order into each unfunded promoted slot instead.
-        // The move commits NO new funds (size is the source's booked size) and
-        // is bounded by the same promotion/geometry guards as a create.
+        // FUND-CONSTRAINED REPAIR: free funds could not fund every tightening
+        // slot. A fully allocated rail (botFunds 100%, every slot resting) has
+        // ~0 free forever, so create-only repair can never close the spread
+        // (live 2026-10-30: "planned 4, placing 1"). Rotate a resting same-side
+        // order into each unfunded tightening slot instead — whether that slot
+        // is a boundary-promoted gap slot or an orphaned rail slot left by the
+        // anchored boundary. The move commits NO new funds (size is the source's
+        // booked size) and is bounded by the same geometry guards as a create.
         const ordersToRotate: SpreadCorrectionRotation[] = [];
         {
             const fundedCreateIds = new Set<string>(ordersToPlace.map((o) => String(o.id)));
@@ -4638,13 +4642,14 @@ export function determineOrderSideByFunds(manager: OrderManagerLike, currentMark
             // placed-price collision filter (a promoted slot whose price is
             // already occupied from another slot must not become a rotation
             // destination). Re-derive the subset instead of bypassing those
-            // guards.
-            const promotedIds = new Set(promotedCandidates.map((c) => String(c.id)));
-            const unfundedPromotions = spreadCandidates
-                .filter((c) => promotedIds.has(String(c.id)))
+            // guards. Orphaned rail slots are tightening candidates too; the
+            // old promoted-only filter left them unfunded forever when the
+            // virtual tail reserved the whole free balance (availableFund=0,
+            // virtual=free), even though a resting tail order could move.
+            const unfundedCandidates = spreadCandidates
                 .filter((c) => !fundedCreateIds.has(String(c.id)))
                 .filter((c) => isSlotAvailable(c));
-            if (unfundedPromotions.length > 0) {
+            if (unfundedCandidates.length > 0) {
                 const windowIds = liveWindowIdSet(manager, railType);
                 const edgeIds = edgeOrderIdSet(
                     allSlotsByPrice,
@@ -4670,7 +4675,7 @@ export function determineOrderSideByFunds(manager: OrderManagerLike, currentMark
                         ? Number(a.price) - Number(b.price)
                         : Number(b.price) - Number(a.price));
                 const usedSourceIds = new Set<string>();
-                for (const dest of unfundedPromotions) {
+                for (const dest of unfundedCandidates) {
                     const source = sourcePool.find((s) => !usedSourceIds.has(String(s.id)));
                     if (!source) break;
                     const sourceSize = Number(source.size);
@@ -4696,7 +4701,7 @@ export function determineOrderSideByFunds(manager: OrderManagerLike, currentMark
                 if (ordersToRotate.length > 0) {
                     manager.logger?.log?.(
                         `[SPREAD-CORRECTION] Fund-constrained promotion on ${sideName}: rotating ` +
-                        `${ordersToRotate.length} resting order(s) into the gap ` +
+                        `${ordersToRotate.length} resting order(s) into unfunded slot(s) ` +
                         `(${ordersToRotate.map((r) => `${r.id}->${r.newGridId}`).join(', ')}) — ` +
                         `no new funds required`,
                         'warn'
@@ -4719,11 +4724,13 @@ export function determineOrderSideByFunds(manager: OrderManagerLike, currentMark
         }
 
         let boundaryIdx: number | undefined;
+        const promotedIds = new Set(promotedCandidates.map((slot) => String(slot.id)));
         const placedPromotedIds = new Set([
             ...ordersToPlace
-                .filter((order) => promotedCandidates.some((slot) => slot.id === order.id))
+                .filter((order) => promotedIds.has(String(order.id)))
                 .map((order) => order.id),
             ...ordersToRotate
+                .filter((rotation) => promotedIds.has(String(rotation.newGridId)))
                 .map((rotation) => rotation.newGridId)
         ]);
         if (placedPromotedIds.size > 0) {
