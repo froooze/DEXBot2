@@ -1223,17 +1223,6 @@ class OrderManager implements OrderManagerLike {
     }
 
     /**
-     * Boolean compatibility wrapper for {@link consumeChainSizeAppliedFillAmount}.
-     * @param {string} orderId - Chain order id
-     * @param {number} filledInt - Base-amount delta in chain integer units
-     * @param {number} [maxAgeMs] - Marker freshness bound
-     * @returns {boolean} true when any part of the fill was already applied
-     */
-    consumeChainSizeAppliedFill(orderId: string, filledInt: number, maxAgeMs: number = TIMING.CHAIN_SIZE_APPLIED_MARKER_TTL_MS): boolean {
-        return this.consumeChainSizeAppliedFillAmount(orderId, filledInt, maxAgeMs) > 0;
-    }
-
-    /**
      * Merge persisted pass-1 markers into the in-memory set (recovery reload).
      * Live markers win on conflict: they may already be partially consumed,
      * and replacing them with the older persisted total would double-count.

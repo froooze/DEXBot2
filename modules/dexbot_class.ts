@@ -87,6 +87,7 @@ import * as Format from './order/format.js';
 import cowRuntime from './dexbot_cow_runtime.js';
 import type { ChainOrderLike, CowResult, OpPhase } from './dexbot_cow_runtime.js';
 import { ProcessedFillStore } from './order/processed_fill_store.js';
+import { isFillBooked } from './order/fill_ledger.js';
 import {
     TIMING,
     DAEMON_CODES,
@@ -664,7 +665,36 @@ class DEXBot implements BotLike {
         return DexbotFillRuntime.buildOrphanFillFallbackKey(this, fill);
     }
 
+    /**
+     * Claim a fill key for this cycle, or report that it was already handled.
+     *
+     * Two authorities, in this order:
+     *   1. **The processed-fill store** — booked keys. Checked first and without
+     *      any clock, because "already credited" does not expire. Before P2 a
+     *      booked key older than the lease window was accepted again here and
+     *      only refused later by accounting, so the replay still paid for queue
+     *      churn and a FILL DETECTED log.
+     *   2. **The claim lease** — fills accepted but not yet booked (deferral,
+     *      crash). Its TTL (`FILL_DEDUPE_WINDOW_MS`) is a lease, not the dedupe
+     *      horizon; the store is the dedupe horizon (`FILL_RECORD_RETENTION_MS`).
+     *
+     * Claims are released on every path that does not book (requeue, orphan
+     * adoption, stale-totals deferral), so a held claim means "in flight".
+     *
+     * @param {string} fillKey - Chain fill identity (`orderId:blockNum:historyId`)
+     * @param {Set<string>} processedFillKeys - Per-cycle key set
+     * @param {string} [label] - Log prefix
+     * @param {string} [orderId] - Chain order id, for the log only
+     * @returns {boolean} true when this cycle may process the fill
+     */
     _isNewFillKey(fillKey: string, processedFillKeys: Set<string>, label: string = '', orderId: string = '') {
+        if (isFillBooked(this._processedFillStore, fillKey)) {
+            if (label) {
+                const idSuffix = orderId ? ` for ${orderId}` : '';
+                this.manager?.logger?.log?.(`${label} Skipping fill${idSuffix}: ${fillKey} is already booked`, 'debug');
+            }
+            return false;
+        }
         const now = Date.now();
         if (this._recentlyQueuedFills.has(fillKey)) {
             const lastProcessed = this._recentlyQueuedFills.get(fillKey) ?? 0;

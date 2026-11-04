@@ -191,8 +191,8 @@ export const TIMING_CLASSIFICATIONS: Readonly<Record<string, TimingClassificatio
     },
     FILL_DEDUPE_WINDOW_MS: {
         kind: 'self-healing',
-        rationale: 'Coalescing window for duplicate fill events.',
-        removal: 'Delete when fill identity is a chain tuple (tx+op) everywhere; the window would then be redundant with that key.',
+        rationale: 'Lease on a fill CLAIM accepted but not yet booked (deferral/crash). The dedupe horizon is the processed-fill store (FILL_RECORD_RETENTION_MS); a booked key is refused at any age.',
+        removal: 'Delete once startup recovery reconciles a restored claim against chain-balance evidence (recomputing the credit from chain truth) instead of bounding it by age.',
     },
 });
 

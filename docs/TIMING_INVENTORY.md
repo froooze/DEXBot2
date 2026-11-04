@@ -48,7 +48,7 @@ operation.
 | `CHAIN_SIZE_APPLIED_MARKER_TTL_MS` | Dedupe marker for a resize already absorbed by sync pass 1. | The fill-history path identifies an applied resize from the lifecycle record instead of a timestamped marker. |
 | `STRUCTURAL_REBUILD_DEFER_MAX_MS` | Caps how long a fill-driven rebalance may defer behind a structural rebuild. | The rebuild publishes a completion event the rebalance can await. |
 | `FILL_BROADCAST_DEFER_MAX_MS` | Bound on fill-consumer deferral while a broadcast is unresolved. | The fill consumer queries the lifecycle phase instead of a clock. |
-| `FILL_DEDUPE_WINDOW_MS` | Coalescing window for duplicate fill events. | Fill identity is a chain tuple (tx+op) everywhere, making the window redundant with that key. |
+| `FILL_DEDUPE_WINDOW_MS` | Lease on a fill CLAIM accepted but not yet booked (deferral, crash-restored claim). Not the dedupe horizon: the processed-fill store refuses a booked key at any age. | Resolve a crash-restored claim from evidence (chain read at the claim block) instead of by age. |
 
 `SYNC_LOCK_FORCE_RELEASE_AGE_MS` is classified `bound`, not `self-healing`: it is
 a liveness escape hatch for a held lock, which no amount of evidence can

@@ -114,12 +114,17 @@ function testBoundaryBudgets() {
 
 function testDedupeLayers() {
     console.log('\n[4] Dedupe layers are the known set (removal moves this list down)');
-    const re = /_chainSizeAppliedFills|alreadyAppliedChainSize|_recentlyQueuedFills/g;
+    // The surviving layers: the chain-size marker map, its per-fill amount
+    // channel (`__chainSizeAppliedInt`), and the claim lease. The pre-P2
+    // `alreadyAppliedChainSize` boolean is gone, and the OLD pattern missed
+    // `accounting.ts` — the writer of the amount — entirely.
+    const re = /_chainSizeAppliedFills|__chainSizeAppliedInt|_recentlyQueuedFills/g;
     check('files referencing a dedupe layer', Object.keys(countByFile(re)).sort(), [
         'modules/dexbot_class.ts',
         'modules/dexbot_fill_runtime.ts',
         'modules/dexbot_startup_runtime.ts',
         'modules/dexbot_state_recovery.ts',
+        'modules/order/accounting.ts',
         'modules/order/grid.ts',
         'modules/order/lifecycle.ts',
         'modules/order/manager.ts',

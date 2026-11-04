@@ -61,7 +61,7 @@ async function runTests() {
 
     console.log(' - 1. pass-1 already applied: size and rawOnChain are not reduced twice...');
     {
-        const result = await engine._computeFillTransitionResult(makeManager(), makeParams({ alreadyAppliedChainSize: true }));
+        const result = await engine._computeFillTransitionResult(makeManager(), makeParams({ alreadyAppliedInt: 3558 }));
         assert.strictEqual(result.isFull, false, 'a residual fill is not a full fill');
         assert.ok(
             Math.abs(Number(result.partialUpdate.size) - 3.3046) < 1e-9,
@@ -75,7 +75,7 @@ async function runTests() {
 
     console.log(' - 2. no pass-1 marker: normal fill still subtracts once...');
     {
-        const result = await engine._computeFillTransitionResult(makeManager(), makeParams({ alreadyAppliedChainSize: false }));
+        const result = await engine._computeFillTransitionResult(makeManager(), makeParams());
         assert.ok(
             Math.abs(Number(result.partialUpdate.size) - 2.9488) < 1e-9,
             `normal path must subtract the fill once, got ${result.partialUpdate.size}`
@@ -105,7 +105,7 @@ async function runTests() {
         assert.strictEqual(mgr.consumeChainSizeAppliedFillAmount('1.7.139', 2558), 0, 'remaining portion is normal accounting');
 
         mgr.noteChainSizeAppliedFill('1.7.140', 3558);
-        assert.strictEqual(mgr.consumeChainSizeAppliedFill('1.7.140', 3558, -1), false, 'an expired marker is dropped');
+        assert.strictEqual(mgr.consumeChainSizeAppliedFillAmount('1.7.140', 3558, -1), 0, 'an expired marker is dropped');
 
         mgr.noteChainSizeAppliedFill('1.7.142', 7116);
         const snapshot = mgr.snapshotChainSizeAppliedFills();
@@ -158,15 +158,18 @@ async function runTests() {
             'the fill trade (totals and free) must be applied exactly once even when pass 1 resized the slot'
         );
     }
-    console.log(' - 6. an explicit partial applied amount is NOT masked by the legacy boolean...');
+    console.log(' - 6. the applied AMOUNT is the only channel (no boolean floor)...');
     {
-        // The aggregated batch path reads `__chainSizeAlreadyApplied` off the
-        // LAST entry of a group while summing the explicit applied amounts. If
-        // the boolean counted as a floor it would collapse the remainder to 0
-        // and skip the unapplied part of the earlier fills (phantom residual).
+        // P2 removed the `alreadyAppliedChainSize` boolean and the
+        // `appliedFromBoolean` fallback: the aggregated batch path read the flag
+        // off the LAST entry of a group while summing the explicit amounts, so a
+        // single marked entry could collapse the unapplied remainder of its
+        // siblings to 0 (phantom residual). A partial amount must subtract
+        // exactly the remainder, and a stray boolean on the fillOp must not
+        // change the arithmetic.
         const result = await engine._computeFillTransitionResult(
             makeManager(),
-            makeParams({ alreadyAppliedInt: 1000, alreadyAppliedChainSize: true })
+            makeParams({ alreadyAppliedInt: 1000 })
         );
         assert.strictEqual(result.isFull, false, 'a partially applied fill is not a full fill');
         assert.ok(
@@ -175,7 +178,14 @@ async function runTests() {
         );
         assert.strictEqual(
             String(result.partialUpdate.rawOnChain.for_sale), '30488',
-            'rawOnChain must carry the remainder-only size even when the boolean flag is set'
+            'rawOnChain carries the remainder-only size'
+        );
+        const strayBoolean: any = makeParams({ alreadyAppliedInt: 1000 });
+        strayBoolean.alreadyAppliedChainSize = true;
+        const stray = await engine._computeFillTransitionResult(makeManager(), strayBoolean);
+        assert.strictEqual(
+            String(stray.partialUpdate.rawOnChain.for_sale), '30488',
+            'a leftover boolean field cannot re-add the whole-fill floor'
         );
     }
 

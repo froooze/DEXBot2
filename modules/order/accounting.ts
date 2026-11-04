@@ -182,13 +182,28 @@ class Accountant {
     }
 
     /**
-     * Apply a list of balance adjustments.
-     * @param {Array<{orderType: string, delta: number, operation: string}>} balanceAdjustments
-     * @returns {void}
+     * Apply balance adjustments ALL-OR-NOTHING.
+     *
+     * A throw from the middle of the list used to leave the earlier deltas
+     * applied. Since P2 releases the dedup claim on failure (so the fill can be
+     * retried), a partial application would then be applied twice on the retry.
+     * The credit is now atomic: an applied prefix is reversed before the error
+     * propagates, so "not credited" is true whenever the claim was released.
      */
     async _applyBalanceAdjustments(balanceAdjustments: Array<{ orderType: string | null | undefined; delta: number; operation: string }>) {
-        for (const adjustment of balanceAdjustments) {
-            await this.adjustTotalBalance(adjustment.orderType, adjustment.delta, adjustment.operation);
+        const applied: Array<{ orderType: string | null | undefined; delta: number; operation: string }> = [];
+        try {
+            for (const adjustment of balanceAdjustments) {
+                await this.adjustTotalBalance(adjustment.orderType, adjustment.delta, adjustment.operation);
+                applied.push(adjustment);
+            }
+        } catch (err) {
+            for (const adjustment of applied.reverse()) {
+                try {
+                    await this.adjustTotalBalance(adjustment.orderType, -adjustment.delta, 'rollback-' + adjustment.operation);
+                } catch { /* keep the original failure */ }
+            }
+            throw err;
         }
     }
 
@@ -1920,30 +1935,56 @@ class Accountant {
               }
           }
 
-          // Consume the pass-1 marker only now that this fill is not a
-         // duplicate and its dedup key is queued. Partial consumption: pass 1
-         // may have absorbed only part of this fill (A+B observed, fill A
-         // drained now); the transition subtracts only the remainder.
-         const consumeApplied = mgr.consumeChainSizeAppliedFillAmount;
-         if (Number.isFinite(filledBaseInt) && typeof consumeApplied === 'function') {
-             appliedInt = Math.max(0, Math.min(
-                 Math.round(Number(consumeApplied.call(mgr, String(fillOp.order_id), filledBaseInt)) || 0),
-                 Math.round(filledBaseInt)
-             ));
-         }
-         if (appliedInt > 0) {
-             (fillOp as unknown as { __chainSizeAlreadyApplied?: boolean }).__chainSizeAlreadyApplied = true;
-             (fillOp as unknown as { __chainSizeAppliedInt?: number }).__chainSizeAppliedInt = appliedInt;
-             mgr?.logger?.log?.(
-                 `[FILL-DEDUP] Fill ${fillKey || fillOp.order_id}: ${appliedInt}/${Math.round(filledBaseInt)} base units already absorbed by sync pass 1; the transition will not shrink them again`,
-                 'debug'
-             );
-         } else {
-             delete (fillOp as unknown as { __chainSizeAlreadyApplied?: boolean }).__chainSizeAlreadyApplied;
-             delete (fillOp as unknown as { __chainSizeAppliedInt?: number }).__chainSizeAppliedInt;
-         }
+          // CLAIM THE KEY AT CREDIT TIME (docs/FILL_PIPELINE.md stage 2).
+          // The store is the dedupe authority, so the key must be visible to the
+          // duplicate check before any balance moves — not after the flush. Without
+          // this, a second fill with the same key can pass the check while the
+          // first is still in flight and reach the transition a second time; the
+          // claim lease in the bot only covers that when its window has not
+          // expired. Rolled back on every failure path below, so the invariant is
+          // "booked ⇒ tracker has the key" with no half-claimed keys.
+          if (fillKey) {
+              tracker.set(fillKey, processedAt || Date.now());
+          }
 
-         await this._applyBalanceAdjustments(balanceAdjustments);
+          try {
+              // Consume the pass-1 marker only now that this fill is not a
+              // duplicate and its dedup key is queued. Partial consumption: pass 1
+              // may have absorbed only part of this fill (A+B observed, fill A
+              // drained now); the transition subtracts only the remainder.
+              // Inside the try: the claim above must be released if the marker
+              // accessor throws, or the fill could never be retried.
+              const consumeApplied = mgr.consumeChainSizeAppliedFillAmount;
+              if (Number.isFinite(filledBaseInt) && typeof consumeApplied === 'function') {
+                  appliedInt = Math.max(0, Math.min(
+                      Math.round(Number(consumeApplied.call(mgr, String(fillOp.order_id), filledBaseInt)) || 0),
+                      Math.round(filledBaseInt)
+                  ));
+              }
+              if (appliedInt > 0) {
+                  (fillOp as unknown as { __chainSizeAppliedInt?: number }).__chainSizeAppliedInt = appliedInt;
+                  mgr?.logger?.log?.(
+                      `[FILL-DEDUP] Fill ${fillKey || fillOp.order_id}: ${appliedInt}/${Math.round(filledBaseInt)} base units already absorbed by sync pass 1; the transition will not shrink them again`,
+                      'debug'
+                  );
+              } else {
+                  delete (fillOp as unknown as { __chainSizeAppliedInt?: number }).__chainSizeAppliedInt;
+              }
+
+              await this._applyBalanceAdjustments(balanceAdjustments);
+          } catch (err) {
+              // The claim was ours (the duplicate check above returned early for an
+              // existing key) and no credit was committed, so release it — otherwise
+              // the fill could never be retried.
+              if (fillKey) {
+                  tracker.delete(fillKey);
+                  processedFillStore?.discard(fillKey, processedAt || Date.now());
+              }
+              if (appliedInt > 0 && typeof mgr.noteChainSizeAppliedFill === 'function') {
+                  mgr.noteChainSizeAppliedFill(String(fillOp.order_id), appliedInt);
+              }
+              throw err;
+          }
 
           // Flush the queued dedup key now that balance adjustments succeeded.
           // For IMMEDIATE mode, this persists durably. For BATCHED mode, the
@@ -1960,6 +2001,7 @@ class Accountant {
                       await this.adjustTotalBalance(adj.orderType, -adj.delta, 'rollback-' + adj.operation);
                   }
                   processedFillStore.discard(fillKey, processedAt || Date.now());
+                  tracker.delete(fillKey);
                   // The marker was consumed for this attempt; the rolled-back
                   // fill must be able to skip the pass-1 size release on retry.
                   if (appliedInt > 0 && typeof mgr.noteChainSizeAppliedFill === 'function') {
@@ -1970,8 +2012,8 @@ class Accountant {
           }
 
           if (fillKey) {
-              tracker.set(fillKey, processedAt || Date.now());
-              // Prune entries beyond the retention horizon to prevent unbounded growth.
+              // Already claimed before the credit; prune beyond the retention
+              // horizon so the tracker cannot grow without bound.
               if (tracker.size > 500) {
                   const cutoff = (processedAt || Date.now()) - TIMING.FILL_RECORD_RETENTION_MS;
                   for (const [k, ts] of tracker) {

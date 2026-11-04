@@ -251,11 +251,6 @@ interface FillTransitionParams {
      * alreadyAppliedInt`; a partial value handles split/aggregated fills.
      */
     alreadyAppliedInt?: number;
-    /**
-     * Backward-compatible boolean form: true means the whole fill was already
-     * applied (equivalent to alreadyAppliedInt = filledAmountInt).
-     */
-    alreadyAppliedChainSize?: boolean;
 }
 
 interface SyncChainData {
@@ -1829,23 +1824,18 @@ class SyncEngine {
         // `rawOnChain.for_sale` may already include the part of this fill that
         // sync pass 1 absorbed. Subtract only the NOT-yet-applied remainder;
         // subtracting the whole fill (or none of it) is the double-shrink /
-        // growth pair from the 2026-11-03 incident. Both forms are supported:
-        // the explicit applied amount (partial coverage) and the legacy boolean.
-        const explicitApplied = Number.isFinite(Number(params.alreadyAppliedInt))
-            ? Math.round(Number(params.alreadyAppliedInt))
-            : 0;
-        // The legacy boolean is a FALLBACK, never a floor: it carries no amount,
-        // so it can only speak for the whole fill. It is honoured ONLY when the
-        // caller supplied no explicit applied amount — otherwise a group in
-        // which ONE entry was marked would skip the unapplied remainder of its
-        // siblings (the aggregated batch path reads the flag off the last entry
-        // only, so the explicit sum must win).
-        const hasExplicitApplied = params.alreadyAppliedInt != null
-            && Number.isFinite(Number(params.alreadyAppliedInt));
-        const appliedFromBoolean = !hasExplicitApplied && params.alreadyAppliedChainSize ? filledAmountInt : 0;
+        // growth pair from the 2026-11-03 incident.
+        //
+        // ONE channel: the applied AMOUNT. The pre-P2 `alreadyAppliedChainSize`
+        // boolean is gone — it carried the same fact without a number, so it
+        // could disagree with the amount, and the aggregated path read it off
+        // the LAST group entry only (a group with one marked entry collapsed the
+        // unapplied remainder of its siblings to 0). `processFillAccounting`
+        // writes `__chainSizeAppliedInt` on every marker it consumes, so the
+        // amount is total.
         const appliedInt = Math.max(0, Math.min(
             filledAmountInt,
-            Math.max(explicitApplied, appliedFromBoolean)
+            Math.round(Number(params.alreadyAppliedInt)) || 0
         ));
         const remainingFillInt = Math.max(0, filledAmountInt - appliedInt);
         const newSizeInt = Math.max(0, currentSizeInt - remainingFillInt);
@@ -2155,7 +2145,6 @@ class SyncEngine {
                         isMaker,
                         fillPrice: ctx.fillPrice,
                         alreadyAppliedInt: Math.max(0, Math.round(Number((fillOp as unknown as { __chainSizeAppliedInt?: number }).__chainSizeAppliedInt) || 0)),
-                        alreadyAppliedChainSize: Boolean((fillOp as unknown as { __chainSizeAlreadyApplied?: boolean }).__chainSizeAlreadyApplied)
                     });
 
                     const filledOrders: ManagedOrder[] = [];
@@ -2474,7 +2463,6 @@ class SyncEngine {
                             isMaker: lastCtx.entry.isMaker,
                             fillPrice: lastCtx.fillPrice,
                             alreadyAppliedInt: Math.min(totalFilledAmountInt, Math.max(0, totalAppliedInt)),
-                            alreadyAppliedChainSize: Boolean((lastCtx.entry.fillOp as unknown as { __chainSizeAlreadyApplied?: boolean }).__chainSizeAlreadyApplied)
                         });
 
                         if (result.isFull) {

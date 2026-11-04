@@ -924,6 +924,8 @@ export interface AccountOrdersLike {
 
 /** Batch-persistence handle for processed fill keys. */
 export interface ProcessedFillStoreLike {
+  /** In-memory booked keys (key -> processedAt). The dedupe authority at credit time. */
+  tracker: Map<string, number>;
   configure(options?: { accountOrders?: AccountOrdersLike | null }): void;
   setShuttingDown(value: boolean): void;
   loadPersisted(options?: { forceReload?: boolean; minTimestamp?: number | null }): number;
@@ -1222,11 +1224,10 @@ export interface OrderManagerLike {
   placementHeldForMs?: () => number;
   /** Force-release a placement region held longer than the leak watchdog. */
   _clearStalePlacementRegion?: (maxAgeMs?: number, options?: { batchInFlightMs?: number }) => boolean;
-  /** Pass-1 chain-size markers (see note/consumeChainSizeAppliedFill). */
+  /** Pass-1 chain-size markers (see note/consumeChainSizeAppliedFillAmount). */
   _chainSizeAppliedFills?: Map<string, { filledInt: number; at: number }>;
   noteChainSizeAppliedFill?: (orderId: string, filledInt: number, maxAgeMs?: number) => void;
   consumeChainSizeAppliedFillAmount?: (orderId: string, filledInt: number, maxAgeMs?: number) => number;
-  consumeChainSizeAppliedFill?: (orderId: string, filledInt: number, maxAgeMs?: number) => boolean;
   snapshotChainSizeAppliedFills?: () => Record<string, { filledInt: number; at: number }>;
   restoreChainSizeAppliedFills?: (payload: unknown) => void;
   isStructuralRebuildStale?: (reason: unknown) => boolean;
