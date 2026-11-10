@@ -254,6 +254,16 @@ const scheduleGapEvacRepair = lazyShim('./dexbot_state_recovery', 'scheduleGapEv
     context?: string
 ) => { stranded: string[]; scheduled: boolean };
 
+/**
+ * Post-repair re-plan (lazy, same reason as the sweep above). A targeted repair
+ * virtualises the dead slot but cannot complete the rotation that slot's batch
+ * was carrying, so the grid needs one fresh plan to re-place the rail.
+ */
+const schedulePostRecoveryRebalance = lazyShim('./dexbot_state_recovery', 'schedulePostRecoveryRebalance') as (
+    bot: BotLike,
+    context?: string
+) => void;
+
 /** Loose JSON-object view. */
 type JsonObj = UnknownRecord;
 
@@ -4130,10 +4140,81 @@ async function runPreBroadcastGuards(bot: BotLike, cowResult: CowResult): Promis
                     bot.manager.logger.log(
                         `[COW] Rejecting UPDATE batch pre-broadcast: ${missing.length} target(s) missing on chain ` +
                         `(${missing.slice(0, 8).join(', ')}${missing.length > 8 ? ', …' : ''}); ` +
-                        `grid/chain existence divergence — structural resync required`,
+                        `grid/chain existence divergence`,
                         'error'
                     );
                     popPushedWorkingGrid(bot, cowResult);
+                    // REPAIR THE SLOT, NOT THE WHOLE GRID. Both reads above agreed
+                    // these ids are absent, so each one is a slot whose chain order
+                    // is gone (a missed fill or a phantom left by an earlier
+                    // reload). The old response — a structural resync, which
+                    // reloads the on-disk snapshot — could only re-read the same
+                    // stale slot from disk and plan the same UPDATE again: the
+                    // refused batch re-armed itself forever, and while that slot
+                    // sat "placed" inside the gap band every boundary slide
+                    // (hence every sell-side promotion) stayed refused, so the
+                    // spread never closed. `_targetedOrderRepair` is the existing
+                    // single-slot repair (chain read -> placeholder when absent),
+                    // already used by the size-drift path; it releases the dead
+                    // commitment and leaves the level as a plain hole.
+                    let repaired = false;
+                    if (typeof bot._targetedOrderRepair === 'function') {
+                        try {
+                            repaired = (await bot._targetedOrderRepair(missing)) === true;
+                        } catch (repairErr) {
+                            bot.manager.logger.log(
+                                `[COW] Targeted repair of missing UPDATE target(s) failed (${getErrorMessage(repairErr)}); ` +
+                                `falling back to structural resync`,
+                                'warn'
+                            );
+                            repaired = false;
+                        }
+                    }
+                    if (repaired) {
+                        // A repair that leaves an id tracked did nothing (e.g. the
+                        // id belongs to no grid slot): that must escalate, not
+                        // silently drop a batch per cycle.
+                        const stillTracked = new Set<string>();
+                        for (const order of bot.manager.orders.values()) {
+                            const trackedId = order?.orderId ? String(order.orderId) : '';
+                            if (trackedId && missing.includes(trackedId)) stillTracked.add(trackedId);
+                        }
+                        if (stillTracked.size > 0) {
+                            bot.manager.logger.log(
+                                `[COW] Targeted repair left ${stillTracked.size} missing target(s) tracked ` +
+                                `(${[...stillTracked].slice(0, 8).join(', ')}); falling back to structural resync`,
+                                'warn'
+                            );
+                            repaired = false;
+                        }
+                    }
+                    if (repaired) {
+                        bot.manager.logger.log(
+                            `[COW] Repaired ${missing.length} missing UPDATE target(s) locally ` +
+                            `(${missing.slice(0, 8).join(', ')}${missing.length > 8 ? ', …' : ''}); ` +
+                            `batch dropped and a fresh plan scheduled — no snapshot reload`,
+                            'warn'
+                        );
+                        schedulePostRecoveryRebalance(
+                            bot,
+                            `missing update target repair (${missing.join(', ')})`
+                        );
+                        return {
+                            proceed: false,
+                            result: {
+                                executed: false,
+                                aborted: true,
+                                // Reason stays UPDATE_TARGET_MISSING so every
+                                // existing classifier/metric keeps its meaning;
+                                // `repairedMissingTargets` tells the re-plan path
+                                // that the grid was repaired rather than reloaded.
+                                reason: 'UPDATE_TARGET_MISSING',
+                                missingUpdateOrderIds: missing,
+                                repairedMissingTargets: true,
+                                hadRotation: false
+                            }
+                        };
+                    }
                     await requestStructuralResync(
                         bot,
                         'pre-broadcast update target missing on chain',

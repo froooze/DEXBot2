@@ -195,6 +195,21 @@ function createManagerFixture() {
 const { ensureFeeCache } = require('./helpers/fee_cache_init');
 ensureFeeCache();
 
+/** Wait until `predicate` is true, yielding between checks (bounded). */
+function waitFor(predicate: () => boolean, message: string, maxMs = 2000) {
+    const start = Date.now();
+    return new Promise<void>((resolve, reject) => {
+        const tick = () => {
+            let done = false;
+            try { done = !!predicate(); } catch (err) { reject(err); return; }
+            if (done) return resolve();
+            if (Date.now() - start >= maxMs) return reject(new Error(`Timed out waiting for ${message}`));
+            setTimeout(tick, 10);
+        };
+        setTimeout(tick, 10);
+    });
+}
+
 function createCowExecutionFixture(masterOrders = new Map()) {
     const bot = new DEXBot({
         botKey: 'test_cow_cache_deduction',
@@ -1107,6 +1122,8 @@ async function testRejectsMissingUpdateTargetBeforeBroadcast() {
     chainOrders.batchReadOrders = async (_ids: string[]) => new Map();
     let executeCalls = 0;
     chainOrders.executeBatch = async () => { executeCalls += 1; return { success: true, operation_results: [] }; };
+    // Repair unavailable/failed -> the structural resync stays the fallback.
+    (bot as any)._targetedOrderRepair = async () => false;
 
     const workingGrid = new WorkingGrid(manager.orders, { baseVersion: 0 });
     try {
@@ -1125,13 +1142,121 @@ async function testRejectsMissingUpdateTargetBeforeBroadcast() {
         assert.strictEqual(result.reason, 'UPDATE_TARGET_MISSING', 'abort reason must identify the missing target');
         assert.deepStrictEqual(result.missingUpdateOrderIds, ['1.7.gone'], 'missing id must be reported');
         assert.strictEqual(executeCalls, 0, 'no blockchain broadcast may be attempted');
-        assert.strictEqual(resyncRequests, 1, 'structural resync must be requested');
+        assert.strictEqual(resyncRequests, 1, 'structural resync must be requested when the targeted repair cannot run');
+        assert.notStrictEqual(result.repairedMissingTargets, true, 'a failed repair must not be reported as repaired');
     } finally {
         chainOrders.batchReadOrders = originalBatchRead;
         chainOrders.executeBatch = originalExecuteBatch;
     }
 
     console.log('✓ COW-COMMIT-013 passed');
+}
+
+async function testRepairsMissingUpdateTargetInPlace() {
+    console.log('\n[COW-COMMIT-013b] missing UPDATE target is repaired in place (no snapshot reload)...');
+
+    const masterOrders = new Map([
+        ['slot-1', createOrder('slot-1', { type: ORDER_TYPES.BUY, price: 1.0, orderId: '1.7.gone' })]
+    ]);
+    const { bot, manager } = createCowExecutionFixture(masterOrders);
+    (manager as any)._gapSlots = 2;
+    let resyncRequests = 0;
+    (manager as any).requestStructuralGridResync = async () => { resyncRequests += 1; return { scheduled: true }; };
+    // Give the fixture the re-plan precondition so the scheduled rebalance is
+    // observable (the real bot always has both).
+    (manager as any).performSafeRebalance = async () => ({ aborted: false });
+
+    const originalBatchRead = chainOrders.batchReadOrders;
+    const originalExecuteBatch = chainOrders.executeBatch;
+    chainOrders.batchReadOrders = async (_ids: string[]) => new Map();
+    let executeCalls = 0;
+    chainOrders.executeBatch = async () => { executeCalls += 1; return { success: true, operation_results: [] }; };
+
+    let repairCalls = 0;
+    (bot as any)._targetedOrderRepair = async (ids: string[]) => {
+        repairCalls += 1;
+        const repaired = new Map<string, any>();
+        for (const [key, order] of masterOrders) {
+            repaired.set(key, ids.includes(String(order.orderId))
+                ? { ...order, state: ORDER_STATES.VIRTUAL, size: 0, type: ORDER_TYPES.SPREAD, orderId: '' }
+                : order);
+        }
+        (manager as any).orders = repaired;
+        return true;
+    };
+
+    const workingGrid = new WorkingGrid(manager.orders, { baseVersion: 0 });
+    try {
+        const result: any = await bot._updateOrdersOnChainBatchCOW({
+            workingGrid,
+            workingIndexes: workingGrid.getIndexes(),
+            workingBoundary: (manager as any).boundaryIdx,
+            actions: [{
+                type: COW_ACTIONS.UPDATE,
+                id: 'slot-1',
+                orderId: '1.7.gone',
+                order: { id: 'slot-1', type: ORDER_TYPES.BUY, price: 1.0, size: 100, state: ORDER_STATES.ACTIVE, orderId: '1.7.gone' }
+            }]
+        });
+        assert.strictEqual(repairCalls, 1, 'the missing target must be repaired exactly once');
+        assert.strictEqual(result.aborted, true, 'the refused batch is still dropped');
+        assert.strictEqual(result.reason, 'UPDATE_TARGET_MISSING', 'reason keeps the shared refusal vocabulary');
+        assert.strictEqual(result.repairedMissingTargets, true, 'the repair must be reported');
+        assert.strictEqual(executeCalls, 0, 'no blockchain broadcast may be attempted');
+        assert.strictEqual(
+            resyncRequests,
+            0,
+            'a repaired target must NOT escalate to a structural resync (that reloads the stale snapshot and re-arms the same refusal)'
+        );
+        assert.strictEqual(Boolean(bot._postRecoveryRebalanceTimer), true, 'a fresh plan must be scheduled after the repair');
+
+        // Let the deferred re-plan run so no timer leaks into the next test.
+        await waitFor(() => !bot._postRecoveryRebalanceTimer, 'deferred post-repair re-plan to settle', 2000);
+    } finally {
+        chainOrders.batchReadOrders = originalBatchRead;
+        chainOrders.executeBatch = originalExecuteBatch;
+    }
+
+    console.log('✓ COW-COMMIT-013b passed');
+}
+
+async function testUnrepairableMissingTargetStillEscalates() {
+    console.log('\n[COW-COMMIT-013c] a repair that leaves the id tracked still escalates...');
+
+    const masterOrders = new Map([
+        ['slot-1', createOrder('slot-1', { type: ORDER_TYPES.BUY, price: 1.0, orderId: '1.7.gone' })]
+    ]);
+    const { bot, manager } = createCowExecutionFixture(masterOrders);
+    (manager as any)._gapSlots = 2;
+    let resyncRequests = 0;
+    (manager as any).requestStructuralGridResync = async () => { resyncRequests += 1; return { scheduled: true }; };
+
+    const originalBatchRead = chainOrders.batchReadOrders;
+    chainOrders.batchReadOrders = async (_ids: string[]) => new Map();
+    // Claims success but leaves the dead id on the slot: dropping the batch
+    // silently would loop one refusal per cycle forever.
+    (bot as any)._targetedOrderRepair = async () => true;
+
+    const workingGrid = new WorkingGrid(manager.orders, { baseVersion: 0 });
+    try {
+        const result: any = await bot._updateOrdersOnChainBatchCOW({
+            workingGrid,
+            workingIndexes: workingGrid.getIndexes(),
+            workingBoundary: (manager as any).boundaryIdx,
+            actions: [{
+                type: COW_ACTIONS.UPDATE,
+                id: 'slot-1',
+                orderId: '1.7.gone',
+                order: { id: 'slot-1', type: ORDER_TYPES.BUY, price: 1.0, size: 100, state: ORDER_STATES.ACTIVE, orderId: '1.7.gone' }
+            }]
+        });
+        assert.notStrictEqual(result.repairedMissingTargets, true, 'an ineffective repair must not be reported as repaired');
+        assert.strictEqual(resyncRequests, 1, 'an ineffective repair must escalate to the structural resync');
+    } finally {
+        chainOrders.batchReadOrders = originalBatchRead;
+    }
+
+    console.log('✓ COW-COMMIT-013c passed');
 }
 
 async function testAllowsPresentUpdateTargetThroughGuard() {
@@ -1278,6 +1403,8 @@ async function run() {
     await testToleranceViolationFiltersCreatesOnly();
     await testSeamPollIntervalDoesNotLeakOnGuardRefusal();
     await testRejectsMissingUpdateTargetBeforeBroadcast();
+    await testRepairsMissingUpdateTargetInPlace();
+    await testUnrepairableMissingTargetStillEscalates();
     await testAllowsPresentUpdateTargetThroughGuard();
     await testLaggingBatchReadIsRescuedBySingleRead();
     await testGapBandPlacementShadowIsObservabilityOnly();
