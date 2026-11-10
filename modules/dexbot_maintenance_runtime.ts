@@ -3644,7 +3644,26 @@ function wireStructuralGridResyncRequest(bot: BotLike) {
             // commit refusal + re-adoption cycle. Defer until the batch
             // completes; the fill consumer is already gated on _batchInFlight,
             // so this only blocks the recovery itself, never new fills.
-            if (bot._batchInFlight > 0) {
+            //
+            // SAME DEFER FOR AN UNSETTLED FILL PIPELINE: a fill batch mutates
+            // the grid in memory long before its persistence flush reaches
+            // disk, so the on-disk snapshot can still describe the PRE-fill
+            // slot sizes. Reloading it rolls an applied fill back, and the next
+            // fill for the same order is then subtracted from that rolled-back
+            // baseline — leaving a phantom residual plus an orderId the chain
+            // no longer has. Observed live: two partial fills of one order in
+            // consecutive blocks; the reload between them turned a completed
+            // order into a phantom parked in the gap band, which froze the
+            // boundary crawl so the spread could not be closed.
+            //
+            // `hasUnsettledFills` is the same predicate the destructive
+            // snapshot-reject gate uses: only a settled fill pipeline makes the
+            // on-disk snapshot a safe base.
+            const fillPipeline = hasUnsettledFills(bot);
+            const deferCause = bot._batchInFlight > 0
+                ? `_batchInFlight=${bot._batchInFlight}`
+                : (fillPipeline.unsettled ? `fill pipeline not settled: ${fillPipeline.reason}` : null);
+            if (deferCause) {
                 const now = Date.now();
                 if (!bot._structuralGridResyncDeferStartedAt) {
                     bot._structuralGridResyncDeferStartedAt = now;
@@ -3654,7 +3673,7 @@ function wireStructuralGridResyncRequest(bot: BotLike) {
                 const deferredMs = now - bot._structuralGridResyncDeferStartedAt;
                 if (deferredMs >= STRUCTURAL_RESYNC_MAX_DEFER_MS) {
                     bot._warn(
-                        `[RECOVERY] Structural resync max-defer reached (${deferredMs}ms, cap ${STRUCTURAL_RESYNC_MAX_DEFER_MS}ms, deferred ${bot._structuralGridResyncDeferCount}x) — forcing despite _batchInFlight=${bot._batchInFlight}: ${reason}`
+                        `[RECOVERY] Structural resync max-defer reached (${deferredMs}ms, cap ${STRUCTURAL_RESYNC_MAX_DEFER_MS}ms, deferred ${bot._structuralGridResyncDeferCount}x) — forcing despite ${deferCause}: ${reason}`
                     );
                     bot._structuralGridResyncDeferStartedAt = null;
                     bot._structuralGridResyncDeferCount = 0;
@@ -3665,11 +3684,11 @@ function wireStructuralGridResyncRequest(bot: BotLike) {
                     // the final forced message.
                     if (bot._structuralGridResyncDeferCount === 1) {
                         bot._warn(
-                            `[RECOVERY] Structural resync defer (batchInFlight=${bot._batchInFlight}, deferred ${deferredMs}ms/${STRUCTURAL_RESYNC_MAX_DEFER_MS}ms): ${reason}`
+                            `[RECOVERY] Structural resync defer (${deferCause}, deferred ${deferredMs}ms/${STRUCTURAL_RESYNC_MAX_DEFER_MS}ms): ${reason}`
                         );
                     } else {
                         bot.manager?.logger?.log?.(
-                            `[RECOVERY] Structural resync defer (suppressed; count=${bot._structuralGridResyncDeferCount}, deferred ${deferredMs}ms/${STRUCTURAL_RESYNC_MAX_DEFER_MS}ms): ${reason}`,
+                            `[RECOVERY] Structural resync defer (suppressed; ${deferCause}, count=${bot._structuralGridResyncDeferCount}, deferred ${deferredMs}ms/${STRUCTURAL_RESYNC_MAX_DEFER_MS}ms): ${reason}`,
                             'debug'
                         );
                     }
