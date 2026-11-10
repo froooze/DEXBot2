@@ -2172,11 +2172,21 @@ class OrderManager implements OrderManagerLike {
             }
 
             if (nextId !== prevId) {
+                const isLoadContext = context === 'grid-load' || context === 'grid-init';
                 // A freshly assigned chain id (create/adopt broadcast in flight, or
                 // not yet visible to a lagging read) must not read as "absent from
                 // chain": absence decisions defer while it is younger than
                 // SYNC_LOCK_TIMEOUT_MS (isRecentlyAssigned).
-                this._lifecycle.markAssigned(slotId, nextId);
+                //
+                // Snapshot/grid load paths are excluded for ids this process
+                // already knows: a reload re-adopts OLD ids, so re-stamping them
+                // would hand the same (possibly dead) order a brand-new defer
+                // window on every reload. The reload that follows a refused
+                // UPDATE re-armed it indefinitely, so a genuinely absent orderId
+                // could never be cleaned up and kept blocking the gap band. First
+                // sight of an id (fresh process) still gets the grace.
+                const isKnownId = this._lifecycle.assignedAt.has(nextId);
+                if (!isLoadContext || !isKnownId) this._lifecycle.markAssigned(slotId, nextId);
                 // Fresh-placement timestamp for the surplus-cancel grace window: a
                 // slot gaining an orderId it did not have is a new placement
                 // (create, adopt, rotation target), and surplus sweeps must not
@@ -2185,7 +2195,6 @@ class OrderManager implements OrderManagerLike {
                 // Snapshot/grid load paths are excluded: reloaded orders are old by
                 // definition, and stamping them would neuter surplus sweeps for 15
                 // minutes after every restart.
-                const isLoadContext = context === 'grid-load' || context === 'grid-init';
                 if (!isLoadContext) this._lifecycle.markPlaced(nextId, undefined, slotId);
             }
 
