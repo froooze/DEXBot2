@@ -14,6 +14,7 @@ import { ON_MISSING_GENESIS, isMissingGenesisError } from './order/genesis_polic
 import type { ManagedOrder, ChainOrder } from './types.js';
 import type { GridGenesis } from './order/utils/math.js';
 import { hasExecutableActions } from './order/utils/validate.js';
+import { releasePlanLease } from './order/placement_lock.js';
 import { getErrorMessage } from './utils/errors.js';
 import type { BotLike } from './types.js';
 const { isGridBloated } = grid;
@@ -751,7 +752,10 @@ async function _rebalanceAfterRecovery(bot: BotLike, context: string) {
         return;
     }
     try {
-        const rebalanceResult = await bot.manager.performSafeRebalance([], new Set());
+        // holdPlanRegion: every result on this path is either executed below or
+        // released explicitly, so the plan→commit window is serialized against
+        // the fill-driven planner.
+        const rebalanceResult = await bot.manager.performSafeRebalance([], new Set(), { holdPlanRegion: true });
         if (!rebalanceResult || rebalanceResult.aborted) {
             // A deferred abort means owed work is still outstanding (broadcast
             // held the plan, or the identical-held-plan suppression is waiting
@@ -775,8 +779,18 @@ async function _rebalanceAfterRecovery(bot: BotLike, context: string) {
             // rebalance stack stays balanced and _rebalanceState returns to
             // NORMAL (mirrors _executeBatchIfNeeded's no-action pop). Aborted
             // results are never pushed, so only this branch needs the pop.
+            // The result also owns the plan region acquired before planning;
+            // no executor will adopt it on this path, so release it here.
+            releasePlanLease(rebalanceResult);
             bot.manager?._popWorkingGridRef?.(rebalanceResult);
             return;
+        }
+        const railCount = Array.isArray(rebalanceResult.actions) ? rebalanceResult.actions.length : 0;
+        if (railCount > 0 && bot._metrics) {
+            // Cost of a recovery reload/repair in re-placed rails. Counted here
+            // (not derived from logs) so the reload→re-place amplification is
+            // observable next to the other churn counters.
+            bot._metrics.reloadReplacedRailCount = (bot._metrics.reloadReplacedRailCount || 0) + railCount;
         }
         bot.manager.logger?.log?.(
             `[RECOVERY] Re-placing ${(rebalanceResult.actions ?? []).length} missing rail(s) after ${context}`,

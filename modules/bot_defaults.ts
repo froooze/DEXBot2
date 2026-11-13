@@ -223,6 +223,11 @@ export function createDefaultBotMetrics(): BotMetrics {
         gapBandPlacementShadowCount: 0,
         spreadCorrectionRefusedCount: 0,
         spreadCorrectionRefusalCauses: {},
-        spreadCorrectionRetryCount: 0
+        spreadCorrectionRetryCount: 0,
+        stalePlanDroppedCount: 0,
+        stalePlanProceedCount: 0,
+        clampedNoopUpdateCount: 0,
+        chunkAbortedOpCount: 0,
+        reloadReplacedRailCount: 0
     };
 }

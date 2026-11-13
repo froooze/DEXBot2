@@ -86,6 +86,7 @@ import { path } from './path_api.js';
 import * as Format from './order/format.js';
 import cowRuntime from './dexbot_cow_runtime.js';
 import type { ChainOrderLike, CowResult, OpPhase } from './dexbot_cow_runtime.js';
+import { takePlanLease, releasePlanLease } from './order/placement_lock.js';
 import { ProcessedFillStore } from './order/processed_fill_store.js';
 import { isFillBooked } from './order/fill_ledger.js';
 import {
@@ -1141,6 +1142,11 @@ class DEXBot implements BotLike {
      */
     async _executeBatchIfNeeded(rebalanceResult: unknown, contextLabel: unknown = 'rebalance'): Promise<unknown> {
         if (!hasExecutableActions(rebalanceResult)) {
+            // A planned result that is not executed owns the plan region
+            // (manager.performSafeRebalance acquires it before planning). No
+            // COW body will adopt it on this path, so release it here or the
+            // region parks every other placement path until the watchdog.
+            releasePlanLease(rebalanceResult);
             this.manager?.logger?.log?.(`[COW] No actions needed for ${contextLabel}`, 'debug');
             // Structural-resync request from the plan path (unrecoverable
             // boundary, rail-edge target, over-distance rotations): the plan
@@ -1655,6 +1661,8 @@ class DEXBot implements BotLike {
         const rb = rebalanceResult as CowResult | null | undefined;
         if (!rb || !rb.workingGrid) {
             const reason = 'NON_COW_PAYLOAD';
+            // Never strand a plan region on a payload the executor cannot use.
+            releasePlanLease(rebalanceResult);
             this.manager?.logger?.log?.(
                 `[COW] Rejected non-COW batch payload. Use updateOrdersOnChainPlan() for plan inputs.`,
                 'error'
@@ -1662,7 +1670,17 @@ class DEXBot implements BotLike {
             return { executed: false, aborted: true, reason };
         }
 
-        return await this._updateOrdersOnChainBatchCOW(rb);
+        // Adopt the plan region carried by the result and hand it to the COW
+        // body, which releases it on every exit (commit, refusal, throw).
+        // Taking it here means a throw before the body adopts can be released
+        // in the catch instead of parking the region (release is idempotent).
+        const planLease = takePlanLease(rb);
+        try {
+            return await this._updateOrdersOnChainBatchCOW(rb, planLease ? { placementLease: planLease } : {});
+        } catch (err) {
+            planLease?.release();
+            throw err;
+        }
     }
 
     /**

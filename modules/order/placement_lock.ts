@@ -59,6 +59,56 @@ export interface PlacementCapableManager {
     placementKind?(): string | null;
 }
 
+/**
+ * Result-carried plan lease (the plan → broadcast → commit region).
+ *
+ * `performSafeRebalance` acquires the placement region BEFORE it plans, so a
+ * second planner cannot build from the master this plan is about to mutate
+ * (the gap between "plan finished" and "executor claimed placement" was the
+ * duplicate-order window: two plans 595 ms apart both passed the
+ * `isPlacementActive()` pre-check, then both broadcast). The lease rides on
+ * the rebalance result until the executor adopts it; every consumer either
+ * takes it (the COW body, which releases it in its own finally) or releases
+ * it (no-action / discarded results).
+ *
+ * Keep the property name in one place: producer (manager), consumer
+ * (dexbot_class / dexbot_cow_runtime / dexbot_state_recovery) and tests must
+ * agree on it.
+ */
+export const PLAN_LEASE_RESULT_KEY = '_planPlacementLease';
+
+type PlanLeaseCarrier = { [PLAN_LEASE_RESULT_KEY]?: PlacementLease | null } & Record<string, unknown>;
+
+export function attachPlanLease(result: unknown, lease: PlacementLease | null | undefined): void {
+    if (!result || typeof result !== 'object' || !lease) return;
+    (result as PlanLeaseCarrier)[PLAN_LEASE_RESULT_KEY] = lease;
+}
+
+/**
+ * Remove and return the plan lease carried by a rebalance result.
+ * The caller becomes the owner and MUST release it (directly or through the
+ * COW body's finally). Taking is idempotent: a second call returns null.
+ */
+export function takePlanLease(result: unknown): PlacementLease | null {
+    if (!result || typeof result !== 'object') return null;
+    const carrier = result as PlanLeaseCarrier;
+    const lease = carrier[PLAN_LEASE_RESULT_KEY] ?? null;
+    if (lease) delete carrier[PLAN_LEASE_RESULT_KEY];
+    return lease;
+}
+
+/**
+ * Release (and drop) a plan lease a caller will not execute. Safe on results
+ * that never carried one, and safe to call twice (lease release is
+ * token-guarded/idempotent).
+ */
+export function releasePlanLease(result: unknown): void {
+    const lease = takePlanLease(result);
+    try {
+        lease?.release();
+    } catch { /* a release must never escape into the settle path */ }
+}
+
 /** Used when the caller has no lock (dry-run mocks / browser shims). */
 const NOOP_PLACEMENT_LEASE: PlacementLease = { kind: 'noop', release: () => { /* no lock */ } };
 

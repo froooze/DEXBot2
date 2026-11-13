@@ -73,6 +73,7 @@ defineEsmMockAbs(require.resolve('../modules/chain_orders'), [
 const DEXBot = require('../modules/dexbot_class').default;
 const { WorkingGrid } = require('../modules/order/working_grid');
 const { ORDER_TYPES, ORDER_STATES, COW_ACTIONS } = require('../modules/constants');
+const { PLAN_LEASE_RESULT_KEY } = require('../modules/order/placement_lock');
 
 const { ensureFeeCache } = require('./helpers/fee_cache_init');
 ensureFeeCache();
@@ -493,6 +494,9 @@ async function testStaleAtReplanLimitProceedsWithResync() {
             workingIndexes: staleWG.getIndexes(),
             workingBoundary: 0,
             actions: [createVirtualCreateAction('slot-2', 1.1)],
+            // A real fill context: the depth-limit branch is only reachable
+            // with fills, because a fill-less stale plan is now dropped.
+            fills: [{ id: 'fill-1', type: ORDER_TYPES.BUY, price: 0.99, size: 5 }],
             _workingGridPushed: true
         }, { replanDepth: 1 });
 
@@ -561,6 +565,54 @@ async function testReplanThrowProceedsWithResync() {
     console.log('✓ COW-GUARD-REPLAN-004 passed');
 }
 
+async function testNoFillContextDropsStalePlan() {
+    console.log('\n[COW-GUARD-REPLAN-008] stale plan with no fill context is dropped, not broadcast...');
+
+    const masterOrders = new Map([
+        ['slot-1', createOrder('slot-1')]
+    ]);
+    const { bot, manager, counters, logs } = createGuardFixture(masterOrders);
+    const restore = installChainStubs(manager, counters);
+
+    // A snapshot grid-load (or a stale cancellation) mutated the master while
+    // this fill-less plan was being built. There is nothing to re-plan from,
+    // so the pre-mutation ops must not ship.
+    manager._gridVersion = 1;
+    const staleWG = makeStaleWorkingGrid(manager);
+
+    try {
+        manager._currentWorkingGridStack.push(staleWG);
+        const result = await bot._updateOrdersOnChainBatchCOW({
+            workingGrid: staleWG,
+            workingIndexes: staleWG.getIndexes(),
+            workingBoundary: 0,
+            actions: [createVirtualCreateAction('slot-2', 1.1)],
+            fills: [],
+            _workingGridPushed: true
+        });
+
+        assert.strictEqual(result.executed, false, 'a fill-less stale plan must not ship');
+        assert.strictEqual(result.aborted, true, 'it must abort (not silently skip)');
+        assert.strictEqual(result.reason, 'STALE_PLAN_NO_FILL_CONTEXT', 'the abort reason must be explicit');
+        assert.strictEqual(result.droppedStalePlan, true, 'the drop must be reported');
+        assert.strictEqual(result.deferred, true, 'a re-derive must remain owed');
+        assert.strictEqual(counters.executeBatchCalls, 0, 'nothing may be broadcast');
+        assert.strictEqual(counters.commitCalls, 0, 'nothing may be committed');
+        assert.strictEqual(counters.resyncCalls, 0, 'the mutation that made it stale is not a reason to resync again');
+        assert.strictEqual(manager._deferredRebalanceAt > 0, true, 'a level-triggered re-derive must be owed');
+        assert.strictEqual(manager._currentWorkingGridStack.length, 0, 'the dropped plan grid must be popped');
+        assert.strictEqual(bot._metrics.stalePlanDroppedCount, 1, 'the drop must be counted');
+        assert(
+            logs.some((m: string) => m.includes('dropping the batch')),
+            'the drop decision must be logged'
+        );
+    } finally {
+        restore();
+    }
+
+    console.log('✓ COW-GUARD-REPLAN-008 passed');
+}
+
 async function testBatchAbortsWhenPlacementLeaseWasTornDown() {
     console.log('\n[COW-GUARD-REPLAN-006] a batch whose lease the watchdog force-released must not broadcast...');
 
@@ -607,6 +659,61 @@ async function testBatchAbortsWhenPlacementLeaseWasTornDown() {
     console.log('✓ COW-GUARD-REPLAN-006 passed');
 }
 
+async function testResultCarriedPlanLeaseIsAdoptedAndReleased() {
+    console.log('\n[COW-GUARD-REPLAN-009] a result-carried plan lease is adopted and released by the COW body...');
+
+    const masterOrders = new Map([
+        ['slot-1', createOrder('slot-1')]
+    ]);
+    const { bot, manager } = createGuardFixture(masterOrders);
+    const restore = installChainStubs(manager, { commitCalls: 0, replanCalls: 0, resyncCalls: 0, executeBatchCalls: 0, clearCalls: 0, restoreCalls: 0, broadcastStarts: 0, broadcastStops: 0 });
+
+    // Mirror the zero-op path (last-fill guard skips the only action) so the
+    // body reaches its finally without broadcasting; the plan lease carried on
+    // the result must be adopted and released there exactly once.
+    manager._lastFilledPrice = 1.0;
+    manager._lastFilledType = ORDER_TYPES.SELL;
+    manager._lastFilledAt = Date.now();
+    manager.lastFillPivotSource = 'fill';
+
+    // A real PlacementLease is token-guarded/idempotent (release() after the
+    // first call is a no-op), so model that: the wrapper's safety release and
+    // the body's finally may both call it.
+    let releases = 0;
+    let releaseCalled = false;
+    const lease = {
+        kind: 'cow-plan',
+        release: () => {
+            if (releaseCalled) return;
+            releaseCalled = true;
+            releases += 1;
+        }
+    };
+
+    try {
+        const workingGrid = new WorkingGrid(manager.orders, { baseVersion: manager._gridVersion });
+        workingGrid.set('slot-2', createVirtualCreateAction('slot-2', 1.1).order);
+        manager._currentWorkingGridStack.push(workingGrid);
+        const result = await bot._updateOrdersOnChainBatchCOW({
+            workingGrid,
+            workingIndexes: workingGrid.getIndexes(),
+            workingBoundary: 0,
+            actions: [createVirtualCreateAction('slot-2', 1.1)],
+            fills: [],
+            _workingGridPushed: true,
+            [PLAN_LEASE_RESULT_KEY]: lease
+        });
+
+        assert.strictEqual(result.executed, false, 'the zero-op batch must not execute');
+        assert.strictEqual(releases, 1, 'the body must adopt and release the carried plan lease');
+        assert.strictEqual(manager._currentWorkingGridStack.length, 0, 'working grid stack must be balanced');
+    } finally {
+        restore();
+    }
+
+    console.log('✓ COW-GUARD-REPLAN-009 passed');
+}
+
 async function run() {
     console.log('Running COW guard bounded re-plan regression tests...');
     await testStalePlanReplansOnceAndExecutes();
@@ -615,7 +722,9 @@ async function run() {
     await testZeroOperationBatchReleasesBroadcastRegion();
     await testStaleAtReplanLimitProceedsWithResync();
     await testReplanThrowProceedsWithResync();
+    await testNoFillContextDropsStalePlan();
     await testBatchAbortsWhenPlacementLeaseWasTornDown();
+    await testResultCarriedPlanLeaseIsAdoptedAndReleased();
     console.log('\n✓ All COW guard re-plan regression tests passed');
 }
 

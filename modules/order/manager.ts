@@ -70,7 +70,7 @@ import {
 } from './utils/validate.js';
 import { resolveSpreadOrderSide, resolveLiveOrderLadderPosition, parseChainOrder, geometryTypeForSlotIndex, isOrderOnChain, resolveEdgeCount, resolveLiveEdgeAnchorPrice, compareEdge, collectRefillSlotIds, isFreshlyPlacedOrder, collectEdgePinnedFillIds, isStructuralRebuildStaleReason } from './utils/order.js';
 import { parseSlotIndex } from './utils/slot.js';
-import PlacementLock, { withPlacement as runWithPlacement } from './placement_lock.js';
+import PlacementLock, { withPlacement as runWithPlacement, attachPlanLease } from './placement_lock.js';
 import type { PlacementLease } from './placement_lock.js';
 import { getErrorMessage, getErrorCode } from '../utils/errors.js';
 import type { GridGenesis } from './utils/math.js';
@@ -2393,7 +2393,10 @@ class OrderManager implements OrderManagerLike {
             const reanchorBudgetBefore = Number((this as unknown as { _boundaryReanchorBudget?: unknown })._boundaryReanchorBudget);
             const rebalanceResult = await this.performSafeRebalance(orders, excl, {
                 ...(options || {}),
-                deferIfBroadcasting: true
+                deferIfBroadcasting: true,
+                // This result is always fed to the executor by
+                // _processFillsWithBatching, so the region can span plan→commit.
+                holdPlanRegion: true
             });
             // Carry the fill set + exclusions on the result so the COW batch
             // executor can re-plan once from fresh master if the plan goes
@@ -3199,9 +3202,14 @@ class OrderManager implements OrderManagerLike {
      * @param {boolean} [options.skipBroadcastWait] - Set by the COW re-plan path,
      *   which runs INSIDE its own startBroadcasting() region and must not wait
      *   on the flag it holds itself.
+     * @param {boolean} [options.holdPlanRegion] - Claim the exclusive placement
+     *   region before planning and ride it on the result, so the plan→broadcast
+     *   window is serialized against other planners. Set by the callers that are
+     *   guaranteed to execute the result (fill path, post-recovery rebalance).
+     *   Planner-only callers (unit fixtures) leave it off and stay lease-free.
      * @returns {Promise<any>}
      */
-    async performSafeRebalance(fills: COWFillLike[] = [], excludeIds: Set<string> = new Set(), options: { skipBroadcastWait?: boolean; deferIfBroadcasting?: boolean; [key: string]: unknown } = {}): Promise<RebalanceResult> {
+    async performSafeRebalance(fills: COWFillLike[] = [], excludeIds: Set<string> = new Set(), options: { skipBroadcastWait?: boolean; deferIfBroadcasting?: boolean; holdPlanRegion?: boolean; [key: string]: unknown } = {}): Promise<RebalanceResult> {
         this.logger.log("[SAFE-REBALANCE] Starting with COW...", "info");
         // A fresh fill set re-enables planning and ends any held-plan
         // suppression run counted below; the next fill-less streak counts
@@ -3302,9 +3310,59 @@ class OrderManager implements OrderManagerLike {
                 }
             }
         }
-        return await this._gridLock.acquire(async () => {
-            return await this._applySafeRebalanceCOW(fills, excludeIds);
-        });
+        // PLAN REGION (plan → broadcast → commit), opted in by holdPlanRegion.
+        // For the callers that are guaranteed to execute the result (the fill
+        // path and the post-recovery rebalance), the region is claimed BEFORE
+        // planning, not by the executor afterwards. The old split left a window
+        // between "plan finished" and "executor claimed placement" in which a
+        // second planner passed every pre-check (`isPlacementActive()` was still
+        // false), built from the same master, and both batches broadcast — the
+        // duplicate-order window (two plans 595 ms apart, observed 2026-11-13).
+        // Holding the lease across the plan makes the next planner defer on the
+        // existing `isPlacementActive()` check; the lease rides on the result
+        // and the executor adopts it (placement_lock.ts PLAN_LEASE_RESULT_KEY).
+        // Planner-only callers leave the flag off: they never execute, so a
+        // lease would only strand the region.
+        //
+        // `skipBroadcastWait` is the COW re-plan recursion: this frame is
+        // already inside the executor's region and hands its own lease to the
+        // inline re-broadcast, so acquiring again would self-deadlock (the
+        // lock is not reentrant).
+        let planLease: PlacementLease | null = null;
+        if (options?.holdPlanRegion === true && !options?.skipBroadcastWait
+            && typeof this.tryAcquirePlacement === 'function') {
+            // Non-blocking by design: a planner that cannot get the region
+            // DEFERS (the same level-triggered contract as the
+            // isPlacementActive() pre-check just above) instead of parking the
+            // fill lock for a full acquisition timeout. The pre-check makes
+            // this a narrow race, not the normal path.
+            planLease = this.tryAcquirePlacement('cow-plan');
+            if (!planLease) {
+                this.logger.log(
+                    '[SAFE-REBALANCE] Deferred: exclusive placement region became unavailable; rebalance retries after it ends',
+                    'info'
+                );
+                this._deferredRebalanceAt = Date.now();
+                return { ...buildAbortedResult('placement-active-deferred'), deferred: true };
+            }
+        }
+        let result: RebalanceResult;
+        try {
+            result = await this._gridLock.acquire(async () => {
+                return await this._applySafeRebalanceCOW(fills, excludeIds);
+            });
+        } catch (err) {
+            // A plan that throws must not park the region (the COW body's own
+            // claim path has the same contract).
+            planLease?.release();
+            throw err;
+        }
+        if (!result || result.aborted) {
+            planLease?.release();
+            return result;
+        }
+        attachPlanLease(result, planLease);
+        return result;
     }
 
     async _applySafeRebalanceCOW(fills: COWFillLike[] = [], excludeIds: Set<string> = new Set()): Promise<RebalanceResult> {

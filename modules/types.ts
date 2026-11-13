@@ -579,6 +579,16 @@ export interface BotMetrics extends UnknownRecord {
   spreadCorrectionRefusalCauses: Record<string, number>;
   /** Bounded re-plan retries attempted after a transient spread-correction refusal. */
   spreadCorrectionRetryCount: number;
+  /** Stale plans dropped because there was no fill context to re-plan from (batch not broadcast). */
+  stalePlanDroppedCount: number;
+  /** Stale fill batches that proceeded anyway at the re-plan limit (bounded policy). */
+  stalePlanProceedCount: number;
+  /** Size updates skipped because a PARTIAL slot's booked remaining already matched (post-fill growth refused). */
+  clampedNoopUpdateCount: number;
+  /** Planned operations thrown away when a definitive chunk failure aborted the remaining chunks. */
+  chunkAbortedOpCount: number;
+  /** Rails re-placed by the post-recovery rebalance (snapshot reload / repair contexts). */
+  reloadReplacedRailCount: number;
 }
 
 /** An unmatched chain order surfaced by a sync pass. */

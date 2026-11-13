@@ -36,6 +36,7 @@ const { validateOrderSize, findCrossedOrder, sameGridLevel, isEvacuationRotation
 import { parseSlotIndex } from './order/utils/slot.js';
 import { resolveTradedSide } from './order/fill_ledger.js';
 import type { PlacementLease } from './order/placement_lock.js';
+import { takePlanLease } from './order/placement_lock.js';
 
 /**
  * Re-verify a B-stamped gap-evacuation rotation against the LIVE committed
@@ -1771,6 +1772,14 @@ async function executeChunkedWithRetryOnUncertain(bot: BotLike, operations: unkn
             // mode already stops at the first failed group; the chunked wrapper
             // should match — continuing would only burn rejected broadcasts.
             abortedChunkCount = chunks.length - idx - 1;
+            if (bot._metrics && abortedChunkCount > 0) {
+                // Planned operations thrown away by this abort (the remaining
+                // chunks are never sent). The plan's work is lost; the metric
+                // makes the cost of a single stale target visible.
+                let abortedOps = 0;
+                for (let k = idx + 1; k < chunks.length; k++) abortedOps += chunks[k].operations.length;
+                bot._metrics.chunkAbortedOpCount = (bot._metrics.chunkAbortedOpCount || 0) + abortedOps;
+            }
             bot.manager.logger.log(
                 `[COW] Chunk ${idx + 1}/${chunks.length} broadcast failed definitively (${getErrorMessage(err)}); ` +
                 `aborting the remaining ${abortedChunkCount} chunk(s) — the rejected chunk landed nothing.`,
@@ -3555,14 +3564,56 @@ async function replanStaleBatch(bot: BotLike, cowResult: CowResult, replanDepth:
         };
     }
 
-    const canReplan = replanDepth < STALE_PLAN_REPLAN_LIMIT
-        && Array.isArray(cowResult.fills) && cowResult.fills.length > 0;
+    const hasFillContext = Array.isArray(cowResult.fills) && cowResult.fills.length > 0;
+    const canReplan = replanDepth < STALE_PLAN_REPLAN_LIMIT && hasFillContext;
     if (!canReplan) {
+        if (!hasFillContext) {
+            // NO FILL CONTEXT → DROP, DON'T SHIP. The master mutated while this
+            // batch was being planned (dominant cause: a snapshot `grid-load`,
+            // also surplus cancels / handle-fill batches) and there is no fill
+            // set to re-plan from. The bounded "proceed anyway" policy exists
+            // because an abort would drop a fill set — that rationale does not
+            // apply here. Shipping it broadcast UPDATE/CREATE ops computed from
+            // the pre-mutation slot/orderId map: observed as missing UPDATE
+            // targets (repair), duplicate creates at the same level, refused
+            // commits, fund drift → snapshot reject → another reload.
+            // Dropping is level-triggered: `_deferredRebalanceAt` makes the
+            // region-end hook (placement release below) schedule the no-fill
+            // rebalance that re-derives from the fresh master.
+            if (bot._metrics) {
+                bot._metrics.stalePlanDroppedCount = (bot._metrics.stalePlanDroppedCount || 0) + 1;
+            }
+            bot.manager.logger.log(
+                `[COW] Plan stale pre-broadcast (${preBroadcastGuard.reason}); no fill context to re-plan ` +
+                `— dropping the batch instead of broadcasting stale slot state`,
+                'warn'
+            );
+            popPushedWorkingGrid(bot, cowResult);
+            clearPendingBroadcastsForSlots(bot, cowResult.actions);
+            if (bot.manager && typeof bot.manager === 'object') {
+                bot.manager._deferredRebalanceAt = Date.now();
+            }
+            return {
+                handled: true,
+                result: {
+                    executed: false,
+                    aborted: true,
+                    deferred: true,
+                    droppedStalePlan: true,
+                    reason: 'STALE_PLAN_NO_FILL_CONTEXT',
+                    hadRotation: false
+                }
+            };
+        }
+        // Fill batch that is still stale at the re-plan limit: keep the
+        // documented bounded policy (proceed + resync) — the fill set is real
+        // and the post-broadcast commit guard + chain adoption close divergence.
+        if (bot._metrics) {
+            bot._metrics.stalePlanProceedCount = (bot._metrics.stalePlanProceedCount || 0) + 1;
+        }
         bot.manager.logger.log(
             `[COW] Plan stale pre-broadcast (${preBroadcastGuard.reason}); ` +
-            (replanDepth >= STALE_PLAN_REPLAN_LIMIT
-                ? 'still stale after re-plan — proceeding with plan (commit guard + chain adoption close divergence)'
-                : 'no fill context for re-plan — proceeding with plan (commit guard + chain adoption close divergence)'),
+            'still stale after re-plan — proceeding with plan (commit guard + chain adoption close divergence)',
             'warn'
         );
         await requestStructuralResync(
@@ -4328,6 +4379,7 @@ async function updateOrdersOnChainBatchCOW(bot: BotLike, cowResult: CowResult, o
     // branch and any re-plan recursion pick it up without changing the
     // production call signature used by the runtime.
     const seamPollIntervalMs = resolveSeamMsOrNull(options?.pollIntervalMs);
+    let resultPlanLease: PlacementLease | null = null;
     const prevSeamPollIntervalMs = bot?._testPollIntervalMs;
     if (seamPollIntervalMs != null) {
         bot._testPollIntervalMs = seamPollIntervalMs;
@@ -4347,12 +4399,21 @@ async function updateOrdersOnChainBatchCOW(bot: BotLike, cowResult: CowResult, o
     // recursion, throws) funnels through the body() finally below, so no exit
     // can leak bot._testPollIntervalMs onto the bot.
     try {
+        // Plan region carried by the result (manager.performSafeRebalance
+        // acquires it before planning). Direct callers of this function (tests,
+        // the re-plan shim) may hand it over here instead of as an option.
+        resultPlanLease = takePlanLease(cowResult);
         return await updateOrdersOnChainBatchCOWBody(
             bot, cowResult, replanDepth,
             seamPollIntervalMs ?? undefined,
-            (options?.placementLease as PlacementLease | null | undefined) ?? null
+            resultPlanLease ?? (options?.placementLease as PlacementLease | null | undefined) ?? null
         );
     } finally {
+        // Idempotent safety release: the body releases the inherited lease on
+        // every one of its own exits; this covers a throw before the body's
+        // try/finally takes ownership, so a direct caller cannot strand the
+        // region on the result path.
+        resultPlanLease?.release();
         // Restore only when this frame actually wrote a seam. The entry
         // single-flight await (inside body()) lets a second, seam-less batch
         // run concurrently: an unguarded restore would delete the seam owned
@@ -5272,7 +5333,30 @@ async function updateOrdersOnChainBatchCOWBody(
                     const plannedNewSize = plannedUpdateSize(action);
                     const newSize = clampPostFillUpdateSize(bot, masterOrder as ManagedOrder, plannedNewSize, action);
                     if (newSize !== plannedNewSize) {
+                        // The clamp only fires when the plan wanted to GROW a
+                        // PARTIAL slot; the target is the booked remainder,
+                        // i.e. the size already on chain. Building the op would
+                        // re-read the order from chain and return null (observed:
+                        // 1 136/1 137 "no blockchain delta" skips were this
+                        // clamp), so skip it here like the rotation path does
+                        // (see the POST-FILL GROWTH GUARD above) — same rule, one
+                        // predicate, no wasted chain read. The slot still joins
+                        // clampedUpdateSlotIds so the commit re-syncs it from
+                        // master (the working grid holds the refused larger size).
                         clampedUpdateSlotIds.add(action.id);
+                        skippedUpdateCount++;
+                        if (action.id) skippedUpdateSlotIds.add(action.id);
+                        if (action.newGridId) skippedUpdateSlotIds.add(action.newGridId);
+                        if (bot._metrics) {
+                            bot._metrics.clampedNoopUpdateCount = (bot._metrics.clampedNoopUpdateCount || 0) + 1;
+                        }
+                        bot.manager.logger.log(
+                            `[COW] Skipping size update ${action.id} (${action.orderId}): ` +
+                            `PARTIAL slot at its booked remaining ${Format.formatAmount(newSize)} — ` +
+                            `growth in place refused, no chain change`,
+                            'debug'
+                        );
+                        continue;
                     }
                     const orderType = action.order?.type || masterOrder?.type;
                     const cachedRawOnChain = masterOrder?.rawOnChain || action.order?.rawOnChain || null;

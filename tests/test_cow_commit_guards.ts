@@ -1388,6 +1388,69 @@ async function testLaggingBatchReadIsRescuedBySingleRead() {
     console.log('✓ COW-COMMIT-016 passed');
 }
 
+async function testPartialGrowthSizeUpdateIsSkippedBeforeTheChainRead() {
+    console.log('\n[COW-COMMIT-017] a clamped PARTIAL-growth size update is skipped before buildUpdateOrderOp...');
+
+    // Master slot is PARTIAL at its booked remainder (50). The plan targets
+    // 100 (a full-side resize computed from the geometric ideal). Growing a
+    // PARTIAL order in place would resurrect the filled size, so the clamp
+    // keeps 50 — which is already on chain, i.e. the op is a provable no-op.
+    // Pre-fix the batch built the op anyway, paying a readSingleOrder to
+    // discover "no blockchain delta".
+    const masterOrders = new Map([
+        ['slot-1', createOrder('slot-1', {
+            type: ORDER_TYPES.BUY,
+            state: ORDER_STATES.PARTIAL,
+            price: 1.0,
+            size: 50,
+            orderId: '1.7.100'
+        })]
+    ]);
+    const { bot, manager } = createCowExecutionFixture(masterOrders);
+    const logs: string[] = [];
+    manager.logger.log = (msg?: any) => { logs.push(String(msg)); };
+    (manager as any)._gapSlots = 2;
+
+    const originalBuild = chainOrders.buildUpdateOrderOp;
+    const originalExecuteBatch = chainOrders.executeBatch;
+    let buildCalls = 0;
+    let executeCalls = 0;
+    chainOrders.buildUpdateOrderOp = async () => { buildCalls += 1; return null; };
+    chainOrders.executeBatch = async () => { executeCalls += 1; return { success: true, operation_results: [] }; };
+
+    const workingGrid = new WorkingGrid(manager.orders, { baseVersion: 0 });
+    try {
+        const result: any = await bot._updateOrdersOnChainBatchCOW({
+            workingGrid,
+            workingIndexes: workingGrid.getIndexes(),
+            workingBoundary: (manager as any).boundaryIdx,
+            actions: [{
+                type: COW_ACTIONS.UPDATE,
+                id: 'slot-1',
+                orderId: '1.7.100',
+                newSize: 100,
+                // ACTIVE on the action's snapshot: the plan-time booked-remainder
+                // guard cannot see the PARTIAL master, so only the clamp fires.
+                order: { id: 'slot-1', type: ORDER_TYPES.BUY, price: 1.0, size: 100, state: ORDER_STATES.ACTIVE, orderId: '1.7.100' }
+            }]
+        });
+
+        assert.strictEqual(result.executed, false, 'a no-op update batch must not execute');
+        assert.strictEqual(buildCalls, 0, 'the size-update op must not be built (no chain read for a provable no-op)');
+        assert.strictEqual(executeCalls, 0, 'nothing may be broadcast');
+        assert.strictEqual(bot._metrics.clampedNoopUpdateCount, 1, 'the skip must be counted');
+        assert(
+            logs.some((m) => m.includes('growth in place refused')),
+            'the skip must be logged as a refused growth'
+        );
+    } finally {
+        chainOrders.buildUpdateOrderOp = originalBuild;
+        chainOrders.executeBatch = originalExecuteBatch;
+    }
+
+    console.log('✓ COW-COMMIT-017 passed');
+}
+
 async function run() {
     console.log('Running COW commit guard regression tests...');
     await testRejectsVersionMismatchWithoutCommit();
@@ -1408,6 +1471,7 @@ async function run() {
     await testAllowsPresentUpdateTargetThroughGuard();
     await testLaggingBatchReadIsRescuedBySingleRead();
     await testGapBandPlacementShadowIsObservabilityOnly();
+    await testPartialGrowthSizeUpdateIsSkippedBeforeTheChainRead();
     console.log('\n✓ All COW commit guard regression tests passed');
 }
 
