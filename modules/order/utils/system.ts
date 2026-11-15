@@ -2378,6 +2378,56 @@ export function normalizeLastMarketFill(row: unknown): { price: number; type: st
 }
 
 /**
+ * LAST-FILL-PIVOT MARKET BOUND — is this fill on the WRONG side of the live
+ * market for its trade direction?
+ *
+ *   BUY  wrong when priced ABOVE  mid (past the tolerance)
+ *   SELL wrong when priced BELOW  mid (past the tolerance)
+ *
+ * Fills at/through the opposite side of the book cannot happen on an honest
+ * market — they are artifacts of a crossed book (typically the bot's own
+ * misplaced order swept by an external taker), and the pivot they would arm
+ * vetoes every near-market counter-side placement for the 24h TTL.
+ *
+ * Evidence: ONLY the cached live market price, and only while fresh
+ * (GRID_LIMITS.LAST_FILL_PIVOT_MARKET_FRESH_MS). No live price or a stale one
+ * returns null (fail-open, matching doesNotCrossMarket's never-guess rule).
+ *
+ * @param {Object} manager - OrderManager instance
+ * @param {string} type - ORDER_TYPES.BUY / ORDER_TYPES.SELL
+ * @param {number} price - Fill price
+ * @returns {{ steps: number, mid: number } | null} Wrong-side detail, or null when allowed/unknowable
+ */
+function wrongSideOfLiveMarket(manager: OrderManagerLike, type: string, price: number): { steps: number; mid: number } | null {
+    const mid = Number(manager?._liveMarketPrice);
+    const midAt = Number(manager?._liveMarketPriceAt);
+    if (!Number.isFinite(mid) || mid <= 0) return null;
+    if (!Number.isFinite(midAt) || midAt <= 0) return null;
+    const freshMs = Number(GRID_LIMITS.LAST_FILL_PIVOT_MARKET_FRESH_MS);
+    if (!(freshMs > 0) || (Date.now() - midAt) > freshMs) return null;
+    const incRaw = Number((manager?.config as { incrementPercent?: unknown } | undefined)?.incrementPercent);
+    const stepPct = Number.isFinite(incRaw) && incRaw > 0 ? incRaw : 0.5;
+    const step = 1 + (stepPct / 100);
+    const tolerance = Number(GRID_LIMITS.LAST_FILL_PIVOT_WRONG_SIDE_TOLERANCE_STEPS);
+    const tol = Number.isFinite(tolerance) && tolerance >= 0 ? tolerance : 1;
+    // Relative epsilon so "exactly N steps above mid" is not refused by
+    // floating-point drift in Math.pow (1000 * 1.005 === 1004.9999999999999).
+    const eps = mid * 1e-9;
+    if (type === ORDER_TYPES.BUY) {
+        const limit = mid * Math.pow(step, tol);
+        if (price > limit + eps) {
+            return { steps: Math.max(1, Math.round(Math.log(price / mid) / Math.log(step))), mid };
+        }
+    } else {
+        const limit = mid / Math.pow(step, tol);
+        if (price < limit - eps) {
+            return { steps: Math.max(1, Math.round(Math.log(mid / price) / Math.log(step))), mid };
+        }
+    }
+    return null;
+}
+
+/**
  * Write the LAST-FILL-GUARD pivot scalar family in one place (free
  * implementation shared by the manager method, cow_runtime's queued-fill
  * refresh, and restoreLastFillPivot).
@@ -2401,6 +2451,30 @@ export function setLastFillPivot(manager: OrderManagerLike, type: string, price:
     if (type !== ORDER_TYPES.BUY && type !== ORDER_TYPES.SELL) return false;
     const p = Number(price);
     if (!Number.isFinite(p) || p <= 0) return false;
+    // LAST-FILL-PIVOT MARKET BOUND (fill provenance only): a real fill may arm
+    // the guard only when it priced on the market's own side of the live
+    // reference — BUY at/below mid, SELL at/above mid. A fill on the WRONG
+    // side is a crossed-book artifact (usually a misplaced order that got
+    // swept at a premium) and arming it vetoes every near-market counter-side
+    // placement for the full 24h TTL. Fail-open when no fresh live price
+    // exists: an ancient mid must never veto a fresh fill after a fast move.
+    // Deliberately applied to EVERY fill-provenance write (direct fills,
+    // queued-fill refresh, rebuild re-arm) so no path can re-arm an
+    // off-market row. The market-fill reference is skipped with it — an
+    // off-mid row as a crossing floor would freeze correction the same way.
+    if (provenance === 'fill') {
+        const wrongSide = wrongSideOfLiveMarket(manager, type, p);
+        if (wrongSide) {
+            manager.logger?.log?.(
+                `[LAST-FILL-GUARD] Refusing to arm pivot ${p}(${type}): it priced ` +
+                `${wrongSide.steps} grid step(s) on the wrong side of the live market ` +
+                `${wrongSide.mid} — a crossed-book artifact, not market truth; the guard ` +
+                `stays as-is and spread correction keeps trading around the live market`,
+                'warn'
+            );
+            return false;
+        }
+    }
     const now = Number.isFinite(Number(atMs)) && Number(atMs) > 0 ? Number(atMs) : Date.now();
     manager._lastFilledPrice = p;
     manager._lastFilledType = type;
@@ -2453,6 +2527,49 @@ export function resetLastFillPivot(manager: OrderManagerLike, reason: string = '
         } catch { /* logging is best-effort */ }
     }
     return wasArmed;
+}
+
+/**
+ * Drop the ENTIRE last-fill guard state — the pivot scalar family AND the
+ * bot-scoped last-market-fill reference, live and persisted — after the
+ * spread watchdog concluded the pivot can never heal the grid (geometry
+ * re-center already tried and failed; SPREAD_STALE_PIVOT_EXPIRE_MS elapsed).
+ *
+ * Mirrors restoreLastMarketFill's dead-row contract: persisted rows are
+ * erased too, so a restart/rebuild cannot re-arm the same veto via
+ * rearmLastFillPivotFromMarketFill. Both references re-arm on the next real
+ * fill.
+ *
+ * @param {Object} manager - OrderManager instance
+ * @param {string} reason - Log/debug label for the expiry
+ */
+export function expireLastFillGuardReferences(manager: OrderManagerLike, reason: string = 'unspecified'): void {
+    if (!manager) return;
+    const pivotArmed = manager._lastFilledPrice != null && manager._lastFilledType != null;
+    const fillRefArmed = manager._lastMarketFillPrice != null;
+    resetLastFillPivot(manager, reason);
+    manager._lastMarketFillPrice = null;
+    manager._lastMarketFillType = null;
+    manager._lastMarketFillAt = 0;
+    try {
+        const acct = manager.accountOrders;
+        if (acct && typeof acct.clearPersistedLastMarketFill === 'function') {
+            void acct.clearPersistedLastMarketFill();
+        }
+        if (acct && typeof acct.clearPersistedLastFillPivot === 'function') {
+            void acct.clearPersistedLastFillPivot();
+        }
+    } catch { /* best-effort */ }
+    if (pivotArmed || fillRefArmed) {
+        try {
+            manager.logger?.log?.(
+                `[LAST-FILL-GUARD] Expired guard references (${reason}): pivot and last-market-fill ` +
+                `cleared live and persisted — spread correction trades around the live market ` +
+                `again; both re-arm on the next real fill`,
+                'warn'
+            );
+        } catch { /* logging is best-effort */ }
+    }
 }
 
 /**
@@ -2544,7 +2661,14 @@ export function restoreLastFillPivot(manager: OrderManagerLike, persisted: unkno
         const validated = cowRuntimeLadderValidator(manager, row.price);
         if (!validated) return false;
         // Arm through the shared writer, preserving the persisted timestamp.
-        setLastFillPivot(manager, row.type, validated.price, 'fill', row.fillsAt);
+        // The writer's wrong-side market bound can refuse (fresh live mid on
+        // the other side of the row) — treat that like any other dead row:
+        // erase the persisted value so a restart cannot re-arm the same veto.
+        const armed = setLastFillPivot(manager, row.type, validated.price, 'fill', row.fillsAt);
+        if (!armed) {
+            dropPersistedRow();
+            return false;
+        }
         manager.logger?.log?.(
             `[LAST-FILL-GUARD] Restored persisted pivot ${validated.price}(${row.type})` +
             `${validated.slotIdx != null ? ` slot=${validated.slotIdx}` : ''}` +

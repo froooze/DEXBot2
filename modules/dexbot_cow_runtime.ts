@@ -27,6 +27,7 @@ const {
     isOrderPlaced,
     chainOrderUnchangedFromCache,
     detectCrossedBookPlan,
+    filterMarketCrossingActions,
     collectKnownOnChainOrderIds,
 } = orderUtils;
 import * as validate from './order/utils/validate.js';
@@ -4359,6 +4360,41 @@ async function runPreBroadcastGuards(bot: BotLike, cowResult: CowResult): Promis
             }
         };
     }
+
+    // MARKET-CROSSING FILTER: drop CREATE/UPDATE actions priced on the wrong
+    // side of the LIVE market (BUY above mid / SELL below mid, fresh mid only
+    // — fail-open otherwise). A batch priced across the live reference is a
+    // crossed-book artifact being re-swept at a premium, not a spread repair.
+    try {
+        const { filtered, dropped } = filterMarketCrossingActions(bot.manager, actions);
+        if (dropped.length > 0) {
+            if (filtered.length === 0) {
+                bot.manager.logger.log(
+                    `[COW] Refusing batch pre-broadcast: every action crosses the live market ` +
+                    `(${dropped.map((d) => d.reason).slice(0, 4).join('; ')})`,
+                    'warn'
+                );
+                popPushedWorkingGrid(bot, cowResult);
+                return {
+                    proceed: false,
+                    result: {
+                        executed: false,
+                        aborted: true,
+                        reason: 'MARKET_CROSSING_FILTERED',
+                        detail: dropped.map((d) => d.reason).slice(0, 8),
+                        hadRotation: false
+                    }
+                };
+            }
+            actions.length = 0;
+            actions.push(...filtered);
+            bot.manager.logger.log(
+                `[COW] Filtered ${dropped.length} market-crossing action(s) pre-broadcast ` +
+                `(${dropped.map((d) => d.reason).slice(0, 4).join('; ')}); ${actions.length} remaining`,
+                'warn'
+            );
+        }
+    } catch { /* the filter must never break a batch */ }
 
     return { proceed: true, crossingCandidates, intraBatchCandidates };
 }

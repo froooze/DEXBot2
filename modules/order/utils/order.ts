@@ -4083,6 +4083,65 @@ function detectCrossedBookPlan(manager: OrderManagerLike, actions: CowAction[]):
 }
 
 /**
+ * Drop batch actions whose result price would sit on the WRONG side of the
+ * live market: a CREATE/UPDATE BUY priced above mid, or a SELL priced below
+ * mid. detectCrossedBookPlan catches buys/sells crossing EACH OTHER inside
+ * the simulated book; this filter catches a whole batch priced across the
+ * LIVE market reference (observed live 2026-11-14: correction batches priced
+ * around a crossed-book pivot sat entirely above mid and kept getting swept
+ * at a premium instead of tightening the spread).
+ *
+ * Evidence: ONLY the cached live market price, and only while fresh
+ * (GRID_LIMITS.LAST_FILL_PIVOT_MARKET_FRESH_MS). No/stale live price returns
+ * the batch unfiltered (fail-open — an ancient mid must never veto a fresh
+ * plan). CANCELs are always kept.
+ *
+ * @param {Object} manager - OrderManager instance
+ * @param {Array} actions - COW batch actions (not mutated)
+ * @returns {{ filtered: Array, dropped: Array<{ index: number, action: Object, reason: string }> }}
+ */
+function filterMarketCrossingActions(manager: OrderManagerLike, actions: CowAction[]): { filtered: CowAction[]; dropped: Array<{ index: number; action: CowAction; reason: string }> } {
+    const list = Array.isArray(actions) ? actions : [];
+    const mid = Number(manager?._liveMarketPrice);
+    const midAt = Number(manager?._liveMarketPriceAt);
+    const freshMs = Number(GRID_LIMITS.LAST_FILL_PIVOT_MARKET_FRESH_MS);
+    const midUsable = Number.isFinite(mid) && mid > 0
+        && Number.isFinite(midAt) && midAt > 0
+        && freshMs > 0
+        && (Date.now() - midAt) <= freshMs;
+    if (!midUsable) return { filtered: list, dropped: [] };
+    const dropped: Array<{ index: number; action: CowAction; reason: string }> = [];
+    const filtered = list.filter((a, index) => {
+        try {
+            if (!a || a.type === COW_ACTIONS.CANCEL) return true;
+            const price = Number(a.type === COW_ACTIONS.UPDATE
+                ? (a.newPrice ?? a.order?.price)
+                : a.order?.price);
+            let type = a.order?.type;
+            if (type !== ORDER_TYPES.BUY && type !== ORDER_TYPES.SELL) {
+                // Same legacy convention as detectCrossedBookPlan: derive the
+                // side from the existing book entry / order being updated.
+                const entry = manager?.orders?.get?.(String(a.orderId ?? a.id ?? ''));
+                type = entry?.type;
+            }
+            if (!Number.isFinite(price) || (type !== ORDER_TYPES.BUY && type !== ORDER_TYPES.SELL)) return true;
+            if (type === ORDER_TYPES.BUY && price > mid) {
+                dropped.push({ index, action: a, reason: `BUY ${price} above live mid ${mid}` });
+                return false;
+            }
+            if (type === ORDER_TYPES.SELL && price < mid) {
+                dropped.push({ index, action: a, reason: `SELL ${price} below live mid ${mid}` });
+                return false;
+            }
+            return true;
+        } catch {
+            return true; // fail-open per action
+        }
+    });
+    return { filtered, dropped };
+}
+
+/**
  * Collect every on-chain order id master currently needs to converge against,
  * so adoption can re-read them by id (immune to the get_full_accounts window
  * truncation) instead of relying on a partial window read.
@@ -4162,7 +4221,7 @@ function collectKnownOnChainOrderIds(mgr: OrderManagerLike, placedResults: unkno
     return { masterIds: [...masterIds], createIds: [...createIds], all: [...all] };
 }
 
-export { parseChainOrder, resolveLiveOrderLadderPosition, applyChainSizeToGridOrder, resolveExecutionPrice, resolveSlotIdForFillPrice, reviveVirtualSlotFromChain, attributeUnmatchedFillToGrid, getLivePendingBroadcasts,  buildFillKey, correctOrderPriceOnChain, correctAllPriceMismatches, _validatePriceCorrectionEntry, _stampCorrectionProvenance, findLiveOrderOwnerByChainId, buildCreateOrderArgs, getOrderTypeFromUpdatedFlags, resolveConfiguredPriceBound, virtualizeOrder, convertToSpreadPlaceholder, toRailHolePlaceholder, geometryTypeForSlotIndex, detectGapEvacuationCandidates, updateGapEvacuationStreaks, resolveSpreadOrderSide, chainOrderMatchesSlot, chainOrderMatchesSlotWithTolerance, crossingCandidateChainId, isCrossingCheckCandidate, buildCrossingCheckCandidates, filterOrdersByType, buildOutsideInPairGroups, extractBatchOperationResults, formatUnmatchedChainOrder, isNonBlockingUnmatchedOrder, isStrandedHoldOrder, isOrderOnChain, isOrderVirtual, hasOnChainId, isOrderPlaced, isPhantomOrder, isSlotAvailable, isEmptyGridSlot, isOrderHealthy, checkSizeThreshold, checkSizesBeforeMinimum, calculateIdealBoundary, assignGridRoles, resolveOnChainRetypeType, shouldFlagOutOfSpread, buildIndexes, validateIndexes, ordersEqual, buildDelta, deriveTargetBoundary, isShiftEligibleFill, resolveEdgeCount, resolveEdgeOrders, selectEdgeSlots, getCoreOrdersTotal, getSideBudget, calculateBudgetedSizes, buildCreateOpFingerprint, isOrderGoneErrorMessage, isStructuralRebuildStaleReason, recordDuplicateOrphanDetection, clearDuplicateOrphanDetection, duplicateOrphanLogInfo, chainOrderUnchangedFromCache, detectCrossedBookPlan, collectKnownOnChainOrderIds, collectEdgePinnedFillIds, edgeOrderIdSet, liveWindowIdSet, checkGridPriceInvariant, reportGridPriceInvariant };
+export { parseChainOrder, resolveLiveOrderLadderPosition, applyChainSizeToGridOrder, resolveExecutionPrice, resolveSlotIdForFillPrice, reviveVirtualSlotFromChain, attributeUnmatchedFillToGrid, getLivePendingBroadcasts,  buildFillKey, correctOrderPriceOnChain, correctAllPriceMismatches, _validatePriceCorrectionEntry, _stampCorrectionProvenance, findLiveOrderOwnerByChainId, buildCreateOrderArgs, getOrderTypeFromUpdatedFlags, resolveConfiguredPriceBound, virtualizeOrder, convertToSpreadPlaceholder, toRailHolePlaceholder, geometryTypeForSlotIndex, detectGapEvacuationCandidates, updateGapEvacuationStreaks, resolveSpreadOrderSide, chainOrderMatchesSlot, chainOrderMatchesSlotWithTolerance, crossingCandidateChainId, isCrossingCheckCandidate, buildCrossingCheckCandidates, filterOrdersByType, buildOutsideInPairGroups, extractBatchOperationResults, formatUnmatchedChainOrder, isNonBlockingUnmatchedOrder, isStrandedHoldOrder, isOrderOnChain, isOrderVirtual, hasOnChainId, isOrderPlaced, isPhantomOrder, isSlotAvailable, isEmptyGridSlot, isOrderHealthy, checkSizeThreshold, checkSizesBeforeMinimum, calculateIdealBoundary, assignGridRoles, resolveOnChainRetypeType, shouldFlagOutOfSpread, buildIndexes, validateIndexes, ordersEqual, buildDelta, deriveTargetBoundary, isShiftEligibleFill, resolveEdgeCount, resolveEdgeOrders, selectEdgeSlots, getCoreOrdersTotal, getSideBudget, calculateBudgetedSizes, buildCreateOpFingerprint, isOrderGoneErrorMessage, isStructuralRebuildStaleReason, recordDuplicateOrphanDetection, clearDuplicateOrphanDetection, duplicateOrphanLogInfo, chainOrderUnchangedFromCache, detectCrossedBookPlan, filterMarketCrossingActions, collectKnownOnChainOrderIds, collectEdgePinnedFillIds, edgeOrderIdSet, liveWindowIdSet, checkGridPriceInvariant, reportGridPriceInvariant };
 export type { CrawlEntry }
 export { resolveEdgeAnchorPrice, resolveLiveEdgeAnchorPrice, compareEdge, collectRefillSlotIds, isFreshlyPlacedOrder, _filterUnmatchedChainOrders };
 

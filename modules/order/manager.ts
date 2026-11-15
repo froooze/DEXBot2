@@ -3501,7 +3501,7 @@ class OrderManager implements OrderManagerLike {
                 comparePrecisions
             });
             if (!preCommitGuard.canCommit) {
-                this.logger.log(`[COW] ${preCommitGuard.reason}`, preCommitGuard.level || 'warn');
+                this.logger.log(`[COW] ${preCommitGuard.reason}`, preCommitGuard?.level || 'warn');
                 releaseStackEntry();
                 return false;
             }
@@ -3514,7 +3514,7 @@ class OrderManager implements OrderManagerLike {
                     comparePrecisions
                 });
                 if (!lockCommitGuard.canCommit) {
-                    this.logger.log(`[COW] ${lockCommitGuard.reason}`, lockCommitGuard.level || 'warn');
+                    this.logger.log(`[COW] ${lockCommitGuard.reason}`, lockCommitGuard?.level || 'warn');
                     // Working grid ref is cleared exactly once below via the
                     // !committed path (the callback returns without committing).
                     return;

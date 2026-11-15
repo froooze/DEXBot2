@@ -877,6 +877,26 @@ let GRID_LIMITS = {
     // is refreshed by every fresh fill.
     LAST_FILL_PIVOT_TTL_MS: 24 * 60 * 60 * 1000,  // 24 hours
 
+    // LAST_FILL_PIVOT_WRONG_SIDE_TOLERANCE_STEPS: a real FILL may only arm the
+    // LAST-FILL-GUARD pivot when it priced on the market's own side of the
+    // live reference: BUY at/below mid, SELL at/above mid (within this
+    // tolerance in grid increments). A fill on the WRONG side (a BUY above
+    // mid, a SELL below mid) is a crossed-book artifact — usually a misplaced
+    // order that got swept — and arming it vetoed every near-market SELL for
+    // the full 24h TTL in a live incident. The pivot AND the bot-scoped
+    // last-market-fill row are both skipped with the refusal (an off-mid row
+    // as a crossing floor freezes correction the same way), so the last
+    // honest fill stays the reference. Fail-open when no fresh live price
+    // exists.
+    LAST_FILL_PIVOT_WRONG_SIDE_TOLERANCE_STEPS: 1,
+
+    // LAST_FILL_PIVOT_MARKET_FRESH_MS: how old the cached live market price
+    // (manager._liveMarketPrice) may be for the wrong-side pivot bound above
+    // (and the COW market-crossing action filter) to trust it. Older than
+    // this, the check fails open — an ancient mid must never veto a fresh
+    // fill after a fast market move.
+    LAST_FILL_PIVOT_MARKET_FRESH_MS: 15 * 60 * 1000,  // 15 minutes
+
 
     // Grid comparison metrics
     // Detects significant divergence between calculated (in-memory) and persisted grid state
