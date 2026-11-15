@@ -29,6 +29,7 @@
  *   - buildCrossingCheckCandidates(...) - Candidate set for crossing-placement checks
  *   - chainOrderUnchangedFromCache(...) - Chain order still matches cached pre-update state
  *   - detectCrossedBookPlan(...) - Pre-broadcast crossed-book assert
+ *   - describeMarketCrossingActions(...) - Observe actions priced across the market floor
  *   - collectKnownOnChainOrderIds(...) - On-chain ids master must converge against
  *
  * SECTION 3: ORDER CONSTRUCTION (5 functions)
@@ -129,7 +130,7 @@ import { ORDER_TYPES, ORDER_STATES, TIMING, FEE_PARAMETERS, GRID_LIMITS, NATIVE_
 import * as Format from '../format.js';
 import * as MathUtils from './math.js';
 import Logger from '../../order/logger.js';
-import { sleep } from './system.js';
+import { sleep, resolveSpreadCrossingFloor } from './system.js';
 import { getErrorMessage, getErrorCode, getErrorName } from '../../utils/errors.js';
 import { hasGenesisLadder } from '../genesis_policy.js';
 import { parseSlotIndex } from './slot.js';
@@ -4083,37 +4084,45 @@ function detectCrossedBookPlan(manager: OrderManagerLike, actions: CowAction[]):
 }
 
 /**
- * Drop batch actions whose result price would sit on the WRONG side of the
- * live market: a CREATE/UPDATE BUY priced above mid, or a SELL priced below
- * mid. detectCrossedBookPlan catches buys/sells crossing EACH OTHER inside
- * the simulated book; this filter catches a whole batch priced across the
- * LIVE market reference (observed live 2026-11-14: correction batches priced
- * around a crossed-book pivot sat entirely above mid and kept getting swept
- * at a premium instead of tightening the spread).
+ * Describe batch actions whose result price sits on the WRONG side of the
+ * market floor — the EVIDENCE for the crossing OBSERVATION.
  *
- * Evidence: ONLY the cached live market price, and only while fresh
- * (GRID_LIMITS.LAST_FILL_PIVOT_MARKET_FRESH_MS). No/stale live price returns
- * the batch unfiltered (fail-open — an ancient mid must never veto a fresh
- * plan). CANCELs are always kept.
+ * Retrospective §9.10/P4 is explicit that this class must not be a hard veto:
+ * "a hard veto re-opens the counter-order deadlock: after a gap the counter
+ * sits across the floor by construction and executes at the best available
+ * price. Made visible instead." A pre-broadcast version that dropped the
+ * actions (and refused the batch when nothing remained) re-created exactly
+ * that deadlock live on 2026-11-15: the only repair for an out-of-spread rail
+ * was priced above a cached mid, the batch was refused, and the grid stayed
+ * 3.0% wide (limit 1.65%) until the mid happened to move 86 minutes later.
+ *
+ * Evidence: the SHARED recency-aware floor (resolveSpreadCrossingFloor — an
+ * executed trade is fresher truth than an older book read). The rejected
+ * implementation re-derived its own reference from manager._liveMarketPrice
+ * behind a 15-minute window, i.e. a second answer to "where is the market?":
+ * live, that mid was 8 minutes old, had itself been the midpoint of the bot's
+ * own book, and the five fills in hand (all newer than the mid, the last one
+ * 4.4% above it) had already falsified it. The same batch, at identical
+ * prices, was accepted at the next tick once a fresher read existed.
+ *
+ * CANCELs are never reported: a cancel cannot cross anything. Fail-open on
+ * every unprovable case (no floor, malformed action).
  *
  * @param {Object} manager - OrderManager instance
- * @param {Array} actions - COW batch actions (not mutated)
- * @returns {{ filtered: Array, dropped: Array<{ index: number, action: Object, reason: string }> }}
+ * @param {Array} actions - COW batch actions (never mutated)
+ * @returns {{ floor: number|null, dropped: Array<{ index: number, action: Object, reason: string }> }}
  */
-function filterMarketCrossingActions(manager: OrderManagerLike, actions: CowAction[]): { filtered: CowAction[]; dropped: Array<{ index: number; action: CowAction; reason: string }> } {
+function describeMarketCrossingActions(manager: OrderManagerLike, actions: CowAction[]): { floor: number | null; dropped: Array<{ index: number; action: CowAction; reason: string }> } {
     const list = Array.isArray(actions) ? actions : [];
-    const mid = Number(manager?._liveMarketPrice);
-    const midAt = Number(manager?._liveMarketPriceAt);
-    const freshMs = Number(GRID_LIMITS.LAST_FILL_PIVOT_MARKET_FRESH_MS);
-    const midUsable = Number.isFinite(mid) && mid > 0
-        && Number.isFinite(midAt) && midAt > 0
-        && freshMs > 0
-        && (Date.now() - midAt) <= freshMs;
-    if (!midUsable) return { filtered: list, dropped: [] };
+    let floor: number | null = null;
+    try { floor = resolveSpreadCrossingFloor(manager); } catch { floor = null; }
+    const usable = floor != null && Number.isFinite(Number(floor)) && Number(floor) > 0;
+    if (!usable) return { floor: null, dropped: [] };
+    const ref = Number(floor);
     const dropped: Array<{ index: number; action: CowAction; reason: string }> = [];
-    const filtered = list.filter((a, index) => {
+    list.forEach((a, index) => {
         try {
-            if (!a || a.type === COW_ACTIONS.CANCEL) return true;
+            if (!a || a.type === COW_ACTIONS.CANCEL) return;
             const price = Number(a.type === COW_ACTIONS.UPDATE
                 ? (a.newPrice ?? a.order?.price)
                 : a.order?.price);
@@ -4124,21 +4133,15 @@ function filterMarketCrossingActions(manager: OrderManagerLike, actions: CowActi
                 const entry = manager?.orders?.get?.(String(a.orderId ?? a.id ?? ''));
                 type = entry?.type;
             }
-            if (!Number.isFinite(price) || (type !== ORDER_TYPES.BUY && type !== ORDER_TYPES.SELL)) return true;
-            if (type === ORDER_TYPES.BUY && price > mid) {
-                dropped.push({ index, action: a, reason: `BUY ${price} above live mid ${mid}` });
-                return false;
+            if (!Number.isFinite(price) || (type !== ORDER_TYPES.BUY && type !== ORDER_TYPES.SELL)) return;
+            if (type === ORDER_TYPES.BUY && price > ref) {
+                dropped.push({ index, action: a, reason: `BUY ${price} above the market floor ${ref}` });
+            } else if (type === ORDER_TYPES.SELL && price < ref) {
+                dropped.push({ index, action: a, reason: `SELL ${price} below the market floor ${ref}` });
             }
-            if (type === ORDER_TYPES.SELL && price < mid) {
-                dropped.push({ index, action: a, reason: `SELL ${price} below live mid ${mid}` });
-                return false;
-            }
-            return true;
-        } catch {
-            return true; // fail-open per action
-        }
+        } catch { /* fail-open per action */ }
     });
-    return { filtered, dropped };
+    return { floor: ref, dropped };
 }
 
 /**
@@ -4221,7 +4224,7 @@ function collectKnownOnChainOrderIds(mgr: OrderManagerLike, placedResults: unkno
     return { masterIds: [...masterIds], createIds: [...createIds], all: [...all] };
 }
 
-export { parseChainOrder, resolveLiveOrderLadderPosition, applyChainSizeToGridOrder, resolveExecutionPrice, resolveSlotIdForFillPrice, reviveVirtualSlotFromChain, attributeUnmatchedFillToGrid, getLivePendingBroadcasts,  buildFillKey, correctOrderPriceOnChain, correctAllPriceMismatches, _validatePriceCorrectionEntry, _stampCorrectionProvenance, findLiveOrderOwnerByChainId, buildCreateOrderArgs, getOrderTypeFromUpdatedFlags, resolveConfiguredPriceBound, virtualizeOrder, convertToSpreadPlaceholder, toRailHolePlaceholder, geometryTypeForSlotIndex, detectGapEvacuationCandidates, updateGapEvacuationStreaks, resolveSpreadOrderSide, chainOrderMatchesSlot, chainOrderMatchesSlotWithTolerance, crossingCandidateChainId, isCrossingCheckCandidate, buildCrossingCheckCandidates, filterOrdersByType, buildOutsideInPairGroups, extractBatchOperationResults, formatUnmatchedChainOrder, isNonBlockingUnmatchedOrder, isStrandedHoldOrder, isOrderOnChain, isOrderVirtual, hasOnChainId, isOrderPlaced, isPhantomOrder, isSlotAvailable, isEmptyGridSlot, isOrderHealthy, checkSizeThreshold, checkSizesBeforeMinimum, calculateIdealBoundary, assignGridRoles, resolveOnChainRetypeType, shouldFlagOutOfSpread, buildIndexes, validateIndexes, ordersEqual, buildDelta, deriveTargetBoundary, isShiftEligibleFill, resolveEdgeCount, resolveEdgeOrders, selectEdgeSlots, getCoreOrdersTotal, getSideBudget, calculateBudgetedSizes, buildCreateOpFingerprint, isOrderGoneErrorMessage, isStructuralRebuildStaleReason, recordDuplicateOrphanDetection, clearDuplicateOrphanDetection, duplicateOrphanLogInfo, chainOrderUnchangedFromCache, detectCrossedBookPlan, filterMarketCrossingActions, collectKnownOnChainOrderIds, collectEdgePinnedFillIds, edgeOrderIdSet, liveWindowIdSet, checkGridPriceInvariant, reportGridPriceInvariant };
+export { parseChainOrder, resolveLiveOrderLadderPosition, applyChainSizeToGridOrder, resolveExecutionPrice, resolveSlotIdForFillPrice, reviveVirtualSlotFromChain, attributeUnmatchedFillToGrid, getLivePendingBroadcasts,  buildFillKey, correctOrderPriceOnChain, correctAllPriceMismatches, _validatePriceCorrectionEntry, _stampCorrectionProvenance, findLiveOrderOwnerByChainId, buildCreateOrderArgs, getOrderTypeFromUpdatedFlags, resolveConfiguredPriceBound, virtualizeOrder, convertToSpreadPlaceholder, toRailHolePlaceholder, geometryTypeForSlotIndex, detectGapEvacuationCandidates, updateGapEvacuationStreaks, resolveSpreadOrderSide, chainOrderMatchesSlot, chainOrderMatchesSlotWithTolerance, crossingCandidateChainId, isCrossingCheckCandidate, buildCrossingCheckCandidates, filterOrdersByType, buildOutsideInPairGroups, extractBatchOperationResults, formatUnmatchedChainOrder, isNonBlockingUnmatchedOrder, isStrandedHoldOrder, isOrderOnChain, isOrderVirtual, hasOnChainId, isOrderPlaced, isPhantomOrder, isSlotAvailable, isEmptyGridSlot, isOrderHealthy, checkSizeThreshold, checkSizesBeforeMinimum, calculateIdealBoundary, assignGridRoles, resolveOnChainRetypeType, shouldFlagOutOfSpread, buildIndexes, validateIndexes, ordersEqual, buildDelta, deriveTargetBoundary, isShiftEligibleFill, resolveEdgeCount, resolveEdgeOrders, selectEdgeSlots, getCoreOrdersTotal, getSideBudget, calculateBudgetedSizes, buildCreateOpFingerprint, isOrderGoneErrorMessage, isStructuralRebuildStaleReason, recordDuplicateOrphanDetection, clearDuplicateOrphanDetection, duplicateOrphanLogInfo, chainOrderUnchangedFromCache, detectCrossedBookPlan, describeMarketCrossingActions, collectKnownOnChainOrderIds, collectEdgePinnedFillIds, edgeOrderIdSet, liveWindowIdSet, checkGridPriceInvariant, reportGridPriceInvariant };
 export type { CrawlEntry }
 export { resolveEdgeAnchorPrice, resolveLiveEdgeAnchorPrice, compareEdge, collectRefillSlotIds, isFreshlyPlacedOrder, _filterUnmatchedChainOrders };
 

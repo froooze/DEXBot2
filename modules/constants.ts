@@ -479,6 +479,17 @@ let TIMING = {
     // separate from BOUNDARY_HOLD_RESYNC_COOLDOWN_MS so tuning boundary-hold
     // behavior never silently changes the spread watchdog cadence.
     SPREAD_STALE_RESYNC_COOLDOWN_MS: 5 * 60 * 1000,  // 5 minutes
+    // SPREAD_STALE_RECHECK_MS: level-triggered retry cadence for the spread
+    // watchdog. Every clock above (5/10/20/30 min) assumes the spread check is
+    // EVALUATED, but with OPEN_ORDERS_SYNC_LOOP_ENABLED=false the only driver
+    // is the post-fill path plus the BLOCKCHAIN_FETCH_INTERVAL_MIN (240 min)
+    // tick — so an out-of-tolerance grid was re-checked once per 4h and every
+    // window above was dead code (live: 86 minutes with no check at all, a
+    // second identical batch accepted only when the mid finally moved). While
+    // the spread is out of tolerance the watchdog now arms a one-shot recheck
+    // at this cadence, so the documented clocks are reachable at any base
+    // cadence. 0 disables the retry (legacy cadence-only behavior).
+    SPREAD_STALE_RECHECK_MS: 60 * 1000,  // 1 minute
 
     // BOUNDARY_HOLD_RESYNC_THRESHOLD / COOLDOWN: consecutive boundary-hold
     // batches (each carrying fresh fills) after which the COW executor asks
@@ -890,11 +901,26 @@ let GRID_LIMITS = {
     // exists.
     LAST_FILL_PIVOT_WRONG_SIDE_TOLERANCE_STEPS: 1,
 
+    // LAST_FILL_PIVOT_MAX_MID_DISTANCE_STEPS: a real FILL may also only arm the
+    // LAST-FILL-GUARD pivot when it priced within this many grid increments of
+    // the live reference, on EITHER side. The wrong-side tolerance below catches
+    // the direction; this catches a premium SWEEP of our own rail — a taker
+    // paying through several of our levels is on the "honest" side by direction
+    // but is not a window trade. Live: a sell 14.5 steps (4.4%) above the mid
+    // armed the pivot at the top of the gap band the geometry had just derived,
+    // so every band sell was vetoed and the spread stayed 3x wide for 86 min.
+    // One full target spread is ~5 steps at the default increment/spread, so 6
+    // keeps every interior window fill and refuses a fill a full spread away.
+    // 0 disables the distance leg (direction bound only).
+    LAST_FILL_PIVOT_MAX_MID_DISTANCE_STEPS: 6,
+
     // LAST_FILL_PIVOT_MARKET_FRESH_MS: how old the cached live market price
-    // (manager._liveMarketPrice) may be for the wrong-side pivot bound above
-    // (and the COW market-crossing action filter) to trust it. Older than
-    // this, the check fails open — an ancient mid must never veto a fresh
-    // fill after a fast market move.
+    // (manager._liveMarketPrice) may be for the pivot market bound above to
+    // trust it. Older than this, the check fails open — an ancient mid must
+    // never veto a fresh fill after a fast market move. (The crossing FLOOR
+    // does not use this window: resolveSpreadCrossingFloor already picks the
+    // newer of the live read and the fill, and the pre-broadcast crossing
+    // check is an observation, not a veto — see retrospective §9.10/P4.)
     LAST_FILL_PIVOT_MARKET_FRESH_MS: 15 * 60 * 1000,  // 15 minutes
 
 

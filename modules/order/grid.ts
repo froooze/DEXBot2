@@ -3068,6 +3068,32 @@ export function calculateCurrentSpread(manager: OrderManagerLike): number {
     }
 
     /**
+     * Measure the current out-of-spread violation in grid steps, from the live
+     * on-chain window only. ONE implementation for the entry reading and the
+     * post-placement reading, so "did the repair reduce the violation?" is the
+     * same arithmetic as "is the spread wide?" (retrospective §9.11.3: a repair
+     * must reduce the violation; the watchdog otherwise counted any placement
+     * as progress).
+     *
+     * @param {import('../types.js').OrderManagerLike} manager - Manager instance
+     * @returns {{ currentSpread: number, nominalSpread: number, excess: number, buyCount: number, sellCount: number }}
+     */
+export function measureSpreadExcess(manager: OrderManagerLike): { currentSpread: number; nominalSpread: number; excess: number; buyCount: number; sellCount: number } {
+        const { onChainBuys, onChainSells } = _getOnChainOrders(manager);
+        const currentSpread = calculateSpreadFromOrders(onChainBuys, onChainSells);
+        const nominalSpread = manager.config.targetSpreadPercent ?? DEFAULT_CONFIG.targetSpreadPercent;
+        // Fixed tolerance: 0.5 steps = half increment (tighter spread check).
+        const toleranceSteps = 0.5;
+        // `_getOnChainOrders` already slot-N/size-gated the window.
+        const buyCount = onChainBuys.length;
+        const sellCount = onChainSells.length;
+        const excess = shouldFlagOutOfSpread(
+            currentSpread, nominalSpread, toleranceSteps, buyCount, sellCount, manager.config.incrementPercent
+        );
+        return { currentSpread, nominalSpread, excess, buyCount, sellCount };
+    }
+
+    /**
      * Proactive spread correction check.
      *
      * CRITICAL: Uses AsyncLock to prevent race conditions with fill processing.
@@ -3088,7 +3114,7 @@ export function calculateCurrentSpread(manager: OrderManagerLike): number {
      * @param {Function|null} [updateOrdersOnChainBatch=null] - Optional batch update function
      * @returns {Promise<any>}
      */
-export async function checkSpreadCondition(manager: OrderManagerLike, _BitShares: unknown, updateOrdersOnChainBatch: ((correction: SpreadCorrection) => Promise<{ executed?: boolean; reason?: unknown; commitRefused?: boolean; skippedStalePlan?: boolean; [key: string]: unknown } | null | undefined>) | null = null): Promise<{ ordersPlaced: number; partialsMoved: number; stall?: SpreadCorrectionStall; transient?: boolean }> {
+export async function checkSpreadCondition(manager: OrderManagerLike, _BitShares: unknown, updateOrdersOnChainBatch: ((correction: SpreadCorrection) => Promise<{ executed?: boolean; reason?: unknown; commitRefused?: boolean; skippedStalePlan?: boolean; [key: string]: unknown } | null | undefined>) | null = null): Promise<{ ordersPlaced: number; partialsMoved: number; stall?: SpreadCorrectionStall; transient?: boolean; excessAfter?: number }> {
         // CRITICAL: Acquire corrections lock to serialize spread correction operations
         // This prevents concurrent fill processing from modifying funds while we're making decisions
         let correction: SpreadCorrection | null = null;
@@ -3135,25 +3161,13 @@ export async function checkSpreadCondition(manager: OrderManagerLike, _BitShares
         const oneSideEmpty = onChainBuys.length === 0 || onChainSells.length === 0;
 
         const executeSpreadCheck = async () => {
-            const currentSpread = calculateCurrentSpread(manager);
-
-            // Nominal spread is the configured target spread percentage.
-            // Keep this fixed: doubled-side flags are fill/replacement mechanics only.
-            const nominalSpread = manager.config.targetSpreadPercent ?? DEFAULT_CONFIG.targetSpreadPercent;
-
+            const measured = measureSpreadExcess(manager);
+            const currentSpread = measured.currentSpread;
+            const nominalSpread = measured.nominalSpread;
             // Fixed tolerance: 0.5 steps = half increment (tighter spread check).
             const toleranceSteps = 0.5;
 
-            const buyCount = manager.getOrdersByTypeAndState(ORDER_TYPES.BUY, ORDER_STATES.ACTIVE)
-                .concat(manager.getOrdersByTypeAndState(ORDER_TYPES.BUY, ORDER_STATES.PARTIAL))
-                .filter((o) => o?.orderId && Number(o?.size || 0) > 0 && parseSlotIndex(o?.id) !== null)
-                .length;
-            const sellCount = manager.getOrdersByTypeAndState(ORDER_TYPES.SELL, ORDER_STATES.ACTIVE)
-                .concat(manager.getOrdersByTypeAndState(ORDER_TYPES.SELL, ORDER_STATES.PARTIAL))
-                .filter((o) => o?.orderId && Number(o?.size || 0) > 0 && parseSlotIndex(o?.id) !== null)
-                .length;
-
-            manager.outOfSpread = shouldFlagOutOfSpread(currentSpread, nominalSpread, toleranceSteps, buyCount, sellCount, manager.config.incrementPercent);
+            manager.outOfSpread = measured.excess;
             if (manager.outOfSpread === 0) return false;
 
             // P-A cold book: the orchestration short-circuit, evaluated in the
@@ -3444,7 +3458,14 @@ export async function checkSpreadCondition(manager: OrderManagerLike, _BitShares
                     if (batchResult && batchResult.executed === true) {
                         await manager.recalculateFunds();
                         const placed = getSpreadCorrectionActionCount(activeCorrection);
-                        return { ordersPlaced: placed, partialsMoved: 0 };
+                        // Post-placement measurement: the watchdog needs to know
+                        // whether this placement REDUCED the violation or merely
+                        // moved orders (§9.11.3). Measured from the committed
+                        // window, so a placement that only touched the side that
+                        // was not blocking reports the same excess.
+                        let excessAfter: number | undefined;
+                        try { excessAfter = measureSpreadExcess(manager).excess; } catch { excessAfter = undefined; }
+                        return { ordersPlaced: placed, partialsMoved: 0, ...(excessAfter === undefined ? {} : { excessAfter }) };
                     }
                     const cause = classifySpreadRefusalCause(batchResult);
                     recordSpreadCorrectionRefusal(manager, cause);

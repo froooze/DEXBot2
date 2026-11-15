@@ -53,7 +53,9 @@
  * SECTION 7: FILL PIPELINE & LAST-FILL GUARD (9 functions)
  *   - reanchorBoundaryFromLastFill(manager, ...) - Re-anchor a rebuilt boundary to the last fill
  *   - rearmLastFillPivotFromMarketFill(manager) - Re-arm the pivot from the last market fill
- *   - isLastFillGuardBlocked(price, type, lastPrice, lastType) - LAST-FILL-GUARD predicate
+ *   - isLastFillGuardBlocked(price, type, lastPrice, lastType) - LAST-FILL-GUARD direction predicate
+ *   - isLastFillBandSellExempt(manager, price) - Geometry territory for a SELL counter-order
+ *   - evaluateLastFillGuard(manager, price, type, pivot, pivotType) - Shared placement verdict
  *   - isLastFillPlacementBlocked(manager, price, type) - Placement-side LAST-FILL-GUARD wrapper
  *   - readFillPipelineState(source) - Projection of the fill-pipeline state
  *   - resolveGridUpdateBlockers(source, options) - Blockers that forbid a grid update right now
@@ -1950,6 +1952,102 @@ export function isLastFillGuardBlocked(price: number, type: unknown, lastPrice: 
 }
 
 /**
+ * The direction rule PLUS the geometry-territory exemption — the verdict
+ * every COW-path guard shares (probe and final gate), so no site re-implements
+ * "may this op be placed against the last fill?".
+ *
+ * @param {Object} manager - OrderManager instance (geometry for the exemption)
+ * @param {number} price - Target price
+ * @param {string} type - ORDER_TYPES.BUY/SELL
+ * @param {number|null} pivotPrice - Resolved pivot (already ladder-snapped by the caller)
+ * @param {string|null} pivotType - Pivot side; null keeps the guard cold
+ * @returns {{blocked: boolean, pivot: number|null, threshold?: number|null, bandExempt?: boolean}}
+ */
+export function evaluateLastFillGuard(manager: OrderManagerLike | null | undefined, price: number, type: unknown, pivotPrice: number | null, pivotType: string | null): { blocked: boolean; pivot: number | null; threshold?: number | null; bandExempt?: boolean } {
+    const check = isLastFillGuardBlocked(price, type, pivotPrice, pivotType);
+    if (!check.blocked) return check;
+    if (type === ORDER_TYPES.SELL && isLastFillBandSellExempt(manager, price)) {
+        return { blocked: false, pivot: check.pivot, bandExempt: true };
+    }
+    return check;
+}
+
+/**
+ *
+ * The direction rule (isLastFillGuardBlocked) says "never sell at/below the last
+ * sale". That is right when the veto is evidence of a fault — retrospective
+ * §9.7/§9.9: "a sell slot below the last sale is evidence that the boundary/
+ * crawl is behind the fill". It is WRONG when the geometry is exactly where the
+ * fill re-anchor puts it: after a SELL fill at slot f the re-anchor rule is
+ * `boundary >= f - gapSlots`, so the gap band (boundary, boundary+gap] tops out
+ * AT the filled level and every band slot is `<= pivot` by construction. The
+ * pivot then vetoes 100% of the counter-order rungs it just derived.
+ *
+ * Live (2026-11-15): a sweep armed the pivot at the band's own top level; every
+ * sell slot in the band was refused as "at/through the last fill", no sell
+ * could be re-placed, and the spread stayed 3.0% (limit 1.65%) for 86 minutes
+ * until an operator-visible watchdog ran out of options.
+ *
+ * The exemption is a GEOMETRY fact, not a second direction rule: it applies
+ *   - SELL only. The BUY mirror is deliberately absent — after a BUY fill the
+ *     band sits ABOVE the fill, and buys above the last buy are the chase class
+ *     the guard was introduced for (§9.7 "buying later at higher prices").
+ *   - inside the band only (boundary < idx <= boundary + gap),
+ *   - strictly below the pivot's own ladder level (the pivot level itself is
+ *     always refused as a same-level re-fill),
+ *   - only when the boundary already satisfies the fill anchor
+ *     (`boundary >= pivotIdx - gapSlots`), i.e. the geometry is NOT behind the
+ *     fill — the precise precondition §9.7 names for the refusal.
+ * Fail-closed on anything unprovable (no genesis, off-ladder price, unknown
+ * boundary/gap).
+ *
+ * @param {Object} manager - OrderManager instance (pivot + boundary + gap + genesis)
+ * @param {number} price - SELL placement price
+ * @returns {boolean} True when the pivot must NOT veto this placement
+ */
+export function isLastFillBandSellExempt(manager: OrderManagerLike | null | undefined, price: unknown): boolean {
+    if (!manager) return false;
+    const p = Number(price);
+    if (!Number.isFinite(p) || p <= 0) return false;
+    let ref: { price: number | null; type: string | null } = { price: null, type: null };
+    try { ref = resolveFillProvenancedReference(manager); } catch { return false; }
+    if (ref.type !== ORDER_TYPES.SELL || ref.price == null || !Number.isFinite(Number(ref.price))) return false;
+    const genesis = (manager as unknown as { _genesis?: GridGenesisLike })._genesis;
+    const levels = genesis?.priceLevels;
+    if (!Array.isArray(levels) || levels.length === 0) return false;
+    const gapRaw = (manager as { _gapSlots?: unknown })._gapSlots;
+    const gap = Number(gapRaw);
+    const boundary = Number(manager.boundaryIdx);
+    if (!Number.isFinite(gap) || gap < 0 || !Number.isFinite(boundary)) return false;
+    const lo = Number(levels[0]);
+    const hi = Number(levels[levels.length - 1]);
+    const inRail = (v: number): boolean => Number.isFinite(v) && v >= lo && v <= hi;
+    if (!inRail(p) || !inRail(Number(ref.price))) return false;
+    let pivotIdx: number;
+    let candIdx: number;
+    try {
+        const g = genesis as Parameters<typeof MathUtils.slotIndexForPrice>[1];
+        pivotIdx = Number(MathUtils.slotIndexForPrice(Number(ref.price), g));
+        candIdx = Number(MathUtils.slotIndexForPrice(p, g));
+    } catch { return false; }
+    if (!Number.isFinite(pivotIdx) || !Number.isFinite(candIdx)) return false;
+    // Only a genuine ladder level: same one-increment drift bound the re-anchor
+    // uses, so an adopted/orphan price cannot invent an exemption.
+    const incRaw = Number((manager.config as { incrementPercent?: unknown } | undefined)?.incrementPercent);
+    const maxDrift = Number.isFinite(incRaw) && incRaw > 0 ? incRaw / 100 : 0.005;
+    let levelPrice: number;
+    try { levelPrice = Number(MathUtils.priceForSlot(candIdx, genesis as Parameters<typeof MathUtils.priceForSlot>[1])); } catch { return false; }
+    if (!Number.isFinite(levelPrice) || levelPrice <= 0 || Math.abs(levelPrice - p) / p > maxDrift) return false;
+    if (candIdx <= boundary) return false;
+    if (candIdx > boundary + Math.floor(gap)) return false;
+    if (candIdx >= pivotIdx) return false;
+    return boundary >= pivotIdx - Math.floor(gap);
+}
+
+/** Minimal genesis shape this module needs (mirrors utils/math's GridGenesis). */
+interface GridGenesisLike { priceLevels?: readonly number[] }
+
+/**
  * LAST-FILL PLACEMENT GUARD — the direction rule applied to a PLACEMENT.
  *
  * Wraps isLastFillGuardBlocked with the same pivot resolution the runtime uses
@@ -1965,6 +2063,10 @@ export function isLastFillGuardBlocked(price: number, type: unknown, lastPrice: 
  * had just bought at, or place a BUY above it (the "buying later at higher
  * prices" incident). Fail-open on a cold pivot (no fill yet) so a fresh grid
  * still builds.
+ *
+ * The SELL band exemption (isLastFillBandSellExempt) is applied between the two
+ * rules: a re-place at the traded level stays blocked, a band counter-order is
+ * not.
  *
  * @param {Object} manager - OrderManager instance (pivot + config.incrementPercent)
  * @param {number} price - Target placement price
@@ -1985,7 +2087,7 @@ export function isLastFillPlacementBlocked(manager: OrderManagerLike | null | un
             return { blocked: true, pivot, reason: 'same-level' };
         }
     } catch { /* fall through to the direction rule */ }
-    const guard = isLastFillGuardBlocked(numPrice, type, pivot, pivotType);
+    const guard = evaluateLastFillGuard(manager, numPrice, type, pivot, pivotType);
     if (guard.blocked) return { blocked: true, pivot, reason: 'direction' };
     return { blocked: false, pivot };
 }
@@ -2378,27 +2480,35 @@ export function normalizeLastMarketFill(row: unknown): { price: number; type: st
 }
 
 /**
- * LAST-FILL-PIVOT MARKET BOUND — is this fill on the WRONG side of the live
- * market for its trade direction?
+ * LAST-FILL-PIVOT MARKET BOUND — is this fill evidence of the CURRENT window,
+ * or of something else? Two legs, one reference:
  *
- *   BUY  wrong when priced ABOVE  mid (past the tolerance)
- *   SELL wrong when priced BELOW  mid (past the tolerance)
+ *   wrong-side  BUY above mid / SELL below mid (past the one-step tolerance).
+ *               Fills at/through the opposite side of the book cannot happen on
+ *               an honest market — a crossed-book artifact (typically the
+ *               bot's own misplaced order swept by an external taker).
+ *   too-far     Either side, further than
+ *               GRID_LIMITS.LAST_FILL_PIVOT_MAX_MID_DISTANCE_STEPS increments
+ *               from the mid. Live: a taker swept our rail up to a level 14.5
+ *               steps (4.4%) ABOVE the mid and EVERY one of those fills is on
+ *               the honest side by direction, so the wrong-side leg let them
+ *               through; the top one armed the pivot at the band's own top,
+ *               vetoing every sell the geometry had just derived and freeing
+ *               nothing for 86 minutes. A premium sweep is not a window trade.
  *
- * Fills at/through the opposite side of the book cannot happen on an honest
- * market — they are artifacts of a crossed book (typically the bot's own
- * misplaced order swept by an external taker), and the pivot they would arm
- * vetoes every near-market counter-side placement for the 24h TTL.
- *
- * Evidence: ONLY the cached live market price, and only while fresh
- * (GRID_LIMITS.LAST_FILL_PIVOT_MARKET_FRESH_MS). No live price or a stale one
- * returns null (fail-open, matching doesNotCrossMarket's never-guess rule).
+ * Both legs judge against the cached live market price, and only while it is
+ * fresh (GRID_LIMITS.LAST_FILL_PIVOT_MARKET_FRESH_MS) — fail-open otherwise.
+ * The reference is deliberately the BOOK read, not the fill-derived one: a
+ * trade must be judged against the quotes it traded through, never against
+ * itself (which would make the bound self-satisfying).
  *
  * @param {Object} manager - OrderManager instance
  * @param {string} type - ORDER_TYPES.BUY / ORDER_TYPES.SELL
  * @param {number} price - Fill price
- * @returns {{ steps: number, mid: number } | null} Wrong-side detail, or null when allowed/unknowable
+ * @returns {{ steps: number, mid: number, kind?: 'wrong-side'|'too-far' } | null}
+ *   Off-market detail, or null when the fill is window evidence / unknowable
  */
-function wrongSideOfLiveMarket(manager: OrderManagerLike, type: string, price: number): { steps: number; mid: number } | null {
+function offMarketFill(manager: OrderManagerLike, type: string, price: number): { steps: number; mid: number; kind?: 'wrong-side' | 'too-far' } | null {
     const mid = Number(manager?._liveMarketPrice);
     const midAt = Number(manager?._liveMarketPriceAt);
     if (!Number.isFinite(mid) || mid <= 0) return null;
@@ -2416,12 +2526,23 @@ function wrongSideOfLiveMarket(manager: OrderManagerLike, type: string, price: n
     if (type === ORDER_TYPES.BUY) {
         const limit = mid * Math.pow(step, tol);
         if (price > limit + eps) {
-            return { steps: Math.max(1, Math.round(Math.log(price / mid) / Math.log(step))), mid };
+            return { steps: Math.max(1, Math.round(Math.log(price / mid) / Math.log(step))), mid, kind: 'wrong-side' };
         }
     } else {
         const limit = mid / Math.pow(step, tol);
         if (price < limit - eps) {
-            return { steps: Math.max(1, Math.round(Math.log(mid / price) / Math.log(step))), mid };
+            return { steps: Math.max(1, Math.round(Math.log(mid / price) / Math.log(step))), mid, kind: 'wrong-side' };
+        }
+    }
+    // Second leg: a fill inside the direction tolerance can still be a premium
+    // sweep (a taker paying through several of our levels). Distance is judged
+    // symmetrically — both sides are equally far from the market.
+    const maxStepsRaw = Number(GRID_LIMITS.LAST_FILL_PIVOT_MAX_MID_DISTANCE_STEPS);
+    const maxSteps = Number.isFinite(maxStepsRaw) && maxStepsRaw > 0 ? maxStepsRaw : 0;
+    if (maxSteps > 0) {
+        const dist = Math.abs(Math.log(price / mid) / Math.log(step));
+        if (dist > maxSteps + 1e-9) {
+            return { steps: Math.max(1, Math.round(dist)), mid, kind: 'too-far' };
         }
     }
     return null;
@@ -2452,24 +2573,29 @@ export function setLastFillPivot(manager: OrderManagerLike, type: string, price:
     const p = Number(price);
     if (!Number.isFinite(p) || p <= 0) return false;
     // LAST-FILL-PIVOT MARKET BOUND (fill provenance only): a real fill may arm
-    // the guard only when it priced on the market's own side of the live
-    // reference — BUY at/below mid, SELL at/above mid. A fill on the WRONG
-    // side is a crossed-book artifact (usually a misplaced order that got
-    // swept at a premium) and arming it vetoes every near-market counter-side
-    // placement for the full 24h TTL. Fail-open when no fresh live price
-    // exists: an ancient mid must never veto a fresh fill after a fast move.
+    // the guard only when it is evidence of the CURRENT window — on the
+    // market's own side of the live reference AND within a full spread of it.
+    // A wrong-side fill is a crossed-book artifact; a fill many steps away on
+    // the honest side is a premium sweep of our own rail. Both are cases where
+    // arming the pivot vetoes the very band the geometry derives, for the full
+    // 24h TTL. Fail-open when no fresh live price exists: an ancient mid must
+    // never veto a fresh fill after a fast move.
     // Deliberately applied to EVERY fill-provenance write (direct fills,
     // queued-fill refresh, rebuild re-arm) so no path can re-arm an
     // off-market row. The market-fill reference is skipped with it — an
-    // off-mid row as a crossing floor would freeze correction the same way.
+    // off-market row as the crossing floor would freeze correction the same
+    // way.
     if (provenance === 'fill') {
-        const wrongSide = wrongSideOfLiveMarket(manager, type, p);
-        if (wrongSide) {
+        const offMarket = offMarketFill(manager, type, p);
+        if (offMarket) {
+            const why = offMarket.kind === 'too-far'
+                ? `it priced ${offMarket.steps} grid step(s) away from the live market `
+                    + `${offMarket.mid} — a premium sweep of our own rail, not a window trade`
+                : `it priced ${offMarket.steps} grid step(s) on the wrong side of the live market `
+                    + `${offMarket.mid} — a crossed-book artifact, not market truth`;
             manager.logger?.log?.(
-                `[LAST-FILL-GUARD] Refusing to arm pivot ${p}(${type}): it priced ` +
-                `${wrongSide.steps} grid step(s) on the wrong side of the live market ` +
-                `${wrongSide.mid} — a crossed-book artifact, not market truth; the guard ` +
-                `stays as-is and spread correction keeps trading around the live market`,
+                `[LAST-FILL-GUARD] Refusing to arm pivot ${p}(${type}): ${why}; the guard `
+                + `stays as-is and spread correction keeps trading around the live market`,
                 'warn'
             );
             return false;

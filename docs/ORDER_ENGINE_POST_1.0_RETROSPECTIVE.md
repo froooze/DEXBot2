@@ -10,11 +10,12 @@
 >
 > **Scope / snapshot:** v1.0.0 → v1.7.1 (`2a85a501`, 2026-11-04), extended through the
 > post-1.7.1 work at `bc20d574` (2026-11-04). §9 is the v1.6.4 → v1.6.17
-> addendum; §9.10 closes the v1.6.18 review pass and §9.11 carries v1.6.18 → v1.7.1.
+> addendum; §9.10 closes the v1.6.18 review pass, §9.11 carries v1.6.18 → v1.7.1,
+> and §9.12 records the subsequent revised-priority review.
 >
 > **Section numbering:** Part II deliberately keeps its original `§0`–`§8` numbers because
 > source-code comments and tests cite them (e.g. `… §2 fix #1`, `… §3 lineage`); §9 is a
-> later addendum (v1.6.4 → v1.6.17, with §9.10/§9.11 extending it) that adds to, and does not
+> later addendum (v1.6.4 → v1.6.17, with §9.10–§9.12 extending it) that adds to, and does not
 > renumber, that range. Part I uses `R1`–`R5` so the two never collide. The closing appendix
 > is unnumbered (`A`).
 >
@@ -50,6 +51,7 @@
 - 9. COW Broadcast, Resync & Geometry Safety (v1.6.4 → v1.6.17) — addendum
   - 9.10 Review pass over v1.6.12 → v1.6.17 (findings P1–P5), released in v1.6.18
   - 9.11 v1.6.18 → v1.7.1: fill identity, absence and the geometry budget
+  - 9.12 Revised priority list: counter-orders, pivot evidence and level-triggered repair
 - A. Grid-Price Invariant — former failure trace (appendix)
 
 ---
@@ -1003,6 +1005,71 @@ re-planning instead of letting its cancel teeth destroy the rotation (`7618f299`
 **Why it belongs in this document:** R3.5's "one rule, several implementations"
 is not a style complaint. Every family above is that pattern applied to a
 different noun — price, fill, existence.
+
+##### 9.12 Revised priority list: counter-orders, pivot evidence and level-triggered repair
+
+This review followed the live out-of-spread incident in priority order. The ordering
+matters: a later watchdog cannot repair a counter-order that an earlier hard veto
+removed, and a pivot policy cannot be trusted if rotation has already corrupted the
+ladder it anchors.
+
+**P0 — keep the counter-order executable.** `describeMarketCrossingActions` uses the
+single recency-aware `resolveSpreadCrossingFloor` only for an observation. It reports
+CREATE/UPDATE actions across the floor but never removes them. The internal crossed-book
+assertion remains blocking: BUY-versus-SELL collisions inside the bot's own simulated
+book are a different invariant. A stale bot-mid must not provide a second floor or veto
+the only action that can narrow a gap.
+
+**P1 — only current-window evidence may arm the pivot.** Fill provenance now has two
+market-bound checks while the cached market read is fresh: wrong-side fills are refused,
+and fills more than `GRID_LIMITS.LAST_FILL_PIVOT_MAX_MID_DISTANCE_STEPS` ladder steps
+from the market are refused symmetrically. The check fails open when the read is absent
+or stale. Separately, `OrderManager.recordLastFilledPrices` skips fills whose current
+slot is in the gap band: those are stranded residuals, not window trades. Edge-pinned
+fills remain excluded by the existing shared classifier. A rail/window fill is still
+recorded once, by the existing pivot writer.
+
+**P2 — the pivot may not veto its own counter-order territory.** The shared
+`evaluateLastFillGuard` verdict is used by both COW placement checks and the final
+pre-broadcast gate. A SELL strictly below a SELL pivot, inside the band that the fill
+anchor itself derives, is allowed only when `boundary >= pivotIdx - gapSlots`; this is
+geometry evidence that the crawl is not behind the fill. The exact pivot level remains
+blocked as a same-level re-fill, and the BUY mirror remains blocked. Unknown geometry,
+off-ladder prices and book-seeded pivots fail closed for the exemption.
+
+**P3 — a rotation moves ownership, not ladder identity.** In
+`buildCowResultFromPlan`, a rotation UPDATE has two effects: the source becomes a hole
+at its own genesis price, while the destination receives the planned price/size. The
+source is never re-priced to the destination. The invariant is checked before apply and
+again by the post-commit transition; non-rotation partial UPDATEs remain in-place size
+updates.
+
+**P4 — a repair must reduce the measured violation.** The entry and post-placement
+readings share `measureSpreadExcess`, including the same slot-N live-window filter and
+one-sided handling. `trackOutOfSpreadStaleness` clears its clock after a placement only
+when `excessAfter < excessBefore`; an unchanged placement is logged and remains stale.
+If a caller cannot measure the post-placement value, the compatibility fail-open path
+preserves the established behavior rather than inventing a negative result.
+
+**P5 — every stale level owns its retry.** While out of tolerance, the watchdog arms one
+shutdown-safe, deduplicated `SPREAD_STALE_RECHECK_MS` timer. It is not dependent on a
+future fill or the four-hour blockchain-fetch cadence, so the 5/10/20/30-minute stale
+windows can actually run. The timer re-enters the normal maintenance pipeline and is
+cancelled with the bot. A healthy reading must hold for the configured in-tolerance
+reset window before clearing stale geometry memory.
+
+**P6 — fill ownership was audited, not duplicated.** The fill history path and orphan
+fill path both book accounting first and delegate unmatched attribution to the shared
+`attributeUnmatchedFillToGrid` owner. Replay keys make the pivot/crawl mutation once per
+fill. No second fill writer was introduced; the regression coverage documents this
+contract instead of changing working attribution code.
+
+**Regression gates added/updated:** `test_last_fill_pivot_market_bound` (distance leg
+and observation/floor recency), `test_pivot_geometry_eligibility` (in-band pivot
+eligibility and veto territory), `test_rotation_source_level` (source/destination
+ladder identity), `test_incident_replay` (end-to-end band evacuation), and
+`test_stale_grid_hardening` (no-progress watchdog and level-triggered recheck). The
+production build, test build and these incident suites must all pass before promotion.
 
 ---
 

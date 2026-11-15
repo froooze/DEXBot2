@@ -45,7 +45,7 @@ const NAMES = {
         'restoreGapEvacStreaks', 'applyPersistedPendingCrawls',
         'resetLastFillPivot', 'restoreLastFillPivot', 'restoreLastMarketFill',
         'resolveSpreadMarketReference', 'evaluateSpreadCorrectionReadiness',
-        'resolveLastFillGuardReference', 'isLastFillGuardBlocked',
+        'resolveLastFillGuardReference', 'isLastFillGuardBlocked', 'evaluateLastFillGuard',
         'maybeRefreshLiveMarketPrice', 'refreshLiveMarketPrice',
         'resolveSpreadFreshnessMs', 'resolveSpreadCrossingFloor',
         'setLastFillPivot', 'normalizeLastFillPivot',

@@ -10,10 +10,11 @@
  *   silent fund loss. They must be parked outside the live queue with keys
  *   released and re-queued on a backoff timer — never dropped, never hot-spun.
  *
- * SPREAD-001..004 — trackOutOfSpreadStaleness (maintenance runtime): a spread
+ * SPREAD-001..006 — trackOutOfSpreadStaleness (maintenance runtime): a spread
  *   correction that keeps placing nothing while the spread stays wide is a
  *   stale grid, not patience. Time-based warn + structural re-center
- *   escalation with cooldown.
+ *   escalation with cooldown; a placement only counts as progress when the
+ *   measured violation decreases; the watchdog owns a level-triggered retry.
  *
  * HOOK-001..002 — region-end fan-out (modules/order/manager): legacy single
  *   listener plus registered listeners all fire; throwing listeners contained;
@@ -31,7 +32,7 @@
 
 const assert = require('assert');
 const { consumeFillQueue, parkFillsForTotalsRetry } = require('../modules/dexbot_fill_runtime');
-const { trackOutOfSpreadStaleness } = require('../modules/dexbot_maintenance_runtime');
+const { trackOutOfSpreadStaleness, scheduleSpreadRecheck } = require('../modules/dexbot_maintenance_runtime');
 const { calculateSpreadFromOrders } = require('../modules/order/utils/math');
 const { shouldFlagOutOfSpread } = require('../modules/order/utils/order');
 const { OrderManager } = require('../modules/order/manager');
@@ -204,7 +205,11 @@ function stubSpreadBot(outOfSpread: number) {
         logs,
         _outOfSpreadSince: 0,
         _outOfSpreadStaleWarned: false,
+        _outOfSpreadNoProgressWarned: false,
         _lastSpreadStaleResyncAt: 0,
+        _spreadRecheckTimer: null,
+        _spreadRecheckInFlight: false,
+        _shuttingDown: true,
         _log: (msg: string, lvl: string) => { logs.push({ msg, lvl }); },
         manager: {
             outOfSpread,
@@ -271,6 +276,54 @@ async function testSPREAD003_UncheckedTickDoesNotAccumulate() {
     assert.strictEqual(bot._outOfSpreadSince, 0, 'clock only starts on an actual check');
     assert.strictEqual(r.escalated, false, 'no escalation without a check');
     console.log('✓ SPREAD-003 passed');
+}
+
+async function testSPREAD004_PlacementMustReduceViolation() {
+    console.log('\n[SPREAD-004] A placement that leaves the violation unchanged is not progress...');
+    const bot: any = stubSpreadBot(3);
+    bot._outOfSpreadSince = Date.now() - 31 * 60 * 1000;
+    const before = bot._outOfSpreadSince;
+    const stalled = trackOutOfSpreadStaleness(bot, true, 2, false, 3);
+    assert.strictEqual(stalled.staleMs >= 31 * 60 * 1000 - 1000, true,
+        'unchanged excess must keep the stale clock running');
+    assert.strictEqual(bot._outOfSpreadSince, before, 'no-progress placement must not reset the clock');
+    assert.ok(bot.logs.some((l: any) => /placed but the spread is still/.test(l.msg)),
+        'no-progress placement must be visible');
+    const healed = trackOutOfSpreadStaleness(bot, true, 1, false, 2);
+    assert.strictEqual(healed.staleMs, 0, 'a reduced violation counts as progress');
+    assert.strictEqual(bot._outOfSpreadSince, 0, 'reduced violation resets the stale clock');
+    console.log('✓ SPREAD-004 passed');
+}
+
+async function testSPREAD005_LevelTriggeredRecheckIsDeduped() {
+    console.log('\n[SPREAD-005] Out-of-spread recheck is level-triggered and deduped...');
+    const bot: any = {
+        _shuttingDown: false,
+        _spreadRecheckTimer: null,
+        _spreadRecheckInFlight: false,
+        _log: () => {},
+        _warn: () => {},
+    };
+    assert.strictEqual(scheduleSpreadRecheck(bot, 5000), true, 'first recheck arms');
+    const timer = bot._spreadRecheckTimer;
+    assert.ok(timer, 'timer handle is retained for shutdown/cancel');
+    assert.strictEqual(scheduleSpreadRecheck(bot, 5000), true, 'second request is accepted as already pending');
+    assert.strictEqual(bot._spreadRecheckTimer, timer, 'only one timer is armed');
+    clearTimeout(bot._spreadRecheckTimer);
+    bot._spreadRecheckTimer = null;
+    bot._shuttingDown = true;
+    assert.strictEqual(scheduleSpreadRecheck(bot, 1), false, 'shutdown never arms deferred work');
+    console.log('✓ SPREAD-005 passed');
+}
+
+async function testSPREAD006_UnknownPostPlacementMeasurementKeepsCompatibility() {
+    console.log('\n[SPREAD-006] An unmeasurable post-placement result keeps the compatibility path...');
+    const bot: any = stubSpreadBot(2);
+    bot._outOfSpreadSince = Date.now() - 60 * 60 * 1000;
+    trackOutOfSpreadStaleness(bot, true, 1, false);
+    assert.strictEqual(bot._outOfSpreadSince, 0,
+        'when a caller cannot provide excessAfter, preserve the established placement-reset behavior');
+    console.log('✓ SPREAD-006 passed');
 }
 
 function newTestManager() {
@@ -364,6 +417,9 @@ async function runAllTests() {
     await testSPREAD001_HealthyOrPlacedResets();
     await testSPREAD002_WarnOnceThenEscalateWithCooldown();
     await testSPREAD003_UncheckedTickDoesNotAccumulate();
+    await testSPREAD004_PlacementMustReduceViolation();
+    await testSPREAD005_LevelTriggeredRecheckIsDeduped();
+    await testSPREAD006_UnknownPostPlacementMeasurementKeepsCompatibility();
     await testSPREADINF001_OneSidedBookReadsInfinite();
     await testSPREADINF002_FlagStaysBoundedOnNonFiniteSpread();
     await testHOOK001_FanOutToAllListeners();

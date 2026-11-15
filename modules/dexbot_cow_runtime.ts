@@ -15,7 +15,7 @@ import { BroadcastUncertainError as BroadcastUncertainErrorBinding } from './dex
 const BroadcastUncertainError = BroadcastUncertainErrorBinding;
 import * as orderUtils from './order/utils/order.js';
 import { lazyShim } from './lazy_shim.js';
-import { sleep, setLastFillPivot, fireStructuralResync, evaluateSpreadCorrectionReadiness, resolveLastFillGuardReference, resolveSpreadCrossingFloor, isLastFillGuardBlocked } from './order/utils/system.js';
+import { sleep, setLastFillPivot, fireStructuralResync, evaluateSpreadCorrectionReadiness, resolveLastFillGuardReference, resolveSpreadCrossingFloor, isLastFillGuardBlocked, evaluateLastFillGuard } from './order/utils/system.js';
 const {
     buildCreateOrderArgs,
     buildCreateOpFingerprint,
@@ -27,7 +27,7 @@ const {
     isOrderPlaced,
     chainOrderUnchangedFromCache,
     detectCrossedBookPlan,
-    filterMarketCrossingActions,
+    describeMarketCrossingActions,
     collectKnownOnChainOrderIds,
 } = orderUtils;
 import * as validate from './order/utils/validate.js';
@@ -2739,10 +2739,28 @@ function buildCowResultFromPlan(bot: BotLike, plan: JsonObj): CowResult {
                 orderId: null,
             });
         } else if (action.type === COW_ACTIONS.UPDATE) {
+            // A ROTATION is TWO effects in one op: the SOURCE becomes a hole at
+            // ITS OWN ladder level and the DESTINATION takes the order at the
+            // destination level. The source is not part of the UPDATE payload —
+            // falling through to the in-place branch below copied `action.order`
+            // (the DESTINATION's price and size) onto the vacated slot, so two
+            // slots ended up on one level. Live: 6 duplicated levels in a
+            // persisted grid, a non-monotonic ladder, a shifted boundary index
+            // and ~32k of double-reserved virtual intent. Apply and leave; the
+            // in-place branch is for a partial-fill size update (same slot).
             if (action.newGridId && action.newGridId !== action.id) {
                 const current = workingGrid.get(action.id);
                 if (current) {
-                    workingGrid.set(action.id, toWorkingHole(current));
+                    // GRID-PRICE-INVARIANT at the writer: a hole keeps the
+                    // level of the slot it vacated. Asserted (not assumed) so a
+                    // future placeholder change cannot re-open the class — the
+                    // emission-site checks never see this slot because no op
+                    // targets it.
+                    const sourceLevel = Number(current.price);
+                    const hole = toWorkingHole(current);
+                    workingGrid.set(action.id, Number.isFinite(sourceLevel) && sourceLevel > 0
+                        ? { ...hole, price: sourceLevel }
+                        : hole);
                 }
 
                 const targetId = action.newGridId;
@@ -2763,6 +2781,7 @@ function buildCowResultFromPlan(bot: BotLike, plan: JsonObj): CowResult {
                     state: ORDER_STATES.VIRTUAL,
                     orderId: null,
                 });
+                continue;
             }
 
             const current = workingGrid.get(action.id);
@@ -4361,40 +4380,27 @@ async function runPreBroadcastGuards(bot: BotLike, cowResult: CowResult): Promis
         };
     }
 
-    // MARKET-CROSSING FILTER: drop CREATE/UPDATE actions priced on the wrong
-    // side of the LIVE market (BUY above mid / SELL below mid, fresh mid only
-    // — fail-open otherwise). A batch priced across the live reference is a
-    // crossed-book artifact being re-swept at a premium, not a spread repair.
+    // MARKET-CROSSING OBSERVATION (retrospective §9.10/P4): actions priced on
+    // the wrong side of the market floor are REPORTED, never dropped. A hard
+    // veto here re-opens the counter-order deadlock P4 rejected — after a gap
+    // the counter sits across the floor by construction, and the live cost of
+    // the veto was a batch refused at identical prices that the next tick
+    // accepted once the reference moved (86 minutes out of spread). The
+    // crossed-book gate above still protects the batch internally (buy >= our
+    // own sell), and the market prices a genuinely crossing op as a taker fill.
     try {
-        const { filtered, dropped } = filterMarketCrossingActions(bot.manager, actions);
+        const { floor, dropped } = describeMarketCrossingActions(bot.manager, actions);
         if (dropped.length > 0) {
-            if (filtered.length === 0) {
-                bot.manager.logger.log(
-                    `[COW] Refusing batch pre-broadcast: every action crosses the live market ` +
-                    `(${dropped.map((d) => d.reason).slice(0, 4).join('; ')})`,
-                    'warn'
-                );
-                popPushedWorkingGrid(bot, cowResult);
-                return {
-                    proceed: false,
-                    result: {
-                        executed: false,
-                        aborted: true,
-                        reason: 'MARKET_CROSSING_FILTERED',
-                        detail: dropped.map((d) => d.reason).slice(0, 8),
-                        hadRotation: false
-                    }
-                };
-            }
-            actions.length = 0;
-            actions.push(...filtered);
             bot.manager.logger.log(
-                `[COW] Filtered ${dropped.length} market-crossing action(s) pre-broadcast ` +
-                `(${dropped.map((d) => d.reason).slice(0, 4).join('; ')}); ${actions.length} remaining`,
+                `[COW-CROSS-GUARD] ${dropped.length}/${actions.length} action(s) priced across the market floor `
+                + `${floor != null ? Format.formatPrice6(floor) : 'n/a'} `
+                + `(${dropped.map((d) => d.reason).slice(0, 4).join('; ')}`
+                + `${dropped.length > 4 ? '; …' : ''}) — observation only, batch broadcast unchanged `
+                + `(a hard veto re-opens the counter-order deadlock; retrospective §9.10/P4)`,
                 'warn'
             );
         }
-    } catch { /* the filter must never break a batch */ }
+    } catch { /* the observation must never break a batch */ }
 
     return { proceed: true, crossingCandidates, intraBatchCandidates };
 }
@@ -6779,7 +6785,20 @@ function runLastFillGuardCheck(bot: BotLike, price: number, type: string, stats:
         } catch { /* logging is best-effort */ }
         stats.pivotOffGrid = (stats.pivotOffGrid || 0) + 1;
     }
-    const check = isLastFillGuardBlocked(price, type, onGrid.price, lastType);
+    const check = evaluateLastFillGuard(bot.manager, price, type, onGrid.price, lastType);
+    // Geometry-territory exemption (see isLastFillBandSellExempt): a SELL that
+    // closes a band the fill anchor itself derived is not a "lower sell" the
+    // guard is meant to refuse — refusing it vetoes 100% of the counter-orders.
+    if (check.bandExempt) {
+        try {
+            bot.manager?.logger?.log?.(
+                `[LAST-FILL-GUARD] Allowing SELL ${Format.formatPrice6(price)} against pivot `
+                + `${Format.formatPrice6(Number(onGrid.price))}: inside the gap band the fill anchor derives `
+                + `(boundary ${bot.manager?.boundaryIdx}/gap ${bot.manager?._gapSlots}) — geometry is not behind the fill`,
+                'debug'
+            );
+        } catch { /* logging is best-effort */ }
+    }
     stats.checked++;
     return { check, refreshed };
 }
@@ -7053,10 +7072,20 @@ function runFinalPivotGate(bot: BotLike, operations: unknown[], opContexts: OpPh
             // violation the gate cannot prove).
             if (!Number.isFinite(price as number) || (price as number) <= 0) continue;
             if (type !== ORDER_TYPES.BUY && type !== ORDER_TYPES.SELL) continue;
-            const check = isLastFillGuardBlocked(price as number, type, onGrid.price, liveType);
+            const check = evaluateLastFillGuard(bot.manager, price as number, type, onGrid.price, liveType);
             if (stats) stats.checked = (Number(stats.checked) || 0) + 1;
             if (!check.blocked) {
                 if (stats) stats.passed = (Number(stats.passed) || 0) + 1;
+                if (check.bandExempt) {
+                    try {
+                        bot.manager?.logger?.log?.(
+                            `[LAST-FILL-GUARD] Final gate keeping ${type} ${ctx.kind} for ${slotId ?? 'unknown'} at `
+                            + `${Format.formatPrice6(price as number)}: inside the gap band the fill anchor derives `
+                            + `(boundary ${bot.manager?.boundaryIdx}/gap ${bot.manager?._gapSlots})`,
+                            'debug'
+                        );
+                    } catch { /* logging is best-effort */ }
+                }
                 continue;
             }
             // Blocked: drop the op + context, restore the slot below.

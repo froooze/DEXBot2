@@ -247,6 +247,15 @@ class DEXBot implements BotLike {
     _outOfSpreadTransientCount!: number;
     /** When the spread first read within tolerance; cleared on any out-of-tolerance cycle. */
     _outOfSpreadToleranceSince!: number;
+    /**
+     * Level-triggered spread recheck (see TIMING.SPREAD_STALE_RECHECK_MS).
+     * Armed by the out-of-spread watchdog while the grid is out of tolerance,
+     * since the base maintenance cadence can be hours.
+     */
+    _spreadRecheckTimer!: ReturnType<typeof setTimeout> | null;
+    _spreadRecheckInFlight!: boolean;
+    /** "placed but did not reduce the violation" was already reported for this run. */
+    _outOfSpreadNoProgressWarned!: boolean;
     _postRecoveryRebalanceDefers!: number;
     _skipEmptyReadConfirmDelay!: boolean;
     _spreadStallArmed!: boolean;
@@ -317,6 +326,9 @@ class DEXBot implements BotLike {
         this._outOfSpreadStaleWarned = false;
         this._outOfSpreadTransientCount = 0;
         this._outOfSpreadToleranceSince = 0;
+        this._spreadRecheckTimer = null;
+        this._spreadRecheckInFlight = false;
+        this._outOfSpreadNoProgressWarned = false;
         this.logPrefix = options.logPrefix || '';
         this._credentialDaemonWatchdogInterval = null;
         this._credentialDaemonDown = false;
@@ -2216,6 +2228,11 @@ class DEXBot implements BotLike {
         if (this._maintenanceIdleTimer) {
             clearTimeout(this._maintenanceIdleTimer);
             this._maintenanceIdleTimer = null;
+        }
+
+        if (this._spreadRecheckTimer) {
+            clearTimeout(this._spreadRecheckTimer);
+            this._spreadRecheckTimer = null;
         }
 
         if (this._credentialRecoveryDeferredTimer) {

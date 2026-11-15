@@ -2928,6 +2928,7 @@ async function executeMaintenanceLogic(bot: BotLike, context: string) {
                 );
             } else {
                 const spreadResult = await bot.manager.checkSpreadCondition(BitShares, bot.updateOrdersOnChainPlan.bind(bot));
+                const spreadExcessAfter = Number(spreadResult?.excessAfter);
                 if (await bot._abortFlowIfIllegalState(`${context} spread check`)) return;
                 // Mirror the stall cause and arm the targeted-sync refresh for
                 // every cause. The check can report 'no-candidates' on a stale
@@ -2943,7 +2944,10 @@ async function executeMaintenanceLogic(bot: BotLike, context: string) {
                 }
                 // Persistence watchdog: a correction that keeps placing nothing
                 // while the spread stays wide is a stale grid, not patience.
-                trackOutOfSpreadStaleness(bot, true, spreadPlaced, spreadResult?.transient === true);
+                // `excessAfter` is the post-placement violation, so a placement
+                // that did not reduce it no longer counts as progress.
+                trackOutOfSpreadStaleness(bot, true, spreadPlaced, spreadResult?.transient === true,
+                    (spreadResult?.excessAfter !== undefined && Number.isFinite(spreadExcessAfter)) ? spreadExcessAfter : undefined);
             }
         } catch (err) {
             bot._warn(`Error running divergence check during ${context}: ${getErrorMessage(err)}`);
@@ -2971,6 +2975,68 @@ function clearGeometryResyncMemory(bot: BotLike) {
 }
 
 /**
+ * Arm a one-shot, level-triggered spread recheck (TIMING.SPREAD_STALE_RECHECK_MS).
+ *
+ * Retrospective R5.5: "Make deferred work level-triggered — never let a retry
+ * depend on a future event." The spread check has no driver of its own: it runs
+ * post-fill and on the blockchain-fetch tick (240 min by default, and the
+ * open-orders loop that would shorten it is OFF by default). Every watchdog
+ * window (warn 10 min, geometry 10 min, fund 5 min, pivot-expiry 20 min) is
+ * therefore unreachable while the grid sits out of tolerance, which is how a
+ * live bot went 86 minutes without a single check. While out of tolerance the
+ * watchdog now schedules its own retry, so the clocks run at any base cadence.
+ *
+ * Deduped and shutdown-safe: one timer at a time, never while a recheck is in
+ * flight, never while shutting down. `performPeriodicGridChecks` keeps its own
+ * pipeline/broadcast deferrals, so this cannot interleave with a fill cycle.
+ *
+ * @param {Object} bot - DEXBot instance
+ * @param {number} [delayOverrideMs] - Injectable delay (tests); production reads TIMING
+ * @returns {boolean} True when a recheck was armed (or already pending)
+ */
+export function scheduleSpreadRecheck(bot: BotLike, delayOverrideMs?: number): boolean {
+    const configured = Number.isFinite(Number(delayOverrideMs)) && Number(delayOverrideMs) > 0
+        ? Number(delayOverrideMs)
+        : (Number(TIMING?.SPREAD_STALE_RECHECK_MS) > 0 ? Number(TIMING.SPREAD_STALE_RECHECK_MS) : 0);
+    const ms = configured > 0 ? configured : 0;
+    if (!(ms > 0)) return false;
+    if (!bot || bot._shuttingDown) return false;
+    if (bot._spreadRecheckTimer || bot._spreadRecheckInFlight) return true;
+    try {
+        bot._spreadRecheckTimer = setTimeout(async () => {
+            bot._spreadRecheckTimer = null;
+            if (bot._shuttingDown || bot._spreadRecheckInFlight) return;
+            bot._spreadRecheckInFlight = true;
+            try {
+                bot._log(
+                    `[SPREAD-STALE] Level-triggered recheck (${Math.round(ms / 1000)}s cadence while out of tolerance)`,
+                    'debug'
+                );
+                await performPeriodicGridChecks(bot);
+            } catch (err) {
+                try { bot._warn(`Spread recheck failed: ${getErrorMessage(err)}`); } catch { /* logging is best-effort */ }
+            } finally {
+                bot._spreadRecheckInFlight = false;
+                // `trackOutOfSpreadStaleness` runs inside the maintenance call,
+                // while this flag is true, so its dedupe check intentionally
+                // does not arm the next timer. Re-arm after the region ends when
+                // the level is still active; otherwise a single retry would be
+                // falsely documented as a recurring level-triggered repair.
+                if (!bot._shuttingDown && Number(bot.manager?.outOfSpread) > 0) {
+                    scheduleSpreadRecheck(bot, ms);
+                }
+            }
+        }, ms);
+        const timer = bot._spreadRecheckTimer as unknown as { unref?: () => void };
+        if (typeof timer?.unref === 'function') timer.unref();
+        return true;
+    } catch {
+        bot._spreadRecheckTimer = null;
+        return false;
+    }
+}
+
+/**
  * Out-of-spread persistence watchdog: the never-run-stale backstop.
  *
  * The spread check retries every pipeline-empty tick (level-triggered), but a
@@ -2988,19 +3054,47 @@ function clearGeometryResyncMemory(bot: BotLike) {
  * @param {number} ordersPlaced - Correction orders placed this tick
  * @param {boolean} [transient=false] - True when the correction was refused for
  *   a retryable reason (stale plan / duplicate CREATE / unclassified non-execution)
+ * @param {number} [excessAfter] - Out-of-spread violation (grid steps) MEASURED
+ *   after the placement, or undefined when the correction placed nothing /
+ *   could not be measured
  * @returns {{staleMs: number, escalated: boolean}}
  */
-export function trackOutOfSpreadStaleness(bot: BotLike, spreadChecked: boolean, ordersPlaced: number, transient = false) {
+export function trackOutOfSpreadStaleness(bot: BotLike, spreadChecked: boolean, ordersPlaced: number, transient = false, excessAfter?: number) {
     const outOfSpread = Number(bot?.manager?.outOfSpread) || 0;
     const nowMs = Date.now();
     const inToleranceResetMs = Number(TIMING?.SPREAD_STALE_IN_TOLERANCE_RESET_MS) > 0
         ? Number(TIMING.SPREAD_STALE_IN_TOLERANCE_RESET_MS)
         : 10 * 60 * 1000;
-    if (ordersPlaced > 0) {
+    // PLACED IS NOT PROGRESS (retrospective §9.11.3, "a repair must reduce the
+    // violation"). Clearing the clock on ANY placement let a correction that
+    // only rotated the side that was not blocking report a heal every cycle:
+    // live, 6 buy rotations at a still-3.0% spread reset the clock AND the
+    // geometry-recenter memory, so the pivot expiry and the one-recenter-per-pivot
+    // budget could never fire while the sell side stayed unquoted for 86 minutes.
+    // A placement now clears the clock only when the measured violation actually
+    // shrank (excessAfter < outOfSpread, or 0). Unmeasurable => legacy behavior
+    // (a placement counts), so a broken measurement can never churn a re-center.
+    const measured = Number(excessAfter);
+    const excessKnown = excessAfter !== undefined && excessAfter !== null && Number.isFinite(measured);
+    const placedReducedViolation = ordersPlaced > 0 && (!excessKnown || measured < outOfSpread);
+    if (ordersPlaced > 0 && !placedReducedViolation) {
+        if (!bot._outOfSpreadNoProgressWarned) {
+            bot._outOfSpreadNoProgressWarned = true;
+            bot._log(
+                `[SPREAD-STALE] ${ordersPlaced} order(s) placed but the spread is still ${measured} step(s) `
+                + `out of tolerance (was ${outOfSpread}) — counting as no progress, the stale clock keeps running`,
+                'warn'
+            );
+        }
+        // Fall through: the clock is NOT cleared, so the documented windows
+        // (warn / geometry / fund / pivot-expiry) stay reachable.
+    }
+    if (placedReducedViolation) {
         bot._outOfSpreadSince = 0;
         bot._outOfSpreadStaleWarned = false;
         bot._outOfSpreadTransientCount = 0;
         bot._outOfSpreadToleranceSince = 0;
+        bot._outOfSpreadNoProgressWarned = false;
         clearGeometryResyncMemory(bot);
         try { bot.manager._spreadRailOversubscribed = null; } catch { /* best-effort */ }
         return { staleMs: 0, escalated: false };
@@ -3023,11 +3117,19 @@ export function trackOutOfSpreadStaleness(bot: BotLike, spreadChecked: boolean, 
         bot._outOfSpreadStaleWarned = false;
         bot._outOfSpreadTransientCount = 0;
         bot._outOfSpreadToleranceSince = 0;
+        bot._outOfSpreadNoProgressWarned = false;
         clearGeometryResyncMemory(bot);
         try { bot.manager._spreadRailOversubscribed = null; } catch { /* best-effort */ }
         return { staleMs: 0, escalated: false };
     }
     bot._outOfSpreadToleranceSince = 0;
+    // LEVEL-TRIGGERED RECHECK. Every watchdog clock below assumes the spread
+    // check is EVALUATED, but the base cadence is the blockchain fetch interval
+    // (240 min by default) plus the post-fill path — so a grid that is out of
+    // tolerance waits hours for the next look and every window becomes dead
+    // code (live: 86 minutes with no check at all). While out of tolerance, arm
+    // one short recheck; it re-arms itself until the spread heals.
+    scheduleSpreadRecheck(bot);
     if (!spreadChecked) {
         const since = Number(bot._outOfSpreadSince) || 0;
         return { staleMs: since > 0 ? Date.now() - since : 0, escalated: false };
@@ -3973,6 +4075,7 @@ export default {
     handlePendingTriggerReset,
     setupTriggerFileDetection,
     performPeriodicGridChecks,
+    scheduleSpreadRecheck,
     isOpenOrdersSyncLoopEnabled,
     startOpenOrdersSyncLoop,
     stopOpenOrdersSyncLoop,

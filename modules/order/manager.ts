@@ -2805,6 +2805,17 @@ class OrderManager implements OrderManagerLike {
      * edge. Skipping keeps the reference on the last WINDOW trade, matching
      * the crawl's classification (collectEdgePinnedFillIds is the shared
      * definition).
+     *
+     * IN-BAND FILLS ARE SKIPPED TOO (same rule, completed). A slot the CURRENT
+     * geometry classifies as gap-band holds a stranded residual — an order the
+     * engine has already declared out of place ("placed_order_in_band") — not a
+     * window trade. Live: a sweep crawled the boundary over a resting sell,
+     * that stranded sell then partially filled 11s later, and the fill armed the
+     * pivot at the top of the band the geometry had just derived. Every SELL in
+     * the band was then `<= pivot`, so the counter-orders the sweep owed could
+     * never be placed. The eligibility rule (§9.6 "Only a window trade may
+     * become the pivot") is applied at this single writer: edge-pinned here,
+     * in-band here, off-market distance in setLastFillPivot.
      * @param {Array} fills
      */
     recordLastFilledPrices(fills: COWFillLike[]): void {
@@ -2812,11 +2823,22 @@ class OrderManager implements OrderManagerLike {
         const edgeFillIds = collectEdgePinnedFillIds(this as unknown as Parameters<typeof collectEdgePinnedFillIds>[0], fills as Array<{ id?: string; type?: string }>);
         let recorded = 0;
         let skippedEdge = 0;
+        let skippedInBand = 0;
         let lastKind = 'unknown';
         let lastPriceSrc = 'direct';
         for (const f of fills) {
             if (!f || (f.type !== ORDER_TYPES.BUY && f.type !== ORDER_TYPES.SELL)) continue;
             if (f.id != null && edgeFillIds.has(String(f.id))) { skippedEdge++; continue; }
+            // Geometry eligibility: an in-band slot is not a window trade. Fails
+            // OPEN when the geometry is unreadable (no boundary/gap yet), because
+            // a cold grid must still arm on its first real fill.
+            if (f.id != null) {
+                try {
+                    const idx = parseSlotIndex(String(f.id));
+                    const geom = geometryTypeForSlotIndex(idx, this.boundaryIdx, this._gapSlots);
+                    if (geom === ORDER_TYPES.SPREAD) { skippedInBand++; continue; }
+                } catch { /* unreadable geometry — treat as eligible */ }
+            }
             let price: number | null = Number(f.price ?? f.order?.price);
             let priceSrc = 'direct';
             if (!Number.isFinite(price) || (price as number) <= 0) {
@@ -2843,14 +2865,18 @@ class OrderManager implements OrderManagerLike {
                     `[FILL-PIVOT] pivot=${fmt(this._lastFilledPrice)}(${this._lastFilledType}) ` +
                     `buy=${fmt(this._lastFilledBuyPrice)} sell=${fmt(this._lastFilledSellPrice)} ` +
                     `n=${recorded} src=${lastKind}/${lastPriceSrc}` +
-                    `${skippedEdge > 0 ? ` edge-skipped=${skippedEdge}` : ''}`,
+                    `${skippedEdge > 0 ? ` edge-skipped=${skippedEdge}` : ''}` +
+                    `${skippedInBand > 0 ? ` band-skipped=${skippedInBand}` : ''}`,
                     'info'
                 );
             } catch { /* logging is best-effort */ }
-        } else if (skippedEdge > 0) {
+        } else if (skippedEdge > 0 || skippedInBand > 0) {
             try {
+                const parts: string[] = [];
+                if (skippedEdge > 0) parts.push(`${skippedEdge} edge-pinned`);
+                if (skippedInBand > 0) parts.push(`${skippedInBand} gap-band (stranded residual)`);
                 this.logger?.log?.(
-                    `[FILL-PIVOT] ${skippedEdge} edge-pinned fill(s) ignored — the guard pivot and the boundary anchor stay on the last window trade`,
+                    `[FILL-PIVOT] ${parts.join(' + ')} fill(s) ignored — the guard pivot and the boundary anchor stay on the last window trade`,
                     'info'
                 );
             } catch { /* logging is best-effort */ }

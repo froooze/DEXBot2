@@ -267,6 +267,15 @@ export interface BotLike {
    * persistence clock — it must hold for SPREAD_STALE_IN_TOLERANCE_RESET_MS.
    */
   _outOfSpreadToleranceSince: number;
+  /**
+   * One-shot level-triggered spread recheck while the grid is out of
+   * tolerance (the base maintenance cadence can be hours; every watchdog
+   * clock assumes the check is evaluated).
+   */
+  _spreadRecheckTimer: ReturnType<typeof setTimeout> | null;
+  _spreadRecheckInFlight: boolean;
+  /** A placement that did not reduce the violation was already reported. */
+  _outOfSpreadNoProgressWarned: boolean;
   _strandedHoldSince: Map<string, number>;
   _recoverySyncInFlight: number;
   _batchInFlight: number;
