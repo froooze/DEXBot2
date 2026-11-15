@@ -50,6 +50,7 @@ const NAMES = {
         'resolveSpreadFreshnessMs', 'resolveSpreadCrossingFloor',
         'setLastFillPivot', 'normalizeLastFillPivot',
         'rearmLastFillPivotFromMarketFill', 'reanchorBoundaryFromLastFill',
+        'expireLastFillGuardReferences',
         'fireStructuralResync',
         // Fill-discipline predicates (grid_reconcile_internal / maintenance
         // runtime): stubbed settled here so the resync stages below exercise
@@ -222,6 +223,7 @@ function installCoreResyncMocks({ snapshotMode = 'live' } = {}) {
         resolveGridUpdateBlockers: () => [],
         noteGridUpdateBlockers: () => ({ cycles: 0, escalate: false }),
         sleep: async () => {},
+        expireLastFillGuardReferences: () => {},
     });
 }
 
@@ -719,6 +721,7 @@ function installDivergenceMocks(opts) {
         resolveGridUpdateBlockers: () => [],
         noteGridUpdateBlockers: () => ({ cycles: 0, escalate: false }),
         sleep: async () => {},
+        expireLastFillGuardReferences: () => {},
     });
     defineEsmMockAbs(require.resolve('../modules/order/grid'), NAMES.grid, {
         monitorDivergence: async () => opts.divergence,

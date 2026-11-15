@@ -9,7 +9,7 @@ import { lazyShim } from './lazy_shim.js';
 
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
-import { nowIso, fireStructuralResync, resolveLastFillGuardReference, hasUnsettledFills, resolveGridUpdateBlockers, noteGridUpdateBlockers } from './order/utils/system.js';
+import { nowIso, fireStructuralResync, resolveLastFillGuardReference, hasUnsettledFills, resolveGridUpdateBlockers, noteGridUpdateBlockers, expireLastFillGuardReferences } from './order/utils/system.js';
 import { withPlacement } from './order/placement_lock.js';
 import { path } from './path_api.js';
 import * as chainOrders from './chain_orders.js';
@@ -3094,12 +3094,27 @@ export function trackOutOfSpreadStaleness(bot: BotLike, spreadChecked: boolean, 
     const geometryEscalateMs = Number(TIMING?.SPREAD_STALE_GEOMETRY_ESCALATE_MS) > 0
         ? Number(TIMING.SPREAD_STALE_GEOMETRY_ESCALATE_MS)
         : 10 * 60 * 1000;
+    // After the one re-center per pivot, the pivot gets a BOUNDED extra window
+    // (SPREAD_STALE_PIVOT_EXPIRE_MS) instead of escalating to NOTHING ("a fill
+    // or the pivot TTL is the only heal"). Live, a single off-market pivot buy
+    // stranded the grid out of spread for the full 24h TTL because every
+    // rebuild re-armed the same pivot. Past the window the guard references
+    // are expired outright (expireLastFillGuardReferences) so spread
+    // correction trades around the live market again; both re-arm on the next
+    // real fill. 0 disables the expiry (legacy behavior).
+    const pivotExpireConfigured = Number(TIMING?.SPREAD_STALE_PIVOT_EXPIRE_MS);
+    const pivotExpireMs = pivotExpireConfigured > 0
+        ? pivotExpireConfigured
+        : pivotExpireConfigured === 0
+            ? Number.POSITIVE_INFINITY
+            : 20 * 60 * 1000;
     const escalateMs = oversubscribedFresh
         ? fundEscalateMs
         : geometryAlreadyRecentered
-            // Do not re-center again for the same fill. Out of the escalation
-            // ladder entirely: a fill (or the pivot TTL) is the only heal.
-            ? Number.POSITIVE_INFINITY
+            // Do not re-center again for the same fill. Bounded pivot-expiry
+            // window instead of Infinity: past it the guard references are
+            // cleared and the market is traded around (see pivotExpireMs).
+            ? pivotExpireMs
             : geometryBlocked
                 ? geometryEscalateMs
                 : (Number(TIMING?.SPREAD_STALE_ESCALATE_MS) > 0
@@ -3137,6 +3152,22 @@ export function trackOutOfSpreadStaleness(bot: BotLike, spreadChecked: boolean, 
         const lastAt = Number(bot._lastSpreadStaleResyncAt) || 0;
         if (now - lastAt >= cooldownMs) {
             bot._lastSpreadStaleResyncAt = now;
+            if (geometryAlreadyRecentered) {
+                // The re-center for this pivot already ran and cannot clear the
+                // veto; the bounded pivot-expiry window is up. Clear the guard
+                // references (live + persisted) so the market is traded around
+                // again instead of staying stranded until the 24h TTL.
+                expireLastFillGuardReferences(
+                    bot.manager,
+                    `out of tolerance ${staleMin}min after re-centering on fill pivot ${geometryPivotKey.split('|')[0]}`
+                );
+                clearGeometryResyncMemory(bot);
+                bot._outOfSpreadSince = 0;
+                bot._outOfSpreadStaleWarned = false;
+                bot._outOfSpreadTransientCount = 0;
+                bot._outOfSpreadToleranceSince = 0;
+                return { staleMs, escalated: true };
+            }
             if (geometryBlocked && geometryPivotKey) bot._lastGeometryResyncPivotKey = geometryPivotKey;
             bot._log(
                 `[SPREAD-STALE] Spread out of tolerance for ${staleMin}min despite corrections` +

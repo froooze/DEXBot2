@@ -128,6 +128,7 @@ export const TIMING_CLASSIFICATIONS: Readonly<Record<string, TimingClassificatio
     SPREAD_STALE_ESCALATE_MS: { kind: 'policy', rationale: 'Out-of-spread persistence before escalation.' },
     SPREAD_STALE_FUND_ESCALATE_MS: { kind: 'policy', rationale: 'Shortened escalation window when the cause is fundability.' },
     SPREAD_STALE_GEOMETRY_ESCALATE_MS: { kind: 'policy', rationale: 'Shortened escalation window when the cause is geometry.' },
+    SPREAD_STALE_PIVOT_EXPIRE_MS: { kind: 'policy', rationale: 'Pivot lifetime after the one re-center per fill before the guard references are expired outright.' },
     SPREAD_STALE_IN_TOLERANCE_RESET_MS: { kind: 'policy', rationale: 'How long in-tolerance must hold before the watchdog resets.' },
     SPREAD_STALE_RESYNC_COOLDOWN_MS: { kind: 'policy', rationale: 'Rate limit on spread-correction resyncs.' },
     SPREAD_STALE_TRANSIENT_GRACE: { kind: 'policy', rationale: 'Consecutive transient corrections tolerated before escalating.' },

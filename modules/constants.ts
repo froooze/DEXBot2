@@ -444,6 +444,16 @@ let TIMING = {
     // (`_lastGeometryResyncPivotKey`): the pivot does not move with the grid, so
     // a second attempt re-derives the identical veto.
     SPREAD_STALE_GEOMETRY_ESCALATE_MS: 10 * 60 * 1000,  // 10 minutes
+    // SPREAD_STALE_PIVOT_EXPIRE_MS: how long after the ONE geometry re-center
+    // per pivot the out-of-spread watchdog waits before clearing the
+    // LAST-FILL-GUARD pivot (and the bot-scoped last-market-fill reference)
+    // outright. Previously that state escalated to NOTHING ("a fill or the
+    // pivot TTL is the only heal") — live, a single off-market pivot buy
+    // stranded the grid out of spread for the full 24h TTL because every
+    // rebuild re-armed the same pivot. Clearing both references lets spread
+    // correction trade around the live market again; both re-arm on the next
+    // real fill. 0 disables the expiry (legacy behavior).
+    SPREAD_STALE_PIVOT_EXPIRE_MS: 20 * 60 * 1000,  // 20 minutes
     // SPREAD_CORRECTION_MAX_ATTEMPTS: bounded attempts for one spread-correction
     // cycle (initial broadcast + fresh-master re-plan retries). Kept next to the
     // other SPREAD_* tunables so the retry budget is centralized; a value < 1
