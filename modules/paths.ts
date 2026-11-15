@@ -329,6 +329,7 @@ const PATHS = {
     ECOSYSTEM_CONFIG_JS: path.join(PROFILES_DIR, 'ecosystem.config.cjs'),
     SUPERVISOR_SOCK: path.join(PROFILES_DIR, 'supervisor.sock'),
     MONOLITHIC_PID: path.join(PROFILES_DIR, 'monolithic.pid'),
+    INSTANCE_LOCKS_DIR: path.join(PROFILES_DIR, 'instance-locks'),
     MONOLITHIC_BOT_PID: path.join(PROFILES_DIR, 'monolithic-bot.pid'),
     MONOLITHIC_BOT_INFO: path.join(PROFILES_DIR, 'monolithic-bot.json'),
     MONOLITHIC_CRED_PID: path.join(PROFILES_DIR, 'monolithic-cred.pid'),

@@ -98,6 +98,7 @@ import { normalizeBotEntry } from './bot_settings.js';
 import { createDefaultBotMetrics } from './bot_defaults.js';
 import type { FillOpLike, FillLike, ReplaySafeFillAccountingOptions } from './dexbot_fill_runtime.js';
 import { getErrorMessage, getErrorCode } from './utils/errors.js';
+import { acquireBotInstanceLock, type BotInstanceLock } from './launcher/instance_lock.js';
 import type {BotLike, AssetPair, IncomingFill, UnknownRecord, GridConfig, OrderManagerLike, AccountOrdersLike, BotMetrics, ProcessedFillStoreLike, CreditRuntimeLike, FillBatchResult, SigningToken, SpreadCorrectionStall} from './types.js';
 
 const waitForConnected = lazyShim('./bitshares_client', 'waitForConnected');
@@ -241,6 +242,8 @@ class DEXBot implements BotLike {
     _marketAdapterWatchdogInFlight!: boolean;
     _outOfSpreadSince!: number;
     _outOfSpreadStaleWarned!: boolean;
+    /** Held single-controller lock for this bot's account (null when not started). */
+    _instanceLock!: BotInstanceLock | null;
     _outOfSpreadTransientCount!: number;
     /** When the spread first read within tolerance; cleared on any out-of-tolerance cycle. */
     _outOfSpreadToleranceSince!: number;
@@ -1788,6 +1791,20 @@ class DEXBot implements BotLike {
      * @private
      */
     async _runStartupSequence() {
+        // SINGLE-CONTROLLER LOCK: refuse to run when another live process
+        // already controls this account (the double-controller incident of
+        // 2026-11-14 had a `dexbot pm2` bot and a `dexbot start` bot trading
+        // the same account for ~36h). Must wrap EVERY placement-producing
+        // startup path (grid and credit-only alike), so it sits here before
+        // the dispatch below. Released in _shutdownImpl; a crashed predecessor
+        // is detected via /proc liveness and its lock taken over.
+        if (this.account && !this._instanceLock) {
+            this._instanceLock = acquireBotInstanceLock(
+                String(this.account),
+                String(this.config?.botKey || this.config?.name || ''),
+                { log: (msg, level) => this._log(msg, level === 'warn' ? 'warn' : 'info') }
+            );
+        }
         try {
             if (this.config.creditOnly) {
                 await this._runCreditOnlyStartup();
@@ -2367,6 +2384,14 @@ class DEXBot implements BotLike {
             `lockContentions=${metrics.lockContentionEvents}, maxQueueDepth=${metrics.maxQueueDepth}, ` +
             `heldChainOrders=${metrics.heldChainOrders ?? 0}, blockingChainOrders=${metrics.blockingChainOrders ?? 0}` +
             refusalSuffix);
+
+        // SINGLE-CONTROLLER LOCK: released last so a restart twin cannot slip
+        // in while this instance still has pending broadcasts or persistence.
+        if (this._instanceLock) {
+            const lock = this._instanceLock;
+            this._instanceLock = null;
+            lock.release();
+        }
 
         await this.manager?.logger?.flush?.();
     }

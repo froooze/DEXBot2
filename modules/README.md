@@ -132,6 +132,7 @@ modules/
 │   ├── credential_secret.ts       secret management
 │   ├── foreign_cred_daemon.ts     external daemon client
 │   ├── headless_password.ts       headless password storage
+│   ├── instance_lock.ts           per-account single-controller lock
 │   ├── launch_modes.ts            monolithic vs isolated routing
 │   ├── market_adapter_runtime.ts  adapter process lifecycle
 │   ├── market_adapter_watchdog.ts adapter process watchdog

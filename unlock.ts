@@ -106,7 +106,7 @@ const {
     listConfiguredBots, getControlBotNames, getControlActionLabel,
     getControlServiceNames, resolveControlRouting, botNotFoundMessage, printControlActionSummary, formatBotCount,
 } = require('./modules/launcher/monolithic_runtime');
-const { isConfiguredBotName } = require('./modules/launcher/runtime_mode');
+const { isConfiguredBotName, listDexbotPm2Processes } = require('./modules/launcher/runtime_mode');
 
 const CODE_ROOT = __dirname;
 const BOTS_FILE = PATHS.PROFILES.BOTS_JSON;
@@ -591,6 +591,34 @@ async function main({ argv = process.argv, startupGraceMs = DEFAULT_STARTUP_GRAC
             console.log('Use `dexbot stat` to inspect it, or `dexbot restart` to restart it.');
             await flushVersionStatusOrHeader(versionStatus);
             process.exitCode = 0;
+            return;
+        }
+    }
+
+    // DOUBLE-CONTROLLER GUARD: refuse to start bots that a PM2 fleet is
+    // already running (same names). Two controllers on one account corrupt
+    // each other's grids and fills (observed live 2026-11-14); fail here with
+    // the offending app names instead of letting the per-bot instance lock
+    // kill the freshly unlocked bots one by one. Internal children skip the
+    // check — their parent launcher already ran it.
+    if (!clawOnly && !dryrun && !isInternalChild && launchedBotNames.length > 0) {
+        // listDexbotPm2Processes() already gates on the pm2 daemon pid file
+        // (no subprocess when PM2 was never run) and keeps only DEXBot2's own
+        // processes, so this stays a cheap, offline-safe probe.
+        const runningApps = listDexbotPm2Processes()
+            .map((p: { name?: string }) => String(p?.name || ''))
+            .filter(Boolean);
+        const overlap = runningApps.filter((appName: string) => launchedBotNames.some((b: string) => isSameBotName(b, appName)));
+        if (overlap.length > 0) {
+            printLauncherHeader({ botName: effectiveBotName || botName, clawOnly, creditOnly, isolated, dryrun, headless });
+            console.error(
+                `The following bot(s) are already running under PM2: ${overlap.join(', ')}.\n` +
+                `Starting them here too would put two controllers on the same accounts.\n` +
+                `Stop the PM2 fleet first: dexbot pm2 stop ${overlap.join(' ')}\n` +
+                `   (or run the bots under PM2 instead: dexbot pm2)`
+            );
+            await flushVersionStatusOrHeader(versionStatus);
+            process.exitCode = 1;
             return;
         }
     }

@@ -163,6 +163,7 @@
     "./dist/modules/launcher/status_reporting.js": false,
     "./dist/modules/launcher/supervisor_control.js": false,
     "./dist/modules/launcher/monolithic_runtime.js": false,
+    "./dist/modules/launcher/instance_lock.js": false,
     "./dist/modules/launcher/runtime_mode.js": false,
     "./dist/modules/launcher/market_adapter_runtime.js": false,
     "./dist/modules/launcher/market_adapter_watchdog.js": false,

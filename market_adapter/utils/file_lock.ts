@@ -273,21 +273,33 @@ async function _acquireLockCoreAsync(lockPath: string, opts: AcquireLockOptions 
  */
 function acquireFileLockSync(lockPath: string, opts: AcquireLockOptions = {}): AcquiredLock {
     const staleMs = typeof opts.staleMs === 'number' && Number.isFinite(opts.staleMs) && opts.staleMs > 0 ? opts.staleMs : (6 * 3600 * 1000);
+    // Explicit opts override the market-adapter defaults (default payload,
+    // liveness heuristic, and message). Callers that pass none — the market
+    // adapter lifecycle lock — keep the exact behavior above; generic callers
+    // (e.g. the per-account bot instance lock) parameterize their own payload,
+    // holder liveness, and contention message.
+    const buildPayload = typeof opts.buildPayload === 'function'
+        ? opts.buildPayload
+        : () => ({ pid: runtime.pid, createdAt: new Date().toISOString() });
+    const aliveCheck = typeof opts.aliveCheck === 'function' ? opts.aliveCheck : isLikelyMarketAdapterProcess;
+    const resolveRunningMsg = typeof opts.alreadyRunningMsg === 'function'
+        ? opts.alreadyRunningMsg
+        : () => `market adapter already running (lock: ${lockPath}, pid: ${loadLockInfo(lockPath).pid ?? 'unknown'})`;
     return _acquireLockCore(lockPath, {
         staleMs,
         maxAttempts: 2,
         retryMs: 0,
         contention: 'throw',
-        aliveCheck: isLikelyMarketAdapterProcess,
+        aliveCheck,
         // The payload's `pid` is display metadata for this message; the
         // release-time identity token is the core-injected `ownerId` (always a
         // fresh unique id, never reused across acquires).
-        buildPayload: () => ({ pid: runtime.pid, createdAt: new Date().toISOString() }),
+        buildPayload,
         // Evaluated lazily at throw time so the reported pid reflects the lock
         // holder at the moment contention is detected, not the state when this
         // function was first called (loadLockInfo tolerates a missing lock file).
-        alreadyRunningMsg: () => `market adapter already running (lock: ${lockPath}, pid: ${loadLockInfo(lockPath).pid ?? 'unknown'})`,
-        timeoutMsg: `cannot acquire lock: ${lockPath}`,
+        alreadyRunningMsg: resolveRunningMsg,
+        timeoutMsg: opts.timeoutMsg || `cannot acquire lock: ${lockPath}`,
     });
 }
 

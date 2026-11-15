@@ -87,6 +87,7 @@ import { existsSync } from 'node:fs';
 import { parseJsonWithComments } from './modules/order/utils/system.js';
 import { readBotsFileWithLock } from './modules/bots_file_lock.js';
 import { loadSettingsFile, selectActiveBotEntries, type BotEntry } from './modules/bot_settings.js';
+import { getProcessDiscovery } from './modules/process_discovery.js';
 import * as chainKeys from './modules/chain_keys.js';
 import * as credentialPolicy from './modules/credential_policy.js';
 import { readHeadlessPassword } from './modules/launcher/headless_password.js';
@@ -494,6 +495,23 @@ async function main({ botNameFilter = null, clawOnly = false, headless = false, 
         // connection confirmation as the only startup output.
         muteChainLogs();
 
+        // DOUBLE-CONTROLLER GUARD: a monolithic instance started via
+        // `dexbot start` is a live controller for the same accounts this PM2
+        // fleet is about to own. Two controllers on one account corrupt each
+        // other's grids and fills (observed live 2026-11-14), so refuse here
+        // instead of letting the per-bot instance lock kill each PM2 app 3
+        // seconds later.
+        const monoPid = readLiveMonolithicPidLite();
+        if (monoPid > 0) {
+            console.error(pm2Error(
+                `DEXBot2 is already running outside PM2 (monolithic PID ${monoPid}).\n` +
+                `Starting the PM2 fleet now would put two controllers on the same accounts.\n` +
+                `Stop it first with 'dexbot stop', then rerun this command.`
+            ));
+            await flushVersionStatusOrHeader(versionStatus);
+            process.exit(1);
+        }
+
         await waitForConnected(TIMING.CONNECTION_TIMEOUT_MS);
 
         console.log(pm2Success('Connected to BitShares'));
@@ -533,6 +551,7 @@ async function main({ botNameFilter = null, clawOnly = false, headless = false, 
 
     // Step 4: Start PM2
     console.log(clawOnly ? 'Starting PM2 with credential daemon only...' : 'Starting PM2 with all services...');
+    await warnStaleDexbotApps(apps);
     await startManagedAppsPM2(apps);
 
     console.log();
@@ -591,6 +610,103 @@ function startManagedAppsPM2(apps: Pm2App[] | null | undefined): Promise<void> {
         return Promise.resolve();
     }
     return startPM2Process(['start', ECOSYSTEM_FILE]);
+}
+
+/**
+ * Lightweight "a `dexbot start` monolithic instance is live" probe.
+ *
+ * Reads the monolithic pid file, so it must confirm the pid still belongs to
+ * an unlock process (a recycled pid must not block PM2 forever). Kept local
+ * instead of importing launcher/monolithic_runtime: pm2.ts is loaded by the
+ * ESM-mocked launcher tests, and that module drags in the whole launcher graph
+ * (bot settings, supervisor, credential runtime) for one check. The
+ * authoritative backstop remains the per-bot instance lock.
+ *
+ * @returns {number} Live monolithic pid, or 0 when absent/dead/unrelated
+ */
+function readLiveMonolithicPidLite(): number {
+    try {
+        const pid = Number(storage.readFile(PATHS.PROFILES.MONOLITHIC_PID).trim());
+        if (!Number.isInteger(pid) || pid <= 0) return 0;
+        const discovery = getProcessDiscovery();
+        if (!discovery.isAlive(pid)) return 0;
+        const cmdline = discovery.readCmdline(pid);
+        if (!/(^|[\\/])unlock\.(?:js|ts)(?:\0|$| )/.test(cmdline)) return 0;
+        return pid;
+    } catch (_) {
+        return 0;
+    }
+}
+
+/**
+ * Names of PM2 apps that are RUNNING dexbot bot/runtime scripts from this
+ * project root. Returns [] when pm2 is unavailable or the query fails — the
+ * caller treats that as "cannot know", never as "none running".
+ */
+async function listRunningDexbotAppNames(): Promise<string[]> {
+    try {
+        const list = await runPm2Raw(['jlist'], { timeoutMs: 15000 });
+        if (list.code !== 0) return [];
+        const parsed = JSON.parse(list.stdout || '[]') as Array<{ name?: unknown; pm2_env?: { pm_cwd?: unknown; pm_exec_path?: unknown; status?: unknown } }> | null;
+        if (!Array.isArray(parsed)) return [];
+        const names: string[] = [];
+        for (const app of parsed) {
+            const env = app?.pm2_env;
+            if (!env) continue;
+            if (String(env.pm_cwd || '') !== PATHS.PROJECT_ROOT) continue;
+            if (!/(^|[\\/])(bot|dexbot|market_adapter|credential-daemon)\.(?:js|ts)$/.test(String(env.pm_exec_path || ''))) continue;
+            const status = String(env.status || '');
+            if (status && status !== 'online' && status !== 'launching') continue;
+            if (typeof app.name === 'string' && app.name) names.push(app.name);
+        }
+        return names;
+    } catch (_) {
+        return [];
+    }
+}
+
+/**
+ * Warn about RUNNING dexbot apps from this project root whose names are not in
+ * the current bots.json set (renamed bots, leftovers from an older ecosystem
+ * generation, a hung interactive-unlock attempt). Such an app comes back on
+ * every `pm2 resurrect`/reboot and can double-run an account against the
+ * freshly generated fleet — the exact double-controller incident of
+ * 2026-11-14. Warn only (never auto-delete): the single-controller instance
+ * lock refuses them at runtime, and deleting operator processes silently
+ * would hide the misconfiguration instead of surfacing it.
+ *
+ * Compared against the FULL configured bot set (not the possibly bot-filtered
+ * `apps` subset) so `dexbot pm2 <bot>` does not flag the operator's other,
+ * legitimately configured bots.
+ */
+async function warnStaleDexbotApps(apps: Pm2App[] | null | undefined): Promise<void> {
+    try {
+        const running = await listRunningDexbotAppNames();
+        if (running.length === 0) return;
+        const current = new Set((apps || []).map((a) => a.name));
+        // Full configured set from bots.json (not the possibly bot-filtered
+        // `apps` subset). Best-effort: a settings read failure just narrows
+        // the comparison to `apps` instead of blocking startup.
+        const configured = new Set<string>();
+        try {
+            if (storage.exists(BOTS_JSON)) {
+                const { config } = loadSettingsFile(BOTS_JSON);
+                for (const b of selectActiveBotEntries(config) as BotEntry[]) {
+                    if (b && b.active !== false && b.name) configured.add(String(b.name));
+                }
+            }
+        } catch (_) { /* best-effort */ }
+        const serviceNames = new Set(['dexbot-adapter', 'dexbot-update', 'dexbot-cred']);
+        for (const name of running) {
+            if (current.has(name) || configured.has(name) || serviceNames.has(name)) continue;
+            if ([...current].some((n) => isSameBotName(n, name)) || [...configured].some((n) => isSameBotName(n, name))) continue;
+            console.warn(
+                `[PM2] Stale dexbot app '${name}' is RUNNING but not in the current bots.json set ` +
+                `(renamed bot or leftover from an older config). It will keep running across reboots and ` +
+                `can double-run an account. Remove it with: pm2 delete ${name} && pm2 save`
+            );
+        }
+    } catch (_) { /* diagnostics only — must never block startup */ }
 }
 
 function startCredentialDaemonPM2({ credentialEnv = {} }: { credentialEnv?: Record<string, string> } = {}): Promise<void> {
