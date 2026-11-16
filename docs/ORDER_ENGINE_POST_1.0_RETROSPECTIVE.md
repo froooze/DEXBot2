@@ -1112,6 +1112,51 @@ Lesson: an offline checker that re-implements gate inputs drifts from the gate i
 audits; it must reconstruct the gate's actual state, and every reconciliation shortcut
 (timestamps, ids, anchors) is a potential false verdict in either direction.
 
+**Addendum 2 (2026-11-16, same-level re-fill loop): the P1 refusal silently suspended
+the P2 same-level block.** The sweep window that produced the six policy divergences
+above also produced a second, previously invisible pattern: one premium
+spread-correction slot was re-armed by the correction loop at the identical level and
+refilled five times in ~2.5 minutes (each cycle: full fill → slot orphaned → next
+correction cycle re-activates the same slot at the same grid price → immediate fill).
+Economically benign — every fill priced well above the day's cost basis and the taker
+kept paying a ~2.9% premium — but a real rule gap:
+
+- §9.12/P2 blocks the exact pivot level as a same-level re-fill; that block keys off
+  the ARMED pivot. §9.12/P1 refuses off-market (premium-sweep) fills from arming.
+  Together: exactly while a sweep runs, the same-level re-fill protection is
+  suspended — the one window it is needed most.
+- The offline checker passed the loop: realized fill prices of the re-placed level
+  differ by sub-sat rounding dust, so the strict "sell→sell must rise" float compare
+  saw a rise at every cycle. §0's ground truth ("equal is a violation") is about the
+  LEVEL, not the float.
+
+Amended policy (both sides of the audit line):
+
+1. Runtime (`modules/order/utils/system.ts`): a refused fill writes an in-memory,
+   TTL-bounded (`GRID_LIMITS.LAST_FILL_REFUSED_LEVEL_TTL_MS`, 30 min) refused-level
+   marker; `evaluateLastFillGuard` (the shared verdict) and
+   `isLastFillPlacementBlocked` refuse a same-side placement within half a grid step
+   (`pricesWithinHalfStep`) of the marked level, surfaced as `refusedLevel` /
+   reason `refused-level` at every skip site. It vetoes exactly one level and nothing
+   else — the counter-side stays governed by the older direction pivot and spread
+   correction keeps trading around the live market, so the unquoted-side deadlock P1
+   was written against cannot re-open through it. Deliberately NOT a cooldown or
+   backoff on the correction loop (R4/§9.10/P4 "observability instead of a veto";
+   §9.12/P5 owns stale-level retries; a hard pause would have left the sell side
+   unquoted mid-sweep — the marked slot was the only placeable one at the time).
+2. Checker (`analysis/grid_correction_check.ts`): same-level transitions (same
+   direction, different orders) are detected with the runtime's OWN
+   `pricesWithinHalfStep` and become strict candidates. In policy-aware mode a
+   same-level candidate whose just-filled level carries a fresh refusal marker in the
+   runtime log is a VIOLATION (the amended gate would have blocked the re-placement;
+   it filled anyway); without marker evidence it is a policy divergence tagged
+   `sameLevel`. `--strict` counts every same-level candidate as a violation.
+
+Pinned by `tests/test_refused_level_refill_block.ts` (REFUSED-1..9) and
+`tests/test_same_level_refill_check.ts` (SL-1..10). With the amendment applied, the
+2026-11-16 audit baseline reads: 10 strict candidates = 4 same-level violations (the
+loop) + 6 policy divergences (the sweep re-quotes, unchanged).
+
 ---
 
 ### A. Grid-Price Invariant — former failure trace

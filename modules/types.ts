@@ -1178,6 +1178,14 @@ export interface OrderManagerLike {
   _lastMarketFillPrice?: number | null;
   _lastMarketFillType?: string | null;
   _lastMarketFillAt?: number | null;
+  /**
+   * Refused (off-market) fill level: a fill the pivot-arming policy refused
+   * (§9.12/P1) still marks its own level as a same-level re-fill block for a
+   * short TTL (§9.12/P2 amended). In-memory only — never persisted.
+   */
+  _lastRefusedFillPrice?: number | null;
+  _lastRefusedFillType?: string | null;
+  _lastRefusedFillAt?: number | null;
   // Externally-observed live market price (B/A) and its read/attempt clocks.
   _liveMarketPrice?: number | null;
   _liveMarketPriceAt?: number | null;

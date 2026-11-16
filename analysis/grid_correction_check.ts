@@ -68,6 +68,7 @@
 
 import { getErrorMessage, getErrorField } from '../modules/utils/errors.js';
 import { isLastFillGuardBlocked } from '../modules/order/utils/system.js';
+import { pricesWithinHalfStep } from '../modules/order/utils/math.js';
 import fs from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import * as KC from '../market_adapter/core/kibana_client.js';
@@ -124,6 +125,15 @@ interface Violation {
     halfInc: number;
     /** The pivot itself (BUY must be below / SELL above it). */
     threshold: number;
+    /**
+     * Same-level re-fill (§0 "equal is a violation — a re-place at the
+     * just-filled level"; §9.12/P2): the transition stayed within half a grid
+     * step of the previous same-side fill (the runtime's own same-level test,
+     * pricesWithinHalfStep). Realized fill prices of one re-placed level differ
+     * by sub-sat rounding dust, so a float-exact compare passes such a loop.
+     * Present on the violation regardless of which rule caught it.
+     */
+    sameLevel?: boolean;
 }
 interface AggregatedOrder {
     orderId: string;
@@ -149,6 +159,39 @@ interface PolicyDivergence {
     reason: string;
     refusalsInRange: number;
     priceDeltaPct: number;
+    /** True when the candidate is a same-level re-fill (within half a grid step of the previous same-side fill). */
+    sameLevel?: boolean;
+}
+
+/**
+ * SAME-LEVEL REFUSAL MARKER (§9.12/P2 amended): did the runtime refuse the
+ * pivot-arm of the just-filled level shortly before this same-level re-fill?
+ * The amended runtime writes a same-level re-fill block when it refuses a
+ * pivot arm, so a same-level fill that the log shows SHOULD have been blocked
+ * is a gate failure — a violation even in policy-aware mode — not a policy
+ * divergence. Fail-open: no log, no matching refusal => normal mirror verdict.
+ */
+function sameLevelRefusalMarker(
+    index: RuntimeLogIndex | null,
+    v: Violation,
+    incrementPercent: number,
+): boolean {
+    if (!index) return false;
+    const prevT = Date.parse(v.prev.time + (/[Zz]|[+-]\d\d:?(\d\d)?$/.test(v.prev.time) ? '' : 'Z'));
+    const currT = Date.parse(v.curr.time + (/[Zz]|[+-]\d\d:?(\d\d)?$/.test(v.curr.time) ? '' : 'Z'));
+    if (!Number.isFinite(prevT) || !Number.isFinite(currT)) return false;
+    const ttl = Number(C.GRID_LIMITS?.LAST_FILL_REFUSED_LEVEL_TTL_MS ?? 0);
+    if (!(ttl > 0)) return false;
+    for (const r of index.refusals) {
+        if (r.type !== v.direction) continue;
+        if (r.t > currT) continue;
+        if (currT - r.t > ttl) continue;
+        // The marker must postdate the just-filled trade itself (5s slack for
+        // block-time vs log-clock skew), else it describes an older level.
+        if (r.t < prevT - 5000) continue;
+        if (pricesWithinHalfStep(r.price, v.prev.price, incrementPercent)) return true;
+    }
+    return false;
 }
 
 /**
@@ -162,6 +205,7 @@ interface PolicyDivergence {
 function applyRuntimeMirror(
     violations: Violation[],
     logPath: string,
+    incrementPercent: number,
 ): { kept: Violation[]; divergences: PolicyDivergence[]; index: RuntimeLogIndex | null; logError: string | null } {
     let text: string;
     try {
@@ -173,6 +217,13 @@ function applyRuntimeMirror(
     const kept: Violation[] = [];
     const divergences: PolicyDivergence[] = [];
     for (const v of violations) {
+        // Same-level re-fill whose just-filled level carries a fresh refusal
+        // marker in the log: the amended §9.12/P2 gate would have blocked the
+        // re-placement — it filled anyway => gate failure, keep as violation.
+        if (v.sameLevel && sameLevelRefusalMarker(index, v, incrementPercent)) {
+            kept.push(v);
+            continue;
+        }
         const cand: TransitionCandidate = {
             prevTime: v.prev.time,
             currTime: v.curr.time,
@@ -193,6 +244,7 @@ function applyRuntimeMirror(
                 reason: verdict.reason,
                 refusalsInRange: verdict.refusalsInRange,
                 priceDeltaPct: v.priceDeltaPct,
+                sameLevel: v.sameLevel,
             });
         } else {
             kept.push(v);
@@ -225,7 +277,9 @@ Usage: node dist/analysis/grid_correction_check.js --bot-key <key> [options]
 
 Validates LAST-FILL-GUARD discipline (DIRECTION ONLY relative to the last fill):
   BUY must be < last fill price, SELL must be > last fill price.
-  Equal price counts as blocked (a re-place at the just-filled level).
+  Equal price counts as blocked (a re-place at the just-filled level); so does
+  a same-level re-fill within half a grid step of the just-filled level
+  (the runtime's own pricesWithinHalfStep test, §9.12/P2).
   Uses the runtime's own predicate (isLastFillGuardBlocked); not a copy.
   Cold start (no previous fill) is disabled.
 
@@ -528,6 +582,7 @@ function aggregateByOrder(trades: TradeFill[], updates: OrderUpdate[] = []): Agg
 function detectViolations(
     items: (TradeFill | AggregatedOrder)[],
     includeCrossPair: boolean,
+    incrementPercent: number,
 ): { violations: Violation[]; checkedTransitions: number } {
     const violations: Violation[] = [];
     let checkedTransitions = 0;
@@ -542,7 +597,17 @@ function detectViolations(
             checkedTransitions++;
 
             const check = isLastFillGuardBlocked(curr.price, curr.direction, prev.price, prev.direction);
-            if (check.blocked) {
+            // SAME-LEVEL RE-FILL (§9.12/P2): judged with the runtime's OWN
+            // same-level predicate (pricesWithinHalfStep, exactly what
+            // isLastFillPlacementBlocked applies) — never a copy of it. Same
+            // direction only: the counter-side is governed by the direction
+            // rule above. A re-placed level's realized fill prices differ by
+            // sub-sat rounding dust, so a float-exact compare would pass a
+            // loop that re-placed at the IDENTICAL level (live 2026-11-16:
+            // one premium spread slot, 5 full fills in 2.5 minutes).
+            const sameLevel = prev.direction === curr.direction
+                && pricesWithinHalfStep(curr.price, prev.price, incrementPercent);
+            if (check.blocked || sameLevel) {
                 const delta = curr.price - prev.price;
                 const deltaPct = prev.price !== 0 ? (delta / prev.price) * 100 : 0;
                 const isSell = curr.direction === 'sell';
@@ -550,14 +615,17 @@ function detectViolations(
                     index: i,
                     pair: `${curr.baseAsset}:${curr.quoteAsset}`,
                     direction: curr.direction,
-                    expected: isSell ? `> ${check.threshold?.toFixed(6)} (last fill ${check.pivot})` : `< ${check.threshold?.toFixed(6)} (last fill ${check.pivot})`,
+                    expected: check.blocked
+                        ? (isSell ? `> ${check.threshold?.toFixed(6)} (last fill ${check.pivot})` : `< ${check.threshold?.toFixed(6)} (last fill ${check.pivot})`)
+                        : `different level (> half a step of ${prev.price.toFixed(6)} — same-level re-fill, §9.12/P2)`,
                     prev: prev as TradeFill,
                     curr: curr as TradeFill,
                     priceDelta: delta,
                     priceDeltaPct: deltaPct,
-                    pivot: check.pivot as number,
+                    pivot: (check.pivot ?? prev.price) as number,
                     halfInc: 0,
-                    threshold: check.threshold as number,
+                    threshold: (check.threshold ?? prev.price) as number,
+                    sameLevel: sameLevel || undefined,
                 });
             }
         }
@@ -637,6 +705,7 @@ function printReport(
     }
     console.log(`  Increment:    ${incrementPercent}%  (informational — the guard is direction-only)`);
     console.log('  Guard:        BUY < last fill / SELL > last fill  — both sides, global pivot');
+    console.log('                (+ same-level re-fill: within half a step of the just-filled level, §9.12/P2)');
     console.log('');
 
     const buyCount = trades.filter(t => t.direction === 'buy').length;
@@ -651,6 +720,11 @@ function printReport(
         console.log(`  Policy divergences:   ${divergences.length}  (runtime gate would have passed them)`);
     }
     console.log(`  Violations:           ${violations.length}${strictCandidates > 0 ? `  (${((violations.length / strictCandidates) * 100).toFixed(2)}% of strict candidates)` : ''}`);
+    const sameLevelViolations = violations.filter(v => v.sameLevel).length;
+    const sameLevelDivergences = divergences.filter(d => d.sameLevel).length;
+    if (sameLevelViolations + sameLevelDivergences > 0) {
+        console.log(`  Same-level re-fills:  ${sameLevelViolations + sameLevelDivergences}  (within half a grid step of the just-filled level, §9.12/P2 — ${sameLevelViolations} violation(s), ${sameLevelDivergences} divergence(s))`);
+    }
     console.log('');
 
     if (violations.length === 0) {
@@ -724,11 +798,15 @@ function printReport(
         const cTime = (v.curr.time || '').slice(0, 19).replace('T', ' ').padEnd(19);
         const pOrd = (v.prev.orderId || '-').slice(0, 16).padEnd(16);
         const cOrd = (v.curr.orderId || '-').slice(0, 16).padEnd(16);
-        const marker = v.direction === 'sell' ? `SELL < ${fmt(v.threshold,4)}` : `BUY > ${fmt(v.threshold,4)}`;
+        const marker = v.sameLevel
+            ? `SAME-LEVEL (≤ half step of ${fmt(v.threshold, 4)})`
+            : v.direction === 'sell' ? `SELL < ${fmt(v.threshold,4)}` : `BUY > ${fmt(v.threshold,4)}`;
         console.log(`  ${(String(i + 1)).padStart(2)}  ${pairLabel}  ${dir}  ${pPrice}  ${cPrice}  ${thr}  ${deltaStr}  ${pTime}  ${cTime}  ${pOrd}  ${cOrd}  ${marker}`);
     }
     console.log('');
-    console.log('  Guard: BUY must be < the last fill price, SELL > it (equal price blocked) — mirrors bot.');
+    console.log('  Guard: BUY must be < the last fill price, SELL > it; the just-filled level itself');
+    console.log('  (equal price, or within half a grid step — the runtime\'s same-level test) is a');
+    console.log('  same-level re-fill and blocked/violation too (§9.12/P2).');
     console.log(`  No band: the grid increment (${incrementPercent}%) is reported for context only.`);
     console.log('');
     if (divergences.length > 0) printDivergences(divergences);
@@ -763,7 +841,9 @@ function printDivergences(divergences: PolicyDivergence[]) {
         const cTime = (d.curr.time || '').slice(0, 19).replace('T', ' ').padEnd(19);
         const cOrd = (d.curr.orderId || '-').slice(0, 16).padEnd(16);
         const ref = String(d.refusalsInRange).padStart(8);
-        const reason = d.pivot
+        const reason = d.sameLevel
+            ? `SAME-LEVEL re-fill (${d.pivot ? 'pivot-arm refused in window' : 'no refusal evidence'})`
+            : d.pivot
             ? (d.refusalsInRange > 0 ? 'pivot-arm refusal(s) in window' : 'pivot older than strict last fill')
             : 'unverifiable pivot';
         console.log(`  ${(String(i + 1)).padStart(2)}  ${pairLabel}  ${dir}  ${pPrice}  ${cPrice}  ${pivStr}  ${deltaStr}  ${pTime}  ${cTime}  ${cOrd}  ${ref}  ${reason}`);
@@ -899,7 +979,7 @@ async function main() {
         items = orders;
     }
 
-    const { violations: strictCandidatesList, checkedTransitions } = detectViolations(items, opts.includeCrossPair);
+    const { violations: strictCandidatesList, checkedTransitions } = detectViolations(items, opts.includeCrossPair, incrementPercent);
 
     // Policy-aware mirror: re-judge strict candidates against the pivot the
     // runtime held at each order's gate. Default on; --strict skips it.
@@ -915,7 +995,7 @@ async function main() {
         runtimeLogPath = opts.runtimeLog ?? defaultLog;
         if (runtimeLogPath) {
             if (fs.existsSync(runtimeLogPath)) {
-                const mirror = applyRuntimeMirror(strictCandidatesList, runtimeLogPath);
+                const mirror = applyRuntimeMirror(strictCandidatesList, runtimeLogPath, incrementPercent);
                 violations = mirror.kept;
                 divergences = mirror.divergences;
                 logError = mirror.logError;
@@ -942,7 +1022,7 @@ async function main() {
     process.exit(violations.length > 0 ? 2 : 0);
 }
 
-export { isLastFillGuardBlocked, classifyFills, TradeFill, Violation };
+export { isLastFillGuardBlocked, detectViolations, applyRuntimeMirror, classifyFills, TradeFill, AggregatedOrder, Violation, PolicyDivergence };
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
     main().catch(e => {

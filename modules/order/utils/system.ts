@@ -1952,24 +1952,77 @@ export function isLastFillGuardBlocked(price: number, type: unknown, lastPrice: 
 }
 
 /**
+ * REFUSED-LEVEL SAME-LEVEL RE-FILL BLOCK (§9.12/P2 amended, 2026-11-16).
+ *
+ * A fill the pivot-arming policy refused (wrong-side / too-far premium sweep)
+ * does not arm the direction pivot — deliberately, so the guard keeps trading
+ * around the live market instead of deadlocking the side for the pivot TTL.
+ * But the same-level re-fill refusal (§9.12/P2: "the exact pivot level remains
+ * blocked as a same-level re-fill") keys off the ARMED pivot, so the P1
+ * refusal silently suspended it: a spread-correction slot could be re-armed at
+ * the identical level and refill immediately, in a loop, for as long as a
+ * taker kept lifting it.
+ *
+ * This predicate closes that gap with a SEPARATE, minimal role: the refused
+ * fill's own level, same side only, within half a grid step (the same
+ * pricesWithinHalfStep test isLastFillPlacementBlocked uses), for a short
+ * in-memory TTL (GRID_LIMITS.LAST_FILL_REFUSED_LEVEL_TTL_MS). It vetoes exactly
+ * one price level — the just-filled one — and nothing else: the counter-side
+ * stays governed by the (older) direction pivot and spread correction can
+ * still trade around the live market, so the unquoted-side deadlock P1 was
+ * written against cannot re-open through it. Fail-open on anything unreadable.
+ *
+ * @param {Object} manager - OrderManager instance
+ * @param {number} price - Candidate placement price
+ * @param {string} type - ORDER_TYPES.BUY / ORDER_TYPES.SELL
+ * @returns {{blocked: boolean, level: number|null}} Verdict + the refused level
+ */
+export function isRefusedLevelRefillBlocked(manager: OrderManagerLike | null | undefined, price: unknown, type: unknown): { blocked: boolean; level: number | null } {
+    const p = Number(price);
+    const level = Number(manager?._lastRefusedFillPrice);
+    const at = Number(manager?._lastRefusedFillAt);
+    const refType = manager?._lastRefusedFillType;
+    if (!Number.isFinite(p) || !Number.isFinite(level) || level <= 0) return { blocked: false, level: null };
+    if (refType !== ORDER_TYPES.BUY && refType !== ORDER_TYPES.SELL) return { blocked: false, level: null };
+    if (type !== refType) return { blocked: false, level };
+    const ttl = Number(GRID_LIMITS.LAST_FILL_REFUSED_LEVEL_TTL_MS);
+    if (!(ttl > 0) || !Number.isFinite(at) || at <= 0 || (Date.now() - at) > ttl) return { blocked: false, level };
+    let sameLevel = false;
+    try { sameLevel = MathUtils.pricesWithinHalfStep(p, level, Number((manager?.config as { incrementPercent?: unknown } | undefined)?.incrementPercent)); } catch { sameLevel = p === level; }
+    return { blocked: sameLevel, level };
+}
+
+/**
  * The direction rule PLUS the geometry-territory exemption — the verdict
  * every COW-path guard shares (probe and final gate), so no site re-implements
  * "may this op be placed against the last fill?".
+ *
+ * Also applies the REFUSED-LEVEL same-level re-fill block (§9.12/P2 amended):
+ * a placement on the same side within half a grid step of a fill whose
+ * pivot-arm was refused stays blocked even though the direction pivot itself
+ * stayed behind that fill. See isRefusedLevelRefillBlocked.
  *
  * @param {Object} manager - OrderManager instance (geometry for the exemption)
  * @param {number} price - Target price
  * @param {string} type - ORDER_TYPES.BUY/SELL
  * @param {number|null} pivotPrice - Resolved pivot (already ladder-snapped by the caller)
  * @param {string|null} pivotType - Pivot side; null keeps the guard cold
- * @returns {{blocked: boolean, pivot: number|null, threshold?: number|null, bandExempt?: boolean}}
+ * @returns {{blocked: boolean, pivot: number|null, threshold?: number|null, bandExempt?: boolean, refusedLevel?: boolean}}
  */
-export function evaluateLastFillGuard(manager: OrderManagerLike | null | undefined, price: number, type: unknown, pivotPrice: number | null, pivotType: string | null): { blocked: boolean; pivot: number | null; threshold?: number | null; bandExempt?: boolean } {
+export function evaluateLastFillGuard(manager: OrderManagerLike | null | undefined, price: number, type: unknown, pivotPrice: number | null, pivotType: string | null): { blocked: boolean; pivot: number | null; threshold?: number | null; bandExempt?: boolean; refusedLevel?: boolean } {
     const check = isLastFillGuardBlocked(price, type, pivotPrice, pivotType);
-    if (!check.blocked) return check;
-    if (type === ORDER_TYPES.SELL && isLastFillBandSellExempt(manager, price)) {
-        return { blocked: false, pivot: check.pivot, bandExempt: true };
+    let verdict: { blocked: boolean; pivot: number | null; threshold?: number | null; bandExempt?: boolean };
+    if (!check.blocked) verdict = check;
+    else if (type === ORDER_TYPES.SELL && isLastFillBandSellExempt(manager, price)) {
+        verdict = { blocked: false, pivot: check.pivot, bandExempt: true };
+    } else verdict = check;
+    if (!verdict.blocked) {
+        const refused = isRefusedLevelRefillBlocked(manager, price, type);
+        if (refused.blocked) {
+            return { blocked: true, pivot: refused.level, threshold: refused.level, refusedLevel: true };
+        }
     }
-    return check;
+    return verdict;
 }
 
 /**
@@ -2071,16 +2124,24 @@ interface GridGenesisLike { priceLevels?: readonly number[] }
  * @param {Object} manager - OrderManager instance (pivot + config.incrementPercent)
  * @param {number} price - Target placement price
  * @param {string} type - ORDER_TYPES.BUY / ORDER_TYPES.SELL
- * @returns {{blocked: boolean, pivot: number|null, reason?: 'direction'|'same-level'}}
+ * @returns {{blocked: boolean, pivot: number|null, reason?: 'direction'|'same-level'|'refused-level'}}
  */
-export function isLastFillPlacementBlocked(manager: OrderManagerLike | null | undefined, price: unknown, type: unknown): { blocked: boolean; pivot: number | null; reason?: 'direction' | 'same-level' } {
+export function isLastFillPlacementBlocked(manager: OrderManagerLike | null | undefined, price: unknown, type: unknown): { blocked: boolean; pivot: number | null; reason?: 'direction' | 'same-level' | 'refused-level' } {
     const numPrice = Number(price);
     if (!Number.isFinite(numPrice) || numPrice <= 0) return { blocked: false, pivot: null };
     let reference: { price: number | null; type: string | null } = { price: null, type: null };
     try { reference = resolveLastFillGuardReference(manager); } catch { reference = { price: null, type: null }; }
     const pivot = reference.price;
     const pivotType = reference.type;
-    if (pivot == null || pivotType == null) return { blocked: false, pivot: null };
+    if (pivot == null || pivotType == null) {
+        // Cold direction pivot: a refused (off-market) fill marker can still be
+        // live and must keep blocking the same-level re-fill (§9.12/P2 amended).
+        try {
+            const refused = isRefusedLevelRefillBlocked(manager, numPrice, type);
+            if (refused.blocked) return { blocked: true, pivot: refused.level, reason: 'refused-level' };
+        } catch { /* fail-open */ }
+        return { blocked: false, pivot: null };
+    }
     if (type !== ORDER_TYPES.BUY && type !== ORDER_TYPES.SELL) return { blocked: false, pivot };
     try {
         if (MathUtils.pricesWithinHalfStep(numPrice, pivot, manager?.config?.incrementPercent)) {
@@ -2088,7 +2149,7 @@ export function isLastFillPlacementBlocked(manager: OrderManagerLike | null | un
         }
     } catch { /* fall through to the direction rule */ }
     const guard = evaluateLastFillGuard(manager, numPrice, type, pivot, pivotType);
-    if (guard.blocked) return { blocked: true, pivot, reason: 'direction' };
+    if (guard.blocked) return { blocked: true, pivot: guard.pivot, reason: (guard as { refusedLevel?: boolean }).refusedLevel ? 'refused-level' : 'direction' };
     return { blocked: false, pivot };
 }
 
@@ -2593,9 +2654,24 @@ export function setLastFillPivot(manager: OrderManagerLike, type: string, price:
                     + `${offMarket.mid} — a premium sweep of our own rail, not a window trade`
                 : `it priced ${offMarket.steps} grid step(s) on the wrong side of the live market `
                     + `${offMarket.mid} — a crossed-book artifact, not market truth`;
+            // REFUSED-LEVEL MARKER (§9.12/P2 amended): the fill does not arm the
+            // direction pivot, but its LEVEL must still refuse the immediate
+            // re-place at the just-filled price. Without this the P1 refusal
+            // silently suspended the P2 same-level block (which keys off the
+            // ARMED pivot): a spread-correction slot re-armed at the identical
+            // level and refilled in a loop for as long as a taker kept lifting
+            // it (live 2026-11-16: 5 full fills at one premium level in 2.5
+            // minutes). In-memory, TTL-bounded (LAST_FILL_REFUSED_LEVEL_TTL_MS).
+            try {
+                manager._lastRefusedFillPrice = p;
+                manager._lastRefusedFillType = type;
+                manager._lastRefusedFillAt = Date.now();
+            } catch { /* marker is best-effort */ }
+            const ttlMin = Math.round(Number(GRID_LIMITS.LAST_FILL_REFUSED_LEVEL_TTL_MS) / 60000);
             manager.logger?.log?.(
                 `[LAST-FILL-GUARD] Refusing to arm pivot ${p}(${type}): ${why}; the guard `
-                + `stays as-is and spread correction keeps trading around the live market`,
+                + `stays as-is and spread correction keeps trading around the live market; `
+                + `the just-filled level stays blocked as a same-level re-fill for ${ttlMin}m`,
                 'warn'
             );
             return false;
@@ -2647,6 +2723,11 @@ export function resetLastFillPivot(manager: OrderManagerLike, reason: string = '
     manager.lastFillPivotSource = null;
     manager._lastFilledBuyPrice = null;
     manager._lastFilledSellPrice = null;
+    // The refused-level marker belongs to the same guard generation: a grid
+    // rebuild invalidates the geometry (and any marker read against it).
+    manager._lastRefusedFillPrice = null;
+    manager._lastRefusedFillType = null;
+    manager._lastRefusedFillAt = 0;
     if (wasArmed) {
         try {
             manager.logger?.log?.(`[LAST-FILL-GUARD] Pivot cleared (${reason}); guard re-arms on the next fill`, 'info');

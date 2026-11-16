@@ -888,6 +888,20 @@ let GRID_LIMITS = {
     // is refreshed by every fresh fill.
     LAST_FILL_PIVOT_TTL_MS: 24 * 60 * 60 * 1000,  // 24 hours
 
+    // LAST_FILL_REFUSED_LEVEL_TTL_MS: how long a fill REFUSED from arming the
+    // pivot (wrong-side / too-far premium sweep, §9.12/P1) still marks its own
+    // level as a same-level re-fill block. The direction pivot deliberately
+    // stays behind such a fill — but the §9.12/P2 same-level refusal keys off
+    // the ARMED pivot, so the P1 refusal silently suspended it: a spread-
+    // correction slot re-placed at the just-filled level ("rises" of sub-sat
+    // rounding dust) refilled 5 times in 2.5 minutes on a live market-pair bot
+    // (2026-11-16). The marker vetoes exactly ONE level — the just-filled one —
+    // and nothing else, so spread correction keeps trading around the live
+    // market and the unquoted-side deadlock P1 was written against cannot
+    // re-open through it. In-memory only and short-lived: it must stop the
+    // immediate re-fill loop, not ratchet for the pivot's 24h TTL.
+    LAST_FILL_REFUSED_LEVEL_TTL_MS: 30 * 60 * 1000,  // 30 minutes
+
     // LAST_FILL_PIVOT_WRONG_SIDE_TOLERANCE_STEPS: a real FILL may only arm the
     // LAST-FILL-GUARD pivot when it priced on the market's own side of the
     // live reference: BUY at/below mid, SELL at/above mid (within this

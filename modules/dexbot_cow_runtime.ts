@@ -4924,9 +4924,10 @@ async function updateOrdersOnChainBatchCOWBody(
                             if (refreshed) lastFillGuardPivotRefreshed = true;
                             if (check.blocked) {
                                 lastFillGuardStats.skipped++;
-                                const dir = order.type === ORDER_TYPES.BUY ? 'above' : 'below';
                                 bot.manager.logger.log(
-                                    `[LAST-FILL-GUARD] Skipping ${order.type} CREATE for ${order.id} at ${Format.formatPrice6(createPrice)}: ${dir} last filled ${Format.formatPrice6(Number(check.pivot))} (direction rule: BUY must be below / SELL above the last fill); re-planned after market moves`,
+                                    (check as { refusedLevel?: boolean }).refusedLevel
+                                        ? `[LAST-FILL-GUARD] Skipping ${order.type} CREATE for ${order.id} at ${Format.formatPrice6(createPrice)}: same-level re-fill of the just-filled level ${Format.formatPrice6(Number(check.pivot))} (its pivot-arm was refused; the level stays blocked for the marker TTL, §9.12/P2 amended); re-planned after market moves`
+                                        : `[LAST-FILL-GUARD] Skipping ${order.type} CREATE for ${order.id} at ${Format.formatPrice6(createPrice)}: ${order.type === ORDER_TYPES.BUY ? 'above' : 'below'} last filled ${Format.formatPrice6(Number(check.pivot))} (direction rule: BUY must be below / SELL above the last fill); re-planned after market moves`,
                                     'debug'
                                 );
                                 if (order.id) skippedCreateSlotIds.add(order.id);
@@ -5308,9 +5309,10 @@ async function updateOrdersOnChainBatchCOWBody(
                                 skippedUpdateCount++;
                                 if (action.id) skippedUpdateSlotIds.add(action.id);
                                 if (action.newGridId) skippedUpdateSlotIds.add(action.newGridId);
-                                const dir = orderType === ORDER_TYPES.BUY ? 'above' : 'below';
                                 bot.manager.logger.log(
-                                    `[LAST-FILL-GUARD] Skipping ${orderType} UPDATE for ${action.id} -> ${action.newGridId} at ${Format.formatPrice6(newPrice)}: ${dir} last filled ${Format.formatPrice6(Number(check.pivot))} (direction rule: BUY must be below / SELL above the last fill)`,
+                                    (check as { refusedLevel?: boolean }).refusedLevel
+                                        ? `[LAST-FILL-GUARD] Skipping ${orderType} UPDATE for ${action.id} -> ${action.newGridId} at ${Format.formatPrice6(newPrice)}: same-level re-fill of the just-filled level ${Format.formatPrice6(Number(check.pivot))} (its pivot-arm was refused; the level stays blocked for the marker TTL, §9.12/P2 amended)`
+                                        : `[LAST-FILL-GUARD] Skipping ${orderType} UPDATE for ${action.id} -> ${action.newGridId} at ${Format.formatPrice6(newPrice)}: ${orderType === ORDER_TYPES.BUY ? 'above' : 'below'} last filled ${Format.formatPrice6(Number(check.pivot))} (direction rule: BUY must be below / SELL above the last fill)`,
                                     'debug'
                                 );
                                 continue;
@@ -7095,9 +7097,14 @@ function runFinalPivotGate(bot: BotLike, operations: unknown[], opContexts: OpPh
             dropped.push({ index: i, kind: ctx.kind, slotId, price, type });
             try {
                 bot.manager?.logger?.log?.(
-                    `[LAST-FILL-GUARD] Final gate dropping ${type} ${ctx.kind} for ${slotId ?? 'unknown'} at ` +
-                    `${Format.formatPrice6(price as number)}: ${dir} last filled ${check.pivot != null ? Format.formatPrice6(Number(check.pivot)) : 'n/a'} ` +
-                    `(direction rule: BUY must be below / SELL above the last fill); re-planned after market moves`,
+                    (check as { refusedLevel?: boolean }).refusedLevel
+                        ? `[LAST-FILL-GUARD] Final gate dropping ${type} ${ctx.kind} for ${slotId ?? 'unknown'} at ` +
+                        `${Format.formatPrice6(price as number)}: same-level re-fill of the just-filled level ` +
+                        `${check.pivot != null ? Format.formatPrice6(Number(check.pivot)) : 'n/a'} ` +
+                        `(its pivot-arm was refused; the level stays blocked for the marker TTL, §9.12/P2 amended)`
+                        : `[LAST-FILL-GUARD] Final gate dropping ${type} ${ctx.kind} for ${slotId ?? 'unknown'} at ` +
+                        `${Format.formatPrice6(price as number)}: ${dir} last filled ${check.pivot != null ? Format.formatPrice6(Number(check.pivot)) : 'n/a'} ` +
+                        `(direction rule: BUY must be below / SELL above the last fill); re-planned after market moves`,
                     'warn'
                 );
             } catch { /* logging is best-effort */ }

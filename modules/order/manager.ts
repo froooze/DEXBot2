@@ -699,6 +699,12 @@ class OrderManager implements OrderManagerLike {
     _lastFilledPrice: number | null;
     _lastFilledType: string | null;
     _lastFilledAt: number;
+    // Refused (off-market) fill level: the pivot-arming refusal (§9.12/P1)
+    // still marks its level as a same-level re-fill block (§9.12/P2 amended).
+    // In-memory only — never persisted, cleared by resetLastFillPivot.
+    _lastRefusedFillPrice: number | null;
+    _lastRefusedFillType: string | null;
+    _lastRefusedFillAt: number;
     /** Timestamp of the fill reference whose read-time expiry was already logged (one line per expired value). */
     _lastFillPivotExpiryLoggedAt: number;
     lastFillPivotSource: 'fill' | 'book' | null;
@@ -880,6 +886,9 @@ class OrderManager implements OrderManagerLike {
         this._lastFilledPrice = null;
         this._lastFilledType = null;
         this._lastFilledAt = 0;
+        this._lastRefusedFillPrice = null;
+        this._lastRefusedFillType = null;
+        this._lastRefusedFillAt = 0;
         this._lastFillPivotExpiryLoggedAt = 0;
         // Pivot provenance for the LAST-FILL-GUARD persist/restore contract:
         // 'fill' = armed by a real fill (persist-eligible), 'book' = armed by
