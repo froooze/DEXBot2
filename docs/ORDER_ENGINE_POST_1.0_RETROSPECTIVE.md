@@ -1071,6 +1071,47 @@ ladder identity), `test_incident_replay` (end-to-end band evacuation), and
 `test_stale_grid_hardening` (no-progress watchdog and level-triggered recheck). The
 production build, test build and these incident suites must all pass before promotion.
 
+**Addendum (2026-11-16, offline audit reconciliation): the checker must audit the gate
+the runtime actually ran.** During a fast sweep of the bot's own premium rail on a live
+market-pair bot, the offline direction checker (`analysis/grid_correction_check.ts`)
+flagged six SELL re-quotes as discipline breaches while the runtime had passed every one
+of them through its own final gate. The two sides disagreed because they used different
+pivots:
+
+- The runtime pivots on `_lastFilledPrice` at decision time, and since P1 above a fill
+  refused from arming (wrong-side, too-far premium sweep, gap-band stranded residual)
+  leaves the pivot behind the true last fill — by up to ~15 grid steps during the sweep.
+- The strict checker fed true consecutive fills into the same predicate
+  (`isLastFillGuardBlocked`), so it judged each re-quote against a pivot the runtime
+  never held at that gate.
+
+The runtime did not breach its own rule: its `mode=`/Final-gate lines show
+`checked/passed` counts consistent with the pivots it held, and every flagged re-quote
+priced above the runtime's (older, lower) pivot, so no sell landed below realized cost.
+The refusal policy is deliberate — reverting it would re-introduce the unquoted-side
+deadlock P1 was written against — so the fix is on the audit side:
+
+- `analysis/pivot_timeline.ts` reconstructs the runtime's pivot timeline from the bot
+  log's own bookkeeping (`[FILL-PIVOT]`, `mode=`, Final-gate, refusal and allowance
+  lines). "Pivot refreshed from N pending queued fill(s)" is deliberately not an
+  observation: it logs queue content that may be exactly the fill the arming policy just
+  refused.
+- The checker's default mode is now policy-aware: each strict candidate is re-judged
+  against the pivot the runtime held when the filled order was last priced. Verdicts:
+  `violation` (the runtime's own pivot would have blocked it — a real gate failure),
+  `policy-divergence` (expected under the P1 arming policy; reported in its own section,
+  not counted as FAIL), `unverifiable` (no placement event / pivot observation near the
+  gate — kept as a violation, failing toward reporting). `--strict` preserves the legacy
+  all-fills behaviour; a missing log falls back to strict with a notice.
+- Order-id joins normalize the Kibana operation suffix (`1.7.x:…` vs the log's plain
+  `1.7.x`), naive Kibana timestamps are read as UTC, and the placement anchor is the
+  order event whose price matches the fill (a post-fill rotation to another level must
+  not become the anchor, or the fill is judged against the pivot it armed itself).
+
+Lesson: an offline checker that re-implements gate inputs drifts from the gate it
+audits; it must reconstruct the gate's actual state, and every reconciliation shortcut
+(timestamps, ids, anchors) is a potential false verdict in either direction.
+
 ---
 
 ### A. Grid-Price Invariant — former failure trace

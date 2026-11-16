@@ -16,17 +16,39 @@
  * cost — i.e. it reported the tightening placements the current engine
  * legitimately makes as violations. Do not reintroduce an increment term here.
  *
+ * MODES — the strict check above is available as `--strict`. The DEFAULT is
+ * policy-aware: it additionally reconstructs the pivot the runtime ACTUALLY
+ * held when each filled order was last priced (from the bot log's own pivot
+ * bookkeeping — FILL-PIVOT / mode= / Final-gate / refusal lines, parsed by
+ * `analysis/pivot_timeline.ts`) and re-judges every strict candidate against
+ * that pivot:
+ *   - violation          the runtime's OWN pivot would have blocked the
+ *                        placement — a real gate failure.
+ *   - policy-divergence  the runtime pivot would have passed it — expected
+ *                        under the pivot-arming policy (see gaps below);
+ *                        reported in its own section, not counted as FAIL.
+ *   - unverifiable       no placement event / pivot observation near the gate
+ *                        — kept as a violation (fail toward reporting).
+ *
  * Intentional offline gaps (documented, acceptable):
  *   - Runtime pivots on _lastFilledPrice/_lastFilledType at decision time; tool
  *     checks consecutive fill pairs. For batch-placed orders (multiple orders
  *     guarded against the same pivot in one COW batch) this diverges — inherent
  *     offline approximation.
  *   - Spread-correction bypass (cowResult.origin === 'spread-correction') is
- *     not simulated — every consecutive pair is checked.
+ *     not simulated — every consecutive pair is checked (correction placements
+ *     do appear in the runtime log's Plan/Placed lines, so the policy-aware
+ *     mirror can still excuse them when the pivot passes them).
  *   - EDGE-pinned insurance fills no longer arm the runtime pivot
  *     (recordLastFilledPrices skips them); this reconstruction has no slot
  *     identity for a fill, so it cannot classify edge fills and will still
  *     judge the pair after one. Expect rare false positives on wick fills.
+ *   - PIVOT-ARMING REFUSALS (66667052 / bc7b5232, retrospective §9.12/P1): a
+ *     fill refused from arming the pivot (wrong-side, too-far premium sweep,
+ *     gap-band stranded residual) leaves the pivot behind the true last fill,
+ *     and a re-quote the gate passes is NOT a discipline breach. The strict
+ *     mode flags these; policy-aware mode classifies them as divergences.
+ *     Without a usable runtime log the tool falls back to strict and says so.
  *
  * Uses the runtime's own predicate (`modules/order/utils/system.ts:`
  * `isLastFillGuardBlocked`); the checker never re-implements it.
@@ -59,6 +81,13 @@ import {
     fetchAllFills,
     resolveAssetPrecisions,
 } from './fills_source.js';
+import {
+    parseRuntimeLog,
+    classifyTransition,
+    TransitionCandidate,
+    RuntimeLogIndex,
+} from './pivot_timeline.js';
+import path from 'node:path';
 
 const { kibanaSearch, DEFAULT_CONFIG: BASE_CONFIG } = KC;
 
@@ -109,6 +138,68 @@ interface AggregatedOrder {
     fillCount: number;
     isMaker: boolean;
 }
+/** A strict candidate the runtime's own gate would have passed (policy-aware mode). */
+interface PolicyDivergence {
+    index: number;
+    pair: string;
+    direction: 'buy' | 'sell';
+    prev: TradeFill;
+    curr: TradeFill;
+    pivot: { price: number; type: string; t: number } | null;
+    reason: string;
+    refusalsInRange: number;
+    priceDeltaPct: number;
+}
+
+/**
+ * Policy-aware mirror: re-judge every strict violation against the pivot the
+ * runtime held when the filled order was last priced (parsed from the bot log
+ * by pivot_timeline.ts). Candidates the runtime's OWN pivot would have passed
+ * become policy divergences — expected under the pivot-arming policy, not gate
+ * failures — and are dropped from the FAIL count. Anything unprovable stays a
+ * violation (fail toward reporting). A missing log falls back to strict mode.
+ */
+function applyRuntimeMirror(
+    violations: Violation[],
+    logPath: string,
+): { kept: Violation[]; divergences: PolicyDivergence[]; index: RuntimeLogIndex | null; logError: string | null } {
+    let text: string;
+    try {
+        text = fs.readFileSync(logPath, 'utf-8');
+    } catch (e) {
+        return { kept: violations, divergences: [], index: null, logError: getErrorMessage(e) };
+    }
+    const index = parseRuntimeLog(text);
+    const kept: Violation[] = [];
+    const divergences: PolicyDivergence[] = [];
+    for (const v of violations) {
+        const cand: TransitionCandidate = {
+            prevTime: v.prev.time,
+            currTime: v.curr.time,
+            prevPrice: v.prev.price,
+            currPrice: v.curr.price,
+            direction: v.direction,
+            currOrderId: v.curr.orderId,
+        };
+        const verdict = classifyTransition(cand, index);
+        if (verdict.verdict === 'policy-divergence') {
+            divergences.push({
+                index: v.index,
+                pair: v.pair,
+                direction: v.direction,
+                prev: v.prev,
+                curr: v.curr,
+                pivot: verdict.pivot,
+                reason: verdict.reason,
+                refusalsInRange: verdict.refusalsInRange,
+                priceDeltaPct: v.priceDeltaPct,
+            });
+        } else {
+            kept.push(v);
+        }
+    }
+    return { kept, divergences, index, logError: null };
+}
 
 // ─── LAST-FILL-GUARD (the runtime's own predicate) ──────────────────────────────
 //
@@ -154,6 +245,11 @@ Options:
   --increment <pct>      Grid increment percent, informational only — the
                          direction-only guard does not use a band
                          (default: from bot config or ${Number(C.DEFAULT_CONFIG?.incrementPercent ?? 0.5)})
+  --runtime-log <path>   Bot log for the policy-aware mirror (default:
+                         profiles/logs/<bot name>.log when it exists)
+  --strict               Skip the runtime-pivot mirror; report every
+                         consecutive-fill descent as a violation (legacy
+                         behaviour — false positives on pivot-arm refusals)
   --per-fill             Check at fill granularity (default: per-order aggregated)
   --include-cross-pair   Check consecutive fills across different pairs (default: same pair only)
   --json <file>          Export violations as JSON
@@ -182,6 +278,8 @@ interface CliOpts {
     json: string | null;
     csv: string | null;
     verbose: boolean;
+    runtimeLog: string | null;
+    strict: boolean;
 }
 
 function parseArgs(): CliOpts {
@@ -212,6 +310,8 @@ function parseArgs(): CliOpts {
         json: null,
         csv: null,
         verbose: false,
+        runtimeLog: null as string | null,
+        strict: false,
     };
 
     for (let i = 0; i < args.length; i++) {
@@ -225,6 +325,8 @@ function parseArgs(): CliOpts {
             case '--per-fill': opts.perFill = true; break;
             case '--include-cross-pair': opts.includeCrossPair = true; break;
             case '--increment': opts.incrementPercent = parseFloat(args[++i]); break;
+            case '--runtime-log': opts.runtimeLog = args[++i]; break;
+            case '--strict': opts.strict = true; break;
             case '--json': opts.json = args[++i]; break;
             case '--csv': opts.csv = args[++i]; break;
             case '--verbose': opts.verbose = true; break;
@@ -504,6 +606,11 @@ function printReport(
     incrementPercent: number,
     gte: string,
     _lte: string,
+    divergences: PolicyDivergence[],
+    mirrorMode: 'policy-aware' | 'strict',
+    runtimeLogPath: string | null,
+    logError: string | null,
+    strictCandidates: number,
 ) {
     const pairGroups = new Map<string, TradeFill[]>();
     for (const t of trades) {
@@ -524,6 +631,10 @@ function printReport(
     console.log(`  Account:      ${accountId}`);
     console.log(`  Range:        ${rangeLabel}`);
     console.log(`  Mode:         ${perFill ? 'per-fill' : 'per-order (aggregated)'}${includeCrossPair ? ', cross-pair enabled' : ', same-pair only'}`);
+    console.log(`  Mirror:       ${mirrorMode === 'policy-aware' ? `policy-aware (runtime pivot from ${runtimeLogPath})` : 'strict (all consecutive fills)'}`);
+    if (mirrorMode === 'strict' && runtimeLogPath) {
+        console.log(`                (strict fallback${logError ? `: ${logError}` : ' — --strict requested'})`);
+    }
     console.log(`  Increment:    ${incrementPercent}%  (informational — the guard is direction-only)`);
     console.log('  Guard:        BUY < last fill / SELL > last fill  — both sides, global pivot');
     console.log('');
@@ -535,17 +646,25 @@ function printReport(
     console.log(`  Pairs observed:       ${[...pairGroups.keys()].join(', ') || '-'}`);
     if (skipped > 0) console.log(`  Skipped (precision):  ${skipped}`);
     console.log(`  Transitions checked:  ${checkedTransitions} consecutive fill/order transitions`);
-    console.log(`  Violations:           ${violations.length}${checkedTransitions > 0 ? `  (${((violations.length / checkedTransitions) * 100).toFixed(2)}%)` : ''}`);
+    if (mirrorMode === 'policy-aware') {
+        console.log(`  Strict candidates:    ${strictCandidates}`);
+        console.log(`  Policy divergences:   ${divergences.length}  (runtime gate would have passed them)`);
+    }
+    console.log(`  Violations:           ${violations.length}${strictCandidates > 0 ? `  (${((violations.length / strictCandidates) * 100).toFixed(2)}% of strict candidates)` : ''}`);
     console.log('');
 
     if (violations.length === 0) {
-        console.log('  ✅  PASS — no LAST-FILL-GUARD violations detected (all BUY < last fill, all SELL > last fill).');
+        console.log('  ✅  PASS — no LAST-FILL-GUARD gate failures detected (all BUY < pivot, all SELL > pivot).');
+        if (mirrorMode === 'policy-aware') {
+            console.log('  The runtime\'s own pivot was the reference for every transition that reached the gate.');
+        }
         console.log('');
         if (checkedTransitions === 0) {
             console.log('  Note: no consecutive transitions in range to check.');
             console.log('  (Need at least two fills/orders to form a transition.)');
+            console.log('');
         }
-        console.log('');
+        if (divergences.length > 0) printDivergences(divergences);
         return;
     }
 
@@ -612,13 +731,73 @@ function printReport(
     console.log('  Guard: BUY must be < the last fill price, SELL > it (equal price blocked) — mirrors bot.');
     console.log(`  No band: the grid increment (${incrementPercent}%) is reported for context only.`);
     console.log('');
+    if (divergences.length > 0) printDivergences(divergences);
 }
 
-function exportJson(filePath: string, violations: Violation[], trades: TradeFill[], rangeLabel: string, botKey: string, accountId: string, incrementPercent: number) {
+/**
+ * Report the strict candidates the runtime's own gate would have passed.
+ * These are NOT discipline breaches: the pivot-arming policy (§9.12/P1)
+ * deliberately excludes wrong-side / too-far premium-sweep / gap-band fills
+ * from arming the pivot, so a re-quote below such a fill is expected.
+ * Listing them keeps the policy auditable instead of silently hidden.
+ */
+function printDivergences(divergences: PolicyDivergence[]) {
+    console.log('  ── Policy divergences (strict candidate vs the runtime pivot at the gate) ──');
+    console.log('  The runtime pivot at placement excluded the strict last fill from arming');
+    console.log('  (window-trade policy: wrong-side / premium-sweep / gap-band refusals).');
+    console.log('');
+    const hdr = '  #  Pair          Dir   Prev Price     Curr Price     Runtime Pivot  Δ%         Prev Time              Curr Time              Curr Order          Refusals  Reason';
+    console.log(hdr);
+    console.log('  ' + '─'.repeat(hdr.length - 2));
+    for (let i = 0; i < divergences.length; i++) {
+        const d = divergences[i];
+        const pairLabel = `${assetSymbol(d.prev.baseAsset)}/${assetSymbol(d.prev.quoteAsset)}`.padEnd(12);
+        const dir = d.direction.padEnd(4);
+        const pPrice = fmt(d.prev.price, 6).padStart(12);
+        const cPrice = fmt(d.curr.price, 6).padStart(12);
+        const piv = d.pivot ? `${fmt(d.pivot.price, 4)}(${d.pivot.type[0]})` : '-';
+        const pivStr = piv.padStart(14);
+        const delta = (d.priceDeltaPct >= 0 ? '+' : '') + d.priceDeltaPct.toFixed(4) + '%';
+        const deltaStr = delta.padStart(9);
+        const pTime = (d.prev.time || '').slice(0, 19).replace('T', ' ').padEnd(19);
+        const cTime = (d.curr.time || '').slice(0, 19).replace('T', ' ').padEnd(19);
+        const cOrd = (d.curr.orderId || '-').slice(0, 16).padEnd(16);
+        const ref = String(d.refusalsInRange).padStart(8);
+        const reason = d.pivot
+            ? (d.refusalsInRange > 0 ? 'pivot-arm refusal(s) in window' : 'pivot older than strict last fill')
+            : 'unverifiable pivot';
+        console.log(`  ${(String(i + 1)).padStart(2)}  ${pairLabel}  ${dir}  ${pPrice}  ${cPrice}  ${pivStr}  ${deltaStr}  ${pTime}  ${cTime}  ${cOrd}  ${ref}  ${reason}`);
+    }
+    console.log('');
+}
+
+function exportJson(
+    filePath: string,
+    violations: Violation[],
+    trades: TradeFill[],
+    rangeLabel: string,
+    botKey: string,
+    accountId: string,
+    incrementPercent: number,
+    divergences: PolicyDivergence[] = [],
+    mirrorMode: 'policy-aware' | 'strict' = 'strict',
+    runtimeLogPath: string | null = null,
+) {
     const payload = {
         botKey, accountId, range: rangeLabel,
         incrementPercent,
         totalFills: trades.length,
+        mirror: { mode: mirrorMode, runtimeLog: runtimeLogPath },
+        policyDivergences: divergences.map(d => ({
+            pair: `${assetSymbol(d.prev.baseAsset)}/${assetSymbol(d.prev.quoteAsset)}`,
+            direction: d.direction,
+            reason: d.reason,
+            prev: { time: d.prev.time, orderId: d.prev.orderId, price: d.prev.price },
+            curr: { time: d.curr.time, orderId: d.curr.orderId, price: d.curr.price },
+            runtimePivot: d.pivot,
+            refusalsInRange: d.refusalsInRange,
+            priceDeltaPct: d.priceDeltaPct,
+        })),
         violations: violations.map(v => ({
             pair: `${assetSymbol(v.prev.baseAsset)}/${assetSymbol(v.prev.quoteAsset)}`,
             pairIds: { base: v.prev.baseAsset, quote: v.prev.quoteAsset },
@@ -720,12 +899,44 @@ async function main() {
         items = orders;
     }
 
-    const { violations, checkedTransitions } = detectViolations(items, opts.includeCrossPair);
+    const { violations: strictCandidatesList, checkedTransitions } = detectViolations(items, opts.includeCrossPair);
+
+    // Policy-aware mirror: re-judge strict candidates against the pivot the
+    // runtime held at each order's gate. Default on; --strict skips it.
+    let violations = strictCandidatesList;
+    let divergences: PolicyDivergence[] = [];
+    let mirrorMode: 'policy-aware' | 'strict' = 'strict';
+    let runtimeLogPath: string | null = null;
+    let logError: string | null = null;
+    if (!opts.strict) {
+        const defaultLog = botMeta && typeof botMeta.name === 'string' && botMeta.name
+            ? path.resolve('profiles/logs', `${botMeta.name}.log`)
+            : null;
+        runtimeLogPath = opts.runtimeLog ?? defaultLog;
+        if (runtimeLogPath) {
+            if (fs.existsSync(runtimeLogPath)) {
+                const mirror = applyRuntimeMirror(strictCandidatesList, runtimeLogPath);
+                violations = mirror.kept;
+                divergences = mirror.divergences;
+                logError = mirror.logError;
+                if (mirror.index) {
+                    mirrorMode = 'policy-aware';
+                    console.log(`  Runtime mirror: ${mirror.index.observations.length} pivot observation(s), ${mirror.index.refusals.length} refusal(s), ${mirror.index.allowances.length} allowance(s) from ${runtimeLogPath}`);
+                } else {
+                    console.log(`  Runtime mirror unavailable (${logError}) — falling back to the strict all-fills check`);
+                    runtimeLogPath = null;
+                }
+            } else {
+                console.log(`  Runtime mirror unavailable (log not found: ${runtimeLogPath}) — falling back to the strict all-fills check`);
+                runtimeLogPath = null;
+            }
+        }
+    }
 
     const ordersForReport = opts.perFill ? null : (items as AggregatedOrder[]);
-    printReport(trades, ordersForReport, violations, checkedTransitions, skipped, label, String(opts.botKey), accountId, botMeta, opts.perFill, opts.includeCrossPair, incrementPercent, gte, lte);
+    printReport(trades, ordersForReport, violations, checkedTransitions, skipped, label, String(opts.botKey), accountId, botMeta, opts.perFill, opts.includeCrossPair, incrementPercent, gte, lte, divergences, mirrorMode, runtimeLogPath, logError, strictCandidatesList.length);
 
-    if (opts.json) exportJson(opts.json, violations, trades, label, String(opts.botKey), accountId, incrementPercent);
+    if (opts.json) exportJson(opts.json, violations, trades, label, String(opts.botKey), accountId, incrementPercent, divergences, mirrorMode, runtimeLogPath);
     if (opts.csv) exportCsv(opts.csv, violations);
 
     process.exit(violations.length > 0 ? 2 : 0);
