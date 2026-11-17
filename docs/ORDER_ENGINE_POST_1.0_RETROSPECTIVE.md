@@ -4,18 +4,20 @@
 > misbehaving (Part I) and the preserved **incident & fix ledger** (Part II), formerly
 > `CONSOLIDATED_ORPHAN_FIX_SUMMARY.md`.
 >
-> **Sources:** `CHANGELOG.md` v1.0.0 → v1.7.1 (plus the post-1.7.1 arc);
+> **Sources:** `CHANGELOG.md` v1.0.0 → v1.7.3 (plus the post-1.7.3 arc on `test`);
 > `docs/GRID_PRICE_INVARIANT.md`; `docs/COW_INVARIANTS.md`; `docs/ORDER_LIFECYCLE.md`.
 > Generic terms only — no live markets, accounts, or order ids.
 >
 > **Scope / snapshot:** v1.0.0 → v1.7.1 (`2a85a501`, 2026-11-04), extended through the
-> post-1.7.1 work at `bc20d574` (2026-11-04). §9 is the v1.6.4 → v1.6.17
-> addendum; §9.10 closes the v1.6.18 review pass, §9.11 carries v1.6.18 → v1.7.1,
-> and §9.12 records the subsequent revised-priority review.
+> post-1.7.1 work at `bc20d574` (2026-11-04), the v1.7.2/v1.7.3 releases, and three
+> unpushed `test` commits (`3b9948e8`, `391ba444`, `5a703297`, 2026-11-17) recorded
+> in §9.13. §9 is the v1.6.4 → v1.6.17 addendum; §9.10 closes the v1.6.18 review pass,
+> §9.11 carries v1.6.18 → v1.7.1, §9.12 records the revised-priority review, and
+> §9.13 records the post-1.7.3 out-of-spread incident and its fixes.
 >
 > **Section numbering:** Part II deliberately keeps its original `§0`–`§8` numbers because
 > source-code comments and tests cite them (e.g. `… §2 fix #1`, `… §3 lineage`); §9 is a
-> later addendum (v1.6.4 → v1.6.17, with §9.10–§9.12 extending it) that adds to, and does not
+> later addendum (v1.6.4 → v1.6.17, with §9.10–§9.13 extending it) that adds to, and does not
 > renumber, that range. Part I uses `R1`–`R5` so the two never collide. The closing appendix
 > is unnumbered (`A`).
 >
@@ -52,6 +54,7 @@
   - 9.10 Review pass over v1.6.12 → v1.6.17 (findings P1–P5), released in v1.6.18
   - 9.11 v1.6.18 → v1.7.1: fill identity, absence and the geometry budget
   - 9.12 Revised priority list: counter-orders, pivot evidence and level-triggered repair
+  - 9.13 Post-1.7.3 out-of-spread incident: sweep eligibility and the silent watchdog
 - A. Grid-Price Invariant — former failure trace (appendix)
 
 ---
@@ -87,6 +90,8 @@ local state.
 | **Stale window after a fill** | A fill is queued but not yet absorbed; the master still counts the filled slot ACTIVE, so a window top-up re-creates the expensive end of the rail and re-buys into a stale pivot | `hasUnsettledFills` defers the targeted reconcile and the window top-up (1:1 repairs still run) + attribution of the real execution price (§9.11.1) |
 | **Fill identity by chain id** | `virtualizeOrder` nulls `orderId`, so a real fill matched no ACTIVE slot and was dropped *after* its accounting was booked; pivot and owed crawl stayed on a stale, higher price | `attributeUnmatchedFillToGrid` falls back to the genesis level of the execution price, refuses prices outside the frozen rail, and owes a crawl only for a hole the grid owns (§9.11.1) |
 | **Chain-existence bookkeeping** | Seven structures with seven clocks; four read sites consulted four subsets and could give four answers for one order | `modules/order/lifecycle.ts`: one record per slot, `unknown` is a real phase, every absence decision asks the same time-bounded `isInFlight()` (§9.11.3) |
+| **Sweep fill drives geometry** | A premium sweep of our own rail is not window evidence, but the crawl counted every swept fill and dragged the boundary ~20 steps below a live market that never traded there; off-market fills could also win the re-anchor extremum | The market-bound predicate (`offMarketFill`) is injected into the crawl and applied at the pending-crawl writer, and the anchor filters its batch extremum through the same single-source classifiers (§9.13/F1, §9.13/C1) |
+| **Partial progress counted as a heal** | A correction reducing excess 14 → 12 cleared the stale clock and skipped the level-triggered recheck, so the book sat wide for 63 minutes with no watchdog line | The clock clears only at zero measured excess (or an unmeasurable read, the compatibility path); a partial reduction keeps the original clock and re-arms the recheck (§9.13/F2) |
 
 Families **not** detailed in Part II: silent hangs and stale correction queues are covered in
 `CHANGELOG.md` (v1.6.1 and v1.6.3 respectively); shelf/edge orders in issue #27 and the v1.6.x
@@ -150,6 +155,13 @@ notes; the grid-price invariant has its own doc — [GRID_PRICE_INVARIANT.md](GR
 - **Observability instead of a veto (§9.10/P4):** where a hard guard would re-create a
   deadlock (a counter order crossing the floor by construction), log it once and let the
   chain price it as a taker fill.
+- **One market-bound fill test (§9.13):** `offMarketFill` is the single definition of
+  “not window evidence”; the pivot writer, the boundary crawl and the re-anchor extremum
+  all consume it, so a premium sweep cannot move geometry through a path that only the
+  guard refuses (fail-open on a stale/missing market read).
+- **A heal is zero excess, not less excess (§9.13):** the stale watchdog clears only
+  when the measured violation is gone; a partial improvement keeps the original clock
+  so the bounded expiry and level-triggered recheck stay reachable.
 
 The winning strategy was **removing writers and sources of truth**, not adding handlers.
 
@@ -189,6 +201,10 @@ The winning strategy was **removing writers and sources of truth**, not adding h
 14. **Absence needs one definition, one clock and one owner.** Seven local counters are seven
     policies; if two sites can disagree about whether an order exists, the disagreement is
     the bug, not either answer (§9.11.3).
+15. **A watchdog must survive partial success.** A guard whose clock resets on “some
+    improvement” is a guard with no lifetime: the two placements that took excess 14 → 12
+    were progress, not a heal, and clearing the clock made every watchdog window dead code
+    for an hour (§9.13/F2). Keep the clock until the violation is actually zero.
 
 ---
 
@@ -369,7 +385,7 @@ Debug line: `[BOUNDARY] boundary=123 sellStart=128 spread=4 anchorProjected=138 
 **#7 Sync-lock/maintenance observability — LANDED.**
 Throttle `Structural resync defer` to first/last per cap window (was 120/30s); log/retry `[MAINT] n/m failed` with orderId/reason.
 
-**Mode C hardening — PARTIAL (2026-10-11).** (b) **LANDED** pre-broadcast UPDATE-target existence check off the slot→orderId map: `runPreBroadcastGuards` re-reads every UPDATE action's `orderId` via `chainOrders.batchReadOrders` and refuses the whole batch (`UPDATE_TARGET_MISSING`) + requests a structural resync when a tracked target is gone on chain, instead of letting a `limit_order_update` abort the chunk mid-broadcast. Fails open on a non-Map/errored read (chain rejection remains the backstop), and re-verifies each candidate missing id with a single `readSingleOrder` before declaring it gone so a node lagging behind a just-created order does not false-refuse. **Residual risk (accepted, safe direction):** if that second read also lags/returns null, the batch is refused — a skipped cycle + structural resync, never a half-applied grid. Unexplained `UPDATE_TARGET_MISSING` churn on a slow node is this mechanism. (No dedicated counter on this path, consistent with the other uncounted pre-broadcast refusals; it shows up in error logs.) (a) **SHADOW ONLY** gap-band placement check: non-spread-correction CREATE/UPDATE destinations inside the plan's gap band are counted (`_metrics.gapBandPlacementShadowCount`) and warned, never blocked — enforcement is deliberately withheld because spread correction legitimately places INTO the band and a hard reject would re-open the reverted P1/e2898e51 regression class. Note: the GAP-P1 same-batch cancel that covered commit-time in-gap placement was reverted `e2898e51`; **P3 gate removed `e7231534`** — commit-time in-gap placement is currently covered by `LAST-FILL-GUARD` + adoption (no chain-evidence veto).
+**Mode C hardening — PARTIAL (2026-10-11).** (b) **LANDED** pre-broadcast UPDATE-target existence check off the slot→orderId map: `runPreBroadcastGuards` re-reads every UPDATE action's `orderId` via `chainOrders.batchReadOrders` and refuses the whole batch (`UPDATE_TARGET_MISSING`) + requests a structural resync when a tracked target is gone on chain, instead of letting a `limit_order_update` abort the chunk mid-broadcast. Fails open on a non-Map/errored read (chain rejection remains the backstop), and re-verifies each candidate missing id with a single `readSingleOrder` before declaring it gone so a node lagging behind a just-created order does not false-refuse. **Residual risk (accepted, safe direction):** if that second read also lags/returns null, the batch is refused — a skipped cycle + structural resync. Unexplained `UPDATE_TARGET_MISSING` churn on a slow node is this mechanism. **Qualified after a 2026-11-17 incident:** the chain can still reject a chunk after the pre-broadcast check — one `limit_order_update` on a vanished target aborted chunk 3 of 8 after two chunks had landed (`2/8` broadcast, remaining five aborted, divergence deferred, fund invariant violation → recovery). So “never half-applied” is an invariant of the **refusal path**, not a guarantee about every broadcast: a node can lose a target between the read and the wire. v1.7.3's in-place missing-target repair and pre-broadcast size-drift check are the recovery; the replay is still open (§9.13). (No dedicated counter on this path, consistent with the other uncounted pre-broadcast refusals; it shows up in error logs.) (a) **SHADOW ONLY** gap-band placement check: non-spread-correction CREATE/UPDATE destinations inside the plan's gap band are counted (`_metrics.gapBandPlacementShadowCount`) and warned, never blocked — enforcement is deliberately withheld because spread correction legitimately places INTO the band and a hard reject would re-open the reverted P1/e2898e51 regression class. Note: the GAP-P1 same-batch cancel that covered commit-time in-gap placement was reverted `e2898e51`; **P3 gate removed `e7231534`** — commit-time in-gap placement is currently covered by `LAST-FILL-GUARD` + adoption (no chain-evidence veto).
 
 #### 2.7 Relation to PRICE_FIRST draft
 
@@ -570,7 +586,8 @@ Original doc regression excerpts preserved: GAP P6 A/B/C; LADDER §2.8 checks (1
 - [x] No other doc/index lists the four (verified 2026-08-31); `analysis/README.md` documents the `grid_correction_check` tool.
 - [x] Stale `*.md` filename references in code comments/tests updated to the consolidated doc (9 module files, 6 test files), then re-pointed to this hub when it absorbed the summary.
 
-*Generated 2026-08-31 from the 4 test-only docs at their HEAD contents; statuses corrected against `test` HEAD `a54863ca` the same day, then refreshed against `1382f267` (2026-09-13), extended through v1.6.14 at `f6c0df32` (2026-10-12), through v1.6.17 at `78ccbb8e`, through the v1.6.18 review pass (`§9.10`: `f4d6da8c`, `a2bf6ba5`, `56481b16`, `3d16f9e4`), and through v1.7.1 at `2a85a501` plus the post-1.7.1 arc (`§9.11`, HEAD `bc20d574`). Landed/reverted/superseded annotations carry commit hashes where known; **line references in §§1-4 were re-verified at `a54863ca` and are subject to drift** — treat them as pointers, not assertions. The GRID-PRICE-INVARIANT guard is **BLOCKING** at all six emission sites (CREATE / UPDATE / CREATE-FALLBACK in `modules/dexbot_cow_runtime.ts`, RECONCILE-CREATE / RECONCILE-UPDATE / STARTUP-CREATE in `modules/order/grid_reconcile_internal.ts`): an off-grid emission is skipped, not merely counted, so a `violated>0` line means an emission was *prevented* rather than a writer merely *pinned*. Counters are still reported (`site=`, `checked=`, `violated=`, `unchecked=`) for observability — see `docs/GRID_PRICE_INVARIANT.md`.*
+*Generated 2026-08-31 from the 4 test-only docs at their HEAD contents; statuses corrected against `test` HEAD `a54863ca` the same day, then refreshed against `1382f267` (2026-09-13), extended through v1.6.14 at `f6c0df32` (2026-10-12), through v1.6.17 at `78ccbb8e`, through the v1.6.18 review pass (`§9.10`: `f4d6da8c`, `a2bf6ba5`, `56481b16`, `3d16f9e4`), and through v1.7.1 at `2a85a501` plus the post-1.7.1 arc (`§9.11`, HEAD `bc20d574`), the v1.7.2/v1.7.3 releases, and the
+post-1.7.3 `test` arc (`§9.13`: `3b9948e8`, `391ba444`, `5a703297`). Landed/reverted/superseded annotations carry commit hashes where known; **line references in §§1-4 were re-verified at `a54863ca` and are subject to drift** — treat them as pointers, not assertions. The GRID-PRICE-INVARIANT guard is **BLOCKING** at all six emission sites (CREATE / UPDATE / CREATE-FALLBACK in `modules/dexbot_cow_runtime.ts`, RECONCILE-CREATE / RECONCILE-UPDATE / STARTUP-CREATE in `modules/order/grid_reconcile_internal.ts`): an off-grid emission is skipped, not merely counted, so a `violated>0` line means an emission was *prevented* rather than a writer merely *pinned*. Counters are still reported (`site=`, `checked=`, `violated=`, `unchecked=`) for observability — see `docs/GRID_PRICE_INVARIANT.md`.*
 
 ---
 
@@ -733,18 +750,26 @@ required is no longer reachable at runtime.
 | `b2f43d8a` | post-1.7.1 | One fill contract, fail-closed grid blockers, one fill identity (P0–P2) |
 | `39675d8a` | post-1.7.1 | Claim the fill key at credit time; drop the duplicate amount channel (P2 tail) |
 | `bc20d574` | post-1.7.1 | One grace-stamp writer, ledger side in export, single-winner fill claim |
+| `3b9948e8` | post-1.7.3 (`test`, unpushed) | Re-anchor extremum uses the pivot writer's eligibility (§9.13/C1) |
+| `391ba444` | post-1.7.3 (`test`, unpushed) | Market-bound eligibility injected into the crawl and pending-crawl writer (§9.13/F1) |
+| `5a703297` | post-1.7.3 (`test`, unpushed) | Stale clock clears only at zero excess; partial progress re-arms the recheck (§9.13/F2) |
 
 #### 9.6 Invariants added
 
 - **Uncertainty defers, it does not rebuild:** a resync requires a chain order unknown to
   master, a non-suspension persist divergence, or a proven pre-broadcast UPDATE-target gap.
 - **Unknown geometry is unknown:** no code path may coerce absent boundary/gap to `0`.
-- **Atomic-or-refused:** a COW batch either applies wholly on chain or is refused before the
-  wire; no `limit_order_update` may abort a chunk.
+- **Atomic-or-refused (refusal path):** a COW batch is refused *before* the wire when a
+  tracked UPDATE target is missing. The chain can still reject a chunk after that check —
+  a 2026-11-17 incident lost a target between read and wire and landed 2 of 8 chunks — so
+  this is an invariant of the guard, not of the broadcast; recovery is the in-place target
+  repair (§9.13, C3 replay open).
 - **Placed is not surplus:** an order inside `SURPLUS_CANCEL_GRACE_MS` is never cancelled by a
   sweep running on a stale snapshot.
 - **Only a window trade may become the pivot:** edge-pinned insurance fills are skipped at the
   single pivot writer, so they can neither veto a side nor anchor the geometry (§9.10/P1).
+  Enforced on all three consumers: the re-anchor filters its extremum with the same
+  classifiers (§9.13/C1) and the crawl consumes the same market-bound predicate (§9.13/F1).
 - **One boundary validator:** a boundary write that can strand a live order in the implied
   band is refused by `validatePersistedBoundary`, whoever computed it — re-anchor, rail clamp,
   restore, commit (§9.10/P2/P3).
@@ -753,7 +778,9 @@ required is no longer reachable at runtime.
 - **The pivot has a lifetime:** re-armed explicitly after a rebuild from the last real fill,
   bounded by the same 24h TTL (enforced at restore and at read time, so a stale row can neither
   arm the guard nor be re-armed), and a re-center is requested at most once per pivot because a
-  re-center cannot move it (§9.10/P2).
+  re-center cannot move it (§9.10/P2). v1.7.3 adds a bounded exit after that one re-center:
+  `SPREAD_STALE_PIVOT_EXPIRE_MS` (20 min, 0 disables) expires the in-memory and persisted pivot
+  and last-market-fill references so correction can quote around the live market again.
 - **An unabsorbed fill blocks the geometry:** while fills are queued, draining, in flight or
   owed a crawl, the targeted reconcile and the window top-up defer (1:1 repairs still run),
   and a fill is attributed by the ladder level of its execution price, not by a chain id that
@@ -896,7 +923,7 @@ found the arc sound and identified five gaps. All five are fixed here.
 | # | Finding | Fix |
 |---|---|---|
 | P1 | The re-anchor ignored the crawl's EDGE-fill exclusion: `recordLastFilledPrices` armed the pivot on every fill, and the re-anchor is absolute, so one wick on a floor insurance BUY teleported the window to the grid floor (repro: boundary 29 → 0 on a 60-slot ladder; mirror at the ceiling). | Eligibility now lives at the single pivot writer: `collectEdgePinnedFillIds` (the placement pickers' own classifier) is applied in `recordLastFilledPrices`, so an edge fill can neither arm the guard nor anchor the geometry. Partials still anchor (a real trade; residual allow-listed). Pinned by `tests/test_edge_fill_pivot.ts`. |
-| P2 | The rebuild site claimed "the guard re-arms on the first real fill of the new generation" while the read-time fallback silently kept the old-generation pivot — so after a re-center in a market that had moved away, one whole side read `last-fill-blocked` forever AND the 10-minute geometry clock rebuilt the new generation again every cooldown, with no way to succeed. | Re-arm is explicit and logged (`rearmLastFillPivotFromMarketFill`, provenance `fill`, original timestamp) so code and docs agree; the geometry escalation is capped at ONE re-center per pivot (`_lastGeometryResyncPivotKey`) and then reports that only a fill or the pivot TTL restores the side. The pivot's survival is the decision, not an accident. Pinned by `tests/test_last_fill_pivot_rearm.ts` and SLF-11. |
+| P2 | The rebuild site claimed "the guard re-arms on the first real fill of the new generation" while the read-time fallback silently kept the old-generation pivot — so after a re-center in a market that had moved away, one whole side read `last-fill-blocked` forever AND the 10-minute geometry clock rebuilt the new generation again every cooldown, with no way to succeed. | Re-arm is explicit and logged (`rearmLastFillPivotFromMarketFill`, provenance `fill`, original timestamp) so code and docs agree; the geometry escalation is capped at ONE re-center per pivot (`_lastGeometryResyncPivotKey`) and then reports that only a fill or the pivot TTL restores the side. The pivot's survival is the decision, not an accident. Pinned by `tests/test_last_fill_pivot_rearm.ts` and SLF-11. **v1.7.3:** the 24h-only exit was replaced by the bounded `SPREAD_STALE_PIVOT_EXPIRE_MS` (20 min) after that one re-center; see §9.6. |
 | P3 | `deriveRailBoundary` clamped the boundary to EVERY live rail order: one stray order 18 slots off clamped 138 → 115 and re-typed the whole window (self-legalizing the corrupt state), and it classified rails by slot id while the rest of the engine had moved to live chain prices. | Rail membership = the batch's own op destinations + master orders on their own side of the planned boundary; strays are skipped and named in the log; rail indices come from `resolveLiveOrderLadderPosition`; the result passes the shared `validatePersistedBoundary` gate (cancel/rotation sources allow-listed, sparse ladders excluded because that gate's ceiling is array-derived). Pinned by RAIL-10..14. |
 | P4 | The crossing floor (`doesNotCrossMarket`) exists only in the spread-correction planner, so a generic reconcile/re-fill CREATE can execute as a taker fill where the planner would refuse. | Deliberately NOT blocked (a hard veto re-opens the counter-order deadlock: after a gap the counter sits across the floor by construction and executes at the best available price). Made visible instead: `warnCrossingCreate`, once per batch, from cached evidence only. Pinned by SLF-12. |
 | P5 | `analysis/grid_correction_check.ts` still implemented the OLD `pivot ± increment/2` band and claimed to mirror the guard 1:1, so it reported the tightening placements the direction-only guard allows as violations. | Predicate reduced to the live direction rule (arity-pinned in LFG-5), report/help text updated, `--increment` documented as informational, edge-fill false-positive class documented. |
@@ -1047,9 +1074,13 @@ updates.
 **P4 — a repair must reduce the measured violation.** The entry and post-placement
 readings share `measureSpreadExcess`, including the same slot-N live-window filter and
 one-sided handling. `trackOutOfSpreadStaleness` clears its clock after a placement only
-when `excessAfter < excessBefore`; an unchanged placement is logged and remains stale.
-If a caller cannot measure the post-placement value, the compatibility fail-open path
-preserves the established behavior rather than inventing a negative result.
+when the measured excess is **zero**; a reduction that still leaves the book out of
+tolerance is progress, not a heal — it keeps the original clock and re-arms the
+level-triggered recheck, because a partial fix must not make every watchdog window dead
+code (corrected in §9.13/F2 after a 63-minute silent incident). An unchanged placement
+is logged and remains stale. If a caller cannot measure the post-placement value, the
+compatibility fail-open path preserves the established behavior rather than inventing
+a negative result.
 
 **P5 — every stale level owns its retry.** While out of tolerance, the watchdog arms one
 shutdown-safe, deduplicated `SPREAD_STALE_RECHECK_MS` timer. It is not dependent on a
@@ -1156,6 +1187,77 @@ Pinned by `tests/test_refused_level_refill_block.ts` (REFUSED-1..9) and
 `tests/test_same_level_refill_check.ts` (SL-1..10). With the amendment applied, the
 2026-11-16 audit baseline reads: 10 strict candidates = 4 same-level violations (the
 loop) + 6 policy divergences (the sweep re-quotes, unchanged).
+
+---
+
+### 9.13 Post-1.7.3 out-of-spread incident: sweep eligibility and the silent watchdog
+
+> **Source:** a live market-pair bot's log/snapshot (2026-11-17, generic terms),
+> `CHANGELOG.md` v1.7.3, and three unpushed `test` commits:
+> `3b9948e8` (C1), `391ba444` (F1), `5a703297` (F2). This section absorbs the former
+> standalone integration plan; no live market, account or order ids are named.
+
+**Incident.** A fast move left the grid window ~20 ladder steps below the live market
+(~1600 vs a window ending near 1500). External takers swept the cheap bid rail.
+`setLastFillPivot()` correctly refused ~20 of those fills as *premium sweeps* (7–27 steps
+from a fresh live mid) and held the pivot at the last legitimate window BUY. The boundary
+nevertheless crawled `139 → 116`, the sell window was re-created below the frozen pivot,
+every tightening sell was refused by the direction rule (`checked=20 passed=0 skipped=20`),
+and the book sat at 5.24–5.87% against a 1.65% target. A chunk also aborted mid-broadcast
+(`2/8` chunks, `DIVERGENCE-COW … not executed`, fund invariant violation → recovery 2/5).
+
+**Corrected causal reading.** The 20-step descent was driven by the **crawl**:
+`isShiftEligibleFill()` excluded edge and non-delayed partials but had no market-bound
+test, so every swept fill shifted the boundary one step. The three re-anchor events in
+the window were **one step each** (`138→137`, `126→125`, `117→116`) — symptoms, not the
+main cause. **Resolution:** the market fell back to the window, a legitimate SELL fill
+armed the pivot, and the SELL re-anchor jumped the boundary `116 → 131`; spread 1.51%.
+Between 15:06 and 16:09 there was **no** `[SPREAD-STALE]` line: two placements had reduced
+excess 14 → 12 and the old progress rule treated that partial improvement as a heal.
+
+**C1 — re-anchor extremum eligibility (`3b9948e8`, defence-in-depth).** A fill the pivot
+writer refuses could still win the batch extremum. `reanchorBoundaryFromLastFill()` now
+filters extremum candidates through the same single-source classifiers
+(`offMarketFill`, `geometryTypeForSlotIndex`, `collectEdgePinnedFillIds`) and falls back to
+the single fill-provenanced ref when none is eligible; every leg fails open on missing
+evidence. This closes an independent gap — an edge-pinned or stranded in-band fill can
+no longer teleport the anchor — and makes §9.6's “nor anchor the geometry” true on the
+geometry path. It did **not** cause the incident's 20-step descent. Tests: REANCHOR-24..27,
+EDGE-8, ELIG-6 (all fail on the pre-fix tree).
+
+**F1 — market-bound crawl eligibility (`391ba444`, root cause of the descent).**
+`offMarketFill()` is exported as the single predicate; `deriveTargetBoundary()` accepts an
+optional `isFillEligibleForCrawl` predicate applied before the shift tally (omitted ⇒
+legacy behaviour), and `strategy.ts` injects it and applies the same test at the
+pending-crawl writer so an ineligible fill cannot leave an owed crawl for a later
+derivation to apply. No new classifier, no `order ↔ system` import cycle; fail-open on a
+stale/missing read keeps legitimate fast moves followable. Test: PEND-019 (boundary 94
+without the fix, 95 with it).
+
+**F2 — partial progress is not a heal (`5a703297`, root cause of the silent hour).**
+`trackOutOfSpreadStaleness()` now clears the clock and geometry memory only when the
+measured excess is zero (or unmeasurable — compatibility path). A reduction that leaves
+the book out of tolerance keeps the **original** clock (escalation must reflect how long
+the book has been broken) and falls through to `scheduleSpreadRecheck()`. Tests:
+SPREAD-004 updated, SPREAD-007 added; both fail on the pre-fix tree. Expected live signal:
+`[SPREAD-STALE] Level-triggered recheck (60s cadence …)` while out of tolerance, then the
+one re-center and the bounded pivot expiry (§9.6) if the book cannot heal.
+
+**Deliberately not done.** (1) No §9.12/P2 exemption for a BUY pivot: the doc keeps
+“the BUY mirror blocked”; selling below the last BUY is below cost and §9.7 calls a lower
+SELL below the last fill a geometry fault. (2) No change to the refused-level marker:
+§9.12 addendum 2 explicitly rejects a cooldown/backoff, and the marker held a deeper
+level here, so it did not block the two placements. (3) No crossing veto: §9.10/P4 and
+§9.2 — a hard reject re-opens the counter-order deadlock. (4) No config/sizing/24h-TTL
+change and no new timing window.
+
+**Doc drift reconciled here:** §9.2/§9.6's “never half-applied” is qualified to the
+refusal path (the chain can reject after the check); §9.6/§9.10/P2 record the v1.7.3
+20-minute pivot expiry; §9.12/P4 now says the clock clears at zero excess, not at any
+reduction. **Still open:** the `2/8`-chunk replay and in-place target-repair verification
+(C3), live verification of the §9.13 signals after promotion, and — only with soak
+evidence — a general market-runaway upward re-anchor when the window sits far below the
+live mid with no eligible fill.
 
 ---
 
