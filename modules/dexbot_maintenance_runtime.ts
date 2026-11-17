@@ -3090,14 +3090,25 @@ export function trackOutOfSpreadStaleness(bot: BotLike, spreadChecked: boolean, 
         // (warn / geometry / fund / pivot-expiry) stay reachable.
     }
     if (placedReducedViolation) {
-        bot._outOfSpreadSince = 0;
-        bot._outOfSpreadStaleWarned = false;
+        // PARTIAL PROGRESS IS NOT A HEAL (live 2026-11-17: 14 slots out, 2
+        // placed, excess 14 -> 12; the book stayed at 5.2% for 63 minutes).
+        // The old rule cleared the clock on ANY reduction, which also skipped
+        // the level-triggered recheck below and made every watchdog window
+        // unreachable. Clear only when the measured violation is actually gone;
+        // otherwise keep the ORIGINAL clock (do not restart it — escalation is
+        // based on how long the book has been broken) and fall through so the
+        // recheck is re-armed. Unmeasurable keeps the compatibility path.
+        const fullyHealed = !excessKnown || measured <= 0;
         bot._outOfSpreadTransientCount = 0;
-        bot._outOfSpreadToleranceSince = 0;
         bot._outOfSpreadNoProgressWarned = false;
-        clearGeometryResyncMemory(bot);
-        try { bot.manager._spreadRailOversubscribed = null; } catch { /* best-effort */ }
-        return { staleMs: 0, escalated: false };
+        if (fullyHealed) {
+            bot._outOfSpreadSince = 0;
+            bot._outOfSpreadStaleWarned = false;
+            bot._outOfSpreadToleranceSince = 0;
+            clearGeometryResyncMemory(bot);
+            try { bot.manager._spreadRailOversubscribed = null; } catch { /* best-effort */ }
+            return { staleMs: 0, escalated: false };
+        }
     }
     if (outOfSpread === 0) {
         // ONE good reading must not clear the clock. The measured spread

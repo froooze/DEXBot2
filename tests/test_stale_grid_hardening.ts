@@ -289,10 +289,31 @@ async function testSPREAD004_PlacementMustReduceViolation() {
     assert.strictEqual(bot._outOfSpreadSince, before, 'no-progress placement must not reset the clock');
     assert.ok(bot.logs.some((l: any) => /placed but the spread is still/.test(l.msg)),
         'no-progress placement must be visible');
-    const healed = trackOutOfSpreadStaleness(bot, true, 1, false, 2);
-    assert.strictEqual(healed.staleMs, 0, 'a reduced violation counts as progress');
-    assert.strictEqual(bot._outOfSpreadSince, 0, 'reduced violation resets the stale clock');
+    // A PARTIAL reduction is not a heal: the live 2026-11-17 incident went
+    // 14 -> 12 with two placements and the old rule cleared the clock for 63
+    // minutes. The clock (and the recheck) must survive until excess is 0.
+    const partial = trackOutOfSpreadStaleness(bot, true, 1, false, 2);
+    assert.ok(partial.staleMs >= 31 * 60 * 1000 - 1000, 'a partial reduction keeps the stale clock running');
+    assert.strictEqual(bot._outOfSpreadSince, before, 'partial reduction must not reset the clock');
+    const healed = trackOutOfSpreadStaleness(bot, true, 1, false, 0);
+    assert.strictEqual(healed.staleMs, 0, 'a fully resolved violation clears the clock');
+    assert.strictEqual(bot._outOfSpreadSince, 0, 'zero excess resets the stale clock');
     console.log('✓ SPREAD-004 passed');
+}
+
+async function testSPREAD007_PartialProgressKeepsRecheckArmed() {
+    console.log('\n[SPREAD-007] partial progress keeps the level-triggered recheck armed...');
+    const bot: any = stubSpreadBot(14);
+    bot._shuttingDown = false;
+    bot._outOfSpreadSince = Date.now() - 5 * 60 * 1000;
+    const r = trackOutOfSpreadStaleness(bot, true, 2, false, 12);
+    assert.strictEqual(r.escalated, false, '5 minutes is still inside the warn/geometry windows');
+    assert.ok(bot._outOfSpreadSince < Date.now() - 4 * 60 * 1000,
+        'the original clock must not restart on a partial reduction');
+    assert.ok(bot._spreadRecheckTimer, 'the level-triggered recheck must stay armed while still out of tolerance');
+    clearTimeout(bot._spreadRecheckTimer);
+    bot._spreadRecheckTimer = null;
+    console.log('✓ SPREAD-007 passed');
 }
 
 async function testSPREAD005_LevelTriggeredRecheckIsDeduped() {
@@ -418,6 +439,7 @@ async function runAllTests() {
     await testSPREAD002_WarnOnceThenEscalateWithCooldown();
     await testSPREAD003_UncheckedTickDoesNotAccumulate();
     await testSPREAD004_PlacementMustReduceViolation();
+    await testSPREAD007_PartialProgressKeepsRecheckArmed();
     await testSPREAD005_LevelTriggeredRecheckIsDeduped();
     await testSPREAD006_UnknownPostPlacementMeasurementKeepsCompatibility();
     await testSPREADINF001_OneSidedBookReadsInfinite();

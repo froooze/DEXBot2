@@ -20,16 +20,28 @@ A fast move in the quote asset left the grid window ~20 ladder steps below the l
 market (~1600 vs a window ending near 1500). External takers swept the bot's cheap
 bid rail. `setLastFillPivot()` correctly refused ~20 of those fills as *premium sweeps*
 (7–27 steps from the live mid) and froze the pivot at the last legitimate window BUY
-(`1574.1358`, slot ~134). But `reanchorBoundaryFromLastFill()` took its **batch extremum**
-from those same ineligible fills and dragged the boundary down `117 → 116 → 113`. The
-sell window was then re-created *below* the frozen pivot, where the direction rule
-blocked every sell (`checked=20 passed=0 skipped=20`). At 15:06:09 the spread was
-`5.87` against a `1.65` target; the planner requested 14 extra slots and found 2.
+(`1574.1358`, slot ~134).
 
-Snapshot state: best bid `1500.22`, best ask `1578.84` (5.24% realized), boundary `118`,
-pivot `1574.1358 (buy)`, 3 owed BUY crawls, and two `SPREAD`-type slots with
-`size > 0` but no chain id. A mid-incident COW chunk also aborted (`2/8` chunks landed,
-`DIVERGENCE-COW … not executed`, fund invariant violation → recovery 2/5).
+**Corrected causal reading (after the full log became available):** the ~20-step
+descent `139 → 116` was driven by the **crawl** (`isShiftEligibleFill` / `deriveTargetBoundary`
+had no market-bound test, so every swept fill shifted the boundary one step). The three
+re-anchor events in the window were **one step each** (`138→137`, `126→125`, `117→116`) —
+symptoms, not the main cause. The sell window ended below the frozen pivot, where the
+direction rule blocked every sell (`checked=20 passed=0 skipped=20`). At 15:06:09 the
+spread was `5.87` against a `1.65` target; the planner requested 14 extra slots and found 2.
+
+Snapshot state at 15:06:15Z: best bid `1500.22`, best ask `1578.84` (5.24% realized),
+boundary `118`, pivot `1574.1358 (buy)`, 3 owed BUY crawls, and two `SPREAD`-type slots
+with `size > 0` but no chain id. A mid-incident COW chunk also aborted (`2/8` chunks
+landed, `DIVERGENCE-COW … not executed`, fund invariant violation → recovery 2/5).
+
+**Resolution (log 16:09:15–16:09:57Z):** the market fell back to ~1574, a legitimate
+SELL fill at slot 135 armed the pivot, and the SELL re-anchor jumped the boundary
+`116 → 131`. Snapshot spread became 1.51% (target 1.65). There was **no** `[SPREAD-STALE]`
+line in the 63 minutes between 15:06 and 16:09 — the watchdog never escalated: the
+two placements at 15:06:15 reduced excess 14 → 12 and the old progress rule treated
+that partial improvement as a full heal, clearing the clock and skipping the
+level-triggered recheck. That is tracked as follow-up F2 below.
 
 ## 2. Already fixed vs residual gap
 
@@ -39,7 +51,9 @@ pivot `1574.1358 (buy)`, 3 owed BUY crawls, and two `SPREAD`-type slots with
 | Refused-level same-price refill marker (§9.12 addendum 2) | v1.7.3 | Worked — did **not** block the promotion (marker held a deeper level) |
 | Stale-pivot expiry after the one re-center (`SPREAD_STALE_PIVOT_EXPIRE_MS`) | v1.7.3 | Would fire ~20 min after the re-center; capture ends before it |
 | Level-triggered stale recheck (§9.12/P5) | v1.7.1/v1.7.3 | Present in this log historically; no line in the 6-min capture |
-| **Eligibility at the re-anchor's batch extremum** | **not enforced** | **Root cause: ineligible fills moved the boundary** |
+| **Eligibility at the re-anchor's batch extremum** | **not enforced** | Defence-in-depth gap: off-market fills nudged the extremum one step; **not** the 20-step root cause |
+| **Eligibility at the crawl** | **not enforced** | **Root cause: every sweep fill crawled the boundary down** |
+| **Partial-progress stale clock** | wrong | 14 → 12 excess cleared the clock for 63 minutes; no watchdog line |
 | Atomic-or-refused COW (§9.6) | claimed | Falsified by `2/8` chunks — narrow residual |
 
 ## 3. Change inventory
@@ -185,3 +199,51 @@ Watch the affected bot's log for one full market cycle:
 3. All gates in Phase 5 pass.
 4. Live log shows the acceptance signals in §6 for one market cycle.
 5. Retrospective and invariant docs match v1.7.3 and the new ledger row.
+
+---
+
+## 10. Follow-up: the actual root causes (2026-11-17)
+
+The full log (through 16:09Z) invalidated the original "re-anchor was the root cause"
+reading. C1 is retained as defence-in-depth; the two changes below address what the
+log actually shows. Both were implemented on `test` in a separate commit.
+
+### F1 — market-bound eligibility for the crawl (root cause of the 20-step descent)
+
+- `modules/order/utils/system.ts`: `offMarketFill()` exported as the single predicate;
+  no new classifier.
+- `modules/order/utils/order.ts`: `deriveTargetBoundary()` takes an optional
+  `isFillEligibleForCrawl` predicate, applied in the crawl loop **before** the
+  `netShift` tally. Omitted ⇒ legacy behaviour (fixtures/older callers unaffected).
+- `modules/order/strategy.ts`: injects the predicate (avoids an `order ↔ system`
+  import cycle) and applies the **same** test at the pending-crawl writer, so a
+  swept fill cannot leave an owed crawl that a later derivation would apply.
+- Fail-open is preserved: no fresh live read ⇒ no filtering, so a legitimate fast
+  move with a stale market read is still followed.
+- Regression: `PEND-019` (`tests/test_pending_fill_crawls.ts`). Mutation: boundary
+  `94` instead of `95` without F1.
+
+### F2 — a partial reduction is progress, not a heal (root cause of the silent hour)
+
+- `modules/dexbot_maintenance_runtime.ts`: `trackOutOfSpreadStaleness()` now clears
+  the clock and geometry memory only when the measured excess is **zero** (or the
+  measurement is unavailable — compatibility path). A reduction that leaves the
+  book out of tolerance keeps the **original** clock (no restart) and falls through
+  to `scheduleSpreadRecheck()`, so the 10/20-minute windows and the bounded pivot
+  expiry stay reachable.
+- Regression: `SPREAD-004` updated, `SPREAD-007` added
+  (`tests/test_stale_grid_hardening.ts`). Mutation: `SPREAD-004` fails without F2.
+- Expected live signal: `[SPREAD-STALE] Level-triggered recheck (60s cadence …)`
+  lines while out of tolerance, followed by the one re-center and then the bounded
+  pivot expiry if the book cannot heal.
+
+### Still open (separate work)
+
+- **C3** — the 15:05 chunk failure (`2/8` chunks, `DIVERGENCE-COW … not executed`,
+  fund invariant violation → recovery) still needs the size-drift replay and the
+  in-place target-repair verification.
+- **C4** — retrospective §9.2 / §9.6 / §9.10/P2 wording is still stale relative to
+  v1.7.3 (20-minute pivot expiry; “never half-applied” claim).
+- A general “market has run away” upward re-anchor (window far below the live mid
+  with no eligible fill) remains a design option; the F1+F2 combination may make
+  it unnecessary, so it needs soak evidence first.
