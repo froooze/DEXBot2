@@ -323,5 +323,73 @@ run('REANCHOR-23 an equal strand count is not a repair', () => {
     assert.strictEqual(r.boundaryIdx, 8, 'the committed boundary is kept');
 });
 
+// ---- Eligibility at the batch extremum (R5.9 / §9.10/P1 / §9.12/P1) --------
+// A fill that setLastFillPivot refuses may no longer move the geometry. The
+// fixture uses a fresh live mid of 110 with a 1% step: a fill at 102 is ~7.6
+// steps away (refused as a premium sweep), while one at 108 is ~1.8 steps
+// away (a genuine window trade).
+
+run('REANCHOR-24 an off-market sweep fill cannot become the batch extremum', () => {
+    const mgr = makeManager(108, ORDER_TYPES.BUY, {
+        _liveMarketPrice: 110,
+        _liveMarketPriceAt: Date.now(),
+    });
+    const r = reanchorBoundaryFromLastFill(mgr, 10, makeSlots(), 1, [
+        { id: 'slot-8', type: ORDER_TYPES.BUY, price: 108 },
+        { id: 'slot-2', type: ORDER_TYPES.BUY, price: 102 },
+    ]);
+    assert.strictEqual(r.reanchored, true, `expected the eligible fill to anchor, got ${JSON.stringify(r)}`);
+    assert.strictEqual(r.fillSlot, 8, 'the off-market low fill must not anchor the window');
+    assert.strictEqual(r.boundaryIdx, 7, 'BUY at idx 8 => boundary 7');
+});
+
+run('REANCHOR-25 a stranded gap-band fill never overrides a rail fill', () => {
+    // boundary 3 / gap 1 => band is idx 4; a fill there is a stranded residual,
+    // not a window trade. With a legitimate pivot the extremum already points
+    // to the rail fill (SELL picks the highest slot); this pins the invariant
+    // so a future change cannot let a stranded residual win.
+    const mgr = makeManager(107, ORDER_TYPES.SELL, { boundaryIdx: 3, _gapSlots: 1 });
+    const r = reanchorBoundaryFromLastFill(mgr, 3, makeSlots(), 1, [
+        { id: 'slot-7', type: ORDER_TYPES.SELL, price: 107 },
+        { id: 'slot-4', type: ORDER_TYPES.SELL, price: 104 },
+    ]);
+    assert.strictEqual(r.reanchored, true, `expected the rail fill to anchor, got ${JSON.stringify(r)}`);
+    assert.strictEqual(r.fillSlot, 7, 'the in-band fill must not anchor the window');
+    assert.strictEqual(r.boundaryIdx, 6, 'SELL at idx 7 => boundary 6');
+});
+
+run('REANCHOR-26 a batch of only ineligible fills falls back to the provenanced ref', () => {
+    const mgr = makeManager(107, ORDER_TYPES.SELL, {
+        boundaryIdx: 3,
+        _gapSlots: 1,
+        _liveMarketPrice: 110,
+        _liveMarketPriceAt: Date.now(),
+    });
+    const r = reanchorBoundaryFromLastFill(mgr, 3, makeSlots(), 1, [
+        { id: 'slot-0', type: ORDER_TYPES.SELL, price: 100 },
+    ]);
+    assert.strictEqual(r.reanchored, true, `expected the ref fallback, got ${JSON.stringify(r)}`);
+    assert.strictEqual(r.fillSlot, 7, 'the single fill-provenanced ref must remain the anchor');
+    assert.strictEqual(r.boundaryIdx, 6);
+});
+
+run('REANCHOR-27 an eligible batch fill still wins over an off-market one', () => {
+    // Guard against over-filtering: the extremum must still advance to the
+    // furthest ELIGIBLE fill of a chunked sweep (the §9.11.2 contract). For a
+    // BUY extremum that is the LOWEST eligible slot; the off-market slot 2 is
+    // lower but 7.6 steps from the live mid, so it must be skipped.
+    const mgr = makeManager(105, ORDER_TYPES.BUY, {
+        _liveMarketPrice: 110,
+        _liveMarketPriceAt: Date.now(),
+    });
+    const r = reanchorBoundaryFromLastFill(mgr, 10, makeSlots(), 1, [
+        { id: 'slot-2', type: ORDER_TYPES.BUY, price: 102 },
+        { id: 'slot-8', type: ORDER_TYPES.BUY, price: 108 },
+    ]);
+    assert.strictEqual(r.reanchored, true, `expected a re-anchor, got ${JSON.stringify(r)}`);
+    assert.strictEqual(r.fillSlot, 8, 'the eligible low fill must still anchor');
+    assert.strictEqual(r.boundaryIdx, 7, 'BUY at idx 8 => boundary 7');
+});
+
 console.log(`\nREANCHOR summary: ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

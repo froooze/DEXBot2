@@ -22,7 +22,7 @@
 const assert = require('assert');
 const { OrderManager } = require('../modules/order/manager');
 const { ORDER_TYPES, ORDER_STATES, GRID_LIMITS } = require('../modules/constants');
-const { isLastFillBandSellExempt, isLastFillPlacementBlocked, evaluateLastFillGuard } = require('../modules/order/utils/system');
+const { isLastFillBandSellExempt, isLastFillPlacementBlocked, evaluateLastFillGuard, reanchorBoundaryFromLastFill } = require('../modules/order/utils/system');
 const { getSellStartIdx } = require('../modules/order/utils/math');
 
 let passed = 0;
@@ -267,6 +267,39 @@ run('ELIG-4 unreadable geometry fails open (a cold grid still arms on its first 
 run('ELIG-5 the distance leg is visible in the constants registry', () => {
     assert.ok(Number(GRID_LIMITS.LAST_FILL_PIVOT_MAX_MID_DISTANCE_STEPS) >= 1,
         'a configured distance bound keeps the sweep class closed');
+});
+
+run('ELIG-6 one eligibility rule decides BOTH the pivot and the geometry anchor', () => {
+    // The same batch goes through both consumers: a premium sweep 8 steps above
+    // a fresh market read must neither arm the guard nor become the extremum
+    // that drags the boundary to its own level (R5.9 / §9.10/P1 / §9.12/P1).
+    const mgr: any = Object.create(OrderManager.prototype);
+    Object.assign(mgr, makeManager({
+        _liveMarketPrice: levels[26],
+        _liveMarketPriceAt: NOW
+    }));
+    // slot 24 is the band TOP (a stranded residual), so the window fill is at
+    // slot 25 — the first sell-rail level — one step below the live mid.
+    const batch = [
+        { id: 'slot-25', type: ORDER_TYPES.SELL, price: levels[25] },
+        { id: 'slot-34', type: ORDER_TYPES.SELL, price: levels[34] }
+    ];
+    mgr._lastFilledPrice = null;
+    mgr._lastFilledType = null;
+    OrderManager.prototype.recordLastFilledPrices.call(mgr, batch);
+    assert.strictEqual(mgr._lastFilledPrice, levels[25],
+        'the sweep fill must not arm the pivot: ' + JSON.stringify(mgr.logs.map((l: any) => l.msg)));
+
+    // Virtual copies isolate the eligibility decision from stranding checks.
+    const virtualSlots = Array.from(mgr.orders.values()).map((s: any) => ({
+        ...s,
+        orderId: null,
+        state: ORDER_STATES.VIRTUAL,
+        size: 0
+    }));
+    const r = reanchorBoundaryFromLastFill(mgr, 18, virtualSlots, GAP, batch);
+    assert.strictEqual(r.fillSlot, 25, `the sweep fill must not anchor the boundary: ${JSON.stringify(r)}`);
+    assert.strictEqual(r.boundaryIdx, 21, 'a SELL fill at slot 25 => boundary 21 with gap 4');
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

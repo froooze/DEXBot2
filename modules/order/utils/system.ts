@@ -1571,9 +1571,18 @@ export function reanchorBoundaryFromLastFill(manager: OrderManagerLike, boundary
     // the last chunk under-advances the window and leaves the furthest fill's
     // counter-order in-band. The rail must clear the FURTHEST fill of the side:
     // max slot for SELL fills, min slot for BUY fills.
+    // ELIGIBILITY (R5.9 / §9.10/P1 / §9.12/P1): only fills that could have armed
+    // the guard may move the geometry. Without this filter a premium-sweep fill
+    // that setLastFillPivot refuses can still become the extremum and drag the
+    // boundary down to its own (off-market) level, putting the counter-order
+    // window below a legitimately armed pivot. Every filter leg fails open when
+    // its evidence is absent, so a cold grid still anchors on its first fill.
     let anchorIdx = idx;
     let anchorPrice = price;
-    const batchExtremum = resolveFillAnchorIndex(fills, side, genesis, maxDrift);
+    const eligibleFills = Array.isArray(fills)
+        ? fills.filter((f) => isEligibleAnchorFill(manager, f, side, genesis, maxDrift))
+        : [];
+    const batchExtremum = resolveFillAnchorIndex(eligibleFills, side, genesis, maxDrift);
     if (batchExtremum) {
         anchorIdx = batchExtremum.idx;
         if (batchExtremum.price != null && Number.isFinite(batchExtremum.price) && batchExtremum.price > 0) {
@@ -1736,6 +1745,84 @@ function resolveFillAnchorIndex(
         }
     }
     return best;
+}
+
+/**
+ * Is this fill the kind of trade that may anchor the ABSOLUTE geometry?
+ *
+ * The pivot writer already refuses three classes of fill: off-market (a
+ * premium sweep of our own rail, or a crossed-book artifact), stranded
+ * gap-band residuals, and edge-pinned insurance. Those refusals used to apply
+ * only to the guard; the batch extremum below then consumed the raw fills, so
+ * the very fill that could not arm the guard could still move the boundary to
+ * its own level (live: a 20-step BUY sweep froze the pivot at 1574 while the
+ * boundary crawled to 116, leaving every counter-SELL below the pivot and the
+ * book out of spread).
+ *
+ * Compose the SAME single-source classifiers — offMarketFill (this module),
+ * geometryTypeForSlotIndex and collectEdgePinnedFillIds (order utils) — rather
+ * than defining a second notion of "real fill" (R3.5, lesson 9). Each leg
+ * fails OPEN when its evidence is missing or unreadable: a cold grid, a stale
+ * market read or unknown gap geometry must still anchor on its first fill.
+ * The pivot reference itself is already eligible by construction (it had to
+ * pass these checks to arm the guard), so a filtered-out batch keeps the
+ * single provenanced ref as the anchor.
+ *
+ * @param {Object} manager - OrderManager instance
+ * @param {Object} f - Fill candidate (id?, type?, price?)
+ * @param {string} side - Side of the anchor (fills of the other side are out)
+ * @param {Object} genesis - Genesis ladder
+ * @param {number} maxDrift - One-increment drift bound for an on-ladder price
+ * @returns {boolean} True when the fill may contribute to the batch extremum
+ */
+function isEligibleAnchorFill(
+    manager: OrderManagerLike,
+    f: { id?: string; type?: string; price?: unknown } | null | undefined,
+    side: string,
+    genesis: Parameters<typeof MathUtils.slotIndexForPrice>[1],
+    maxDrift: number
+): boolean {
+    if (!f || f.type !== side) return false;
+    let price = Number(f.price);
+    let idx: number | null = null;
+    const idIdx = parseSlotIndex(String(f.id ?? ''));
+    const slotIdx = idIdx !== null && idIdx !== undefined && Number.isFinite(Number(idIdx)) ? Number(idIdx) : null;
+    if (!Number.isFinite(price) || price <= 0) {
+        if (slotIdx !== null) {
+            try { price = Number(MathUtils.priceForSlot(slotIdx, genesis)); } catch { price = NaN; }
+        }
+    } else {
+        try {
+            const candidateIdx = Number(MathUtils.slotIndexForPrice(price, genesis));
+            const candidateLevel = Number(MathUtils.priceForSlot(candidateIdx, genesis));
+            if (Number.isFinite(candidateIdx) && candidateIdx >= 0
+                && Number.isFinite(candidateLevel) && candidateLevel > 0
+                && Math.abs(candidateLevel - price) / price <= maxDrift) {
+                idx = candidateIdx;
+            }
+        } catch { /* fall through to the slot id */ }
+        if (idx === null && slotIdx !== null) idx = slotIdx;
+    }
+    // Off-market: the exact predicate setLastFillPivot applies at every
+    // fill-provenance write. A missing/stale market read returns null (fail open).
+    if (Number.isFinite(price) && price > 0 && offMarketFill(manager, side, price)) return false;
+    // Gap-band residual: not a window trade. Unknown geometry -> null -> eligible.
+    if (idx !== null) {
+        try {
+            const boundaryIdx = (manager as unknown as { boundaryIdx?: string | number | null }).boundaryIdx;
+            const gapSlots = (manager as unknown as { _gapSlots?: string | number | null })._gapSlots;
+            const geo = OrderUtils.geometryTypeForSlotIndex(idx, boundaryIdx, gapSlots);
+            if (geo === ORDER_TYPES.SPREAD) return false;
+        } catch { /* unreadable geometry: fail open */ }
+    }
+    // Edge-pinned insurance: the same classifier the pivot writer uses. No id
+    // means it cannot be classified -> eligible.
+    if (f.id != null && String(f.id)) {
+        try {
+            if (OrderUtils.collectEdgePinnedFillIds(manager, [{ id: String(f.id), type: side }]).has(String(f.id))) return false;
+        } catch { /* unreadable classification: fail open */ }
+    }
+    return true;
 }
 
 /**

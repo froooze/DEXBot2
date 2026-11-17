@@ -166,6 +166,44 @@ async function main() {
         assert.strictEqual(r.boundaryIdx, 3);
     });
 
+    run('EDGE-8 an edge fill cannot hijack the batch extremum', () => {
+        // The pivot writer refuses an edge fill, but the re-anchor used to take
+        // the highest SELL slot of the raw batch — so a ceiling fill could
+        // still teleport the anchor. The same edge classifier now applies to
+        // the extremum candidates. Use unfrozen slot copies with no orderIds so
+        // no placed order can refuse the boundary on stranding grounds.
+        arm(manager, 1.05, ORDER_TYPES.SELL);
+        const slots = Array.from((manager.orders as Map<string, any>).values()).map((s) => ({
+            ...s,
+            orderId: null
+        }));
+        const stub = {
+            _genesis: {
+                priceLevels: Array.from({ length: 12 }, (_, i) => 1 + i / 100),
+                startPrice: 1,
+                incrementPercent: 1
+            },
+            config: { ...(manager.config as object) },
+            orders: new Map(slots.map((s) => [s.id, s])),
+            boundaryIdx: 3,
+            _gapSlots: 1,
+            _lastFilledPrice: 1.05,
+            _lastFilledType: ORDER_TYPES.SELL,
+            _lastFilledAt: Date.now(),
+            lastFillPivotSource: 'fill',
+            _lastMarketFillPrice: 1.05,
+            _lastMarketFillType: ORDER_TYPES.SELL,
+            _lastMarketFillAt: Date.now(),
+            logger: { log: () => {} }
+        };
+        const r = reanchorBoundaryFromLastFill(stub as never, 3, slots as never, 1, [
+            { id: 'slot-5', type: ORDER_TYPES.SELL, price: 1.05 },
+            { id: 'slot-11', type: ORDER_TYPES.SELL, price: 1.11 }
+        ]);
+        assert.strictEqual(r.fillSlot, 5, `the ceiling edge fill must not anchor: ${JSON.stringify(r)}`);
+        assert.strictEqual(r.boundaryIdx, 4, 'SELL at slot 5 => boundary 4');
+    });
+
     run('EDGE-7 with edgeOrders disabled the same fill DOES arm the pivot', () => {
         // Classification is config-driven: an operator without insurance orders
         // has no edge slots, so nothing is skipped.
