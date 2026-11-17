@@ -1220,6 +1220,77 @@ async function testRepairsMissingUpdateTargetInPlace() {
     console.log('✓ COW-COMMIT-013b passed');
 }
 
+async function testSizeDriftGoneTargetRoutesToInPlaceRepair() {
+    console.log('\n[COW-COMMIT-018] a gone target detected by the size-drift pre-read routes to in-place repair...');
+
+    const masterOrders = new Map([
+        ['slot-1', createOrder('slot-1', { type: ORDER_TYPES.BUY, price: 1.0, orderId: '1.7.1001' })]
+    ]);
+    const { bot, manager } = createCowExecutionFixture(masterOrders);
+    (manager as any)._gapSlots = 2;
+    (manager as any).performSafeRebalance = async () => ({ aborted: false });
+    let resyncRequests = 0;
+    (manager as any).requestStructuralGridResync = async () => { resyncRequests += 1; return { scheduled: true }; };
+
+    const originalBatchRead = chainOrders.batchReadOrders;
+    const originalExecuteBatch = chainOrders.executeBatch;
+    const originalBuildUpdate = chainOrders.buildUpdateOrderOp;
+    // The MODE C(b) pre-broadcast check sees the target as PRESENT here: the
+    // failure is the TOCTOU window where it vanishes before executeBatch's own
+    // size-drift read (the live 2026-11-17 signature).
+    chainOrders.batchReadOrders = async (_ids: string[]) => new Map([['1.7.1001', { id: '1.7.1001' }]]);
+    chainOrders.buildUpdateOrderOp = async () => ({
+        op: { op_name: 'limit_order_update', op_data: { order: '1.7.1001' } },
+        finalInts: null
+    });
+    let executeCalls = 0;
+    chainOrders.executeBatch = async () => {
+        executeCalls += 1;
+        throw new Error(
+            'object 1.7.1001 does not exist: limit_order_update delta=-778125 targets an order ' +
+            'missing on chain (detected pre-broadcast size-drift)'
+        );
+    };
+
+    let repairIds: string[] = [];
+    (bot as any)._targetedOrderRepair = async (ids: string[]) => {
+        repairIds = ids;
+        return true;
+    };
+    let staleCleanupCalls = 0;
+    (bot as any)._recoverExplicitStaleOrders = async () => {
+        staleCleanupCalls += 1;
+        return { executed: false, stale: true };
+    };
+
+    const workingGrid = new WorkingGrid(manager.orders, { baseVersion: 0 });
+    try {
+        const result: any = await bot._updateOrdersOnChainBatchCOW({
+            workingGrid,
+            workingIndexes: workingGrid.getIndexes(),
+            workingBoundary: (manager as any).boundaryIdx,
+            actions: [{
+                type: COW_ACTIONS.UPDATE,
+                id: 'slot-1',
+                orderId: '1.7.1001',
+                order: { id: 'slot-1', type: ORDER_TYPES.BUY, price: 1.0, size: 100, state: ORDER_STATES.ACTIVE, orderId: '1.7.1001' }
+            }]
+        });
+        assert.strictEqual(executeCalls >= 1, true, 'the batch must have reached the chain');
+        assert.deepStrictEqual(repairIds, ['1.7.1001'], 'the vanished target must go to the in-place repair');
+        assert.strictEqual(staleCleanupCalls, 0, 'stale cleanup must not run for a size-drift gone target');
+        assert.strictEqual(result.reason, 'ORDER_SIZE_DRIFT_TARGETED', 'the targeted repair result must survive');
+        assert.strictEqual(resyncRequests, 0, 'no snapshot reload / structural resync for a repaired slot');
+        await waitFor(() => !bot._postRecoveryRebalanceTimer, 'deferred post-repair re-plan to settle', 2000);
+    } finally {
+        chainOrders.batchReadOrders = originalBatchRead;
+        chainOrders.executeBatch = originalExecuteBatch;
+        chainOrders.buildUpdateOrderOp = originalBuildUpdate;
+    }
+
+    console.log('✓ COW-COMMIT-018 passed');
+}
+
 async function testUnrepairableMissingTargetStillEscalates() {
     console.log('\n[COW-COMMIT-013c] a repair that leaves the id tracked still escalates...');
 
@@ -1467,6 +1538,7 @@ async function run() {
     await testSeamPollIntervalDoesNotLeakOnGuardRefusal();
     await testRejectsMissingUpdateTargetBeforeBroadcast();
     await testRepairsMissingUpdateTargetInPlace();
+    await testSizeDriftGoneTargetRoutesToInPlaceRepair();
     await testUnrepairableMissingTargetStillEscalates();
     await testAllowsPresentUpdateTargetThroughGuard();
     await testLaggingBatchReadIsRescuedBySingleRead();

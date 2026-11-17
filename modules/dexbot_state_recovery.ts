@@ -255,7 +255,26 @@ async function recoverExplicitStaleOrders(bot: BotLike, staleOrderIds: unknown, 
  * @returns {Promise<Object>}
  */
 async function recoverBatchSizeDrift(bot: BotLike, err: unknown, opContexts: unknown = []) {
-    const affectedOrderIds = extractSizeDriftOrderIds(opContexts);
+    let affectedOrderIds = extractSizeDriftOrderIds(opContexts);
+    if (affectedOrderIds.length === 0) {
+        // A gone UPDATE target found by findOverReducingUpdateOpError can arrive
+        // with plain UPDATE contexts (no size-update/rotation kind), so the
+        // context extractor finds nothing. The chain error itself names the id;
+        // parse it so the in-place repair still gets its slot instead of falling
+        // back to a full recovery sync (which reloaded the stale snapshot and
+        // re-armed the same failure on the live 2026-11-17 incident).
+        const errMsg = getErrorMessage(err);
+        const fromMessage = new Set<string>();
+        for (const re of [
+            /object (1\.7\.\d+) does not exist/gi,
+            /order (1\.7\.\d+) does not exist/gi,
+            /Limit order (1\.7\.\d+) does not exist/gi
+        ]) {
+            let m;
+            while ((m = re.exec(errMsg)) !== null) fromMessage.add(m[1]);
+        }
+        affectedOrderIds = Array.from(fromMessage);
+    }
     if (affectedOrderIds.length > 0) {
         bot.manager.logger.log(
             `[COW] Targeted size-drift repair for ${affectedOrderIds.length} order(s): ${affectedOrderIds.join(', ')}`,

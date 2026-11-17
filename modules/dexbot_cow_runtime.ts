@@ -6287,7 +6287,8 @@ async function updateOrdersOnChainBatchCOWBody(
         const hardAbortResult = await bot._handleBatchHardAbort(err, 'COW batch processing', operations.length);
         if (hardAbortResult) return hardAbortResult as JsonObj;
 
-        const staleOrderIds = new Set();
+        const errMsg = getErrorMessage(err);
+        const staleOrderIds = new Set<string>();
         const patterns = [
             /Limit order (1\.7\.\d+) does not exist/g,
             /Unable to find Object (1\.7\.\d+)/g,
@@ -6295,12 +6296,22 @@ async function updateOrdersOnChainBatchCOWBody(
         ];
         for (const pattern of patterns) {
             let m;
-            while ((m = pattern.exec(getErrorMessage(err))) !== null) {
+            while ((m = pattern.exec(errMsg)) !== null) {
                 staleOrderIds.add(m[1]);
             }
         }
 
-        if (/Cannot deduct all or more from order than order contains/.test(getErrorMessage(err))) {
+        // A gone UPDATE target detected by the PRE-BROADCAST size-drift read is
+        // not an "explicit stale order". findOverReducingUpdateOpError emits
+        // this exact marker; routing it to stale cleanup frees the slot's funds
+        // without releasing the dead commitment, discards the working grid,
+        // defers divergence and leaves the optimistic ledger short — the live
+        // 2026-11-17 signature (2 of 8 chunks landed, fund invariant violation,
+        // recovery 2/5). Send it to the SAME in-place _targetedOrderRepair the
+        // over-reducing-size branch uses; it is the single-slot repair owner.
+        const preBroadcastSizeDriftGone = /\(detected pre-broadcast size-drift\)/.test(errMsg)
+            && /does not exist/i.test(errMsg);
+        if (/Cannot deduct all or more from order than order contains/.test(errMsg) || preBroadcastSizeDriftGone) {
             return await bot._recoverBatchSizeDrift(err, opContexts) as JsonObj;
         }
 

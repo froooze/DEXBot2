@@ -9,9 +9,9 @@
 > Generic terms only — no live markets, accounts, or order ids.
 >
 > **Scope / snapshot:** v1.0.0 → v1.7.1 (`2a85a501`, 2026-11-04), extended through the
-> post-1.7.1 work at `bc20d574` (2026-11-04), the v1.7.2/v1.7.3 releases, and three
-> unpushed `test` commits (`3b9948e8`, `391ba444`, `5a703297`, 2026-11-17) recorded
-> in §9.13. §9 is the v1.6.4 → v1.6.17 addendum; §9.10 closes the v1.6.18 review pass,
+> post-1.7.1 work at `bc20d574` (2026-11-04), the v1.7.2/v1.7.3 releases, and four
+> unpushed `test` commits (`3b9948e8`, `391ba444`, `5a703297`, `bad3cc30`, 2026-11-17)
+> recorded in §9.13. §9 is the v1.6.4 → v1.6.17 addendum; §9.10 closes the v1.6.18 review pass,
 > §9.11 carries v1.6.18 → v1.7.1, §9.12 records the revised-priority review, and
 > §9.13 records the post-1.7.3 out-of-spread incident and its fixes.
 >
@@ -162,6 +162,10 @@ notes; the grid-price invariant has its own doc — [GRID_PRICE_INVARIANT.md](GR
 - **A heal is zero excess, not less excess (§9.13):** the stale watchdog clears only
   when the measured violation is gone; a partial improvement keeps the original clock
   so the bounded expiry and level-triggered recheck stay reachable.
+- **One repair owner for a vanished target (§9.13/C3):** both pre-broadcast absence
+  checks feed `_targetedOrderRepair`; the size-drift read no longer falls into stale
+  cleanup, which freed funds without releasing the dead commitment and tripped a
+  fund invariant violation.
 
 The winning strategy was **removing writers and sources of truth**, not adding handlers.
 
@@ -587,7 +591,7 @@ Original doc regression excerpts preserved: GAP P6 A/B/C; LADDER §2.8 checks (1
 - [x] Stale `*.md` filename references in code comments/tests updated to the consolidated doc (9 module files, 6 test files), then re-pointed to this hub when it absorbed the summary.
 
 *Generated 2026-08-31 from the 4 test-only docs at their HEAD contents; statuses corrected against `test` HEAD `a54863ca` the same day, then refreshed against `1382f267` (2026-09-13), extended through v1.6.14 at `f6c0df32` (2026-10-12), through v1.6.17 at `78ccbb8e`, through the v1.6.18 review pass (`§9.10`: `f4d6da8c`, `a2bf6ba5`, `56481b16`, `3d16f9e4`), and through v1.7.1 at `2a85a501` plus the post-1.7.1 arc (`§9.11`, HEAD `bc20d574`), the v1.7.2/v1.7.3 releases, and the
-post-1.7.3 `test` arc (`§9.13`: `3b9948e8`, `391ba444`, `5a703297`). Landed/reverted/superseded annotations carry commit hashes where known; **line references in §§1-4 were re-verified at `a54863ca` and are subject to drift** — treat them as pointers, not assertions. The GRID-PRICE-INVARIANT guard is **BLOCKING** at all six emission sites (CREATE / UPDATE / CREATE-FALLBACK in `modules/dexbot_cow_runtime.ts`, RECONCILE-CREATE / RECONCILE-UPDATE / STARTUP-CREATE in `modules/order/grid_reconcile_internal.ts`): an off-grid emission is skipped, not merely counted, so a `violated>0` line means an emission was *prevented* rather than a writer merely *pinned*. Counters are still reported (`site=`, `checked=`, `violated=`, `unchecked=`) for observability — see `docs/GRID_PRICE_INVARIANT.md`.*
+post-1.7.3 `test` arc (`§9.13`: `3b9948e8`, `391ba444`, `5a703297`, `bad3cc30`). Landed/reverted/superseded annotations carry commit hashes where known; **line references in §§1-4 were re-verified at `a54863ca` and are subject to drift** — treat them as pointers, not assertions. The GRID-PRICE-INVARIANT guard is **BLOCKING** at all six emission sites (CREATE / UPDATE / CREATE-FALLBACK in `modules/dexbot_cow_runtime.ts`, RECONCILE-CREATE / RECONCILE-UPDATE / STARTUP-CREATE in `modules/order/grid_reconcile_internal.ts`): an off-grid emission is skipped, not merely counted, so a `violated>0` line means an emission was *prevented* rather than a writer merely *pinned*. Counters are still reported (`site=`, `checked=`, `violated=`, `unchecked=`) for observability — see `docs/GRID_PRICE_INVARIANT.md`.*
 
 ---
 
@@ -753,6 +757,7 @@ required is no longer reachable at runtime.
 | `3b9948e8` | post-1.7.3 (`test`, unpushed) | Re-anchor extremum uses the pivot writer's eligibility (§9.13/C1) |
 | `391ba444` | post-1.7.3 (`test`, unpushed) | Market-bound eligibility injected into the crawl and pending-crawl writer (§9.13/F1) |
 | `5a703297` | post-1.7.3 (`test`, unpushed) | Stale clock clears only at zero excess; partial progress re-arms the recheck (§9.13/F2) |
+| `bad3cc30` | post-1.7.3 (`test`, unpushed) | Size-drift gone targets route to the in-place repair, not stale cleanup (§9.13/C3) |
 
 #### 9.6 Invariants added
 
@@ -763,7 +768,7 @@ required is no longer reachable at runtime.
   tracked UPDATE target is missing. The chain can still reject a chunk after that check —
   a 2026-11-17 incident lost a target between read and wire and landed 2 of 8 chunks — so
   this is an invariant of the guard, not of the broadcast; recovery is the in-place target
-  repair (§9.13, C3 replay open).
+  repair (§9.13/C3), now shared by both pre-broadcast absence checks.
 - **Placed is not surplus:** an order inside `SURPLUS_CANCEL_GRACE_MS` is never cancelled by a
   sweep running on a stale snapshot.
 - **Only a window trade may become the pivot:** edge-pinned insurance fills are skipped at the
@@ -1193,8 +1198,8 @@ loop) + 6 policy divergences (the sweep re-quotes, unchanged).
 ### 9.13 Post-1.7.3 out-of-spread incident: sweep eligibility and the silent watchdog
 
 > **Source:** a live market-pair bot's log/snapshot (2026-11-17, generic terms),
-> `CHANGELOG.md` v1.7.3, and three unpushed `test` commits:
-> `3b9948e8` (C1), `391ba444` (F1), `5a703297` (F2). This section absorbs the former
+> `CHANGELOG.md` v1.7.3, and four unpushed `test` commits:
+> `3b9948e8` (C1), `391ba444` (F1), `5a703297` (F2), `bad3cc30` (C3). This section absorbs the former
 > standalone integration plan; no live market, account or order ids are named.
 
 **Incident.** A fast move left the grid window ~20 ladder steps below the live market
@@ -1251,13 +1256,26 @@ level here, so it did not block the two placements. (3) No crossing veto: §9.10
 §9.2 — a hard reject re-opens the counter-order deadlock. (4) No config/sizing/24h-TTL
 change and no new timing window.
 
+**C3 — gone-target routing (`bad3cc30`).** The two pre-broadcast absence checks had
+different failure paths. `runPreBroadcastGuards()` (MODE C(b)) found a missing UPDATE
+target and called `_targetedOrderRepair` in place; `findOverReducingUpdateOpError()`
+inside `executeBatch()` found the same class of target in the TOCTOU window before the
+wire and emitted the chain's `object <id> does not exist … (detected pre-broadcast
+size-drift)` error, which the COW catch block routed to **stale cleanup** — funds freed,
+working grid discarded, divergence deferred, fund invariant violation → recovery
+(`2/8` chunks had landed). The error is now recognised by its size-drift marker and
+routed to `_recoverBatchSizeDrift`, the single in-place repair owner; that helper also
+parses the id from the error message when the op contexts carry no size-update/rotation
+kind, so the repair still reaches its slot instead of reloading the stale snapshot.
+No guard weakened; structural resync remains the fallback. Regression: COW-COMMIT-018
+(mutation-checked).
+
 **Doc drift reconciled here:** §9.2/§9.6's “never half-applied” is qualified to the
 refusal path (the chain can reject after the check); §9.6/§9.10/P2 record the v1.7.3
 20-minute pivot expiry; §9.12/P4 now says the clock clears at zero excess, not at any
-reduction. **Still open:** the `2/8`-chunk replay and in-place target-repair verification
-(C3), live verification of the §9.13 signals after promotion, and — only with soak
-evidence — a general market-runaway upward re-anchor when the window sits far below the
-live mid with no eligible fill.
+reduction. **Still open:** live verification of the §9.13 signals after promotion, and
+— only with soak evidence — a general market-runaway upward re-anchor when the window
+sits far below the live mid with no eligible fill.
 
 ---
 
