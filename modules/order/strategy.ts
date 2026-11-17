@@ -52,7 +52,7 @@ import { ORDER_TYPES, ORDER_STATES } from '../constants.js';
 import { calculateGapSlots } from './grid.js';
 import { isSlotInRail } from './utils/math.js';
 import { deriveTargetBoundary, getSideBudget, calculateBudgetedSizes, getCoreOrdersTotal, resolveEdgeCount, resolveLiveEdgeAnchorPrice, selectEdgeSlots, isShiftEligibleFill } from './utils/order.js';
-import { reanchorBoundaryFromLastFill } from './utils/system.js';
+import { reanchorBoundaryFromLastFill, offMarketFill } from './utils/system.js';
 import { assignGridRoles } from './utils/order.js';
 import {
     convertToSpreadPlaceholder,
@@ -142,6 +142,10 @@ class StrategyEngine {
             // buys re-bought after restart). Cleared on any accepted
             // non-null boundary commit. Same eligibility as the crawl itself.
             if (isShiftEligibleFill(filledOrder)
+                // Same market-bound eligibility as the crawl and the anchor: a
+                // premium sweep must not leave an owed crawl that a later
+                // derivation would apply, undoing this filter one cycle later.
+                && !offMarketFill(mgr, String(filledOrder.type), Number(filledOrder.price))
                 && typeof filledOrder.id === 'string' && filledOrder.id.length > 0
                 && (filledOrder.type === ORDER_TYPES.BUY || filledOrder.type === ORDER_TYPES.SELL)
                 // dryRun never commits a boundary, so a recorded crawl could
@@ -314,7 +318,12 @@ class StrategyEngine {
             buy: resolveLiveEdgeAnchorPrice(this.manager, 'buy'),
             sell: resolveLiveEdgeAnchorPrice(this.manager, 'sell'),
         };
-        let { boundaryIdx: newBoundaryIdx, remainingBudget, consumedCrawlIds } = deriveTargetBoundary(fills, currentBoundaryIdx, allSlots, boundaryConfig, gapSlots, crossChunkBudget, this.manager._pendingFillCrawls, edgeAnchors);
+        // One market-bound predicate for the pivot, the anchor and the crawl
+        // (R5.9): off-market sweep fills are not window evidence and must not
+        // drag the boundary away from the live market.
+        const isCrawlEligible = (fill: { id?: string; price?: number; type?: string; [key: string]: unknown }) =>
+            !offMarketFill(this.manager, String(fill?.type), Number(fill?.price));
+        let { boundaryIdx: newBoundaryIdx, remainingBudget, consumedCrawlIds } = deriveTargetBoundary(fills, currentBoundaryIdx, allSlots, boundaryConfig, gapSlots, crossChunkBudget, this.manager._pendingFillCrawls, edgeAnchors, isCrawlEligible);
         if (crossChunkBudget != null) {
             this.manager._boundaryShiftBudget = remainingBudget;
         }

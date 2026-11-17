@@ -3121,7 +3121,7 @@ function isShiftEligibleFill(fill: { isPartial?: boolean; isDelayedRotationTrigg
     return fill?.isPartial !== true || fill?.isDelayedRotationTrigger === true;
 }
 
-function deriveTargetBoundary(fills: Array<{ id?: string; price?: number; type?: string; [key: string]: unknown }> | null | undefined, currentBoundaryIdx: number | null | undefined, allSlots: ManagedOrder[], config: { startPrice?: number | string; genesisStartPrice?: number | string; coreOrders?: { buy?: number; sell?: number; [key: string]: unknown }; [key: string]: unknown } | null | undefined, gapSlots: number, crossChunkBudget?: number | null, pendingCrawls?: Array<{ slotId?: string; side?: string; [key: string]: unknown }> | null, edgeAnchors?: { buy?: number | null; sell?: number | null } | null): { boundaryIdx: number | null; remainingBudget: number; consumedCrawlIds: CrawlEntry[] } {
+function deriveTargetBoundary(fills: Array<{ id?: string; price?: number; type?: string; [key: string]: unknown }> | null | undefined, currentBoundaryIdx: number | null | undefined, allSlots: ManagedOrder[], config: { startPrice?: number | string; genesisStartPrice?: number | string; coreOrders?: { buy?: number; sell?: number; [key: string]: unknown }; [key: string]: unknown } | null | undefined, gapSlots: number, crossChunkBudget?: number | null, pendingCrawls?: Array<{ slotId?: string; side?: string; [key: string]: unknown }> | null, edgeAnchors?: { buy?: number | null; sell?: number | null } | null, isFillEligibleForCrawl?: ((fill: { id?: string; price?: number; type?: string; [key: string]: unknown }) => boolean) | null): { boundaryIdx: number | null; remainingBudget: number; consumedCrawlIds: CrawlEntry[] } {
     let newBoundaryIdx: number | null = currentBoundaryIdx ?? null;
 
     // Recovery when the committed boundary is unknown (GRID-LOAD rejected a
@@ -3292,6 +3292,14 @@ function deriveTargetBoundary(fills: Array<{ id?: string; price?: number; type?:
     const consumedAll = (): CrawlEntry[] => allPending.map(toCrawlEntry);
     for (const fill of fills ?? []) {
         if (!isShiftEligibleFill(fill)) continue;
+        // MARKET-BOUND ELIGIBILITY (R5.9 / §9.12/P1): a premium sweep of our own
+        // rail is not window evidence. Letting every swept fill crawl the
+        // boundary one step drags the whole window away from a live market that
+        // never traded there; the guard and the anchor already refuse these
+        // fills, so the crawl must use the SAME predicate. Injected by the caller
+        // (system.ts owns offMarketFill) to keep this module free of a circular
+        // import; omitted => legacy behaviour for older/fixture callers.
+        if (isFillEligibleForCrawl && !isFillEligibleForCrawl(fill)) continue;
         if (fill && fill.type === ORDER_TYPES.BUY && edgeBuyIds && fill.id != null && edgeBuyIds.has(fill.id)) continue;
         if (fill && fill.type === ORDER_TYPES.SELL && edgeSellIds && fill.id != null && edgeSellIds.has(fill.id)) continue;
         if (fill.type === ORDER_TYPES.SELL) netShift++;

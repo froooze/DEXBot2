@@ -57,6 +57,7 @@
  *   - isLastFillBandSellExempt(manager, price) - Geometry territory for a SELL counter-order
  *   - evaluateLastFillGuard(manager, price, type, pivot, pivotType) - Shared placement verdict
  *   - isLastFillPlacementBlocked(manager, price, type) - Placement-side LAST-FILL-GUARD wrapper
+ *   - offMarketFill(manager, type, price) - Is a fill current-window evidence (shared eligibility)
  *   - readFillPipelineState(source) - Projection of the fill-pipeline state
  *   - resolveGridUpdateBlockers(source, options) - Blockers that forbid a grid update right now
  *   - noteGridUpdateBlockers(...) - Log/record the blockers for one decision
@@ -2656,7 +2657,7 @@ export function normalizeLastMarketFill(row: unknown): { price: number; type: st
  * @returns {{ steps: number, mid: number, kind?: 'wrong-side'|'too-far' } | null}
  *   Off-market detail, or null when the fill is window evidence / unknowable
  */
-function offMarketFill(manager: OrderManagerLike, type: string, price: number): { steps: number; mid: number; kind?: 'wrong-side' | 'too-far' } | null {
+export function offMarketFill(manager: OrderManagerLike, type: string, price: number): { steps: number; mid: number; kind?: 'wrong-side' | 'too-far' } | null {
     const mid = Number(manager?._liveMarketPrice);
     const midAt = Number(manager?._liveMarketPriceAt);
     if (!Number.isFinite(mid) || mid <= 0) return null;

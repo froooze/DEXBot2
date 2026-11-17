@@ -35,7 +35,7 @@ const {
 const { ORDER_TYPES, ORDER_STATES } = require('../modules/constants');
 const { OrderManager } = require('../modules/order/manager');
 const { WorkingGrid } = require('../modules/order/working_grid');
-const { applyPersistedPendingCrawls } = require('../modules/order/utils/system');
+const { applyPersistedPendingCrawls, offMarketFill } = require('../modules/order/utils/system');
 const { loadGrid } = require('../modules/order/grid');
 const { buildGenesisFromPriceLevels, calculateGapSlots } = require('../modules/order/utils/math');
 
@@ -632,12 +632,38 @@ async function testPersistSkip_RestartReplaysCommitOnce() {
     console.log('✓ PEND-018 passed');
 }
 
+async function testPending_OffMarketFillsDoNotCrawl() {
+    console.log('\n[PEND-019] off-market sweep fills are not window evidence for the crawl...');
+    const mid = 0.001 + 95 * 0.000004;
+    const mgr = { config: CFG, _liveMarketPrice: mid, _liveMarketPriceAt: Date.now() };
+    const isCrawlEligible = (f: any) => !offMarketFill(mgr, String(f.type), Number(f.price));
+    // slot 95 is one step from the mid (eligible); slot 80 is ~16 steps away
+    // (a premium sweep of our own rail) and must not move the boundary.
+    const { boundaryIdx } = deriveTargetBoundary(
+        [buyFill(80), buyFill(95)],
+        96,
+        buildSlots(N_SLOTS),
+        CFG,
+        GAP,
+        null,
+        null,
+        null,
+        isCrawlEligible
+    );
+    assert.strictEqual(boundaryIdx, 95, `only the window fill may crawl 96 -> 95 (got ${boundaryIdx})`);
+    // Legacy callers without the predicate keep the previous behaviour.
+    const legacy = deriveTargetBoundary([buyFill(80), buyFill(95)], 96, buildSlots(N_SLOTS), CFG, GAP);
+    assert.strictEqual(legacy.boundaryIdx, 94, 'omitting the predicate keeps legacy crawl behaviour');
+    console.log('✓ PEND-019 passed');
+}
+
 async function main() {
     await testPending_IncorporatedIncrementally();
     await testPending_CurrentBatchDeduped();
     await testPending_AbsoluteAnchorSubsumes();
     await testPending_GenesisAnchorKeepsOwed();
     await testPending_ReserveEntriesSkipped();
+    await testPending_OffMarketFillsDoNotCrawl();
     await testConsume_AppliesOntoRestored();
     await testConsume_DropsOnNull();
     await testConsume_DropsOnEmptyStringBoundary();
