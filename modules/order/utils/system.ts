@@ -2039,6 +2039,54 @@ export function isLastFillGuardBlocked(price: number, type: unknown, lastPrice: 
     return { blocked: false, pivot: null, threshold: null };
 }
 
+/** Upper bound on distinct refused levels kept in memory (one sweep batch). */
+const MAX_REFUSED_FILL_LEVELS = 64;
+
+interface RefusedFillLevel { price: number; type: string; at: number }
+
+/**
+ * The refused-level marker set, read with the marker TTL at read time.
+ *
+ * A premium sweep lifts several adjacent rungs in one batch; keeping only the
+ * last refused price let the others be re-placed immediately (live 2026-11-18:
+ * five adjacent premium rungs refilled repeatedly in ~7 minutes). The set is
+ * the single owner of "which levels may not be re-placed on the same side" —
+ * COW placements, startup reconcile and spread correction all read it through
+ * isRefusedLevelRefillBlocked. Single-field managers (older stubs/direct test
+ * fixtures) fall back to the scalar marker. Expired entries are pruned on read
+ * AND before a write extends the set to the cap.
+ */
+function isFreshRefusedLevel(e: RefusedFillLevel | null | undefined, now: number, ttl: number): boolean {
+    return !!e && Number.isFinite(e.price) && e.price > 0
+        && (e.type === ORDER_TYPES.BUY || e.type === ORDER_TYPES.SELL)
+        && Number.isFinite(e.at) && e.at > 0 && ttl > 0 && (now - e.at) <= ttl;
+}
+
+function refusedFillLevels(manager: OrderManagerLike | null | undefined): RefusedFillLevel[] {
+    const ttl = Number(GRID_LIMITS.LAST_FILL_REFUSED_LEVEL_TTL_MS);
+    const now = Date.now();
+    const list = manager?._lastRefusedFillLevels;
+    if (Array.isArray(list) && list.length > 0) {
+        const out = list.filter((e) => isFreshRefusedLevel(e, now, ttl));
+        if (out.length !== list.length) {
+            list.length = 0;
+            list.push(...out);
+        }
+        return out;
+    }
+    const one: RefusedFillLevel = {
+        price: Number(manager?._lastRefusedFillPrice),
+        type: String(manager?._lastRefusedFillType ?? ''),
+        at: Number(manager?._lastRefusedFillAt)
+    };
+    return isFreshRefusedLevel(one, now, ttl) ? [one] : [];
+}
+
+/** Fill evidence for the COW spread-correction bypass gate: a refused fill is a fill. */
+export function hasLiveRefusedFillLevels(manager: OrderManagerLike | null | undefined): boolean {
+    return refusedFillLevels(manager).length > 0;
+}
+
 /**
  * REFUSED-LEVEL SAME-LEVEL RE-FILL BLOCK (§9.12/P2 amended, 2026-11-16).
  *
@@ -2051,33 +2099,33 @@ export function isLastFillGuardBlocked(price: number, type: unknown, lastPrice: 
  * the identical level and refill immediately, in a loop, for as long as a
  * taker kept lifting it.
  *
- * This predicate closes that gap with a SEPARATE, minimal role: the refused
- * fill's own level, same side only, within half a grid step (the same
- * pricesWithinHalfStep test isLastFillPlacementBlocked uses), for a short
- * in-memory TTL (GRID_LIMITS.LAST_FILL_REFUSED_LEVEL_TTL_MS). It vetoes exactly
- * one price level — the just-filled one — and nothing else: the counter-side
- * stays governed by the (older) direction pivot and spread correction can
- * still trade around the live market, so the unquoted-side deadlock P1 was
- * written against cannot re-open through it. Fail-open on anything unreadable.
+ * This predicate closes that gap with a minimal role: every level the current
+ * batch refused to arm, same side only, within half a grid step (the shared
+ * pricesWithinHalfStep test), for a short in-memory TTL
+ * (GRID_LIMITS.LAST_FILL_REFUSED_LEVEL_TTL_MS). Only levels that actually
+ * traded are vetoed — a contiguous sweep blocks its own rungs, not a band of
+ * prices the market never touched. The counter-side stays governed by the
+ * (older) direction pivot and spread correction can still trade around the
+ * live market, so the unquoted-side deadlock P1 was written against cannot
+ * re-open through it. Fail-open on anything unreadable.
  *
  * @param {Object} manager - OrderManager instance
  * @param {number} price - Candidate placement price
  * @param {string} type - ORDER_TYPES.BUY / ORDER_TYPES.SELL
- * @returns {{blocked: boolean, level: number|null}} Verdict + the refused level
+ * @returns {{blocked: boolean, level: number|null}} Verdict + the matched level
  */
 export function isRefusedLevelRefillBlocked(manager: OrderManagerLike | null | undefined, price: unknown, type: unknown): { blocked: boolean; level: number | null } {
     const p = Number(price);
-    const level = Number(manager?._lastRefusedFillPrice);
-    const at = Number(manager?._lastRefusedFillAt);
-    const refType = manager?._lastRefusedFillType;
-    if (!Number.isFinite(p) || !Number.isFinite(level) || level <= 0) return { blocked: false, level: null };
-    if (refType !== ORDER_TYPES.BUY && refType !== ORDER_TYPES.SELL) return { blocked: false, level: null };
-    if (type !== refType) return { blocked: false, level };
-    const ttl = Number(GRID_LIMITS.LAST_FILL_REFUSED_LEVEL_TTL_MS);
-    if (!(ttl > 0) || !Number.isFinite(at) || at <= 0 || (Date.now() - at) > ttl) return { blocked: false, level };
-    let sameLevel = false;
-    try { sameLevel = MathUtils.pricesWithinHalfStep(p, level, Number((manager?.config as { incrementPercent?: unknown } | undefined)?.incrementPercent)); } catch { sameLevel = p === level; }
-    return { blocked: sameLevel, level };
+    if (!Number.isFinite(p) || p <= 0) return { blocked: false, level: null };
+    if (type !== ORDER_TYPES.BUY && type !== ORDER_TYPES.SELL) return { blocked: false, level: null };
+    const inc = Number((manager?.config as { incrementPercent?: unknown } | undefined)?.incrementPercent);
+    for (const entry of refusedFillLevels(manager)) {
+        if (entry.type !== type) continue;
+        let sameLevel = false;
+        try { sameLevel = MathUtils.pricesWithinHalfStep(p, entry.price, inc); } catch { sameLevel = p === entry.price; }
+        if (sameLevel) return { blocked: true, level: entry.price };
+    }
+    return { blocked: false, level: null };
 }
 
 /**
@@ -2105,10 +2153,14 @@ export function evaluateLastFillGuard(manager: OrderManagerLike | null | undefin
         verdict = { blocked: false, pivot: check.pivot, bandExempt: true };
     } else verdict = check;
     if (!verdict.blocked) {
-        const refused = isRefusedLevelRefillBlocked(manager, price, type);
-        if (refused.blocked) {
-            return { blocked: true, pivot: refused.level, threshold: refused.level, refusedLevel: true };
-        }
+        // Fail open on anything unreadable, exactly as isLastFillPlacementBlocked
+        // does: a broken marker must never veto a healthy placement.
+        try {
+            const refused = isRefusedLevelRefillBlocked(manager, price, type);
+            if (refused.blocked) {
+                return { blocked: true, pivot: refused.level, threshold: refused.level, refusedLevel: true };
+            }
+        } catch { /* marker is best-effort */ }
     }
     return verdict;
 }
@@ -2849,9 +2901,36 @@ export function setLastFillPivot(manager: OrderManagerLike, type: string, price:
             // it (live 2026-11-16: 5 full fills at one premium level in 2.5
             // minutes). In-memory, TTL-bounded (LAST_FILL_REFUSED_LEVEL_TTL_MS).
             try {
+                const now = Date.now();
                 manager._lastRefusedFillPrice = p;
                 manager._lastRefusedFillType = type;
-                manager._lastRefusedFillAt = Date.now();
+                manager._lastRefusedFillAt = now;
+                // The set is the authoritative marker: a sweep refuses several
+                // rungs in one batch, and each must stay blocked for the TTL.
+                const levels = manager._lastRefusedFillLevels || (manager._lastRefusedFillLevels = []);
+                const ttl = Number(GRID_LIMITS.LAST_FILL_REFUSED_LEVEL_TTL_MS);
+                // Prune before dedup/cap so an expired rung never survives just
+                // because it sat at index 0, and eviction is TTL-ordered (oldest
+                // clock first) instead of insertion-ordered — a re-refused level
+                // gets a fresh `at` and must not be evicted ahead of staler ones.
+                const fresh = levels.filter((e) => isFreshRefusedLevel(e, now, ttl));
+                if (fresh.length !== levels.length) {
+                    levels.length = 0;
+                    levels.push(...fresh);
+                }
+                const inc = Number((manager?.config as { incrementPercent?: unknown } | undefined)?.incrementPercent);
+                let merged = false;
+                for (const entry of levels) {
+                    if (entry.type !== type) continue;
+                    let same = false;
+                    try { same = MathUtils.pricesWithinHalfStep(p, entry.price, inc); } catch { same = p === entry.price; }
+                    if (same) { entry.price = p; entry.at = now; merged = true; break; }
+                }
+                if (!merged) levels.push({ price: p, type, at: now });
+                if (levels.length > MAX_REFUSED_FILL_LEVELS) {
+                    levels.sort((a, b) => a.at - b.at);
+                    levels.splice(0, levels.length - MAX_REFUSED_FILL_LEVELS);
+                }
             } catch { /* marker is best-effort */ }
             const ttlMin = Math.round(Number(GRID_LIMITS.LAST_FILL_REFUSED_LEVEL_TTL_MS) / 60000);
             manager.logger?.log?.(
@@ -2914,6 +2993,7 @@ export function resetLastFillPivot(manager: OrderManagerLike, reason: string = '
     manager._lastRefusedFillPrice = null;
     manager._lastRefusedFillType = null;
     manager._lastRefusedFillAt = 0;
+    manager._lastRefusedFillLevels = [];
     if (wasArmed) {
         try {
             manager.logger?.log?.(`[LAST-FILL-GUARD] Pivot cleared (${reason}); guard re-arms on the next fill`, 'info');

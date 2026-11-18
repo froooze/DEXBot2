@@ -1178,13 +1178,17 @@ Amended policy (both sides of the audit line):
    marker; `evaluateLastFillGuard` (the shared verdict) and
    `isLastFillPlacementBlocked` refuse a same-side placement within half a grid step
    (`pricesWithinHalfStep`) of the marked level, surfaced as `refusedLevel` /
-   reason `refused-level` at every skip site. It vetoes exactly one level and nothing
-   else — the counter-side stays governed by the older direction pivot and spread
-   correction keeps trading around the live market, so the unquoted-side deadlock P1
-   was written against cannot re-open through it. Deliberately NOT a cooldown or
-   backoff on the correction loop (R4/§9.10/P4 "observability instead of a veto";
-   §9.12/P5 owns stale-level retries; a hard pause would have left the sell side
-   unquoted mid-sweep — the marked slot was the only placeable one at the time).
+   reason `refused-level` at every skip site. It vetoes only the levels that actually
+   traded and nothing else — the counter-side stays governed by the older direction
+   pivot and spread correction keeps trading around the live market, so the
+   unquoted-side deadlock P1 was written against cannot re-open through it.
+   Deliberately NOT a cooldown or backoff on the correction loop (R4/§9.10/P4
+   "observability instead of a veto"; §9.12/P5 owns stale-level retries; a hard pause
+   would have left the sell side unquoted mid-sweep — the marked slot was the only
+   placeable one at the time). The marker is the single writer/owner of this rule:
+   COW placements, startup reconcile and spread correction all read it through the
+   same two predicates, so no path carries a second answer to "may this level be
+   re-placed?".
 2. Checker (`analysis/grid_correction_check.ts`): same-level transitions (same
    direction, different orders) are detected with the runtime's OWN
    `pricesWithinHalfStep` and become strict candidates. In policy-aware mode a
@@ -1197,6 +1201,60 @@ Pinned by `tests/test_refused_level_refill_block.ts` (REFUSED-1..9) and
 `tests/test_same_level_refill_check.ts` (SL-1..10). With the amendment applied, the
 2026-11-16 audit baseline reads: 10 strict candidates = 4 same-level violations (the
 loop) + 6 policy divergences (the sweep re-quotes, unchanged).
+
+**Addendum 3 (2026-11-18, multi-rung sweeps): the refused-level marker is a set,
+not a scalar.** On a live market-pair bot an external taker swept several adjacent
+premium SELL rungs in one batch while the market stayed six-to-eleven ladder steps
+below. Every fill was correctly refused from arming the pivot (§9.12/P1), but the
+Addendum-2 marker kept only the LAST refused price, so the other just-filled rungs
+were re-placed at the identical level and lifted again — one fill producing another
+sell at the same price instead of one counter order. This is the same P1×P2 gap as
+Addendum 2, scaled from one slot to a whole sweep.
+
+Amended policy (still one owner, still no cooldown):
+
+- The marker (`modules/order/utils/system.ts`) now holds one entry per distinct
+  refused level: side, execution price and its own timestamp, deduplicated with the
+  runtime's `pricesWithinHalfStep`, pruned by the same 30-minute TTL at read time
+  and before a write grows the set, evicted by oldest clock when the bound is hit,
+  in-memory only and cleared with the grid by `resetLastFillPivot`.
+  `evaluateLastFillGuard` and `isLastFillPlacementBlocked` match against every entry,
+  so COW, startup reconcile and spread correction all enforce the same block without
+  a second predicate or a second fill-batch code path. Both spread-correction legs
+  had to stop skipping that owner on a cold pivot: the planner's
+  `lastFillPivot == null` short-circuit is gone (the placement predicate already
+  answers a cold pivot correctly), and the COW correction bypass is denied while a
+  refused-level marker is live — a refused fill is fill evidence, and the bypass
+  would otherwise skip the only guard that reads the marker. This is the incident's
+  own shape: no accepted fill in the window means no persisted reference and a cold
+  direction pivot, so the marker is the only protection.
+- **Reporting is not escalation.** With a cold pivot the planner's exclusion report
+  still names the refused marker (`lastFillRuleText` fallback), but the stall hint
+  deliberately stays `no-candidates` instead of `last-fill-blocked`. The maintenance
+  re-center dedupes on `geometryPivotKey` from `resolveLastFillGuardReference`,
+  which is `''` on a cold pivot, so `geometryAlreadyRecentered` could never become
+  true and the bot would re-center every cycle. Anyone completing that branch must
+  fix the dedupe key first; this addendum does not.
+- Only levels that actually traded are vetoed. There is no band, no backoff and no
+  frozen side: the next rung up and the whole counter side remain placeable, so one
+  fill still yields one counter order — just not at a price the taker already took.
+- Deliberately NOT a pre-broadcast action filter. Dropping a CREATE at that gate
+  leaves the plan's working-grid projection in place (`projectTargetToWorkingGrid`),
+  so master commits a sized VIRTUAL slot with no chain order and the next plan emits
+  the CREATE again — a one-cycle deferral, not a fix. The existing guard owner is the
+  durable place for the rule.
+- **Known limit (inherited, not introduced here):** the marker stays in-memory. A
+  restart during an active sweep loses it — the persisted pivot and last-market-fill
+  rows deliberately exclude off-market fills (§9.12/P1, `66667052`) and the book seed
+  leaves the guard cold — so startup reconcile can re-quote the swept levels until a
+  new fill re-marks them or the market moves. Persisting the marker would add a
+  second writer and a new persisted row against `FILL_PIPELINE.md §2.3` and the
+  "no new state" constraint, so it is deliberately out of scope here.
+
+Pinned by `tests/test_fill_one_counter_order.ts` (MULTI-1..14, covering the
+multi-rung sweep, multi-chunk accumulation, TTL-ordered eviction and both
+spread-correction gates) alongside `tests/test_refused_level_refill_block.ts`
+(REFUSED-1..9).
 
 ---
 
@@ -1255,10 +1313,12 @@ one re-center and the bounded pivot expiry (§9.6) if the book cannot heal.
 
 **Deliberately not done.** (1) No §9.12/P2 exemption for a BUY pivot: the doc keeps
 “the BUY mirror blocked”; selling below the last BUY is below cost and §9.7 calls a lower
-SELL below the last fill a geometry fault. (2) No change to the refused-level marker:
+SELL below the last fill a geometry fault. (2) No change to the refused-level marker in that pass:
 §9.12 addendum 2 explicitly rejects a cooldown/backoff, and the marker held a deeper
-level here, so it did not block the two placements. (3) No crossing veto: §9.10/P4 and
-§9.2 — a hard reject re-opens the counter-order deadlock. (4) No config/sizing/24h-TTL
+level here, so it did not block the two placements. The multi-rung capacity was added
+later by §9.12 Addendum 3 (a set of actually-traded levels, still not a cooldown).
+(3) No crossing veto: §9.10/P4 and §9.2 — a hard reject re-opens the counter-order
+deadlock. (4) No config/sizing/24h-TTL
 change and no new timing window.
 
 **C3 — gone-target routing (`bad3cc30`).** The two pre-broadcast absence checks had

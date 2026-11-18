@@ -63,6 +63,7 @@ function makeManager(over: Record<string, unknown> = {}) {
         _lastRefusedFillPrice: null as number | null,
         _lastRefusedFillType: null as string | null,
         _lastRefusedFillAt: 0,
+        _lastRefusedFillLevels: [] as Array<{ price: number; type: string; at: number }>,
         _liveMarketPrice: null as number | null,
         _liveMarketPriceAt: null as number | null,
         config: { incrementPercent: 0.5 },
@@ -144,7 +145,7 @@ run('REFUSED-6 the marker expires after LAST_FILL_REFUSED_LEVEL_TTL_MS', () => {
     assert.ok(ttl > 0 && ttl < Number(GRID_LIMITS.LAST_FILL_PIVOT_TTL_MS), 'the marker TTL must be positive and shorter than the pivot TTL');
     const mgr: any = makeManager({ _lastFilledPrice: 900, _lastFilledType: ORDER_TYPES.BUY, _lastFilledAt: NOW_MS - 60_000, _lastFilledBuyPrice: 900, lastFillPivotSource: 'fill' });
     refuseSweepSell(mgr);
-    mgr._lastRefusedFillAt = Date.now() - ttl - 1000;
+    for (const entry of mgr._lastRefusedFillLevels) entry.at = Date.now() - ttl - 1000;
     const check = evaluateLastFillGuard(mgr, SWEEP_SELL, ORDER_TYPES.SELL, 900, ORDER_TYPES.BUY);
     assert.strictEqual(check.blocked, false, 'an expired marker must not veto');
 });
@@ -178,6 +179,7 @@ run('REFUSED-9 resetLastFillPivot clears the marker', () => {
     assert.strictEqual(mgr._lastRefusedFillPrice, null);
     assert.strictEqual(mgr._lastRefusedFillType, null);
     assert.strictEqual(mgr._lastRefusedFillAt, 0);
+    assert.strictEqual(mgr._lastRefusedFillLevels.length, 0, 'the whole marker set must be cleared');
     const check = evaluateLastFillGuard(mgr, SWEEP_SELL, ORDER_TYPES.SELL, null, null);
     assert.strictEqual(check.blocked, false, 'after the reset the placement must pass again');
 });

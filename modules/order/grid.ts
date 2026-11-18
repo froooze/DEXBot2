@@ -567,7 +567,7 @@ import {
     getOrderTypeFromUpdatedFlags
 } from './utils/order.js';
 import { parseSlotIndex } from './utils/slot.js';
-import { loadAmaCenterPrice, loadAmaCenterSnapshot, withBlockchainRetry, restoreLastFillPivot, resetLastFillPivot, rearmLastFillPivotFromMarketFill, reanchorBoundaryFromLastFill, evaluateSpreadCorrectionReadiness, maybeRefreshLiveMarketPrice, resolveLastFillGuardReference, isLastFillPlacementBlocked } from './utils/system.js';
+import { loadAmaCenterPrice, loadAmaCenterSnapshot, withBlockchainRetry, restoreLastFillPivot, resetLastFillPivot, rearmLastFillPivotFromMarketFill, reanchorBoundaryFromLastFill, evaluateSpreadCorrectionReadiness, maybeRefreshLiveMarketPrice, resolveLastFillGuardReference, isLastFillPlacementBlocked, hasLiveRefusedFillLevels } from './utils/system.js';
 import * as MathUtils from './utils/math.js';
 import { derivePriceWithPoolRef, resolveStartPriceMode } from './utils/withPoolRef.js';
 import { getWhitelistFlags } from '../market_adapter_whitelist.js';
@@ -3986,9 +3986,10 @@ export function determineOrderSideByFunds(manager: OrderManagerLike, currentMark
         const lastFillPivot = lastFillRef.price != null && Number.isFinite(Number(lastFillRef.price))
             ? Number(lastFillRef.price)
             : null;
-        const lastFillSide = lastFillRef.type;
         const lastFillBlocks = (c: ManagedOrder): boolean => {
-            if (lastFillPivot == null || lastFillSide == null) return false;
+            // No cold-pivot short-circuit: isLastFillPlacementBlocked answers a
+            // cold pivot correctly and still reads the refused-level set (a
+            // premium sweep never arms the pivot — that is the marker's case).
             if (c?.price == null || !Number.isFinite(Number(c.price))) return false;
             // Judge candidates with the SAME predicate the placement guards use
             // (direction rule + same grid level). The raw-pivot direction check
@@ -4019,8 +4020,13 @@ export function determineOrderSideByFunds(manager: OrderManagerLike, currentMark
             lastFillExcluded++;
             return false;
         };
+        // A refused premium sweep never arms the pivot, so lastFillExcluded can
+        // be > 0 on a COLD pivot. Name that reason in the report instead of
+        // emitting "Excluded 3 candidates: " with an empty rule.
+        let hasRefusedLevels = false;
+        try { hasRefusedLevels = hasLiveRefusedFillLevels(manager); } catch { /* best-effort */ }
         const lastFillRuleText = lastFillPivot == null
-            ? ''
+            ? (hasRefusedLevels ? `${String(railType).toUpperCase()} at a just-filled (refused) level` : '')
             : `${railType === ORDER_TYPES.BUY ? 'BUY must be below' : 'SELL must be above'} the last fill ${Format.formatPrice6(lastFillPivot)}`;
         const configuredMissingSlots = Number(outOfSpread || 0);
         const missingSlots = configuredMissingSlots > 0
@@ -4441,10 +4447,15 @@ export function determineOrderSideByFunds(manager: OrderManagerLike, currentMark
         }
 
         if (spreadCandidates.length === 0) {
+            // Keep the armed-pivot wording byte-identical (pinned by SLF-1/3);
+            // only a cold pivot with a live refused-level marker uses the new
+            // explanation, where there is no price to name.
+            const noPlaceableReason = lastFillPivot != null
+                ? `every tightening slot is at/through the last fill ${Format.formatPrice6(lastFillPivot)} (${lastFillRuleText})`
+                : `every tightening slot on the ${sideName} side is a just-filled (refused) level`;
             manager.logger?.log?.(
-                lastFillExcluded > 0 && lastFillPivot != null
-                    ? `[SPREAD-CORRECTION] No placeable ${sideName} slot: every tightening slot is at/through the last fill ` +
-                      `${Format.formatPrice6(lastFillPivot)} (${lastFillRuleText}). The spread cannot be tightened on this ` +
+                lastFillExcluded > 0
+                    ? `[SPREAD-CORRECTION] No placeable ${sideName} slot: ${noPlaceableReason}. The spread cannot be tightened on this ` +
                       `side; a boundary move or a fill must restore headroom.`
                     : bestLiveOnRail == null
                         ? `[SPREAD-CORRECTION] No orphaned virtual slots or spread slots found. Skipping.`
@@ -4454,6 +4465,13 @@ export function determineOrderSideByFunds(manager: OrderManagerLike, currentMark
             // Name the geometry bind: the window itself is wrong (a sell slot
             // below the last sale means the boundary/crawl is behind the fill),
             // so placement cannot repair the side and a re-center can.
+            // DELIBERATELY narrow to an ARMED pivot: a refused sweep leaves the
+            // pivot cold, and the maintenance re-center dedupes on
+            // geometryPivotKey built from resolveLastFillGuardReference — ''
+            // on a cold pivot. Reporting 'last-fill-blocked' here would make
+            // geometryAlreadyRecentered never true and re-center EVERY cycle.
+            // The empty report above still names the refused-level reason; the
+            // stall stays 'no-candidates' until that dedupe key is fixed too.
             const emptyStall: SpreadCorrectionStall = (lastFillExcluded > 0 && lastFillPivot != null)
                 ? 'last-fill-blocked'
                 : refusalStallHint;

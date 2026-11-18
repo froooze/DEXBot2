@@ -48,7 +48,7 @@ const NAMES = {
         'resolveLastFillGuardReference', 'isLastFillGuardBlocked', 'evaluateLastFillGuard',
         'maybeRefreshLiveMarketPrice', 'refreshLiveMarketPrice',
         'resolveSpreadFreshnessMs', 'resolveSpreadCrossingFloor',
-        'setLastFillPivot', 'normalizeLastFillPivot',
+        'setLastFillPivot', 'normalizeLastFillPivot', 'hasLiveRefusedFillLevels',
         'rearmLastFillPivotFromMarketFill', 'reanchorBoundaryFromLastFill',
         'expireLastFillGuardReferences',
         'fireStructuralResync',

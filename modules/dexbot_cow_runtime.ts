@@ -15,7 +15,7 @@ import { BroadcastUncertainError as BroadcastUncertainErrorBinding } from './dex
 const BroadcastUncertainError = BroadcastUncertainErrorBinding;
 import * as orderUtils from './order/utils/order.js';
 import { lazyShim } from './lazy_shim.js';
-import { sleep, setLastFillPivot, fireStructuralResync, evaluateSpreadCorrectionReadiness, resolveLastFillGuardReference, resolveSpreadCrossingFloor, isLastFillGuardBlocked, evaluateLastFillGuard, extractGoneOrderIds, extractUpdateTargetOrderIds } from './order/utils/system.js';
+import { sleep, setLastFillPivot, fireStructuralResync, evaluateSpreadCorrectionReadiness, resolveLastFillGuardReference, resolveSpreadCrossingFloor, isLastFillGuardBlocked, evaluateLastFillGuard, extractGoneOrderIds, extractUpdateTargetOrderIds, hasLiveRefusedFillLevels } from './order/utils/system.js';
 const {
     buildCreateOrderArgs,
     buildCreateOpFingerprint,
@@ -2384,7 +2384,10 @@ function collectGapBandPlacementShadowSlots(actions: CowAction[] | null | undefi
  * proxy-case valve, not a licence to trade through the last real fill.
  *
  * Denied too when the snapshot is stale or has known-unmatched chain orders
- * (a stale edge can hide the real window edge), fail-closed on a gate throw.
+ * (a stale edge can hide the real window edge), and while a refused-level
+ * marker is live: a premium sweep that was refused from arming is still fill
+ * evidence, and the bypass would skip the only guard that reads its levels.
+ * Fail-closed on a gate throw.
  *
  * Exported for tests.
  * @param {Object} bot
@@ -2398,11 +2401,14 @@ function isSpreadCorrectionBypassAllowed(bot: BotLike): boolean {
     // reference exists. The LAST-FILL-GUARD is fill-based, so a live market
     // price (which only strengthens the planner's crossing floor) must not
     // change this decision. A real fill denies it; a stale or known-unmatched
-    // snapshot denies it too (the guard applies instead). Fail-closed (deny
-    // bypass) if the gate throws — never less safe than applying the guard.
+    // snapshot denies it too (the guard applies instead). A REFUSED fill is
+    // still fill evidence: while a refused-level marker is live the bypass
+    // would skip the only guard that reads it, so deny it and let the guard
+    // block just those levels. Fail-closed (deny bypass) if the gate throws.
     try {
         const readiness = evaluateSpreadCorrectionReadiness(mgr);
-        return readiness.snapshotTrusted && readiness.fillMarketRef == null;
+        return readiness.snapshotTrusted && readiness.fillMarketRef == null
+            && !hasLiveRefusedFillLevels(mgr);
     } catch {
         return false;
     }

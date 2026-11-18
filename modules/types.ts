@@ -1188,11 +1188,20 @@ export interface OrderManagerLike {
   /**
    * Refused (off-market) fill level: a fill the pivot-arming policy refused
    * (§9.12/P1) still marks its own level as a same-level re-fill block for a
-   * short TTL (§9.12/P2 amended). In-memory only — never persisted.
+   * short TTL (§9.12/P2 amended). In-memory only — never persisted. LEGACY
+   * mirror of the most recent refusal: production reads _lastRefusedFillLevels
+   * below; these scalar fields remain for observability and single-field stubs.
    */
   _lastRefusedFillPrice?: number | null;
   _lastRefusedFillType?: string | null;
   _lastRefusedFillAt?: number | null;
+  /**
+   * Every level refused from arming in the current batch. A premium sweep can
+   * lift several adjacent rungs at once; the last-refused scalar above is just
+   * the most recent one, so this set is what the same-level guard actually
+   * reads. Same TTL and in-memory-only lifetime as the scalar.
+   */
+  _lastRefusedFillLevels?: Array<{ price: number; type: string; at: number }> | null;
   // Externally-observed live market price (B/A) and its read/attempt clocks.
   _liveMarketPrice?: number | null;
   _liveMarketPriceAt?: number | null;
