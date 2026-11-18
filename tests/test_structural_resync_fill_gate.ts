@@ -114,6 +114,44 @@ async function testQueuedFillDefersReload() {
 }
 
 // ---------------------------------------------------------------------------
+// 1b. An active placement region defers the reload too
+// ---------------------------------------------------------------------------
+async function testPlacementRegionDefersReload() {
+    console.log('\n[1b] an active placement region defers the snapshot reload');
+    const { bot, calls } = makeBot('test_structural_resync_placement_gate');
+    let held = true;
+    (bot.manager as any).isPlacementActive = () => held;
+    (bot.manager as any).placementKind = () => 'spread-correction';
+    bot._wireStructuralGridResyncRequest();
+
+    await bot.manager.requestStructuralGridResync('fund invariant drift', {});
+    await sleep(600);
+    check('no reload while a placement region is held', calls, []);
+    check('placement defer is counted', bot._structuralGridResyncDeferCount > 1, true);
+
+    held = false;
+    await waitFor(() => calls.length >= 1, 'deferred resync to run after the region ends');
+    check('reload ran once after region end', calls, ['reload']);
+}
+
+// ---------------------------------------------------------------------------
+// 1c. The reload gate honours the same four deferrals as the snapshot gate
+// ---------------------------------------------------------------------------
+async function testOtherInFlightFlagsDeferReload() {
+    console.log('\n[1c] recovery-sync and deferred-rebalance flags defer the reload too');
+    for (const flag of ['recovery', 'rebalance'] as const) {
+        const { bot, calls } = makeBot(`test_structural_resync_${flag}_gate`);
+        if (flag === 'recovery') bot._recoverySyncInFlight = 1;
+        else (bot.manager as any)._deferredRebalanceAt = Date.now();
+        bot._wireStructuralGridResyncRequest();
+        await bot.manager.requestStructuralGridResync('fund invariant drift', {});
+        await sleep(450);
+        check(`no reload while ${flag} is pending`, calls, []);
+        if (bot._structuralGridResyncTimer) clearTimeout(bot._structuralGridResyncTimer);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 2. A deferred fill drain (the reload-between-two-fills case) defers as well
 // ---------------------------------------------------------------------------
 async function testDeferredDrainDefersReload() {
@@ -137,6 +175,8 @@ async function testDeferredDrainDefersReload() {
 async function run() {
     console.log('Running structural-resync fill-gate tests...');
     await testQueuedFillDefersReload();
+    await testPlacementRegionDefersReload();
+    await testOtherInFlightFlagsDeferReload();
     await testDeferredDrainDefersReload();
 
     if (failures > 0) {

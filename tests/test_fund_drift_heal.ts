@@ -26,6 +26,7 @@ const AccountingModule = require('../modules/order/accounting');
 const Accountant = AccountingModule.default;
 const fundRegistry = require('../modules/fund_registry');
 const { createSilentLogger } = require('./helpers/silent_logger');
+const { FILL_PROCESSING } = require('../modules/constants');
 
 const now = Date.now();
 // Unique (per-run) account names keep the fund-registry fixture hermetic — no
@@ -306,6 +307,51 @@ async function testLEDGER080_AccumulatesSameSideDirection() {
     console.log('✓ LEDGER-080 passed');
 }
 
+async function testINV100_UnreadablePipelineDefersThenEscalates() {
+    console.log('\n[INV-100] an unreadable manager-scoped pipeline field defers, then escalates...');
+    const limit: number = Number(FILL_PROCESSING.GRID_BLOCKED_ESCALATE_CYCLES) || 12;
+    const args: [number, number, number, number, number, number] = [300000, 414.84, 3100, 74.1, 303100, 563.3516];
+    // _verifyFundInvariants is called with the MANAGER (accounting.ts:550), so
+    // readFillPipelineState sees only manager-scoped fields. Malforming the
+    // bot-scoped _incomingFillQueue here would exercise a shape this call site
+    // cannot produce. Both reachable triggers are covered.
+    for (const bad of [
+        { name: '_pendingFillCrawls (non-array)', field: '_pendingFillCrawls', value: 'broken' },
+        { name: '_fillBatchInFlight (non-numeric)', field: '_fillBatchInFlight', value: 'broken' },
+    ]) {
+        const logs: Array<{ msg: string; level?: string }> = [];
+        const mgr: any = {
+            assets: { assetA: { precision: 4 }, assetB: { precision: 4 } },
+            accountTotals: { sell: 563.3516, sellFree: 414.84, buy: 303100, buyFree: 300000 },
+            config: { gridLimits: { FUND_INVARIANT_PERCENT_TOLERANCE: 0.1 } },
+            _pendingFillCrawls: [],
+            _fillBatchInFlight: 0,
+            _orphanFillsCreditedAt: null,
+            _fundDriftLedger: null,
+            logger: { level: 'debug', log: (msg: string, level?: string) => logs.push({ msg: String(msg), level }) },
+        };
+        mgr[bad.field] = bad.value;
+        const accountant = new Accountant(mgr);
+        accountant._attemptFundRecovery = async () => false;
+
+        for (let cycle = 1; cycle < limit; cycle++) {
+            await accountant._verifyFundInvariants(mgr, ...args);
+            assert.strictEqual(mgr._fundDriftLedger, null, `${bad.name}: cycle ${cycle} must still defer`);
+        }
+        assert.strictEqual(mgr._fundInvariantUnreadableCycles, limit - 1, `${bad.name}: each unreadable cycle is counted`);
+        await accountant._verifyFundInvariants(mgr, ...args);
+        assert(logs.some((l) => l.msg.includes(`Fill pipeline unreadable for ${limit} cycles`) && l.level === 'error'),
+            `${bad.name}: the escalation is observable at error level`);
+        assert(mgr._fundDriftLedger, `${bad.name}: the forced check must run the CRITICAL guard`);
+
+        // A readable pipeline resets the counter, so healthy cycles cannot accumulate.
+        mgr[bad.field] = bad.field === '_pendingFillCrawls' ? [] : 0;
+        await accountant._verifyFundInvariants(mgr, ...args);
+        assert.strictEqual(mgr._fundInvariantUnreadableCycles, 0, `${bad.name}: readable state clears the streak`);
+    }
+    console.log('✓ INV-100 passed');
+}
+
 async function testLEDGER090_BothSidesAndFlipReset() {
     console.log('\n[LEDGER-090] Two-sided drift and direction flips reset the ledger...');
     const mgr: any = {
@@ -353,6 +399,7 @@ async function runAllTests() {
     await testLEDGER070_BuildsOnFirstViolation();
     await testLEDGER080_AccumulatesSameSideDirection();
     await testLEDGER090_BothSidesAndFlipReset();
+    await testINV100_UnreadablePipelineDefersThenEscalates();
     console.log('\n=== All fund-drift heal tests passed! ===');
 }
 

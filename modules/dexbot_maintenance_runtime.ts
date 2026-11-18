@@ -9,8 +9,9 @@ import { lazyShim } from './lazy_shim.js';
 
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
-import { nowIso, fireStructuralResync, resolveLastFillGuardReference, hasUnsettledFills, resolveGridUpdateBlockers, noteGridUpdateBlockers, expireLastFillGuardReferences } from './order/utils/system.js';
+import { nowIso, fireStructuralResync, resolveLastFillGuardReference, hasUnsettledFills, resolveGridUpdateBlockers, noteGridUpdateBlockers, expireLastFillGuardReferences, readBotInFlightFlags } from './order/utils/system.js';
 import { withPlacement } from './order/placement_lock.js';
+import { resolveTradedSide } from './order/fill_ledger.js';
 import { path } from './path_api.js';
 import * as chainOrders from './chain_orders.js';
 import * as grid from './order/grid.js';
@@ -765,10 +766,15 @@ function getTargetedSyncReason(bot: BotLike) {
         const required = resolveEdgeCount(bot.config, side);
         if (!(required > 0)) continue;
         const liveEdges = countLiveEdgeOrders(bot.manager, bot.config, type);
-        if (liveEdges !== null && liveEdges < required) {
-            if (_hasBudgetForSide(bot.manager, bot.config, side)) {
-                shortfalls.push(`${side} edges ${liveEdges}/${required}`);
-            }
+        // countLiveEdgeOrders returns null when it cannot read the full master
+        // grid. Treating that as "no shortfall" is fail-OPEN: the one case the
+        // edge check exists for (an otherwise full window with a missing edge
+        // order) would never trigger a reconcile. Unknown => ask for the
+        // reconcile (bounded by its cooldown), never silently skip.
+        if ((liveEdges === null || liveEdges < required) && _hasBudgetForSide(bot.manager, bot.config, side)) {
+            shortfalls.push(liveEdges === null
+                ? `${side} edges unknown/${required}`
+                : `${side} edges ${liveEdges}/${required}`);
         }
     }
 
@@ -2684,18 +2690,35 @@ async function executeMaintenanceLogic(bot: BotLike, context: string) {
     // with batch broadcasts — transient mismatches are expected during a COW cycle.
     // Also skip while a structural recovery reload is in flight (it runs without
     // the fill lock, so this check must gate on the recovery flag explicitly).
-    // Liveness count from the single authority; a test double that does not
-    // model it falls back to the raw map size (a COUNT only — never a second
-    // TTL policy), so a partial mock cannot make the gate throw.
+    // Liveness count from the single authority. If it cannot be read the count
+    // is UNKNOWN, not zero: falling back to raw `_pendingBroadcasts.size` would
+    // impose a second liveness policy (no TTL/GC) and could open the gate on a
+    // live broadcast. Unknown defers this lightweight sync to a later tick —
+    // the fail-closed direction (INV-FILL-003, INV-BROADCAST-005).
     let pendingBroadcastCount = 0;
+    let pendingBroadcastKnown = true;
     try {
         pendingBroadcastCount = Number(getLivePendingBroadcasts(bot.manager)?.length) || 0;
-    } catch {
-        pendingBroadcastCount = Number(bot.manager?._pendingBroadcasts?.size) || 0;
+        // A later, different break deserves its own warning: the latch records
+        // an ACTIVE outage, not a permanent "this was once broken" fact.
+        bot._lightweightSyncLivenessWarned = false;
+    } catch (err) {
+        pendingBroadcastKnown = false;
+        // A lazyShim export failure throws on EVERY tick. The gate must stay
+        // shut (unknown != zero), but an unbounded silent deferral hides a
+        // broken module: report it once and keep the fail-closed behaviour.
+        if (bot._lightweightSyncLivenessWarned !== true) {
+            bot._lightweightSyncLivenessWarned = true;
+            bot._warn?.(
+                `[SYNC] Lightweight sync deferred: pending-broadcast liveness is unreadable ` +
+                `(${getErrorMessage(err)}); the gate stays closed until it can be read`
+            );
+        }
     }
     if (
         !bot._recoverySyncInFlight &&
         !bot._batchInFlight &&
+        pendingBroadcastKnown &&
         pendingBroadcastCount === 0 &&
         (bot._lightweightSyncCheckAt == null || Date.now() - bot._lightweightSyncCheckAt >= TIMING.LIGHTWEIGHT_SYNC_CHECK_INTERVAL_MS)
     ) {
@@ -3159,8 +3182,11 @@ export function trackOutOfSpreadStaleness(bot: BotLike, spreadChecked: boolean, 
             ? Number(TIMING.SPREAD_STALE_TRANSIENT_GRACE)
             : 3;
         if (transientCount <= grace) {
-            bot._outOfSpreadSince = now;
-            bot._outOfSpreadStaleWarned = false;
+            // A refused correction is NOT progress: keep the original clock so
+            // the warn/escalate windows still measure how long the book has
+            // actually been broken (the 5a703297 "a heal is zero excess" rule).
+            // The grace still bounds the deferral — it must not restart the
+            // watchdog itself.
             bot._log(
                 `[SPREAD-STALE] Transient spread-correction refusal ${transientCount}/${grace} ` +
                 `(outOfSpread=${outOfSpread}); retrying before any structural re-center`,
@@ -3618,9 +3644,23 @@ async function acquireBts(bot: BotLike, deficit: number) {
     }, { timeoutMs: 10000, isShuttingDown: () => bot._shuttingDown === true });
     if (swapOk !== true) return;
 
-    const orderType = (best.asset.id === bot.assets?.assetA?.id) ? 'sell' : 'buy';
-    if (bot.manager.accountant) {
+    // One pays-asset side rule (INV-FILL-002): selling the base asset is a
+    // SELL, selling the quote asset is a BUY. Unknown/unrecognised asset now
+    // yields null rather than being guessed as a BUY.
+    const orderType = resolveTradedSide(best.asset.id, {
+        assetA: { id: bot.assets?.assetA?.id },
+        assetB: { id: bot.assets?.assetB?.id },
+    });
+    if (orderType && bot.manager.accountant) {
         await bot.manager.accountant.adjustTotalBalance(orderType, -best.sellAmount, 'bts-acquisition-swap-sell');
+    } else if (!orderType) {
+        // Skipping is safer than guessing a bucket, but the local total is now
+        // overstated for a swap that DID broadcast. Make that observable rather
+        // than silently drifting until the next chain-truth refresh.
+        bot._warn?.(
+            `[BTS-ACQ] Balance adjustment skipped: asset ${best.asset.id} is neither configured side; ` +
+            `chain-truth refresh must reconcile the swap`
+        );
     }
     // Do NOT optimistically bump btsBalance.free/total here. expectedReceive is
     // a pre-swap estimate and may diverge from the actual fill (slippage, fees,
@@ -3804,9 +3844,29 @@ function wireStructuralGridResyncRequest(bot: BotLike) {
             // snapshot-reject gate uses: only a settled fill pipeline makes the
             // on-disk snapshot a safe base.
             const fillPipeline = hasUnsettledFills(bot);
-            const deferCause = bot._batchInFlight > 0
-                ? `_batchInFlight=${bot._batchInFlight}`
-                : (fillPipeline.unsettled ? `fill pipeline not settled: ${fillPipeline.reason}` : null);
+            // A placement region is as dirty an in-memory master as an
+            // unsettled fill: the holder is building ops from the CURRENT grid
+            // and a snapshot reload swaps that master out from under it (the
+            // plan-from-master-X / commit-on-master-Y class). The destructive
+            // snapshot-reject gate already asks isPlacementActive(); this gate
+            // must ask the same question before reloading (§9.6 "uncertainty
+            // defers, it does not rebuild"). The 0-ms retry after region end
+            // re-derives from the freshly reloaded grid.
+            const inFlight = readBotInFlightFlags(bot);
+            const placementKind = bot.manager?.isPlacementActive?.() === true
+                ? (bot.manager?.placementKind?.() || 'unknown')
+                : null;
+            // Same four deferrals as the snapshot-reject gate (batch, recovery,
+            // deferred rebalance, pipeline) plus the placement region: the
+            // max-defer cap bounds all of them, so this symmetry cannot park
+            // a resync forever.
+            const deferCause = !inFlight.ok
+                ? 'pipeline activity unreadable'
+                : (inFlight.batchInFlight ? `batch in flight`
+                    : (inFlight.recoveryInFlight ? 'recovery sync in flight'
+                        : (inFlight.deferredRebalance ? 'deferred rebalance pending'
+                            : (fillPipeline.unsettled ? `fill pipeline not settled: ${fillPipeline.reason}`
+                                : (placementKind ? `placement region held by ${placementKind}` : null)))));
             if (deferCause) {
                 const now = Date.now();
                 if (!bot._structuralGridResyncDeferStartedAt) {

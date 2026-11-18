@@ -110,6 +110,37 @@ async function testP0d_GenesisAnchorRecoversHonestBoundary() {
     console.log('✓ ANCHOR-004 passed');
 }
 
+async function testP0f_NullBoundaryAnchorUsesEligibleFillsOnly() {
+    console.log('\n[ANCHOR-010] null-boundary fill anchor ignores fills the guard refused...');
+    // Tier-1 recovery used to take its extremum from RAW fills ("eligible or
+    // dust"), so a premium sweep / wrong-side fill the pivot writer refused
+    // could position the absolute boundary through this early return, which
+    // bypasses the filtered crawl loop. The injected single-source predicate
+    // must gate the anchor too; omitting it keeps legacy callers unchanged.
+    const slots = buildSlots(N_SLOTS);
+    const eligible = 0.0015;
+    const hijack = 0.0011;
+    const fills = [
+        { id: 'slot-125', type: ORDER_TYPES.SELL, price: eligible },
+        { id: 'slot-25', type: ORDER_TYPES.SELL, price: hijack },
+    ];
+    const isEligible = (f: any) => Number(f?.price) > 0.0013;
+
+    const { boundaryIdx: honest } = deriveTargetBoundary(
+        fills, null, slots, POOL_CFG, GAP, null, null, null, isEligible
+    );
+    const { boundaryIdx: legacy } = deriveTargetBoundary(
+        fills, null, slots, POOL_CFG, GAP
+    );
+
+    assert.strictEqual(honest, calculateIdealBoundary(slots, eligible, GAP),
+        'the anchor must use the fill the guard would have armed');
+    assert.strictEqual(legacy, calculateIdealBoundary(slots, hijack, GAP),
+        'without the predicate the legacy extremum is unchanged');
+    assert.notStrictEqual(honest, legacy, 'the rejected fill must not be able to move the anchor');
+    console.log('  ✓ fill-anchor recovery consumes only eligible fills');
+}
+
 async function testP0e_KnownBoundaryCrawlUnchanged() {
     console.log('\n[ANCHOR-005] known-boundary fill crawl unchanged (no anchor needed)...');
     const { boundaryIdx } = deriveTargetBoundary(
@@ -251,6 +282,7 @@ async function main() {
     await testP0b_NumericReferenceUnchanged();
     await testP0c_NullBoundaryWithoutPricedAnchorFallsToCenter();
     await testP0d_GenesisAnchorRecoversHonestBoundary();
+    await testP0f_NullBoundaryAnchorUsesEligibleFillsOnly();
     await testP0e_KnownBoundaryCrawlUnchanged();
     await testP4_NullBoundaryPlanAbortsWithResync();
     await testP1_RailEdgePlanWarnsAndProceeds();

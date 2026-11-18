@@ -230,6 +230,10 @@ export interface BotLike {
   _deferredFillRetryDelayMs: number;
   _lastTargetedDriftSyncAt: number;
   _lightweightSyncCheckAt: number;
+  // One-shot latch for an unreadable pending-broadcast liveness probe: the
+  // lightweight-sync gate stays closed, but the reason is logged once instead
+  // of deferring silently forever.
+  _lightweightSyncLivenessWarned?: boolean;
   _lastUncertainResyncAt: number;
   _lastResolvedPollIntervalMs: number;
   _fillBroadcastDeferSince: number;
@@ -1138,6 +1142,9 @@ export interface OrderManagerLike {
   // `noteGridUpdateBlockers` (order/utils/system.ts); read/written only there.
   // A cycle count, not a timing window — never a TIMING entry (INV-TIME-001).
   _gridUpdateBlockedCycles?: number;
+  // Consecutive unreadable-pipeline cycles at the fund-invariant guard.
+  // Cycle count, not a timing window (INV-TIME-001).
+  _fundInvariantUnreadableCycles?: number;
   _fillProcessingLock: ManagerLock;
   _syncLock: ManagerLock;
   _divergenceLock: ManagerLock;

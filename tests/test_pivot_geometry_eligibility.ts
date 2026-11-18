@@ -23,7 +23,7 @@ const assert = require('assert');
 const { OrderManager } = require('../modules/order/manager');
 const { ORDER_TYPES, ORDER_STATES, GRID_LIMITS } = require('../modules/constants');
 const { isLastFillBandSellExempt, isLastFillPlacementBlocked, evaluateLastFillGuard, reanchorBoundaryFromLastFill } = require('../modules/order/utils/system');
-const { getSellStartIdx } = require('../modules/order/utils/math');
+const { getSellStartIdx, resolveGapSlots } = require('../modules/order/utils/math');
 
 let passed = 0;
 let failed = 0;
@@ -159,7 +159,7 @@ run('GEO-4 BUY placements are never exempt (the chase mirror stays closed)', () 
     assert.strictEqual(higherBuy.reason, 'direction');
 });
 
-run('GEO-5 out-of-band prices and unknown geometry fail closed', () => {
+run('GEO-5 out-of-band prices fail closed; an unknown gap resolves to the config band', () => {
     const mgr: any = makeManager();
     assert.strictEqual(isLastFillBandSellExempt(mgr, levels[SELL_START + 3]), false,
         'a rail sell above the band is not exempt (direction already allows it)');
@@ -169,8 +169,23 @@ run('GEO-5 out-of-band prices and unknown geometry fail closed', () => {
         'a price far below the rail cannot invent an exemption');
     const noGenesis: any = makeManager({ _genesis: null });
     assert.strictEqual(isLastFillBandSellExempt(noGenesis, levels[22]), false, 'no genesis => no exemption');
-    const noGap: any = makeManager({ _gapSlots: null });
-    assert.strictEqual(isLastFillBandSellExempt(noGap, levels[22]), false, 'unknown gap => no exemption');
+    // A blank gap is UNKNOWN, not gap 0 (§9.6): resolveGapSlots substitutes
+    // the config-derived band. The old assertion ("no exemption") passed only
+    // by arithmetic luck — the fixture's config gap (2) kept
+    // boundary(20) < pivotIdx(24) - 2 = 22. Pin the CONTRACT instead: with a
+    // config that derives the real gap 4, the same blank gap grants the
+    // exemption. A gap-0 coercion would make both cases diverge.
+    const blankGap: any = makeManager({ _gapSlots: null });
+    const wideConfig: any = makeManager({
+        _gapSlots: null,
+        config: { incrementPercent: INC, targetSpreadPercent: 2.5 },
+    });
+    assert.strictEqual(resolveGapSlots(blankGap), 2, 'blank gap falls back to the fixture config band');
+    assert.strictEqual(resolveGapSlots(wideConfig), 4, 'a 2.5% target derives the real 4-slot band');
+    assert.strictEqual(isLastFillBandSellExempt(blankGap, levels[22]), false,
+        'config-derived gap 2 still leaves the pivot ahead of this rung');
+    assert.strictEqual(isLastFillBandSellExempt(wideConfig, levels[22]), true,
+        'config-derived gap 4 grants the exemption — blank is not gap 0');
     const noBoundary: any = makeManager({ boundaryIdx: null });
     assert.strictEqual(isLastFillBandSellExempt(noBoundary, levels[22]), false, 'unknown boundary => no exemption');
 });

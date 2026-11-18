@@ -57,6 +57,10 @@ const NAMES = {
         // their own subject instead of the new deferral gates.
         'hasUnsettledFills', 'isLastFillPlacementBlocked',
         'resolveGridUpdateBlockers', 'noteGridUpdateBlockers',
+        // Newly consolidated single-source readers used by modules loaded
+        // under this manifest (order.ts, maintenance/cow runtime, accounting).
+        'offMarketFill', 'readBotInFlightFlags', 'readFillPipelineState',
+        'extractGoneOrderIds', 'extractUpdateTargetOrderIds',
     ],
     format: ['formatCurrency', 'formatMetric2', 'isValidNumber', 'toFiniteNumber', 'toKnownNumber', 'formatPrice6', 'formatPercent'],
     orderUtils: [
@@ -222,6 +226,13 @@ function installCoreResyncMocks({ snapshotMode = 'live' } = {}) {
         isLastFillPlacementBlocked: () => ({ blocked: false, pivot: null }),
         resolveGridUpdateBlockers: () => [],
         noteGridUpdateBlockers: () => ({ cycles: 0, escalate: false }),
+        offMarketFill: () => null,
+        readBotInFlightFlags: () => ({
+            ok: true, batchInFlight: false, recoveryInFlight: false, deferredRebalance: false,
+        }),
+        readFillPipelineState: () => ({ ok: true, queued: 0, deferred: false, inFlight: 0, owed: 0 }),
+        extractGoneOrderIds: () => new Set<string>(),
+        extractUpdateTargetOrderIds: () => new Set<string>(),
         sleep: async () => {},
         expireLastFillGuardReferences: () => {},
     });
@@ -720,6 +731,13 @@ function installDivergenceMocks(opts) {
         isLastFillPlacementBlocked: () => ({ blocked: false, pivot: null }),
         resolveGridUpdateBlockers: () => [],
         noteGridUpdateBlockers: () => ({ cycles: 0, escalate: false }),
+        offMarketFill: () => null,
+        readBotInFlightFlags: () => ({
+            ok: true, batchInFlight: false, recoveryInFlight: false, deferredRebalance: false,
+        }),
+        readFillPipelineState: () => ({ ok: true, queued: 0, deferred: false, inFlight: 0, owed: 0 }),
+        extractGoneOrderIds: () => new Set<string>(),
+        extractUpdateTargetOrderIds: () => new Set<string>(),
         sleep: async () => {},
         expireLastFillGuardReferences: () => {},
     });
@@ -907,6 +925,13 @@ async function testDexbotClassPerformGridResyncForwardsOptions() {
         isLastFillPlacementBlocked: () => ({ blocked: false, pivot: null }),
         resolveGridUpdateBlockers: () => [],
         noteGridUpdateBlockers: () => ({ cycles: 0, escalate: false }),
+        offMarketFill: () => null,
+        readBotInFlightFlags: () => ({
+            ok: true, batchInFlight: false, recoveryInFlight: false, deferredRebalance: false,
+        }),
+        readFillPipelineState: () => ({ ok: true, queued: 0, deferred: false, inFlight: 0, owed: 0 }),
+        extractGoneOrderIds: () => new Set<string>(),
+        extractUpdateTargetOrderIds: () => new Set<string>(),
         sleep: async () => {},
     });
     defineEsmMockAbs(require.resolve('../modules/order/utils/validate'), NAMES.validate, {

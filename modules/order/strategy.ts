@@ -49,8 +49,7 @@
 
 
 import { ORDER_TYPES, ORDER_STATES } from '../constants.js';
-import { calculateGapSlots } from './grid.js';
-import { isSlotInRail } from './utils/math.js';
+import { isSlotInRail, resolveGapSlots } from './utils/math.js';
 import { deriveTargetBoundary, getSideBudget, calculateBudgetedSizes, getCoreOrdersTotal, resolveEdgeCount, resolveLiveEdgeAnchorPrice, selectEdgeSlots, isShiftEligibleFill } from './utils/order.js';
 import { reanchorBoundaryFromLastFill, offMarketFill } from './utils/system.js';
 import { assignGridRoles } from './utils/order.js';
@@ -298,7 +297,15 @@ class StrategyEngine {
         // Use the stored gapSlots from grid creation (always consistent with
         // the grid geometry) instead of recomputing from live config which may
         // have drifted if targetSpreadPercent or gridLimits changed.
-        const gapSlots = this.manager._genesis?.gapSlots ?? this.manager._gapSlots ?? calculateGapSlots(config.incrementPercent, config.targetSpreadPercent, config.gridLimits);
+        // One absent-aware gap reader: the frozen genesis gap keeps priority,
+        // then the live gap, then the config-derived fallback. `??` used to
+        // pass a blank `_gapSlots` through to downstream helpers that coerce it
+        // to 0, collapsing the band on the boundary-crawl path (§9.6).
+        const gapSlots = resolveGapSlots(
+            this.manager as unknown as { _gapSlots?: number | null; config?: GridConfig | null },
+            this.manager._genesis?.gapSlots,
+            config
+        );
         const crossChunkBudget = this.manager._boundaryShiftBudget as number | null | undefined;
         // Anchor recovery on the frozen genesis center when config.startPrice
         // is an unresolved "pool"/"book" mode string: a fill carries direction

@@ -301,6 +301,23 @@ async function testSPREAD004_PlacementMustReduceViolation() {
     console.log('✓ SPREAD-004 passed');
 }
 
+async function testSPREAD008_TransientRefusalKeepsOriginalClock() {
+    console.log('\n[SPREAD-008] a transient refusal does not restart the stale clock');
+    const bot: any = stubSpreadBot(14);
+    bot._shuttingDown = false;
+    const original = Date.now() - 12 * 60 * 1000;
+    bot._outOfSpreadSince = original;
+    bot._outOfSpreadStaleWarned = true;
+
+    const r = trackOutOfSpreadStaleness(bot, true, 0, true, 14);
+    assert.strictEqual(r.escalated, false, 'the grace still defers escalation');
+    assert.strictEqual(bot._outOfSpreadSince, original, 'a refusal is not progress — keep the original clock');
+    assert.strictEqual(bot._outOfSpreadStaleWarned, true, 'the warn state must not be cleared by a refusal');
+    assert.strictEqual(bot._outOfSpreadTransientCount, 1, 'the refusal is still counted');
+    if (bot._spreadRecheckTimer) clearTimeout(bot._spreadRecheckTimer);
+    console.log('  ✓ transient refusal keeps the watchdog clock running');
+}
+
 async function testSPREAD007_PartialProgressKeepsRecheckArmed() {
     console.log('\n[SPREAD-007] partial progress keeps the level-triggered recheck armed...');
     const bot: any = stubSpreadBot(14);
@@ -440,6 +457,7 @@ async function runAllTests() {
     await testSPREAD003_UncheckedTickDoesNotAccumulate();
     await testSPREAD004_PlacementMustReduceViolation();
     await testSPREAD007_PartialProgressKeepsRecheckArmed();
+    await testSPREAD008_TransientRefusalKeepsOriginalClock();
     await testSPREAD005_LevelTriggeredRecheckIsDeduped();
     await testSPREAD006_UnknownPostPlacementMeasurementKeepsCompatibility();
     await testSPREADINF001_OneSidedBookReadsInfinite();

@@ -130,7 +130,7 @@ import { ORDER_TYPES, ORDER_STATES, TIMING, FEE_PARAMETERS, GRID_LIMITS, NATIVE_
 import * as Format from '../format.js';
 import * as MathUtils from './math.js';
 import Logger from '../../order/logger.js';
-import { sleep, resolveSpreadCrossingFloor } from './system.js';
+import { sleep, resolveSpreadCrossingFloor, offMarketFill } from './system.js';
 import { getErrorMessage, getErrorCode, getErrorName } from '../../utils/errors.js';
 import { hasGenesisLadder } from '../genesis_policy.js';
 import { parseSlotIndex } from './slot.js';
@@ -663,14 +663,24 @@ function attributeUnmatchedFillToGrid(
     //    slot that is actually a HOLE the grid owns — a crawl is owed because
     //    the level must be re-placed, which cannot happen while an order still
     //    occupies it (and cannot be consumed for a slot that does not exist).
-    //    Same eligibility as strategy.processFillsOnly: the edge classification
-    //    that decides whether a crawl is APPLIED lives in the boundary
-    //    derivation. Re-delivery replaces, never stacks; dry runs never commit a
-    //    boundary, so they must not grow the ledger.
+    //    MARKET-BOUND ELIGIBILITY (§9.13/F1): strategy.processFillsOnly refuses
+    //    an off-market fill at THIS writer, because the record stores no price
+    //    and the downstream derivation cannot re-judge it. This path is the
+    //    second writer of the same ledger (orphan-credit / unmatched-fill), so
+    //    it must apply the identical single predicate or a premium sweep can
+    //    re-enter the owed crawl the guard just refused and drag the boundary
+    //    after it. Fail-open on a stale/missing market read: a cold grid still
+    //    owes its first genuine crawl. Re-delivery replaces, never stacks; dry
+    //    runs never commit a boundary, so they must not grow the ledger.
     const slotIsHole = !!slot && !isOrderPlaced(slot);
+    let marketEligible = true;
+    try { marketEligible = !offMarketFill(mgr as OrderManagerLike, type, price); }
+    catch { /* unreadable market read fails open — same as the pivot writer */ }
+    const ledgerAvailable = Array.isArray(mgr._pendingFillCrawls);
+    const crawlOwed = slotIsHole && marketEligible && mgr.config?.dryRun !== true && ledgerAvailable;
     try {
-        if (slotIsHole && mgr.config?.dryRun !== true && Array.isArray(mgr._pendingFillCrawls)) {
-            const pending = mgr._pendingFillCrawls;
+        if (crawlOwed && slotId) {
+            const pending = mgr._pendingFillCrawls as Array<{ slotId?: string; side?: string; ts?: number }>;
             const at = pending.findIndex((e) => e && e.slotId === slotId);
             if (at >= 0) pending.splice(at, 1);
             pending.push({ slotId, side: type, ts: Date.now() });
@@ -683,7 +693,12 @@ function attributeUnmatchedFillToGrid(
         `[SYNC] Fill for order ${chainOrderId ?? 'unknown'} attributed to ${slotId} via ${identity} ` +
         `(${type} @ ${Format.formatPrice6(price)}): ` +
         `${pivotRecorded ? 'pivot recorded' : 'pivot NOT armed (edge-pinned fill or no writer)'}` +
-        `${slotIsHole ? ' + owed boundary crawl' : ' (slot still holds a live order: no crawl)'}` +
+        `${crawlOwed ? ' + owed boundary crawl'
+            : (slotIsHole
+                ? (!marketEligible ? ' (off-market fill: no crawl)'
+                    : (mgr.config?.dryRun === true ? ' (dry run: no crawl)'
+                        : (ledgerAvailable ? '' : ' (no crawl ledger: no crawl)')))
+                : ' (slot still holds a live order: no crawl)')}` +
         `; accounting already booked`,
         'warn'
     );
@@ -3135,11 +3150,18 @@ function deriveTargetBoundary(fills: Array<{ id?: string; price?: number; type?:
     let anchoredFromFills = false;
     if (newBoundaryIdx === undefined || newBoundaryIdx === null) {
         // Tier 1 — live fills: gap-side extreme (highest buy / lowest sell,
-        // midpoint when both sides filled). Any fill price, eligible or
-        // dust, is real market position and beats every config guess.
+        // midpoint when both sides filled). A REAL window fill beats every
+        // config guess, but only window evidence may position absolute geometry
+        // (§9.13/C1): the same market-bound predicate the crawl and the pivot
+        // writer use decides here too. A premium sweep that the guard refused
+        // must not become the recovered boundary through this early return,
+        // which bypasses the filtered crawl loop below. Omitted predicate keeps
+        // legacy/fixture callers unchanged; a stale/missing market read fails
+        // open, so a cold grid still anchors on its first genuine fill.
         let topBuy = -Infinity;
         let botSell = Infinity;
         for (const fill of fills ?? []) {
+            if (isFillEligibleForCrawl && !isFillEligibleForCrawl(fill)) continue;
             const p = Number(fill?.price);
             if (!Number.isFinite(p)) continue;
             if (fill?.type === ORDER_TYPES.BUY && p > topBuy) topBuy = p;
@@ -3450,17 +3472,10 @@ export function consumePendingFillCrawls(manager: OrderManagerLike): { applied: 
         1
     );
     if (Math.abs(netShift) > fallbackCap) netShift = Math.sign(netShift) * fallbackCap;
-    // Absent-aware: Number(null) === 0 is finite, so a plain Number() would use
-    // a collapsed (0) gap instead of the config-derived fallback and let the
-    // ceiling + validatePersistedBoundary run on the wrong band.
-    let gapSlots = Format.toKnownNumber(manager?._gapSlots);
-    if (!Number.isFinite(gapSlots)) {
-        try {
-            gapSlots = MathUtils.calculateGapSlots(config?.incrementPercent, config?.targetSpreadPercent, config?.gridLimits);
-        } catch {
-            gapSlots = 0;
-        }
-    }
+    // One absent-aware reader (§9.6): this used to re-implement resolveGapSlots
+    // inline with a `catch -> 0`, so an unreadable config collapsed the band and
+    // let the ceiling + validatePersistedBoundary run on the wrong geometry.
+    const gapSlots = MathUtils.resolveGapSlots(manager as never);
     const ceiling = (slots.length - gapSlots - 1) >= 0 ? (slots.length - gapSlots - 1) : (slots.length - 1);
     const candidate = Math.max(0, Math.min(ceiling, boundary + netShift));
     if (candidate === boundary) {

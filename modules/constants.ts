@@ -1153,13 +1153,15 @@ let FILL_PROCESSING = {
     // FILL_PROCESSING in general.settings.json).
     COALESCE_BACKLOG_REPLAY: false,
 
-    // GRID_BLOCKED_ESCALATE_CYCLES: how many consecutive attempts a grid update
-    // may be refused with an UNREADABLE pipeline state before the blocker
-    // escalation fires a structural resync. A cycle count, not a timing window:
-    // it is deliberately not a TIMING entry (see modules/timing_policy.ts) and
-    // must not be turned into one. Only `unknown-blocker` escalates — a busy
-    // pipeline (fills in flight, an unresolved broadcast, a held placement
-    // region) is normal work and is bounded by its own watchdog.
+    // GRID_BLOCKED_ESCALATE_CYCLES: how many consecutive UNREADABLE pipeline
+    // readings a guard tolerates before it escalates. Shared by two consumers:
+    //  1. `noteGridUpdateBlockers` — escalates `unknown-blocker` to a structural
+    //     resync (busy states — fills in flight, unresolved broadcasts, held
+    //     placement regions — are normal work and never escalate);
+    //  2. `Accountant._verifyFundInvariants` — forces the fund-invariant CRITICAL
+    //     check instead of deferring forever on a malformed manager field.
+    // Tuning it changes BOTH. A cycle count, not a timing window: deliberately
+    // not a TIMING entry (see modules/timing_policy.ts) and must not become one.
     GRID_BLOCKED_ESCALATE_CYCLES: 12,
 
     // MAX_CONSECUTIVE_CONSUMER_FAILURES: Threshold for the _consumeFillQueue

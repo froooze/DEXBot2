@@ -2140,7 +2140,10 @@ export function evaluateLastFillGuard(manager: OrderManagerLike | null | undefin
  *     (`boundary >= pivotIdx - gapSlots`), i.e. the geometry is NOT behind the
  *     fill — the precise precondition §9.7 names for the refusal.
  * Fail-closed on anything unprovable (no genesis, off-ladder price, unknown
- * boundary/gap).
+ * boundary). The gap is the deliberate exception: a blank/unpublished value
+ * is UNKNOWN, not gap 0 (§9.6), so `resolveGapSlots` substitutes the
+ * config-derived band rather than collapsing it — a decision gate, not a
+ * proof path (INV-FILL-006).
  *
  * @param {Object} manager - OrderManager instance (pivot + boundary + gap + genesis)
  * @param {number} price - SELL placement price
@@ -2156,8 +2159,12 @@ export function isLastFillBandSellExempt(manager: OrderManagerLike | null | unde
     const genesis = (manager as unknown as { _genesis?: GridGenesisLike })._genesis;
     const levels = genesis?.priceLevels;
     if (!Array.isArray(levels) || levels.length === 0) return false;
-    const gapRaw = (manager as { _gapSlots?: unknown })._gapSlots;
-    const gap = Number(gapRaw);
+    // One absent-aware reader: a blank/unpublished gap must fall back to the
+    // config-derived band, never read as a genuine gap 0 (§9.6 "unknown
+    // geometry is unknown"). Number('') === 0 is the trap resolveGapSlots
+    // exists to close — otherwise the exemption is declined and the pivot
+    // vetoes a legitimate SELL counter-order.
+    const gap = MathUtils.resolveGapSlots(manager as never);
     const boundary = Number(manager.boundaryIdx);
     if (!Number.isFinite(gap) || gap < 0 || !Number.isFinite(boundary)) return false;
     const lo = Number(levels[0]);
@@ -2262,6 +2269,56 @@ export type GridUpdateBlockerCode =
 export interface GridUpdateBlocker {
     code: GridUpdateBlockerCode;
     detail: string;
+}
+
+/**
+ * The ONE set of chain wordings for "order id no longer exists".
+ *
+ * The COW catch block and the size-drift repair used to carry different regex
+ * sets: "Unable to find Object 1.7.X" was classified as stale (destructive
+ * cleanup) but could never be parsed into a repair id, while "order 1.7.X does
+ * not exist" parsed but was not classified. One parser now serves both
+ * decisions, so a vanished UPDATE target cannot land in stale cleanup just
+ * because the node worded its rejection differently (R3.5, §9.13/C3).
+ */
+export function extractGoneOrderIds(error: unknown): Set<string> {
+    const msg = getErrorMessage(error);
+    const ids = new Set<string>();
+    for (const re of [
+        /Limit order (1\.7\.\d+) does not exist/gi,
+        /Unable to find Object (1\.7\.\d+)/gi,
+        /object (1\.7\.\d+) (?:does not exist|not found)/gi,
+        /\border (1\.7\.\d+) does not exist/gi,
+    ]) {
+        let m;
+        while ((m = re.exec(msg)) !== null) ids.add(m[1]);
+    }
+    return ids;
+}
+
+/**
+ * Order ids this batch planned to UPDATE (size update / rotation), not cancel.
+ *
+ * A gone CANCEL target is harmless — the order is already off chain — while a
+ * gone UPDATE target is the TOCTOU window that must reach the in-place repair.
+ * Kept here so the classifier and the repair owner ask the same question.
+ */
+export function extractUpdateTargetOrderIds(opContexts: unknown): Set<string> {
+    const ids = new Set<string>();
+    if (!Array.isArray(opContexts)) return ids;
+    for (const ctx of opContexts as Array<{
+        kind?: unknown;
+        updateInfo?: { partialOrder?: { orderId?: unknown } };
+        rotation?: { oldOrder?: { orderId?: unknown } };
+    }>) {
+        if (!ctx || typeof ctx !== 'object') continue;
+        if (ctx.kind === 'size-update' && ctx.updateInfo?.partialOrder?.orderId != null) {
+            ids.add(String(ctx.updateInfo.partialOrder.orderId));
+        } else if (ctx.kind === 'rotation' && ctx.rotation?.oldOrder?.orderId != null) {
+            ids.add(String(ctx.rotation.oldOrder.orderId));
+        }
+    }
+    return ids;
 }
 
 /** Pipeline state the fill blockers are derived from. `ok: false` means UNREADABLE, not settled. */
@@ -2479,6 +2536,47 @@ export function getPipelineInFlightAgeMs(source: unknown, nowMs?: number): numbe
         if (age > oldest) oldest = age;
     }
     return oldest > 0 ? oldest : 0;
+}
+
+/**
+ * Read the bot-level "is a destructive reload safe right now?" flags ONCE.
+ *
+ * The snapshot-reject gate and the structural-resync gate used to peek the
+ * same three counters with their own `Number(x) || 0` fallbacks, so an
+ * unreadable counter silently meant "not in flight" at one gate and was
+ * compared raw at the other. Unreadable is now a first-class answer and both
+ * gates defer (INV-FILL-003).
+ */
+export function readBotInFlightFlags(source: unknown): {
+    ok: boolean;
+    batchInFlight: boolean;
+    recoveryInFlight: boolean;
+    deferredRebalance: boolean;
+} {
+    const outer = source as { manager?: unknown } | null | undefined;
+    const hasManager = !!(outer?.manager && typeof outer.manager === 'object');
+    const bot = (hasManager ? outer : source) as Record<string, unknown> | null | undefined;
+    if (!bot || typeof bot !== 'object') {
+        return { ok: false, batchInFlight: false, recoveryInFlight: false, deferredRebalance: false };
+    }
+    const count = (value: unknown): number => {
+        if (value == null || value === '') return 0;
+        const n = Number(value);
+        return Number.isFinite(n) ? n : NaN;
+    };
+    // Batch/recovery counters are bot-scoped; the deferred-rebalance stamp is
+    // manager-scoped (manager.ts:3297 etc). Reading it from the bot would make
+    // the "deferred rebalance pending" branch dead code.
+    const mgr = hasManager ? outer!.manager as Record<string, unknown> : null;
+    const batch = count(bot._batchInFlight);
+    const recovery = count(bot._recoverySyncInFlight);
+    const deferred = count(mgr?._deferredRebalanceAt);
+    return {
+        ok: Number.isFinite(batch) && Number.isFinite(recovery) && Number.isFinite(deferred),
+        batchInFlight: batch > 0,
+        recoveryInFlight: recovery > 0,
+        deferredRebalance: deferred > 0,
+    };
 }
 
 /**
@@ -3098,11 +3196,10 @@ export async function applyGridDivergenceCorrections(manager: OrderManagerLike, 
         const workingBoundaryIdx = Number.isFinite(toKnownNumber(pendingBoundaryIdx))
             ? Number(pendingBoundaryIdx)
             : manager.boundaryIdx;
-        const gapSlots = manager._genesis?.gapSlots ?? manager._gapSlots ?? MathUtils.calculateGapSlots(
-            manager.config?.incrementPercent,
-            manager.config?.targetSpreadPercent,
-            manager.config?.gridLimits
-        );
+        // Same priority as the strategy crawl: frozen genesis gap, live gap,
+        // then the config-derived fallback — all through the absent-aware
+        // owner so a blank gap cannot collapse the rail filter to gap 0.
+        const gapSlots = MathUtils.resolveGapSlots(manager as never, manager._genesis?.gapSlots);
         const inRailByType = (orderType: string) => (slot: ManagedOrder) =>
             MathUtils.isSlotInRail(workingBoundaryIdx, gapSlots, orderType, slot);
 

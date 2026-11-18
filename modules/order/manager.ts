@@ -631,6 +631,11 @@ class OrderManager implements OrderManagerLike {
     // reader). Cleared when the gate is evaluated healthy or not evaluated at
     // all; a cycle count, never a timing window.
     _gridUpdateBlockedCycles: number;
+    // Consecutive unreadable-pipeline cycles at the fund-invariant guard.
+    // Owned by Accountant._verifyFundInvariants; a cycle count (never a TIMING
+    // window) that escalates to a forced check so a permanently malformed
+    // field cannot silently disable the CRITICAL guard.
+    _fundInvariantUnreadableCycles: number;
     _pauseRecalcLogging: boolean;
     _pauseRecalcLoggingWatchdog: ReturnType<typeof setTimeout> | null;
     _throwOnIllegalState: boolean;
@@ -849,6 +854,7 @@ class OrderManager implements OrderManagerLike {
         // fills' size. The check runs once the batch settles instead.
         this._fillBatchInFlight = 0;
         this._gridUpdateBlockedCycles = 0;
+        this._fundInvariantUnreadableCycles = 0;
         this._pauseRecalcLogging = false;
         this._pauseRecalcLoggingWatchdog = null;
         this._throwOnIllegalState = false;

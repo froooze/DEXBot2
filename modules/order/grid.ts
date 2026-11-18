@@ -2769,7 +2769,11 @@ export async function updateGridFromBlockchainSnapshot(manager: OrderManagerLike
         // boundary itself is only written atomically inside _commitWorkingGrid
         // via _setBoundary.
         if (overrideBoundaryIdx !== null && overrideBoundaryIdx !== manager.boundaryIdx) {
-            const gapSlots = manager._gapSlots ?? calculateGapSlots(manager.config.incrementPercent, manager.config.targetSpreadPercent, manager.config.gridLimits);
+            // Absent-aware read: a blank/unpublished gap must not collapse to 0
+            // (§9.6 "unknown geometry is unknown"). Same genesis-first priority
+            // as the strategy crawl so a snapshot re-type cannot band
+            // differently from the plan that produced it.
+            const gapSlots = MathUtils.resolveGapSlots(manager, manager._genesis?.gapSlots);
             const allSlots = Array.from(workingGrid.values())
                 .filter((s) => s.price != null)
                 .sort((a, b) => a.price - b.price);
@@ -3212,7 +3216,10 @@ export async function checkSpreadCondition(manager: OrderManagerLike, _BitShares
                 const allSlots = Array.from(manager.orders.values())
                     .filter((o) => o.price != null)
                     .sort((a, b) => a.price - b.price);
-                const gapSlots = manager._gapSlots ?? calculateGapSlots(manager.config.incrementPercent, manager.config.targetSpreadPercent, manager.config.gridLimits);
+                // Absent-aware, genesis-first (same as the crawl and the
+                // snapshot re-type): a blank gap must not collapse to 0 on a
+                // structural-resync decision either.
+                const gapSlots = MathUtils.resolveGapSlots(manager, manager._genesis?.gapSlots);
                 const railLen = allSlots.length;
                 const buyEndIdx = manager.boundaryIdx;
                 const sellStartIdx = getSellStartIdx(manager.boundaryIdx, gapSlots);

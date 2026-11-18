@@ -1616,19 +1616,30 @@ function getSellStartIdx(boundaryIdx: number | string | null | undefined, gapSlo
  * pattern — used by resolveGapBand and the COW boundary-commit gate so the
  * two can never disagree on band width.
  */
-function resolveGapSlots(manager: { _gapSlots?: number | null; config?: GridConfig | null }): number {
+function resolveGapSlots(
+    manager: { _gapSlots?: number | null; config?: GridConfig | null },
+    preferred?: unknown,
+    configOverride?: GridConfig | null
+): number {
     // Absent-aware: Number('') === 0 is finite, so a '' _gapSlots would pass
     // the finite test as a valid 0 and collapse the band. '' is unknown →
     // fall back to the config-derived gap (same contract as
-    // consumePendingFillCrawls' dc87ce01 fallback).
-    const raw = Format.toKnownNumber(manager._gapSlots);
-    if (Number.isFinite(raw)) {
-        return Math.max(0, Math.floor(raw));
+    // consumePendingFillCrawls' dc87ce01 fallback). `preferred` lets the caller
+    // with a frozen genesis gap keep its priority without re-implementing the
+    // absent-aware read (strategy's boundary crawl).
+    for (const candidate of [preferred, manager._gapSlots]) {
+        const raw = Format.toKnownNumber(candidate);
+        if (Number.isFinite(raw)) return Math.max(0, Math.floor(raw));
     }
+    // `configOverride` lets a caller whose resolved settings differ from the
+    // manager's live config (the strategy's params) keep its fallback WITHOUT
+    // handing the owner a synthetic manager that would drift if this reader
+    // ever grows another field.
+    const config = configOverride ?? manager.config;
     return calculateGapSlots(
-        manager.config?.incrementPercent,
-        manager.config?.targetSpreadPercent,
-        manager.config?.gridLimits
+        config?.incrementPercent,
+        config?.targetSpreadPercent,
+        config?.gridLimits
     );
 }
 

@@ -8,7 +8,7 @@ import { ORDER_TYPES, TIMING } from './constants.js';
 import * as Format from './order/format.js';
 import * as grid from './order/grid.js';
 import { convertToSpreadPlaceholder, parseChainOrder, isNonBlockingUnmatchedOrder, detectGapEvacuationCandidates, updateGapEvacuationStreaks } from './order/utils/order.js';
-import { restoreGapEvacStreaks, applyPersistedPendingCrawls, resetLastFillPivot, hasUnsettledFills } from './order/utils/system.js';
+import { restoreGapEvacStreaks, applyPersistedPendingCrawls, resetLastFillPivot, hasUnsettledFills, extractGoneOrderIds, extractUpdateTargetOrderIds, readBotInFlightFlags } from './order/utils/system.js';
 import { blockchainToFloat, calculateGapSlots, resolveGapSlots, validatePersistedBoundary, isTransientInBandRejection } from './order/utils/math.js';
 import { ON_MISSING_GENESIS, isMissingGenesisError } from './order/genesis_policy.js';
 import type { ManagedOrder, ChainOrder } from './types.js';
@@ -260,20 +260,11 @@ async function recoverBatchSizeDrift(bot: BotLike, err: unknown, opContexts: unk
         // A gone UPDATE target found by findOverReducingUpdateOpError can arrive
         // with plain UPDATE contexts (no size-update/rotation kind), so the
         // context extractor finds nothing. The chain error itself names the id;
-        // parse it so the in-place repair still gets its slot instead of falling
-        // back to a full recovery sync (which reloaded the stale snapshot and
-        // re-armed the same failure on the live 2026-11-17 incident).
-        const errMsg = getErrorMessage(err);
-        const fromMessage = new Set<string>();
-        for (const re of [
-            /object (1\.7\.\d+) does not exist/gi,
-            /order (1\.7\.\d+) does not exist/gi,
-            /Limit order (1\.7\.\d+) does not exist/gi
-        ]) {
-            let m;
-            while ((m = re.exec(errMsg)) !== null) fromMessage.add(m[1]);
-        }
-        affectedOrderIds = Array.from(fromMessage);
+        // the shared parser covers every node wording (including the direct
+        // "Unable to find Object 1.7.X" rejection that the old repair-only regex
+        // set missed) so the repair still reaches its slot instead of reloading
+        // the stale snapshot on the live 2026-11-17 incident.
+        affectedOrderIds = Array.from(extractGoneOrderIds(err));
     }
     if (affectedOrderIds.length > 0) {
         bot.manager.logger.log(
@@ -323,16 +314,7 @@ async function recoverBatchSizeDrift(bot: BotLike, err: unknown, opContexts: unk
  * @returns {string[]}
  */
 function extractSizeDriftOrderIds(opContexts: unknown) {
-    if (!Array.isArray(opContexts)) return [];
-    const ids = new Set<string>();
-    for (const ctx of opContexts as Array<{ kind?: string; updateInfo?: { partialOrder?: { orderId?: string } }; rotation?: { oldOrder?: { orderId?: string } } }>) {
-        if (ctx?.kind === 'size-update' && ctx?.updateInfo?.partialOrder?.orderId) {
-            ids.add(ctx.updateInfo.partialOrder.orderId);
-        } else if (ctx?.kind === 'rotation' && ctx?.rotation?.oldOrder?.orderId) {
-            ids.add(ctx.rotation.oldOrder.orderId);
-        }
-    }
-    return Array.from(ids);
+    return Array.from(extractUpdateTargetOrderIds(opContexts));
 }
 
 /**
@@ -886,16 +868,16 @@ async function rejectCorruptedGridSnapshot(bot: BotLike, context: string) {
     // rejected as corrupted while deferred fills were pending). Gate the
     // destructive decision on a settled pipeline.
     const pipeline = hasUnsettledFills(bot);
-    const batchInFlight = Number((bot as unknown as { _batchInFlight?: unknown })._batchInFlight) || 0;
-    const recoveryInFlight = Number((bot as unknown as { _recoverySyncInFlight?: unknown })._recoverySyncInFlight) || 0;
+    const inFlight = readBotInFlightFlags(bot);
     const placementHeld = typeof bot.manager.isPlacementActive === 'function' && bot.manager.isPlacementActive() === true;
-    const deferredRebalance = Number((bot.manager as unknown as { _deferredRebalanceAt?: unknown })._deferredRebalanceAt) || 0;
-    if (pipeline.unsettled || batchInFlight > 0 || recoveryInFlight > 0 || placementHeld || deferredRebalance > 0) {
-        const why = pipeline.reason
-            || (batchInFlight > 0 ? 'batch in flight'
-                : recoveryInFlight > 0 ? 'recovery sync in flight'
-                    : placementHeld ? `placement region held by ${bot.manager.placementKind?.() || 'unknown'}`
-                        : 'deferred rebalance pending');
+    if (!inFlight.ok || pipeline.unsettled || inFlight.batchInFlight || inFlight.recoveryInFlight || placementHeld || inFlight.deferredRebalance) {
+        const why = !inFlight.ok
+            ? 'pipeline activity unreadable'
+            : (pipeline.reason
+                || (inFlight.batchInFlight ? 'batch in flight'
+                    : inFlight.recoveryInFlight ? 'recovery sync in flight'
+                        : placementHeld ? `placement region held by ${bot.manager.placementKind?.() || 'unknown'}`
+                            : 'deferred rebalance pending'));
         bot._warn?.(
             `[SNAPSHOT-REJECT] Skipping corruption check (${context}): pipeline not settled — ` +
             `${why}; the snapshot is preserved and re-checked once fills settle`

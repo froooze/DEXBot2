@@ -863,6 +863,25 @@ async function runTests() {
             !deficitReason.reason.includes('buy 12/8'),
             `window surplus stays silent (got: ${deficitReason.reason})`
         );
+        // Unreadable master grid is UNKNOWN, not "no shortfall": the one case
+        // the edge check exists for must still trigger a reconcile, not be
+        // silently skipped by a null count.
+        const unknownMgr: any = await makeTriggerMgr([2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+        // countLiveEdgeOrders reads Array.from(manager.orders.values()). Proxy
+        // just that read into a throw; the manager's own Symbol.iterator and
+        // Map methods still work through the proxy's bound getters.
+        unknownMgr.orders = new Proxy(unknownMgr.orders, {
+            get(target, prop) {
+                if (prop === 'values') return () => { throw new Error('unreadable master grid'); };
+                const value = Reflect.get(target, prop);
+                return typeof value === 'function' ? value.bind(target) : value;
+            },
+        });
+        const unknownReason: any = getTargetedSyncReason({ manager: unknownMgr, config: unknownMgr.config });
+        assert(
+            unknownReason && typeof unknownReason.reason === 'string' && unknownReason.reason.includes('buy edges unknown/'),
+            `an unreadable edge count must request a reconcile (got: ${unknownReason && unknownReason.reason})`
+        );
         // Filled clears: floor reserves live + window live (8 >= 8) => null.
         const filledMgr = await makeTriggerMgr([0, 1, 8, 9, 10, 11, 12, 13]);
         assert.strictEqual(

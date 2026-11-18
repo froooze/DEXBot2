@@ -15,7 +15,7 @@ import { BroadcastUncertainError as BroadcastUncertainErrorBinding } from './dex
 const BroadcastUncertainError = BroadcastUncertainErrorBinding;
 import * as orderUtils from './order/utils/order.js';
 import { lazyShim } from './lazy_shim.js';
-import { sleep, setLastFillPivot, fireStructuralResync, evaluateSpreadCorrectionReadiness, resolveLastFillGuardReference, resolveSpreadCrossingFloor, isLastFillGuardBlocked, evaluateLastFillGuard } from './order/utils/system.js';
+import { sleep, setLastFillPivot, fireStructuralResync, evaluateSpreadCorrectionReadiness, resolveLastFillGuardReference, resolveSpreadCrossingFloor, isLastFillGuardBlocked, evaluateLastFillGuard, extractGoneOrderIds, extractUpdateTargetOrderIds } from './order/utils/system.js';
 const {
     buildCreateOrderArgs,
     buildCreateOpFingerprint,
@@ -6288,35 +6288,31 @@ async function updateOrdersOnChainBatchCOWBody(
         if (hardAbortResult) return hardAbortResult as JsonObj;
 
         const errMsg = getErrorMessage(err);
-        const staleOrderIds = new Set<string>();
-        const patterns = [
-            /Limit order (1\.7\.\d+) does not exist/g,
-            /Unable to find Object (1\.7\.\d+)/g,
-            /object (1\.7\.\d+) (?:does not exist|not found)/gi
-        ];
-        for (const pattern of patterns) {
-            let m;
-            while ((m = pattern.exec(errMsg)) !== null) {
-                staleOrderIds.add(m[1]);
-            }
-        }
+        const goneOrderIds = extractGoneOrderIds(errMsg);
 
-        // A gone UPDATE target detected by the PRE-BROADCAST size-drift read is
-        // not an "explicit stale order". findOverReducingUpdateOpError emits
-        // this exact marker; routing it to stale cleanup frees the slot's funds
-        // without releasing the dead commitment, discards the working grid,
-        // defers divergence and leaves the optimistic ledger short — the live
-        // 2026-11-17 signature (2 of 8 chunks landed, fund invariant violation,
-        // recovery 2/5). Send it to the SAME in-place _targetedOrderRepair the
-        // over-reducing-size branch uses; it is the single-slot repair owner.
+        // A gone UPDATE target is NOT an "explicit stale order", whichever side
+        // reported it. The pre-broadcast size-drift read marks its error; a
+        // direct chain rejection (TOCTOU window, or a swallowed pre-read) does
+        // not — it carries the same "does not exist" wording the stale regexes
+        // match. Routing that to stale cleanup frees the slot's funds without
+        // releasing the dead commitment, discards the working grid, defers
+        // divergence and leaves the optimistic ledger short (the live 2026-11-17
+        // 2-of-8-chunks signature). Classify by what the batch PLANNED to do:
+        // a vanished size-update/rotation target reaches the single in-place
+        // repair owner; a vanished cancel target is already gone and may still
+        // use stale cleanup. No guard weakened — structural resync stays the
+        // fallback when the repair fails.
         const preBroadcastSizeDriftGone = /\(detected pre-broadcast size-drift\)/.test(errMsg)
             && /does not exist/i.test(errMsg);
-        if (/Cannot deduct all or more from order than order contains/.test(errMsg) || preBroadcastSizeDriftGone) {
+        const updateTargetIds = extractUpdateTargetOrderIds(opContexts);
+        const goneUpdateTarget = [...goneOrderIds].some((id) => updateTargetIds.has(id));
+        if (/Cannot deduct all or more from order than order contains/.test(errMsg)
+            || preBroadcastSizeDriftGone || goneUpdateTarget) {
             return await bot._recoverBatchSizeDrift(err, opContexts) as JsonObj;
         }
 
-        if (staleOrderIds.size > 0) {
-            return await bot._recoverExplicitStaleOrders(staleOrderIds, 'cow-stale-order-cleanup') as JsonObj;
+        if (goneOrderIds.size > 0) {
+            return await bot._recoverExplicitStaleOrders(goneOrderIds, 'cow-stale-order-cleanup') as JsonObj;
         }
 
         throw err;

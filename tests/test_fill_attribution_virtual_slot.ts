@@ -135,6 +135,29 @@ async function testAttributionRecordsPivotAndCrawl() {
     console.log('  ✓ pivot + owed crawl recorded, slot untouched');
 }
 
+async function testOffMarketFillRecordsNoOwedCrawl() {
+    console.log('\n[FA-1b] an off-market fill arms no owed crawl through the unmatched-fill writer');
+    // The 2026-11-17 incident re-entered through THIS writer: the guard refused
+    // the premium sweep, but the second pending-crawl ledger writer still
+    // recorded an owed delta that the next derivation applied unconditionally.
+    // 1400 against a fresh mid of 1000 at 0.3% steps is ~114 steps away — far
+    // outside the 6-step market bound. The fixture keeps the live mid stale by
+    // default, so a genuine first fill still owes its crawl (FA-1 above).
+    const slot = virtualisedBuySlot({ id: 'slot-140', price: 1400, orderId: '1.7.900140' });
+    const mgr = makeMgr({ slots: [slot] });
+    (mgr as any)._liveMarketPrice = 1000;
+    (mgr as any)._liveMarketPriceAt = Date.now();
+
+    const absorbed = ENGINE._absorbUnmatchedFill(mgr, { orderId: slot.orderId, ...buyFill(1400, 1) });
+
+    assert.strictEqual(absorbed, true, 'attribution itself still succeeds');
+    assert.strictEqual(mgr._pendingFillCrawls.length, 0, 'a premium sweep must not leave an owed crawl');
+    assert.strictEqual(mgr._gridDirty, false, 'no ledger write means no dirty mark');
+    assert(mgr._logs.some((l: any) => /off-market fill: no crawl/.test(l.msg)),
+        'the suppression is observable in the attribution log');
+    console.log('  ✓ off-market fill creates no owed crawl');
+}
+
 async function testUnknownOrderIsStillIgnored() {
     console.log('\n[FA-2] a fill for an order the grid never owned is not absorbed');
     const mgr = makeMgr({ slots: [virtualisedBuySlot()], pivot: 1000, pivotType: ORDER_TYPES.BUY });
@@ -320,6 +343,7 @@ async function testUnsettledFillsSignal() {
 async function main() {
     console.log('=== Fill attribution to a virtualised slot ===');
     await testAttributionRecordsPivotAndCrawl();
+    await testOffMarketFillRecordsNoOwedCrawl();
     await testUnknownOrderIsStillIgnored();
     await testRedeliveryDoesNotStackCrawls();
     await testDryRunRecordsNoCrawl();

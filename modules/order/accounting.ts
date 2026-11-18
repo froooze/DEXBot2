@@ -90,8 +90,8 @@
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 
-import { ORDER_TYPES, ORDER_STATES, PIPELINE_TIMING, TIMING, FEE_PARAMETERS, GRID_LIMITS } from '../constants.js';
-import { resolveAccountRef } from './utils/system.js';
+import { ORDER_TYPES, ORDER_STATES, PIPELINE_TIMING, TIMING, FEE_PARAMETERS, GRID_LIMITS, FILL_PROCESSING } from '../constants.js';
+import { resolveAccountRef, readFillPipelineState } from './utils/system.js';
 import { resolveSpreadOrderSide, parseChainOrder, applyChainSizeToGridOrder, convertToSpreadPlaceholder, resolveEdgeCount } from './utils/order.js';
 import { parseSlotIndex } from './utils/slot.js';
 import { readSlotLifecycle } from './lifecycle.js';
@@ -603,11 +603,45 @@ class Accountant {
           // that window produces a spurious CRITICAL equal to the batch size.
           // The check is deferred until the batch settles (grid mutation +
           // authoritative re-anchor) and is re-run by the resume recalculation.
-          if ((mgr._fillBatchInFlight ?? 0) > 0) {
-              if (mgr.logger?.level === 'debug') {
-                  mgr.logger.log('[INVARIANT] Fill batch in flight; deferring fund-invariant check until batch settles.', 'debug');
+          // One fail-closed reader (INV-FILL-003): a raw `?? 0` peek with no
+          // validity check would run the CRITICAL check mid-batch if the
+          // counter were unreadable — the spurious alert this guard exists to
+          // prevent. Unreadable state defers, but ONLY for a bounded run of
+          // consecutive cycles: after GRID_BLOCKED_ESCALATE_CYCLES the check is
+          // forced with an error log, so a permanently malformed field cannot
+          // silently disable the CRITICAL guard forever. Like
+          // noteGridUpdateBlockers, escalation repeats on every further
+          // unreadable cycle until the state clears (not one-and-done). This
+          // is a cycle count (INV-TIME-001), not a new timing window.
+          const fillPipeline = readFillPipelineState(mgr);
+          if (!fillPipeline.ok) {
+              const holder = mgr as OrderManagerLike & { _fundInvariantUnreadableCycles?: number };
+              const prev = Number(holder._fundInvariantUnreadableCycles);
+              const cycles = (Number.isFinite(prev) && prev > 0 ? prev : 0) + 1;
+              holder._fundInvariantUnreadableCycles = cycles;
+              const rawLimit = Number(FILL_PROCESSING.GRID_BLOCKED_ESCALATE_CYCLES);
+              const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? rawLimit : 12;
+              if (cycles < limit) {
+                  if (mgr.logger?.level === 'debug') {
+                      mgr.logger.log(
+                          `[INVARIANT] Fill pipeline unreadable (${fillPipeline.error}); deferring fund-invariant check ` +
+                          `(${cycles}/${limit})`, 'debug'
+                      );
+                  }
+                  return;
               }
-              return;
+              mgr.logger?.log(
+                  `[INVARIANT] Fill pipeline unreadable for ${cycles} cycles (limit ${limit}): ${fillPipeline.error}. ` +
+                  `Forcing the fund-invariant check so the CRITICAL guard cannot stay disabled.`, 'error'
+              );
+          } else {
+              (mgr as OrderManagerLike & { _fundInvariantUnreadableCycles?: number })._fundInvariantUnreadableCycles = 0;
+              if (fillPipeline.inFlight > 0) {
+                  if (mgr.logger?.level === 'debug') {
+                      mgr.logger.log('[INVARIANT] Fill batch in flight; deferring fund-invariant check until batch settles.', 'debug');
+                  }
+                  return;
+              }
           }
           const buyPrecision = mgr.assets?.assetB?.precision;
           const sellPrecision = mgr.assets?.assetA?.precision;
@@ -1874,6 +1908,14 @@ class Accountant {
          const assetASymbol = mgr.config?.assetA;
          const assetBSymbol = mgr.config?.assetB;
 
+         // NOTE: these two mappings are NOT a duplicate of resolveTradedSide.
+         // That helper answers "which side did the fill TRADE?" from the paid
+         // asset. `orderType` here names the BALANCE BUCKET being adjusted:
+         // paying the base debits the SELL bucket while receiving the quote
+         // credits the BUY bucket, and the mirror for the other orientation.
+         // Collapsing them to one traded side would move fill proceeds onto the
+         // wrong bucket (proven by the accounting/fee suites). Keep the two
+         // independent bucket mappings.
          if (pays.asset_id === assetAId) {
              const amount = blockchainToFloat(pays.amount, assetAPrecision);
              balanceAdjustments.push({ orderType: ORDER_TYPES.SELL, delta: -amount, operation: 'fill-pays' });

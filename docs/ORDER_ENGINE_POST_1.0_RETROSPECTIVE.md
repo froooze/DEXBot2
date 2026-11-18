@@ -156,9 +156,12 @@ notes; the grid-price invariant has its own doc — [GRID_PRICE_INVARIANT.md](GR
   deadlock (a counter order crossing the floor by construction), log it once and let the
   chain price it as a taker fill.
 - **One market-bound fill test (§9.13):** `offMarketFill` is the single definition of
-  “not window evidence”; the pivot writer, the boundary crawl and the re-anchor extremum
-  all consume it, so a premium sweep cannot move geometry through a path that only the
-  guard refuses (fail-open on a stale/missing market read).
+  “not window evidence”; the pivot writer, the boundary crawl, the re-anchor extremum,
+  the unmatched-fill pending-crawl writer and the null-boundary recovery anchor all
+  consume it, so a premium sweep cannot move geometry through a path that only the guard
+  refuses (fail-open on a stale/missing market read). The second pending-crawl writer was
+  the missed case in the original incident review: it records no price, so eligibility
+  cannot be re-applied downstream and must be decided at write time.
 - **A heal is zero excess, not less excess (§9.13):** the stale watchdog clears only
   when the measured violation is gone; a partial improvement keeps the original clock
   so the bounded expiry and level-triggered recheck stay reachable.
@@ -773,8 +776,10 @@ required is no longer reachable at runtime.
   sweep running on a stale snapshot.
 - **Only a window trade may become the pivot:** edge-pinned insurance fills are skipped at the
   single pivot writer, so they can neither veto a side nor anchor the geometry (§9.10/P1).
-  Enforced on all three consumers: the re-anchor filters its extremum with the same
-  classifiers (§9.13/C1) and the crawl consumes the same market-bound predicate (§9.13/F1).
+  Enforced on all five consumers: the re-anchor filters its extremum with the same
+  classifiers (§9.13/C1), the crawl and the unmatched-fill writer consume the same
+  market-bound predicate (§9.13/F1 and the post-release audit addendum below), and the
+  null-boundary recovery anchor filters its Tier-1 fills through the same predicate.
 - **One boundary validator:** a boundary write that can strand a live order in the implied
   band is refused by `validatePersistedBoundary`, whoever computed it — re-anchor, rail clamp,
   restore, commit (§9.10/P2/P3).
@@ -1276,6 +1281,48 @@ refusal path (the chain can reject after the check); §9.6/§9.10/P2 record the 
 reduction. **Still open:** live verification of the §9.13 signals after promotion, and
 — only with soak evidence — a general market-runaway upward re-anchor when the window
 sits far below the live mid with no eligible fill.
+
+**Post-release audit addendum (four residual gaps in the same families).** A static
+re-review of the P0–P3 surface against the invariants above found four residuals, all
+fixed with mutation-checked regressions:
+
+- **Second pending-crawl writer (F1 residual).** `attributeUnmatchedFillToGrid` is a
+  second writer of `_pendingFillCrawls` (orphan-credit / unmatched-fill path). `391ba444`
+  added the market-bound predicate to the strategy writer only; this writer stores no
+  price, so the downstream derivation cannot re-judge it. It now applies the same
+  `offMarketFill` at write time (FA-1b).
+  **Migration residual (accepted):** crawls persisted by an older build contain only
+  `{slotId, side, ts}`, so a restart cannot retroactively re-judge them against the
+  live market. They are not purged here; they are consumed by the next accepted
+  boundary commit (or discarded by a re-derivation), and no new ineligible record can
+  be written after the upgrade. Bounded one-time residual, not a growing leak — and
+  inventing a price-based filter the ledger cannot support would be a second writer
+  of the same question.
+- **Marker-less gone-target rejection (C3 residual).** The in-place repair escape in the
+  COW catch block keyed on the size-drift marker; a direct chain rejection of the same
+  vanished UPDATE target (TOCTOU / swallowed pre-read) carries no marker and still routed
+  to destructive stale cleanup. Routing is now by what the batch PLANNED (a vanished
+  size-update/rotation target → repair; a vanished cancel target → stale cleanup), and
+  one shared parser covers every node wording (COW-COMMIT-019, shared-reader contract).
+- **Null-boundary recovery anchor (C1 residual).** Tier-1 of `deriveTargetBoundary` took
+  its extremum from raw fills, bypassing the filtered crawl loop. The injected predicate
+  now gates the anchor too; omitting it keeps legacy callers unchanged (ANCHOR-010).
+- **Destructive reload gates.** The structural-resync deferral now asks `isPlacementActive()`
+  like the snapshot-reject gate, and both read the in-flight flags through one owner;
+  unreadable counters defer instead of reading as settled. The edge-count and
+  pending-broadcast gates fail closed on an unreadable source, and a transient spread
+  refusal no longer restarts the stale clock.
+
+Two scanner candidates were **rejected after source review**: accounting's pays/receives
+mappings are two different balance buckets (not a copy of `resolveTradedSide`), and the
+COW working-hole gap read fails closed to a SPREAD placeholder by design. A follow-up
+review of the same diff pinned the blank-gap contract (GEO-5 now asserts the
+config-derived band, not an accidental arithmetic outcome), named the real reason for a
+suppressed owed crawl in the log, made a skipped BTS-swap balance adjustment observable,
+bounded-and-escalated the fund-invariant unreadable deferral, added a one-shot warn for
+an unreadable pending-broadcast liveness probe, made both destructive reload gates honour
+the same four deferrals, and aligned the genesis-gap priority across call sites. No new
+timing window, veto, config or sizing change was introduced.
 
 ---
 
