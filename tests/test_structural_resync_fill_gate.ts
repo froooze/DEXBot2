@@ -36,23 +36,86 @@ function check(name: string, actual: any, expected: any) {
     }
 }
 
-function sleep(ms: number) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+/**
+ * Virtual clock for the defer mechanism.
+ *
+ * The production gate re-arms a `TIMING.LOCK_REFRESH_MIN_MS` (250 ms)
+ * `setTimeout` on every defer and does its cap math with `Date.now()`. Driving
+ * that with real wall-clock sleeps cost ~6 s per run of this file — the slowest
+ * test in the suite by an order of magnitude — while asserting nothing about
+ * real elapsed time. A virtual clock runs the exact same timer callbacks and
+ * cap checks in a few milliseconds. This file runs in its own Node process
+ * (the runner spawns one per test), so patching the globals here cannot affect
+ * production or any other test.
+ */
+function installFakeClock() {
+    const realSetTimeout = globalThis.setTimeout;
+    const realClearTimeout = globalThis.clearTimeout;
+    const realSetInterval = globalThis.setInterval;
+    const realClearInterval = globalThis.clearInterval;
+    const realDateNow = Date.now;
+    let now = realDateNow();
+    let seq = 0;
+    const timers = new Map<number, { id: number; at: number; fn: () => void; every: number | null }>();
+
+    (globalThis as any).setTimeout = (fn: (...a: any[]) => void, ms = 0, ...args: any[]) => {
+        const id = ++seq;
+        timers.set(id, { id, at: now + ms, fn: () => fn(...args), every: null });
+        return id as any;
+    };
+    (globalThis as any).clearTimeout = (id: any) => { timers.delete(Number(id)); };
+    (globalThis as any).setInterval = (fn: (...a: any[]) => void, ms = 0, ...args: any[]) => {
+        const id = ++seq;
+        timers.set(id, { id, at: now + ms, fn: () => fn(...args), every: ms });
+        return id as any;
+    };
+    (globalThis as any).clearInterval = (id: any) => { timers.delete(Number(id)); };
+    Date.now = () => now;
+
+    /** Move virtual time forward, firing every due timer in order. */
+    async function advance(ms: number) {
+        const target = now + ms;
+        while (true) {
+            let next: { id: number; at: number; fn: () => void; every: number | null } | undefined;
+            for (const t of timers.values()) {
+                if (t.at <= target && (!next || t.at < next.at || (t.at === next.at && t.id < next.id))) next = t;
+            }
+            if (!next) break;
+            now = Math.max(now, next.at);
+            if (next.every !== null) next.at = now + next.every;
+            else timers.delete(next.id);
+            next.fn();
+            // Let promise continuations spawned by the callback settle before
+            // evaluating the next timer or a predicate.
+            await new Promise<void>((resolve) => realSetTimeout(resolve, 0));
+        }
+        now = target;
+    }
+
+    function restore() {
+        (globalThis as any).setTimeout = realSetTimeout;
+        (globalThis as any).clearTimeout = realClearTimeout;
+        (globalThis as any).setInterval = realSetInterval;
+        (globalThis as any).clearInterval = realClearInterval;
+        Date.now = realDateNow;
+    }
+    return { advance, restore };
 }
 
-/** Wait until `predicate` is true, yielding between checks. */
-function waitFor(predicate: () => boolean, message: string, maxMs = 3000) {
-    const start = Date.now();
-    return new Promise<void>((resolve, reject) => {
-        const tick = () => {
-            let done = false;
-            try { done = !!predicate(); } catch (err) { reject(err); return; }
-            if (done) return resolve();
-            if (Date.now() - start >= maxMs) return reject(new Error(`Timed out waiting for ${message}`));
-            setTimeout(tick, 10);
-        };
-        setTimeout(tick, 10);
-    });
+const clock = installFakeClock();
+
+function sleep(ms: number) {
+    return clock.advance(ms);
+}
+
+/** Advance virtual time until `predicate` is true. */
+async function waitFor(predicate: () => boolean, message: string, maxMs = 3000) {
+    let waited = 0;
+    while (!predicate()) {
+        if (waited >= maxMs) throw new Error(`Timed out waiting for ${message}`);
+        await clock.advance(10);
+        waited += 10;
+    }
 }
 
 function makeBot(botKey: string) {
@@ -295,6 +358,7 @@ async function run() {
     await testDeferClassChangeRestoresClock();
     await testAlternatingCauseStillForces();
 
+    clock.restore();
     if (failures > 0) {
         console.error(`\n❌ ${failures} structural-resync fill-gate assertion(s) failed`);
         process.exit(1);
@@ -303,6 +367,7 @@ async function run() {
 }
 
 run().catch((err) => {
+    clock.restore();
     console.error('Structural-resync fill-gate test failed:', err);
     process.exit(1);
 });

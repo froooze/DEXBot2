@@ -30,12 +30,13 @@ function dexbot(argv: string[]) {
 
 async function testLiquidSpellingsForwardHelp() {
     // `liq` is the default shorthand; `liqu`/`liquidity` are alternates and
-    // `liquid` is the canonical command.
-    for (const spelling of ['liq', 'liqu', 'liquidity', 'liquid']) {
+    // `liquid` is the canonical command. Each probe is an independent child
+    // process, so run them together instead of paying Node startup 4 times.
+    await Promise.all(['liq', 'liqu', 'liquidity', 'liquid'].map(async (spelling) => {
         const res = await dexbot([spelling, '--help']);
         assert.strictEqual(res.status, 0, `dexbot ${spelling} --help should exit 0, got ${res.status}: ${res.stderr}`);
         assert.match(res.stdout, /Usage: dexbot liquid /, `dexbot ${spelling} --help should print liquid usage`);
-    }
+    }));
 }
 
 async function testHelpListsDefaultShorthand() {
@@ -48,8 +49,10 @@ async function testHelpListsDefaultShorthand() {
 }
 
 async function run() {
-    await testLiquidSpellingsForwardHelp();
-    await testHelpListsDefaultShorthand();
+    await Promise.all([
+        testLiquidSpellingsForwardHelp(),
+        testHelpListsDefaultShorthand(),
+    ]);
     console.log('CLI alias tests passed');
 }
 

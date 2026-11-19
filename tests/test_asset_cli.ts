@@ -160,13 +160,18 @@ async function run() {
     testHelpAndMissingTarget();
     testRejectsBadInput();
     testAnalyzerTable();
-    await testHelpPrintsAssetUsageOffline();
-    await testNoTargetPrintsUsageAndFails();
-    await testWrongTargetFlagFailsBeforeChainWork();
-    await testRemovedTokenKeywordFailsBeforeChainWork();
-    await testDexbotForwardsHelpToAsset();
-    await testShorthandAliasForwardsHelp();
-    await testHelpListsAssetCommand();
+    // Each probe is an independent, read-only child process. Run them together
+    // instead of paying seven separate Node startups; each assertion still
+    // checks its own child's captured output.
+    await Promise.all([
+        testHelpPrintsAssetUsageOffline(),
+        testNoTargetPrintsUsageAndFails(),
+        testWrongTargetFlagFailsBeforeChainWork(),
+        testRemovedTokenKeywordFailsBeforeChainWork(),
+        testDexbotForwardsHelpToAsset(),
+        testShorthandAliasForwardsHelp(),
+        testHelpListsAssetCommand(),
+    ]);
     console.log('asset cli tests passed');
 }
 

@@ -119,11 +119,16 @@ async function testUnknownTargetListsAccounts(profileRoot: string) {
 async function run() {
     const profileRoot = makeProfileRoot();
     try {
-        await testHelpAcceptsAccountTarget(profileRoot);
-        await testAccountWithoutDebtPolicyIsReported(profileRoot);
-        await testEnabledTargetWithoutPolicyIsReported(profileRoot);
-        await testInactiveAccountTargetIsReported(profileRoot);
-        await testUnknownTargetListsAccounts(profileRoot);
+        // Each probe is an independent, read-only child process over the same
+        // static bot config. Run them together instead of paying five separate
+        // Node startups; assertions still capture each child's own output.
+        await Promise.all([
+            testHelpAcceptsAccountTarget(profileRoot),
+            testAccountWithoutDebtPolicyIsReported(profileRoot),
+            testEnabledTargetWithoutPolicyIsReported(profileRoot),
+            testInactiveAccountTargetIsReported(profileRoot),
+            testUnknownTargetListsAccounts(profileRoot),
+        ]);
     } finally {
         fs.rmSync(profileRoot, { recursive: true, force: true });
     }
