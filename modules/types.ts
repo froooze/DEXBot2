@@ -602,6 +602,10 @@ export interface BotMetrics extends UnknownRecord {
   chunkAbortedOpCount: number;
   /** Rails re-placed by the post-recovery rebalance (snapshot reload / repair contexts). */
   reloadReplacedRailCount: number;
+  /** Batches whose pivot moved between batch-start freeze and the pre-broadcast final gate (§9.14 Stage 4). */
+  lastFillPivotMovedUnderBatchCount: number;
+  /** Batches where the final pivot gate threw and its fail-open path kept the built ops (§9.14 Stage 4). */
+  lastFillGateFailOpenCount: number;
 }
 
 /** An unmatched chain order surfaced by a sync pass. */

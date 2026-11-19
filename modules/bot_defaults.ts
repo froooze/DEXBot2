@@ -228,6 +228,8 @@ export function createDefaultBotMetrics(): BotMetrics {
         stalePlanProceedCount: 0,
         clampedNoopUpdateCount: 0,
         chunkAbortedOpCount: 0,
-        reloadReplacedRailCount: 0
+        reloadReplacedRailCount: 0,
+        lastFillPivotMovedUnderBatchCount: 0,
+        lastFillGateFailOpenCount: 0
     };
 }

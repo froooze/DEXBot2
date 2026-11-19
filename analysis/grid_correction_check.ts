@@ -30,6 +30,12 @@
  *   - unverifiable       no placement event / pivot observation near the gate
  *                        — kept as a violation (fail toward reporting).
  *
+ * Anchor selection is source-aware (§9.14): a `plan-action` anchor looks FORWARD
+ * to the gate, a `placed` anchor looks BACKWARD to the gate line (preferring
+ * mode=/Final-gate/rearm over an intervening fill-pivot). Candidates that were
+ * in the old FAIL list but pass the corrected rule are reported under
+ * `pivot-anchor-artifact` — neither failures nor ordinary divergences.
+ *
  * Intentional offline gaps (documented, acceptable):
  *   - Runtime pivots on _lastFilledPrice/_lastFilledType at decision time; tool
  *     checks consecutive fill pairs. For batch-placed orders (multiple orders
@@ -88,6 +94,7 @@ import {
     TransitionCandidate,
     RuntimeLogIndex,
 } from './pivot_timeline.js';
+import type { RefusalEvent } from './pivot_timeline.js';
 import path from 'node:path';
 
 const { kibanaSearch, DEFAULT_CONFIG: BASE_CONFIG } = KC;
@@ -134,6 +141,13 @@ interface Violation {
      * Present on the violation regardless of which rule caught it.
      */
     sameLevel?: boolean;
+    /** Policy-aware mirror evidence: absent in --strict or the same-level-marker path. */
+    mirrorVerdict?: 'violation' | 'unverifiable' | null;
+    mirrorReason?: string | null;
+    /** Runtime gate pivot used by the mirror (distinct from the strict `pivot`). */
+    mirrorPivot?: { price: number; type: string; t: number; src?: string } | null;
+    anchor?: { kind: string; t: number; price: number; orderId: string } | null;
+    pivotSelection?: 'forward' | 'backward' | null;
 }
 interface AggregatedOrder {
     orderId: string;
@@ -155,12 +169,34 @@ interface PolicyDivergence {
     direction: 'buy' | 'sell';
     prev: TradeFill;
     curr: TradeFill;
-    pivot: { price: number; type: string; t: number } | null;
+    pivot: { price: number; type: string; t: number; src?: string } | null;
     reason: string;
     refusalsInRange: number;
     priceDeltaPct: number;
     /** True when the candidate is a same-level re-fill (within half a grid step of the previous same-side fill). */
     sameLevel?: boolean;
+    anchor: { kind: string; t: number; price: number; orderId: string } | null;
+    pivotSelection: 'forward' | 'backward' | null;
+}
+
+/**
+ * A strict candidate that was in the pre-§9.14 FAIL list (the old forward
+ * lookup either blocked it or could not verify it) but passes the corrected
+ * source-aware rule. Kept in its own report section so the audit correction
+ * stays visible instead of silently shrinking the FAIL count.
+ * NOT a gate failure and NOT an ordinary policy divergence.
+ */
+interface PivotAnchorArtifact {
+    index: number;
+    pair: string;
+    direction: 'buy' | 'sell';
+    prev: TradeFill;
+    curr: TradeFill;
+    anchor: { kind: string; t: number; price: number } | null;
+    legacyPivot: { price: number; type: string; t: number; src?: string } | null;
+    correctedPivot: { price: number; type: string; t: number; src?: string } | null;
+    reason: string;
+    priceDeltaPct: number;
 }
 
 /**
@@ -170,18 +206,20 @@ interface PolicyDivergence {
  * pivot arm, so a same-level fill that the log shows SHOULD have been blocked
  * is a gate failure — a violation even in policy-aware mode — not a policy
  * divergence. Fail-open: no log, no matching refusal => normal mirror verdict.
+ * Returns the MATCHED refusal event, not a boolean, so the FAIL entry can carry
+ * the price/timestamp that decided it (Finding 1 provenance).
  */
 function sameLevelRefusalMarker(
     index: RuntimeLogIndex | null,
     v: Violation,
     incrementPercent: number,
-): boolean {
-    if (!index) return false;
+): RefusalEvent | null {
+    if (!index) return null;
     const prevT = Date.parse(v.prev.time + (/[Zz]|[+-]\d\d:?(\d\d)?$/.test(v.prev.time) ? '' : 'Z'));
     const currT = Date.parse(v.curr.time + (/[Zz]|[+-]\d\d:?(\d\d)?$/.test(v.curr.time) ? '' : 'Z'));
-    if (!Number.isFinite(prevT) || !Number.isFinite(currT)) return false;
+    if (!Number.isFinite(prevT) || !Number.isFinite(currT)) return null;
     const ttl = Number(C.GRID_LIMITS?.LAST_FILL_REFUSED_LEVEL_TTL_MS ?? 0);
-    if (!(ttl > 0)) return false;
+    if (!(ttl > 0)) return null;
     for (const r of index.refusals) {
         if (r.type !== v.direction) continue;
         if (r.t > currT) continue;
@@ -189,9 +227,9 @@ function sameLevelRefusalMarker(
         // The marker must postdate the just-filled trade itself (5s slack for
         // block-time vs log-clock skew), else it describes an older level.
         if (r.t < prevT - 5000) continue;
-        if (pricesWithinHalfStep(r.price, v.prev.price, incrementPercent)) return true;
+        if (pricesWithinHalfStep(r.price, v.prev.price, incrementPercent)) return r;
     }
-    return false;
+    return null;
 }
 
 /**
@@ -206,22 +244,37 @@ function applyRuntimeMirror(
     violations: Violation[],
     logPath: string,
     incrementPercent: number,
-): { kept: Violation[]; divergences: PolicyDivergence[]; index: RuntimeLogIndex | null; logError: string | null } {
+): {
+    kept: Violation[];
+    divergences: PolicyDivergence[];
+    artifacts: PivotAnchorArtifact[];
+    index: RuntimeLogIndex | null;
+    logError: string | null;
+} {
     let text: string;
     try {
         text = fs.readFileSync(logPath, 'utf-8');
     } catch (e) {
-        return { kept: violations, divergences: [], index: null, logError: getErrorMessage(e) };
+        return { kept: violations, divergences: [], artifacts: [], index: null, logError: getErrorMessage(e) };
     }
     const index = parseRuntimeLog(text);
     const kept: Violation[] = [];
     const divergences: PolicyDivergence[] = [];
+    const artifacts: PivotAnchorArtifact[] = [];
     for (const v of violations) {
         // Same-level re-fill whose just-filled level carries a fresh refusal
         // marker in the log: the amended §9.12/P2 gate would have blocked the
         // re-placement — it filled anyway => gate failure, keep as violation.
-        if (v.sameLevel && sameLevelRefusalMarker(index, v, incrementPercent)) {
-            kept.push(v);
+        const marker = v.sameLevel ? sameLevelRefusalMarker(index, v, incrementPercent) : null;
+        if (marker) {
+            kept.push({
+                ...v,
+                mirrorVerdict: 'violation',
+                mirrorReason: `same-level refusal marker (§9.12/P2): ${marker.price}(${marker.type}) at ${new Date(marker.t).toISOString()} — the amended gate would have blocked this re-placement`,
+                mirrorPivot: null,
+                anchor: null,
+                pivotSelection: null,
+            });
             continue;
         }
         const cand: TransitionCandidate = {
@@ -234,23 +287,56 @@ function applyRuntimeMirror(
         };
         const verdict = classifyTransition(cand, index);
         if (verdict.verdict === 'policy-divergence') {
-            divergences.push({
-                index: v.index,
-                pair: v.pair,
-                direction: v.direction,
-                prev: v.prev,
-                curr: v.curr,
-                pivot: verdict.pivot,
-                reason: verdict.reason,
-                refusalsInRange: verdict.refusalsInRange,
-                priceDeltaPct: v.priceDeltaPct,
-                sameLevel: v.sameLevel,
-            });
+            // Audit trail for the §9.14 correction: anything that was in the
+            // OLD FAIL list (violation OR unverifiable, both kept as failures)
+            // but passes the corrected source-aware rule is reclassified into
+            // its own section — never silently dropped from the report.
+            const legacy = classifyTransition(cand, index, { pivotRule: 'forward' });
+            if (legacy.verdict !== 'policy-divergence') {
+                artifacts.push({
+                    index: v.index,
+                    pair: v.pair,
+                    direction: v.direction,
+                    prev: v.prev,
+                    curr: v.curr,
+                    anchor: verdict.anchor
+                        ? { kind: verdict.anchor.kind, t: verdict.anchor.t, price: verdict.anchor.price }
+                        : null,
+                    legacyPivot: legacy.pivot,
+                    correctedPivot: verdict.pivot,
+                    reason: verdict.reason,
+                    priceDeltaPct: v.priceDeltaPct,
+                });
+            } else {
+                divergences.push({
+                    index: v.index,
+                    pair: v.pair,
+                    direction: v.direction,
+                    prev: v.prev,
+                    curr: v.curr,
+                    pivot: verdict.pivot,
+                    reason: verdict.reason,
+                    refusalsInRange: verdict.refusalsInRange,
+                    priceDeltaPct: v.priceDeltaPct,
+                    sameLevel: v.sameLevel,
+                    anchor: verdict.anchor ? { ...verdict.anchor } : null,
+                    pivotSelection: verdict.pivotSelection,
+                });
+            }
         } else {
-            kept.push(v);
+            // Keep the mirror evidence on every FAIL entry so the verdict can
+            // be re-checked from the JSON/CSV without re-running the checker.
+            kept.push({
+                ...v,
+                mirrorVerdict: verdict.verdict,
+                mirrorReason: verdict.reason,
+                mirrorPivot: verdict.pivot ? { ...verdict.pivot } : null,
+                anchor: verdict.anchor ? { ...verdict.anchor } : null,
+                pivotSelection: verdict.pivotSelection,
+            });
         }
     }
-    return { kept, divergences, index, logError: null };
+    return { kept, divergences, artifacts, index, logError: null };
 }
 
 // ─── LAST-FILL-GUARD (the runtime's own predicate) ──────────────────────────────
@@ -306,7 +392,7 @@ Options:
                          behaviour — false positives on pivot-arm refusals)
   --per-fill             Check at fill granularity (default: per-order aggregated)
   --include-cross-pair   Check consecutive fills across different pairs (default: same pair only)
-  --json <file>          Export violations as JSON
+  --json <file>          Export violations, divergences and artifacts as JSON
   --csv <file>           Export violations as CSV
   --verbose              Print the fetched trade sequence before checking
   --list-bots            List available bot keys and exit
@@ -675,6 +761,7 @@ function printReport(
     gte: string,
     _lte: string,
     divergences: PolicyDivergence[],
+    artifacts: PivotAnchorArtifact[],
     mirrorMode: 'policy-aware' | 'strict',
     runtimeLogPath: string | null,
     logError: string | null,
@@ -718,6 +805,7 @@ function printReport(
     if (mirrorMode === 'policy-aware') {
         console.log(`  Strict candidates:    ${strictCandidates}`);
         console.log(`  Policy divergences:   ${divergences.length}  (runtime gate would have passed them)`);
+        console.log(`  Pivot-anchor artifacts: ${artifacts.length}  (legacy forward-pivot verdicts reclassified — not failures)`);
     }
     console.log(`  Violations:           ${violations.length}${strictCandidates > 0 ? `  (${((violations.length / strictCandidates) * 100).toFixed(2)}% of strict candidates)` : ''}`);
     const sameLevelViolations = violations.filter(v => v.sameLevel).length;
@@ -739,6 +827,7 @@ function printReport(
             console.log('');
         }
         if (divergences.length > 0) printDivergences(divergences);
+        if (artifacts.length > 0) printPivotAnchorArtifacts(artifacts);
         return;
     }
 
@@ -810,6 +899,7 @@ function printReport(
     console.log(`  No band: the grid increment (${incrementPercent}%) is reported for context only.`);
     console.log('');
     if (divergences.length > 0) printDivergences(divergences);
+    if (artifacts.length > 0) printPivotAnchorArtifacts(artifacts);
 }
 
 /**
@@ -851,6 +941,39 @@ function printDivergences(divergences: PolicyDivergence[]) {
     console.log('');
 }
 
+/**
+ * §9.14: candidates that were in the old FAIL list (the forward lookup either
+ * blocked them or could not verify them) but pass the corrected source-aware
+ * rule. Reported in their own section so the audit correction stays auditable —
+ * they are neither failures nor divergences.
+ */
+function printPivotAnchorArtifacts(artifacts: PivotAnchorArtifact[]) {
+    console.log('  ── Pivot-anchor artifacts (old FAIL-list entries reclassified) ──');
+    console.log('  A `Placed` line is emitted at commit, after the gate; the old forward rule');
+    console.log('  judged it against the NEXT batch\'s pivot (or found no observation at all).');
+    console.log('  The corrected rule uses the last pivot at/before the placement. These are');
+    console.log('  not gate failures and no longer count toward the FAIL total.');
+    console.log('');
+    const hdr = '  #  Pair          Dir   Curr Price     Legacy Pivot        Corrected Pivot     Anchor    Δ%       Reason';
+    console.log(hdr);
+    console.log('  ' + '─'.repeat(hdr.length - 2));
+    for (let i = 0; i < artifacts.length; i++) {
+        const a = artifacts[i];
+        const pairLabel = `${assetSymbol(a.prev.baseAsset)}/${assetSymbol(a.prev.quoteAsset)}`.padEnd(12);
+        const dir = a.direction.padEnd(4);
+        const cPrice = fmt(a.curr.price, 6).padStart(12);
+        const fmtPivot = (p: { price: number; type: string; t: number; src?: string } | null) =>
+            p ? `${fmt(p.price, 4)}(${(p.type || '?')[0]})${p.src ? `[${p.src}]` : ''}` : '-';
+        const legacy = fmtPivot(a.legacyPivot).padStart(18);
+        const corrected = fmtPivot(a.correctedPivot).padStart(18);
+        const anchor = (a.anchor ? a.anchor.kind : '-').padEnd(9);
+        const delta = (a.priceDeltaPct >= 0 ? '+' : '') + a.priceDeltaPct.toFixed(4) + '%';
+        const reason = a.reason.replace(/^runtime pivot /, 'pivot ').slice(0, 60);
+        console.log(`  ${String(i + 1).padStart(2)}  ${pairLabel}  ${dir}  ${cPrice}  ${legacy}  ${corrected}  ${anchor}  ${delta.padStart(9)}  ${reason}`);
+    }
+    console.log('');
+}
+
 function exportJson(
     filePath: string,
     violations: Violation[],
@@ -860,6 +983,7 @@ function exportJson(
     accountId: string,
     incrementPercent: number,
     divergences: PolicyDivergence[] = [],
+    artifacts: PivotAnchorArtifact[] = [],
     mirrorMode: 'policy-aware' | 'strict' = 'strict',
     runtimeLogPath: string | null = null,
 ) {
@@ -868,6 +992,18 @@ function exportJson(
         incrementPercent,
         totalFills: trades.length,
         mirror: { mode: mirrorMode, runtimeLog: runtimeLogPath },
+        pivotAnchorArtifacts: artifacts.map(a => ({
+            index: a.index,
+            pair: `${assetSymbol(a.prev.baseAsset)}/${assetSymbol(a.prev.quoteAsset)}`,
+            direction: a.direction,
+            reason: a.reason,
+            prev: { time: a.prev.time, orderId: a.prev.orderId, price: a.prev.price },
+            curr: { time: a.curr.time, orderId: a.curr.orderId, price: a.curr.price },
+            anchor: a.anchor,
+            legacyPivot: a.legacyPivot,
+            correctedPivot: a.correctedPivot,
+            priceDeltaPct: a.priceDeltaPct,
+        })),
         policyDivergences: divergences.map(d => ({
             pair: `${assetSymbol(d.prev.baseAsset)}/${assetSymbol(d.prev.quoteAsset)}`,
             direction: d.direction,
@@ -875,6 +1011,8 @@ function exportJson(
             prev: { time: d.prev.time, orderId: d.prev.orderId, price: d.prev.price },
             curr: { time: d.curr.time, orderId: d.curr.orderId, price: d.curr.price },
             runtimePivot: d.pivot,
+            anchor: d.anchor,
+            pivotSelection: d.pivotSelection,
             refusalsInRange: d.refusalsInRange,
             priceDeltaPct: d.priceDeltaPct,
         })),
@@ -890,6 +1028,13 @@ function exportJson(
             threshold: v.threshold,
             priceDelta: v.priceDelta,
             priceDeltaPct: v.priceDeltaPct,
+            mirror: {
+                verdict: v.mirrorVerdict ?? null,
+                reason: v.mirrorReason ?? null,
+                runtimePivot: v.mirrorPivot ?? null,
+                anchor: v.anchor ?? null,
+                pivotSelection: v.pivotSelection ?? null,
+            },
         })),
     };
     fs.writeFileSync(filePath, JSON.stringify(payload, null, 2), 'utf-8');
@@ -897,7 +1042,7 @@ function exportJson(
 }
 
 function exportCsv(filePath: string, violations: Violation[]) {
-    const header = 'index,pair,direction,expected,prev_time,prev_order,prev_price,curr_time,curr_order,curr_price,threshold,halfInc,pivot,delta_pct';
+    const header = 'index,pair,direction,expected,prev_time,prev_order,prev_price,curr_time,curr_order,curr_price,threshold,halfInc,pivot,delta_pct,mirror_verdict,mirror_reason,mirror_pivot,anchor_kind,anchor_time,pivot_selection';
     const rows = violations.map((v, i) =>
         [
             i + 1,
@@ -907,6 +1052,12 @@ function exportCsv(filePath: string, violations: Violation[]) {
             v.curr.time, v.curr.orderId, v.curr.price,
             v.threshold, v.halfInc, v.pivot,
             v.priceDeltaPct.toFixed(6),
+            v.mirrorVerdict ?? '',
+            v.mirrorReason ?? '',
+            v.mirrorPivot ? `${v.mirrorPivot.price}(${v.mirrorPivot.type})${v.mirrorPivot.src ? `[${v.mirrorPivot.src}]` : ''}@${new Date(v.mirrorPivot.t).toISOString()}` : '',
+            v.anchor?.kind ?? '',
+            v.anchor ? new Date(v.anchor.t).toISOString() : '',
+            v.pivotSelection ?? '',
         ].map(x => `"${String(x).replace(/"/g, '""')}"`).join(',')
     );
     fs.writeFileSync(filePath, [header, ...rows].join('\n') + '\n', 'utf-8');
@@ -985,6 +1136,7 @@ async function main() {
     // runtime held at each order's gate. Default on; --strict skips it.
     let violations = strictCandidatesList;
     let divergences: PolicyDivergence[] = [];
+    let artifacts: PivotAnchorArtifact[] = [];
     let mirrorMode: 'policy-aware' | 'strict' = 'strict';
     let runtimeLogPath: string | null = null;
     let logError: string | null = null;
@@ -998,6 +1150,7 @@ async function main() {
                 const mirror = applyRuntimeMirror(strictCandidatesList, runtimeLogPath, incrementPercent);
                 violations = mirror.kept;
                 divergences = mirror.divergences;
+                artifacts = mirror.artifacts;
                 logError = mirror.logError;
                 if (mirror.index) {
                     mirrorMode = 'policy-aware';
@@ -1014,15 +1167,16 @@ async function main() {
     }
 
     const ordersForReport = opts.perFill ? null : (items as AggregatedOrder[]);
-    printReport(trades, ordersForReport, violations, checkedTransitions, skipped, label, String(opts.botKey), accountId, botMeta, opts.perFill, opts.includeCrossPair, incrementPercent, gte, lte, divergences, mirrorMode, runtimeLogPath, logError, strictCandidatesList.length);
+    printReport(trades, ordersForReport, violations, checkedTransitions, skipped, label, String(opts.botKey), accountId, botMeta, opts.perFill, opts.includeCrossPair, incrementPercent, gte, lte, divergences, artifacts, mirrorMode, runtimeLogPath, logError, strictCandidatesList.length);
 
-    if (opts.json) exportJson(opts.json, violations, trades, label, String(opts.botKey), accountId, incrementPercent, divergences, mirrorMode, runtimeLogPath);
+    if (opts.json) exportJson(opts.json, violations, trades, label, String(opts.botKey), accountId, incrementPercent, divergences, artifacts, mirrorMode, runtimeLogPath);
     if (opts.csv) exportCsv(opts.csv, violations);
 
     process.exit(violations.length > 0 ? 2 : 0);
 }
 
-export { isLastFillGuardBlocked, detectViolations, applyRuntimeMirror, classifyFills, TradeFill, AggregatedOrder, Violation, PolicyDivergence };
+export { isLastFillGuardBlocked, detectViolations, applyRuntimeMirror, classifyFills, exportJson, exportCsv };
+export type { TradeFill, AggregatedOrder, Violation, PolicyDivergence, PivotAnchorArtifact };
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
     main().catch(e => {

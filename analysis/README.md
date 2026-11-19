@@ -263,6 +263,8 @@ Validates LAST-FILL-GUARD discipline from the same Kibana fill pipeline as `trad
 
 **Offline limits:** the tool reconstructs pivots from consecutive fills, so it cannot see the runtime's edge-pinned-fill exclusion (no slot identity per fill) nor the spread-correction bypass — expect rare false positives on wick/insurance fills.
 
+**Pivot anchors (§9.14):** a `plan-action` placement is judged against the first pivot observation after it; a `Placed` line is emitted at commit, *after* the gate, so it is judged against the last **gate line** (`mode=` / Final-gate / re-arm) before it. A `fill-pivot` is a fill event, not a gate, and is never used as a fallback — with no gate line the candidate stays `unverifiable`. Candidates that the old forward lookup left in the FAIL list but that the corrected rule passes are reported in a separate `pivot-anchor-artifact` section (and JSON field), not silently dropped. An unverifiable candidate still stays a violation, failing toward reporting.
+
 **Pipeline:** Kibana `fill_order` query (paginated `search_after`) → on-chain asset precision resolution → buy/sell classification → chronological sort → per-order/price-epoch aggregation (partial fills at one price collapsed to weighted-average; repriced order lifetimes kept separate) → consecutive direction comparison → violation report with daily histogram.
 
 ```bash

@@ -55,6 +55,7 @@
   - 9.11 v1.6.18 → v1.7.1: fill identity, absence and the geometry budget
   - 9.12 Revised priority list: counter-orders, pivot evidence and level-triggered repair
   - 9.13 Post-1.7.3 out-of-spread incident: sweep eligibility and the silent watchdog
+  - 9.14 Fix plan — LAST-FILL-GUARD audit-side defect and post-1.0 residuals
 - A. Grid-Price Invariant — former failure trace (appendix)
 
 ---
@@ -431,7 +432,7 @@ Slot-90 loop is *proximate* form; rotation suppression is mechanism, cascade is 
 
 **P0 Recovery must not lose orders when snapshot deleted — LANDED `1b27f6eb`.** `recoverFromPersistedGrid` (`dexbot_state_recovery.ts`) on truncated window falls back to `batchReadOrders` over `persistedGrid[*].orderId` (recovers bot's own incl. ID-adopted creates now persisted), without virtualizing ACTIVE; cannot discover brand-new orphans (prevented above); with no known ids still defers. Intentionally lossy for unenumeratable = reconcile virtualize-as-filled acceptable here; adoption path hard-defers.
 
-**P1 Atomic plan→broadcast→commit — PARTIAL.** Landed pieces: `restoreBoundaryAfterAdoption` re-applies the batch's shifted boundary immediately after by-id adoption (`1b27f6eb`); Phase-2 reconcile wrapped in a refcounted broadcast flag with `_awaitBroadcastIdle` deferral (`d808c052`); stale-commit refusal lives at `utils/validate.ts`. Still open: full re-plan from fresh master after winning `waitForCowBroadcastSingleFlight` + a COW-plan mutex covering the entire plan→broadcast→commit; dust-cancel `checkGridHealth` waits.
+**P1 Atomic plan→broadcast→commit — LANDED core (status corrected 2026-11-19, §9.14 Stage 2).** Landed pieces: `restoreBoundaryAfterAdoption` re-applies the batch's shifted boundary immediately after by-id adoption (`1b27f6eb`); Phase-2 reconcile wrapped in a refcounted broadcast flag with `_awaitBroadcastIdle` deferral (`d808c052`); stale-commit refusal lives at `utils/validate.ts`. The two formerly-listed open pieces are also landed: a fresh-master re-plan AFTER winning `waitForCowBroadcastSingleFlight` (`dexbot_cow_runtime.ts:5917–5960`), and the COW-plan mutex in the form of the placement lease claimed before planning and held through broadcast/commit (`PLAN_LEASE_RESULT_KEY`, `claimPlacement`). Fill-less stale plans are deliberately dropped with a deferred region-end re-derivation (`replanStaleBatch:3594`, v1.7.3 changelog) — that is the safe path, not a gap. The dust-cancel `checkGridHealth` wait is moot: `checkGridHealth` is detection-only (`order/grid.ts:3524–3539`) and `cancelDustOrders` holds the exclusive placement region via `runWithPlacement` (`dexbot_maintenance_runtime.ts:3387+`). Residual: observability only (§9.14 Stage 4); no behavior change proposed.
 
 **P1 Rotation same-slot — LANDED core (`1b27f6eb`); sub-fixes superseded.** (1) `skipBoundaryShift:true` removed from both dust synthetic fills (was `dexbot_maintenance_runtime.ts`) — dust fills are shift-eligible again; regression guard `tests/test_rotation_no_same_slot.ts` now 4 cases (ROT-4 same-slot loop case removed this commit, guard deleted); no defensive `skipBoundaryShift` check remains (`order/utils/order.ts` + `manager.ts` removed). Reintroduction of the flag would silently restore the same-slot fill loop. (2) moot — dust fills now trigger the crawl naturally. (3) SUPERSEDED — the Phase-2 projection override was removed entirely (`3713c496`); `ANCHOR.PROJECTION_ENABLED` no longer exists at all — it was deleted with the anchor in `e7231534`, so it is not merely an unused constant. (4) SUPERSEDED — the `d808c052` anchor-refill/price-sanity guard extensions were removed `e2898e51`; the original `calculateTargetGrid` fill-range rotation (`strategy.ts`) remains.
 
@@ -1383,6 +1384,175 @@ bounded-and-escalated the fund-invariant unreadable deferral, added a one-shot w
 an unreadable pending-broadcast liveness probe, made both destructive reload gates honour
 the same four deferrals, and aligned the genesis-gap priority across call sites. No new
 timing window, veto, config or sizing change was introduced.
+
+---
+
+### 9.14 Fix plan — LAST-FILL-GUARD audit-side defect and post-1.0 residuals
+
+> **Working copy:** [GRID_GUARD_FIX_PLAN.md](GRID_GUARD_FIX_PLAN.md) carries the
+> checkbox status and stage progress; this section is the canonical historical record.
+
+> **Source:** a policy-aware `grid_correction_check` run over a live market-pair bot's
+> runtime log (2026-10-14 → 2026-11-18), cross-referenced with §3.3, §2, §9.12 and
+> §9.13 of this ledger. Generic terms only — no market, pair, account, bot or order
+> id is named. Recorded 2026-11-19. This section is a plan, not a change: every stage
+> carries a gate and a stop condition, and nothing here weakens a guard.
+
+**Audit result.** 3,791 fills → 2,360 order epochs → 2,359 transitions; 152 strict
+candidates → 104 policy divergences (expected under the §9.12/P1 arming policy) and
+48 violations. Triage of the 48:
+
+- 16 direction candidates: 8 were classified by pivot comparison, 8 were
+  `unverifiable` (no placement event or no pivot observation near the gate) and kept
+  by the fail-toward-reporting policy.
+- 32 same-level re-fill candidates: 30 predate the build carrying §9.12 Addendum 2/3;
+  2 occur late in the window on that build.
+- **All 8 pivot-classified candidates would have passed the last pivot observation at
+  or before their placement**, and 3 more old FAIL-list entries were unverifiable
+  under the forward lookup. The FAIL is an audit-side defect, not a runtime breach.
+
+**Root cause (audit side, not runtime).** `analysis/pivot_timeline.ts` calls
+`pivotAtOrAfter(index.observations, placement.t)` for both `plan-action` and `placed`
+anchors. A `Placed` line is emitted at commit, i.e. AFTER `runFinalPivotGate`
+(`modules/dexbot_cow_runtime.ts:5605`) and the broadcast (`:5966`), so the first
+observation after a `Placed` event can belong to the NEXT batch. In the audited window
+a placement was judged against a pivot logged a fraction of a second later by the
+following batch, while the pivot actually held a few seconds earlier would have passed
+it. The §9.12 addendum deliberately refuses to treat "Pivot refreshed from N pending
+queued fill(s)" as pivot evidence (the queue may hold refused fills); the correct
+repair is therefore source-aware anchor selection, not promoting that log line.
+
+**Late same-level fills.** The two post-fix same-level fills are a one-cycle
+marker-write race: the refusal lines and the subsequent
+`same-level re-fill … (its pivot-arm was refused)` skip lines share the same window —
+the orders were already placed before the marker was written, and the guard stopped
+the next re-placement. This is the in-memory marker limitation already accepted in
+§9.12 Addendum 3, not a persistent loop. No code change is proposed for it here.
+
+**Stage verdicts.**
+
+| Stage | Verdict | Reason |
+|---|---|---|
+| 0 — source-aware pivot anchoring | **P0, do first** | Fixes every confirmed artifact; pure audit-side change |
+| 1 — duplicate-orphan cancel verify/hard error | **Deferred, reproduction-gated** | Doc "OPEN" (§3.3 P1) with no reproducing failure; chain-mutating path with documented lag/deferral pitfalls |
+| 2 — plan→broadcast atomicity | **Drop the code change** | Fresh-master re-plan after the single-flight and the placement lease are already landed; §3.3 P1 is stale |
+| 3 — chunk replay | **Bounded spike** | Reproduce the partial-chunk incident before changing broadcast behavior |
+| 4 — final-gate observability | **Counters only** | The gate runs pre-broadcast; `dropped=0` is not evidence of a failure |
+| 5 — mirror provenance | **Merged into Stage 0** | Keep the deliberate non-observation rule; export provenance instead |
+| 6 — non-goals | **Unchanged** | §9.12 Addendum 2/3, §9.13 "Deliberately not done" |
+
+**Stage 0 — source-aware pivot anchoring (P0).** In `classifyTransition`
+(`analysis/pivot_timeline.ts:343–396`), choose the pivot by anchor kind:
+`kind === 'plan-action'` keeps `pivotAtOrAfter` (the gate follows the plan);
+`kind === 'placed'` uses `pivotAtOrBefore` (the gate precedes the commit). Bound the
+backward search with a maximum lookback so a distant observation yields `unverifiable`
+rather than a verdict. Extend `TransitionVerdict` with the chosen observation's `src`,
+the anchor's `kind` and both timestamps, and surface them in the checker's JSON/CSV
+(Stage 5). Reclassified candidates are **not deleted**: they move to a new
+`pivot-anchor-artifact` report section so the correction stays auditable. Regression
+tests must pin a pivot change between plan and commit for both anchor kinds and assert
+that a `placed` candidate flips from violation to policy-divergence. Gate: re-running
+the policy-aware check over the same window reports zero pivot-classified violations,
+and the artifact section lists all 11 reclassified old FAIL-list entries with their
+two pivots.
+
+**Stage 0 outcome (landed).** Re-running the same window after the change: 152 strict
+candidates = 104 policy divergences + 11 pivot-anchor artifacts + 37 violations. Zero
+of the 37 are classified as violations by the corrected rule (31 are `unverifiable`
+and kept by the fail-toward-reporting policy; 6 are same-level cases kept by the
+§9.12/P2 refusal marker). No new violations were introduced; the divergence count is
+unchanged. Regression coverage: PT-11..PT-15, SL-11..SL-14 and FG-14.
+
+**Mirror provenance on every FAIL entry (Finding 1 follow-up).** `applyRuntimeMirror`
+records the mirror verdict, reason, runtime pivot, anchor and pivot-selection rule on
+violations, divergences and artifacts in both JSON and CSV, so no verdict needs a
+re-run to re-check. The same-level refusal-marker path — which short-circuits before
+`classifyTransition` — now returns the MATCHED `RefusalEvent` and writes its price and
+timestamp into `mirror.reason`; without it those entries were indistinguishable from
+"no mirror data". CSV timestamps are ISO-8601 throughout. The counts above were
+re-derived from this new mirror JSON, which is why the earlier 34/3 (and 4/3) split
+changed to 31/6 (and 5/2).
+
+**Behavior change on slow chains.** A `Placed` line that lands more than 120 s after
+its gate (chunk retries / congested chain — the broadcast scenario Stage 3 studied)
+can no longer be verified against a later batch's pivot: it becomes `unverifiable`
+and stays in the FAIL list. That is the documented fail-toward-reporting policy, not a
+new runtime breach. The audited window produced zero such reclassifications, but a
+future audit should confirm `mirror.verdict` / `mirror.reason` in the JSON before
+treating any new unverifiable entry as a regression. The 120 s backward window was
+deliberately not widened: measured fill-to-detection gaps of 30–42 s showed the
+nearest `Placed` lines were re-placements *after* detection, not the original gate.
+No fallback to a `fill-pivot` line exists — a fill event is not a gate decision.
+
+**Stage 1 — duplicate-orphan cancellation (deferred).** §3.3 P1 asks to verify that a
+`queueCorrection` cancelOnly actually executes and to hard-error when it cannot.
+`queueCorrection` (`modules/order/sync_engine.ts:1096–1124`) only enqueues; any
+verification belongs at the drain (`modules/order/utils/order.ts:1517+`), re-reading
+the target by id with the existing lag-deferral pattern and escalating only after
+bounded retries. It must verify *already-queued* cancels — it must not reintroduce the
+P1/P2 cancel sweeps reverted in §1. Enter this stage only with a reproducing log or
+test; otherwise leave the doc status OPEN.
+
+**Stage 2 — atomicity status reconciliation (no runtime change).** The fresh-master
+re-plan after winning the single-flight is already implemented
+(`modules/dexbot_cow_runtime.ts:5917–5960`), and the placement lease is claimed before
+planning and held through commit (`PLAN_LEASE_RESULT_KEY`, `claimPlacement`). Fill-less
+stale plans are deliberately dropped with a deferred region-end re-derivation
+(`replanStaleBatch:3594`, v1.7.3 changelog). §3.3 P1 line 434 must be annotated as
+superseded except for the dust-cancel `checkGridHealth` waits. The log signature
+`Plan stale pre-broadcast … dropping the batch` is the intended safe path, not a bug.
+Gate: doc status corrected and a test for the wait→re-plan path exists.
+
+**Stage 3 — chunk replay (bounded spike).** `executeChunkedWithRetryOnUncertain`
+continues uncertain chunks and aborts the remainder on definitive failure;
+`adoptPlacedBatchFromChain` reconciles landed ops by id. Any replay must first adopt by
+id, then re-plan only the unlanded remainder, and must respect §2 Mode C's caveat that
+"never half-applied" is an invariant of the refusal path only. Stop condition:
+reproduce the `2/8` partial-chunk incident in a test; if it cannot be reproduced with
+the current tree, record that and do not change broadcast behavior.
+
+**Stage 4 — final-gate observability (counters only).** `runFinalPivotGate`
+(`:6888–6954`) already re-checks built ops against the refreshed pivot before
+broadcast; `dropped=0` means no built op violated it. Add counters for "pivot moved
+under batch" and for the fail-open gate catch (`:5651`), using the existing
+`bot._metrics` pattern. Do not add a veto or freeze the fill queue: §9.13's
+"Deliberately not done" (3) forbids a hard reject that re-opens the counter-order
+deadlock, and the queue-refresh line remains non-evidence per §9.12. **Landed:**
+`recordFinalGateMetric` (`dexbot_cow_runtime.ts`) is the single owner for
+`lastFillPivotMovedUnderBatchCount` / `lastFillGateFailOpenCount`, seeded in
+`createDefaultBotMetrics()` and pinned by FG-14 — observability only, no behavior
+change. Stage 3's spike reached its stop condition (no test seam to inject a chunk-3
+failure) and changed no broadcast code; Stage 1 stays deferred without a reproducing
+case.
+
+**Stage 5 — mirror provenance.** Merged into Stage 0: export anchor kind, pivot source
+and both timestamps with each candidate. Do not introduce a `queue-refresh` observation
+class.
+
+**Stage 6 — non-goals.** No refused-level marker persistence (§9.12 Addendum 3), no
+cooldown/backoff (Addendum 2), no BUY-pivot §9.12/P2 exemption and no crossing veto
+(§9.13 lines 1314–1322), no general market-runaway re-anchor without soak evidence
+(§9.13 lines 1341–1343), and no config/sizing or 24h-TTL change.
+
+**Verification gate for this plan.**
+
+```
+npm run analysis:grid-check -- --bot-key <bot-key> \
+  --runtime-log profiles/logs/<bot-name>.log --start <iso> --end <iso> \
+  --json <out.json>
+npm test && npm run typecheck:analysis && npm run check:any
+```
+
+Expected: 0 pivot-classified violations; the 11 reclassified candidates listed under
+`pivot-anchor-artifact`; same-level candidates annotated by deploy generation;
+104 divergences still reported in their own section. Regression suites to keep green:
+`test_refused_level_refill_block`, `test_same_level_refill_check`,
+`test_fill_one_counter_order`, `test_stale_grid_hardening`, `test_incident_replay`.
+
+**Decisions recorded.** (1) Reclassified candidates stay visible in a dedicated
+report section rather than disappearing. (2) Stage 1 is deferred until a reproducing
+case exists; this round is the checker fix plus the doc reconciliation. (3) The plan
+is appended here as §9.14.
 
 ---
 

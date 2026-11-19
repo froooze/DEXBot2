@@ -48,14 +48,19 @@
  *                      toward reporting, never toward silence).
  *
  * Approximations (documented, offline-inherent):
- *   - The pivot for a placement is the FIRST observation at/after the
- *     placement event within PIVOT_LOOKAHEAD_MS — the gate runs between the
- *     plan build and the broadcast, and the batch's own mode=/Final-gate line
- *     is that gate's effective pivot. A dropped plan re-planned into a later
- *     batch resolves to the later batch's pivot (same orderId+action shape).
- *     The placement anchor is the order's event whose PRICE matches the
- *     filled price (a rotation to another level belongs to a different
- *     epoch); without a price match the latest event in the window is used.
+ *   - The pivot is selected by ANCHOR KIND. For a `plan-action` anchor the
+ *     gate follows the plan, so the FIRST observation at/after the event
+ *     within PIVOT_LOOKAHEAD_MS is used (a dropped plan re-planned into a later
+ *     batch resolves to that later batch's pivot). For a `placed` anchor the
+ *     gate and the broadcast PRECEDE the commit log line, so the LAST
+ *     GATE line at/before the event is used (bounded by PIVOT_LOOKBACK_MS) —
+ *     `mode`/`final-gate`/`rearm` only. A `fill-pivot` is a fill event, not a
+ *     gate, and is never used as a fallback; with no gate line the candidate
+ *     is `unverifiable`. Using a forward lookup picks the NEXT batch's pivot
+ *     — audit-side false violations (retrospective §9.14). The placement anchor is the
+ *     order's event whose PRICE matches the filled price (a rotation to
+ *     another level belongs to a different epoch); without a price match the
+ *     latest event in the window is used.
  *   - Band-exempt allowances are logged at DEBUG; without debug logs such a
  *     transition stays a violation (conservative: fail toward reporting).
  *   - Spread-correction placements go through the same Plan/Placed lines, so
@@ -106,13 +111,29 @@ export interface TransitionVerdict {
     verdict: 'policy-divergence' | 'violation' | 'unverifiable';
     reason: string;
     /** The runtime pivot used at the gate (null when unverifiable). */
-    pivot: { price: number; type: string; t: number } | null;
+    pivot: { price: number; type: string; t: number; src?: PivotObservation['src'] } | null;
     /** Refusals logged between the two fills (sweep-policy context). */
     refusalsInRange: number;
+    /** The placement event used as the gate anchor (null when unverifiable). */
+    anchor: { kind: PlacementEvent['kind']; t: number; price: number; orderId: string } | null;
+    /** Which pivot-selection rule produced the verdict (null when unverifiable). */
+    pivotSelection: 'forward' | 'backward' | null;
+}
+
+/** Audit-only classifier options. Default is the corrected source-aware rule. */
+export interface ClassifyOptions {
+    /**
+     * `forward` reproduces the pre-§9.14 bug (every anchor judged against the
+     * first observation after it). Used by the checker to report reclassified
+     * candidates as `pivot-anchor-artifact` instead of silently dropping them.
+     */
+    pivotRule?: 'source-aware' | 'forward';
 }
 
 /** How far after a placement event the judging gate may log its pivot. */
 export const PIVOT_LOOKAHEAD_MS = 120_000;
+/** How far before a `placed` event its pre-commit gate pivot may still be. */
+export const PIVOT_LOOKBACK_MS = 120_000;
 /** How wide an allowance match may drift around the gate pivot. */
 export const ALLOWANCE_WINDOW_MS = 120_000;
 /**
@@ -255,6 +276,24 @@ function pushPlacement(map: Map<string, PlacementEvent[]>, ev: PlacementEvent): 
     else map.set(ev.orderId, [ev]);
 }
 
+/**
+ * Gate-decision observations only. A `fill-pivot` line reports a fill event,
+ * not a placement gate, so it must never re-judge an order already priced.
+ * Cached per index so repeated classifyTransition calls do not re-filter the
+ * full observation timeline (relevant for multi-month logs). Assumes the index
+ * is immutable after parseRuntimeLog — both call sites only read it; sorting
+ * or appending observations afterwards would leave this cache stale.
+ */
+const gateIndexCache = new WeakMap<RuntimeLogIndex, PivotObservation[]>();
+function gateObservationsOf(index: RuntimeLogIndex): PivotObservation[] {
+    let cached = gateIndexCache.get(index);
+    if (!cached) {
+        cached = index.observations.filter(o => o.src !== 'fill-pivot');
+        gateIndexCache.set(index, cached);
+    }
+    return cached;
+}
+
 /** Latest pivot observation at or before `t` (binary search), or null. */
 export function pivotAtOrBefore(observations: PivotObservation[], t: number): PivotObservation | null {
     let lo = 0;
@@ -340,16 +379,26 @@ function parseIso(t: string): number {
  * held when `currOrderId` was last priced. Verdicts and the fail direction are
  * documented in the module header: anything unprovable stays a violation.
  */
-export function classifyTransition(cand: TransitionCandidate, index: RuntimeLogIndex): TransitionVerdict {
+export function classifyTransition(
+    cand: TransitionCandidate,
+    index: RuntimeLogIndex,
+    opts: ClassifyOptions = {},
+): TransitionVerdict {
     const currT = parseIso(cand.currTime);
     const prevT = parseIso(cand.prevTime);
-    const unverifiable = (reason: string): TransitionVerdict => ({
+    const unverifiable = (
+        reason: string,
+        anchor: TransitionVerdict['anchor'] = null,
+        pivotSelection: TransitionVerdict['pivotSelection'] = null,
+    ): TransitionVerdict => ({
         verdict: 'unverifiable',
         reason,
         pivot: null,
         refusalsInRange: Number.isFinite(prevT) && Number.isFinite(currT)
             ? countRefusalsBetween(index.refusals, prevT, currT)
             : 0,
+        anchor,
+        pivotSelection,
     });
 
     if (!Number.isFinite(currT)) return unverifiable('unparseable curr fill timestamp');
@@ -357,18 +406,52 @@ export function classifyTransition(cand: TransitionCandidate, index: RuntimeLogI
     if (!placement) {
         return unverifiable(`no placement event for order ${cand.currOrderId} before the fill`);
     }
-    // The gate runs between plan build and broadcast; its effective pivot is
-    // the batch's own mode=/Final-gate line. Look FORWARD from the event, not
-    // backward — the previous batch's pivot would understate the gate.
-    const obs = pivotAtOrAfter(index.observations, placement.t);
+    // A plan-action anchor precedes the gate; a placed anchor FOLLOWS it (the
+    // Placed line is emitted at commit, after runFinalPivotGate and broadcast).
+    // Using a forward lookup on a placed anchor picks the NEXT batch's pivot —
+    // the §9.14 audit defect. Legacy `forward` reproduces that old verdict for
+    // the checker's artifact section; it is not the default.
+    const useBackward = opts.pivotRule !== 'forward' && placement.kind === 'placed';
+    const anchor = {
+        kind: placement.kind,
+        t: placement.t,
+        price: placement.price,
+        orderId: placement.orderId,
+    };
+    let obs: PivotObservation | null;
+    let tooOld = false;
+    if (!useBackward) {
+        obs = pivotAtOrAfter(index.observations, placement.t);
+    } else {
+        // A `fill-pivot` line is a FILL-processing event, not a gate decision.
+        // For a `placed` anchor the effective pivot is ONLY in the batch's
+        // mode=/Final-gate/re-arm line. There is deliberately no fallback to
+        // a fill-pivot: a fill between the gate and the commit must not
+        // re-judge an order that was already priced. If no gate line is
+        // available (cold/unuarded batch), the candidate is unverifiable.
+        obs = pivotAtOrBefore(gateObservationsOf(index), placement.t);
+        if (obs && placement.t - obs.t > PIVOT_LOOKBACK_MS) {
+            tooOld = true;
+            obs = null;
+        }
+    }
     if (!obs) {
-        return unverifiable(`no pivot observation within ${PIVOT_LOOKAHEAD_MS / 1000}s of the placement event`);
+        return unverifiable(
+            tooOld
+                ? `gate pivot observation is older than ${PIVOT_LOOKBACK_MS / 1000}s before the placed event`
+                : useBackward
+                    ? `no gate pivot observation at/before the ${placement.kind} event`
+                    : `no pivot observation within ${PIVOT_LOOKAHEAD_MS / 1000}s of the placement event`,
+            anchor,
+            useBackward ? 'backward' : 'forward',
+        );
     }
     const refusalsInRange = Number.isFinite(prevT)
         ? countRefusalsBetween(index.refusals, prevT, currT)
         : 0;
-    const pivot = { price: obs.price, type: obs.type, t: obs.t };
+    const pivot = { price: obs.price, type: obs.type, t: obs.t, src: obs.src };
     const check = isLastFillGuardBlocked(cand.currPrice, cand.direction, obs.price, obs.type);
+    const pivotSelection = useBackward ? 'backward' : 'forward' as const;
     if (!check.blocked) {
         return {
             verdict: 'policy-divergence',
@@ -377,6 +460,8 @@ export function classifyTransition(cand: TransitionCandidate, index: RuntimeLogI
                 : `runtime pivot ${obs.price}(${obs.type}) at the gate was older than the strict last fill`,
             pivot,
             refusalsInRange,
+            anchor,
+            pivotSelection,
         };
     }
     const allowed = findAllowance(index.allowances, cand.direction, cand.currPrice, pivot.t - ALLOWANCE_WINDOW_MS, pivot.t + 5000);
@@ -386,6 +471,8 @@ export function classifyTransition(cand: TransitionCandidate, index: RuntimeLogI
             reason: `guard allowance logged at the gate (band-exempt / stamped evacuation; pivot ${obs.price}(${obs.type}))`,
             pivot,
             refusalsInRange,
+            anchor,
+            pivotSelection,
         };
     }
     return {
@@ -393,5 +480,7 @@ export function classifyTransition(cand: TransitionCandidate, index: RuntimeLogI
         reason: `the runtime's own pivot ${obs.price}(${obs.type}) would have blocked this placement`,
         pivot,
         refusalsInRange,
+        anchor,
+        pivotSelection,
     };
 }

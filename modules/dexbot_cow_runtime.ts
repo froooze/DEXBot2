@@ -5616,6 +5616,10 @@ async function updateOrdersOnChainBatchCOWBody(
             });
             if (finalGate.refreshed) lastFillGuardPivotRefreshed = true;
             if (finalGate.pivotChanged) {
+                // §9.14 Stage 4: observability only. The gate re-checks the
+                // built ops against the refreshed pivot; a move is not by
+                // itself a failure (dropped=0 means nothing violated it).
+                recordFinalGateMetric(bot, 'pivot-moved');
                 try {
                     const fmtP = (v: unknown) => (v == null || !Number.isFinite(Number(v)) ? 'none' : Format.formatPrice6(Number(v)));
                     bot.manager?.logger?.log?.(
@@ -5648,7 +5652,12 @@ async function updateOrdersOnChainBatchCOWBody(
             // skippedUpdateCount is threaded via countRef so the restore
             // below covers gate-dropped rotations too.
             if (skippedUpdateCountRef.count > 0) skippedUpdateCount += skippedUpdateCountRef.count;
-        } catch (_gateErr) { /* gate is fail-open: keep the built ops */ }
+        } catch (_gateErr) {
+            // Fail-open is deliberate (§9.13 "Deliberately not done" 3): a
+            // hard veto would re-open the counter-order deadlock. Count it so
+            // the exposure is visible via getMetrics() instead of silent.
+            recordFinalGateMetric(bot, 'fail-open');
+        }
 
         // Batch-level LAST-FILL-GUARD summary: per-action pass lines would spam
         // big batches, so one line per batch records the mode, pivot, resolved
@@ -6816,6 +6825,21 @@ function runLastFillGuardCheck(bot: BotLike, price: number, type: string, stats:
     }
     stats.checked++;
     return { check, refreshed };
+}
+
+/**
+ * §9.14 Stage 4: increment the shared-metrics counters for final-gate
+ * observability. One owner keeps the gate body and its fail-open catch from
+ * drifting, and lets tests exercise the counting directly.
+ */
+export function recordFinalGateMetric(bot: BotLike | null | undefined, kind: 'pivot-moved' | 'fail-open'): void {
+    const metrics = bot?._metrics;
+    if (!metrics) return;
+    if (kind === 'pivot-moved') {
+        metrics.lastFillPivotMovedUnderBatchCount = (metrics.lastFillPivotMovedUnderBatchCount || 0) + 1;
+    } else {
+        metrics.lastFillGateFailOpenCount = (metrics.lastFillGateFailOpenCount || 0) + 1;
+    }
 }
 
 /**

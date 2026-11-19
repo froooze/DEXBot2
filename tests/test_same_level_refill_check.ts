@@ -30,7 +30,9 @@ const fs = require('fs');
 const path = require('path');
 const {
     detectViolations,
-    applyRuntimeMirror
+    applyRuntimeMirror,
+    exportJson,
+    exportCsv,
 } = require('../analysis/grid_correction_check');
 
 let passed = 0;
@@ -167,6 +169,7 @@ run('SL-8 a same-level re-fill under a fresh refusal marker is a VIOLATION (amen
 run('SL-9 a same-level re-fill WITHOUT refusal evidence is a policy divergence', () => {
     const log = writeLog([
         '[2026-11-16T14:15:54.000Z] [INFO] [DEXBot] [FILL-PIVOT] pivot=1502.1427(buy) buy=1502.1427 sell=1557.105088 n=1 src=full/direct',
+        '[2026-11-16T14:16:09.000Z] [DEBUG] [DEXBot] [LAST-FILL-GUARD] mode=per-order pivot=1502.1427(buy) checked=16 passed=16',
         '[2026-11-16T14:16:10.000Z] [INFO] [DEXBot] Placed sell order slot-166 @1557.105084 x1.31590000 -> 1.7.576470829',
         '[2026-11-16T14:16:12.000Z] [DEBUG] [DEXBot] [LAST-FILL-GUARD] mode=per-order pivot=1502.1427(buy) checked=16 passed=16',
     ]);
@@ -175,6 +178,9 @@ run('SL-9 a same-level re-fill WITHOUT refusal evidence is a policy divergence',
     assert.strictEqual(mirror.divergences.length, 1, 'the runtime pivot (older, lower) legally passed it');
     assert.strictEqual(mirror.kept.length, 0);
     assert.strictEqual(mirror.divergences[0].sameLevel, true, 'the divergence must be tagged sameLevel');
+    assert.ok(mirror.divergences[0].anchor, 'divergence carries its placement anchor');
+    assert.strictEqual(mirror.divergences[0].anchor.kind, 'placed');
+    assert.strictEqual(mirror.divergences[0].pivotSelection, 'backward');
     fs.unlinkSync(log);
 });
 
@@ -183,6 +189,112 @@ run('SL-10 a missing log falls back to strict (same-level stays a violation)', (
     assert.ok(mirror.logError);
     assert.strictEqual(mirror.kept.length, 1);
     assert.strictEqual(mirror.divergences.length, 0);
+});
+
+run('SL-11 a legacy forward-pivot verdict is reported as a pivot-anchor artifact (§9.14)', () => {
+    const log = writeLog([
+        '[2026-11-16T10:00:00.000Z] [INFO] [DEXBot] [FILL-PIVOT] pivot=1020.000000(sell) buy=1000.000000 sell=1020.000000 n=1 src=full/direct',
+        '[2026-11-16T10:00:01.000Z] [INFO] [DEXBot] [COW] Plan action: update slot-110 -> slot-100 (orderId=1.7.900020, size=1.00000000, price=1010.000000)',
+        '[2026-11-16T10:00:02.000Z] [INFO] [DEXBot] [LAST-FILL-GUARD] mode=active pivot=1020.000000(sell) pivotSlot=100(snapped) inc=0.3% pivotRefreshed=false checked=1 passed=1 skipped=0 bypassed=0',
+        '[2026-11-16T10:00:03.000Z] [INFO] [DEXBot] Placed buy order slot-100 @1010.000000 x1.00000000 -> 1.7.900020',
+        '[2026-11-16T10:00:04.000Z] [INFO] [DEXBot] [FILL-PIVOT] pivot=1005.000000(buy) buy=1005.000000 sell=1020.000000 n=1 src=full/direct',
+    ]);
+    const violation = detectViolations([
+        fill(1, '2026-11-16T10:00:00Z', 'buy', 1000.0, '1.7.900019'),
+        fill(2, '2026-11-16T10:00:10Z', 'buy', 1010.0, '1.7.900020'),
+    ] as any, false, INC).violations[0];
+    assert.ok(violation, 'strict candidate detected');
+    const mirror = applyRuntimeMirror([violation], log, INC);
+    assert.strictEqual(mirror.logError, null);
+    assert.strictEqual(mirror.kept.length, 0, 'not a gate failure');
+    assert.strictEqual(mirror.divergences.length, 0, 'not an ordinary divergence');
+    assert.strictEqual(mirror.artifacts.length, 1, 'reclassified into its own section');
+    assert.strictEqual(mirror.artifacts[0].legacyPivot.price, 1005.0);
+    assert.strictEqual(mirror.artifacts[0].correctedPivot.price, 1020.0);
+    assert.strictEqual(mirror.artifacts[0].anchor.kind, 'placed');
+    fs.unlinkSync(log);
+});
+
+run('SL-12 an old-unverifiable FAIL entry is also reported as an artifact', () => {
+    const log = writeLog([
+        '[2026-11-16T10:00:00.000Z] [INFO] [DEXBot] [FILL-PIVOT] pivot=1020.000000(sell) buy=1000.000000 sell=1020.000000 n=1 src=full/direct',
+        '[2026-11-16T10:00:01.000Z] [INFO] [DEXBot] [LAST-FILL-GUARD] mode=active pivot=1020.000000(sell) pivotSlot=100(snapped) inc=0.3% pivotRefreshed=false checked=1 passed=1 skipped=0 bypassed=0',
+        // No observation after the placed line: the old forward lookup found nothing.
+        '[2026-11-16T10:00:03.000Z] [INFO] [DEXBot] Placed buy order slot-100 @1010.000000 x1.00000000 -> 1.7.900022',
+    ]);
+    const violation = detectViolations([
+        fill(1, '2026-11-16T10:00:00Z', 'buy', 1000.0, '1.7.900021'),
+        fill(2, '2026-11-16T10:00:10Z', 'buy', 1010.0, '1.7.900022'),
+    ] as any, false, INC).violations[0];
+    assert.ok(violation, 'strict candidate detected');
+    const mirror = applyRuntimeMirror([violation], log, INC);
+    assert.strictEqual(mirror.kept.length, 0);
+    assert.strictEqual(mirror.divergences.length, 0);
+    assert.strictEqual(mirror.artifacts.length, 1, 'reclassified from the old FAIL list');
+    assert.strictEqual(mirror.artifacts[0].legacyPivot, null, 'old rule could not verify it');
+    assert.strictEqual(mirror.artifacts[0].correctedPivot.price, 1020.0);
+    fs.unlinkSync(log);
+});
+
+run('SL-13 both kept paths carry re-checkable mirror provenance', () => {
+    // Marker path: the refusal event that decided the FAIL is recorded verbatim.
+    const markerLog = writeLog([
+        '[2026-11-16T14:15:54.000Z] [INFO] [DEXBot] [FILL-PIVOT] pivot=1502.1427(buy) buy=1502.1427 sell=1557.105088 n=1 src=full/direct',
+        '[2026-11-16T14:15:54.000Z] [WARN] [DEXBot] [LAST-FILL-GUARD] Refusing to arm pivot 1557.105084(sell): it priced 10 grid step(s) away from the live market 1513.412157925161 — a premium sweep of our own rail, not a window trade',
+    ]);
+    const marked = applyRuntimeMirror([dustClusterViolation()], markerLog, INC);
+    assert.strictEqual(marked.kept.length, 1);
+    const mk = marked.kept[0];
+    assert.strictEqual(mk.mirrorVerdict, 'violation', 'marker path is an explicit gate failure');
+    assert.ok(mk.mirrorReason.includes('refusal marker'), 'reason names the marker');
+    assert.ok(mk.mirrorReason.includes('1557.105084'), 'reason carries the matched refusal price');
+    assert.ok(mk.mirrorReason.includes('2026-11-16T14:15:54.000Z'), 'reason carries the refusal timestamp');
+    assert.strictEqual(mk.mirrorPivot, null);
+    assert.strictEqual(mk.anchor, null);
+    assert.strictEqual(mk.pivotSelection, null);
+    fs.unlinkSync(markerLog);
+
+    // Unverifiable path: no placement event, fail toward reporting.
+    const bareLog = writeLog([
+        '[2026-11-16T14:15:54.000Z] [INFO] [DEXBot] [FILL-PIVOT] pivot=1502.1427(buy) buy=1502.1427 sell=1557.105088 n=1 src=full/direct',
+    ]);
+    const v = dustClusterViolation();
+    v.curr.orderId = '1.7.999999';
+    const bare = applyRuntimeMirror([v], bareLog, INC);
+    assert.strictEqual(bare.kept.length, 1);
+    assert.strictEqual(bare.kept[0].mirrorVerdict, 'unverifiable');
+    assert.ok(bare.kept[0].mirrorReason.includes('no placement event'));
+    assert.strictEqual(bare.kept[0].anchor, null);
+    fs.unlinkSync(bareLog);
+});
+
+run('SL-14 JSON and CSV exports carry the mirror provenance columns', () => {
+    const t = Date.parse('2026-11-16T14:16:09.000Z');
+    const v = {
+        ...dustClusterViolation(),
+        mirrorVerdict: 'violation',
+        mirrorReason: 'same-level refusal marker',
+        mirrorPivot: null,
+        anchor: { kind: 'placed', t, price: 1557.105084, orderId: '1.7.900099' },
+        pivotSelection: 'backward',
+    };
+    const stamp = `${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+    const jp = path.join('/tmp/opencode', `sl-export-${stamp}.json`);
+    const cp = path.join('/tmp/opencode', `sl-export-${stamp}.csv`);
+    exportJson(jp, [v], [], 'test-range', 'test-bot', 'test-account', INC);
+    exportCsv(cp, [v]);
+    const j = JSON.parse(fs.readFileSync(jp, 'utf8'));
+    assert.deepStrictEqual(Object.keys(j.violations[0].mirror).sort(),
+        ['anchor', 'pivotSelection', 'reason', 'runtimePivot', 'verdict']);
+    assert.strictEqual(j.violations[0].mirror.anchor.kind, 'placed');
+    assert.strictEqual(j.violations[0].mirror.pivotSelection, 'backward');
+    const csv = fs.readFileSync(cp, 'utf8').split('\n');
+    for (const col of ['mirror_verdict', 'mirror_reason', 'mirror_pivot', 'anchor_kind', 'anchor_time', 'pivot_selection']) {
+        assert.ok(csv[0].includes(col), `CSV header has ${col}`);
+    }
+    assert.ok(csv[1].includes('2026-11-16T14:16:09.000Z'), 'anchor_time is ISO, not epoch ms');
+    fs.unlinkSync(jp);
+    fs.unlinkSync(cp);
 });
 
 console.log(`\n  ${passed} passed, ${failed} failed`);

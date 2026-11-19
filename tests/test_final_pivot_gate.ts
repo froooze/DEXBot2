@@ -23,7 +23,9 @@ const {
     isLastFillGuardBlocked,
     refreshLastFillPivotFromQueue,
     runFinalPivotGate,
+    recordFinalGateMetric,
 } = require('../modules/dexbot_cow_runtime');
+const { createDefaultBotMetrics } = require('../modules/bot_defaults');
 const { ORDER_TYPES, COW_ACTIONS } = require('../modules/constants');
 
 const INC = 0.3;
@@ -567,6 +569,21 @@ async function testStaleEvacuationStampNeverBypasses() {
     console.log('✓ FG-13 passed');
 }
 
+async function testFinalGateCounters() {
+    console.log('\n[FG-14] final-gate observability counters (§9.14 Stage 4)');
+    const metrics = createDefaultBotMetrics();
+    assert.strictEqual(metrics.lastFillPivotMovedUnderBatchCount, 0, 'counters start at zero');
+    assert.strictEqual(metrics.lastFillGateFailOpenCount, 0);
+    const bot = makeBot({ bot: { _metrics: metrics } });
+    recordFinalGateMetric(bot, 'pivot-moved');
+    recordFinalGateMetric(bot, 'pivot-moved');
+    recordFinalGateMetric(bot, 'fail-open');
+    assert.strictEqual(metrics.lastFillPivotMovedUnderBatchCount, 2, 'pivot moves counted');
+    assert.strictEqual(metrics.lastFillGateFailOpenCount, 1, 'fail-open counted, not silently swallowed');
+    recordFinalGateMetric({}, 'pivot-moved'); // no metrics object => no-op, no throw
+    console.log('✓ FG-14 passed');
+}
+
 async function main() {
     await testNoOpWhenPivotUnchanged();
     await testIncidentReplayDropsBothRotations();
@@ -580,6 +597,7 @@ async function main() {
     await testSameSlotUpdateResolvesSourceAction();
     await testIndexRemapResolvesSameContext();
     await testStaleEvacuationStampNeverBypasses();
+    await testFinalGateCounters();
     console.log('\nAll final-pivot-gate regression tests passed.');
 }
 

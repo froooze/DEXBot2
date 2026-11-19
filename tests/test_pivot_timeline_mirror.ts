@@ -32,6 +32,14 @@
  *   - Sweep replay shape: refused sweep fill between fills + re-quote below
  *     the strict last fill but above the runtime pivot => policy-divergence
  *     with refusalsInRange > 0.
+ *   - §9.14 audit correction (all synthetic values):
+ *       PT-11 a `placed` anchor uses the pivot at/before the commit line; the
+ *             legacy forward rule (and its next-batch pivot) is reproducible.
+ *       PT-12 a `plan-action` anchor still uses the forward gate lookup.
+ *       PT-13 a too-distant backward pivot yields `unverifiable`, not a verdict.
+ *       PT-14 a fill-pivot between the gate line and the commit does not
+ *             become the anchor's pivot (gate lines are preferred).
+ *       PT-15 a fill-pivot is never a fallback when no gate line exists.
  */
 
 const assert = require('assert');
@@ -326,6 +334,105 @@ async function testUnverifiableFailsTowardReporting() {
     console.log('✓ PT-10 passed');
 }
 
+async function testSourceAwarePivotAnchoring() {
+    console.log('\n[PT-11] placed anchors use the pre-commit pivot (§9.14 audit correction)');
+    const log = [
+        '[2026-11-16T10:00:00.000Z] [INFO] [DEXBot] [FILL-PIVOT] pivot=1020.000000(sell) buy=1000.000000 sell=1020.000000 n=1 src=full/direct',
+        '[2026-11-16T10:00:01.000Z] [INFO] [DEXBot] [COW] Plan action: update slot-110 -> slot-100 (orderId=1.7.900010, size=1.00000000, price=1010.000000)',
+        '[2026-11-16T10:00:02.000Z] [INFO] [DEXBot] [LAST-FILL-GUARD] mode=active pivot=1020.000000(sell) pivotSlot=100(snapped) inc=0.3% pivotRefreshed=false checked=1 passed=1 skipped=0 bypassed=0',
+        '[2026-11-16T10:00:03.000Z] [INFO] [DEXBot] Placed buy order slot-100 @1010.000000 x1.00000000 -> 1.7.900010',
+        '[2026-11-16T10:00:04.000Z] [INFO] [DEXBot] [FILL-PIVOT] pivot=1005.000000(buy) buy=1005.000000 sell=1020.000000 n=1 src=full/direct',
+    ].join('\n');
+    const idx = parseRuntimeLog(log);
+    const c = cand('1.7.900010', '2026-11-16T10:00:10.000Z', 1010.0, 'buy',
+        '2026-11-16T10:00:00.000Z', 1000.0);
+    const fixed = classifyTransition(c, idx);
+    const legacy = classifyTransition(c, idx, { pivotRule: 'forward' });
+    assert.ok(fixed.anchor, 'anchor reported');
+    assert.strictEqual(fixed.anchor.kind, 'placed', 'latest price-matched event is the commit line');
+    assert.strictEqual(fixed.pivotSelection, 'backward');
+    assert.strictEqual(fixed.verdict, 'policy-divergence', 'the held SELL pivot passes this BUY');
+    assert.ok(fixed.pivot && fixed.pivot.price === 1020.0 && fixed.pivot.type === 'sell');
+    assert.strictEqual(fixed.pivot.src, 'mode', 'pivot provenance reported');
+    assert.strictEqual(legacy.verdict, 'violation', 'the old rule judged it against the next batch');
+    assert.ok(legacy.pivot && legacy.pivot.price === 1005.0, 'legacy pivot is the later BUY pivot');
+    assert.strictEqual(legacy.pivot.src, 'fill-pivot');
+    assert.strictEqual(legacy.pivotSelection, 'forward');
+    console.log('✓ PT-11 passed');
+}
+
+async function testPlanActionStillUsesForwardLookup() {
+    console.log('\n[PT-12] plan-action anchors keep the forward gate lookup');
+    const log = [
+        '[2026-11-16T10:00:00.000Z] [INFO] [DEXBot] [FILL-PIVOT] pivot=1020.000000(sell) buy=1000.000000 sell=1020.000000 n=1 src=full/direct',
+        '[2026-11-16T10:00:01.000Z] [INFO] [DEXBot] [COW] Plan action: update slot-110 -> slot-100 (orderId=1.7.900012, size=1.00000000, price=1010.000000)',
+        '[2026-11-16T10:00:02.000Z] [INFO] [DEXBot] [LAST-FILL-GUARD] mode=active pivot=1020.000000(sell) pivotSlot=100(snapped) inc=0.3% pivotRefreshed=false checked=1 passed=1 skipped=0 bypassed=0',
+    ].join('\n');
+    const idx = parseRuntimeLog(log);
+    const c = cand('1.7.900012', '2026-11-16T10:00:10.000Z', 1010.0, 'buy',
+        '2026-11-16T10:00:00.000Z', 1000.0);
+    const fixed = classifyTransition(c, idx);
+    const legacy = classifyTransition(c, idx, { pivotRule: 'forward' });
+    assert.strictEqual(fixed.anchor.kind, 'plan-action');
+    assert.strictEqual(fixed.pivotSelection, 'forward');
+    assert.strictEqual(fixed.verdict, legacy.verdict, 'the rule does not change plan-action verdicts');
+    assert.deepStrictEqual(fixed.pivot, legacy.pivot);
+    console.log('✓ PT-12 passed');
+}
+
+async function testStaleBackwardPivotIsUnverifiable() {
+    console.log('\n[PT-13] a too-distant pre-commit pivot is unverifiable, not a verdict');
+    const log = [
+        '[2026-11-16T10:00:00.000Z] [INFO] [DEXBot] [LAST-FILL-GUARD] mode=active pivot=1000.000000(buy) pivotSlot=100(snapped) inc=0.3% pivotRefreshed=false checked=1 passed=1 skipped=0 bypassed=0',
+        '[2026-11-16T10:03:00.000Z] [INFO] [DEXBot] Placed sell order slot-101 @1010.000000 x1.00000000 -> 1.7.900014',
+    ].join('\n');
+    const idx = parseRuntimeLog(log);
+    const v = classifyTransition(
+        cand('1.7.900014', '2026-11-16T10:03:10.000Z', 1010.0, 'sell'), idx);
+    assert.strictEqual(v.verdict, 'unverifiable');
+    assert.ok(v.reason.includes('older than'), 'reason names the lookback bound');
+    assert.ok(v.anchor && v.anchor.kind === 'placed', 'anchor still reported');
+    assert.strictEqual(v.pivotSelection, 'backward');
+    assert.strictEqual(v.pivot, null);
+    console.log('✓ PT-13 passed');
+}
+
+async function testGateSourcePreferredOverFillPivot() {
+    console.log('\n[PT-14] a fill between gate and commit does not re-judge the placed order');
+    const log = [
+        '[2026-11-16T10:00:00.000Z] [INFO] [DEXBot] [FILL-PIVOT] pivot=1020.000000(sell) buy=1000.000000 sell=1020.000000 n=1 src=full/direct',
+        '[2026-11-16T10:00:01.000Z] [INFO] [DEXBot] [LAST-FILL-GUARD] mode=active pivot=1020.000000(sell) pivotSlot=100(snapped) inc=0.3% pivotRefreshed=false checked=1 passed=1 skipped=0 bypassed=0',
+        '[2026-11-16T10:00:02.000Z] [INFO] [DEXBot] [FILL-PIVOT] pivot=1005.000000(buy) buy=1005.000000 sell=1020.000000 n=1 src=full/direct',
+        '[2026-11-16T10:00:03.000Z] [INFO] [DEXBot] Placed buy order slot-100 @1010.000000 x1.00000000 -> 1.7.900016',
+    ].join('\n');
+    const v = classifyTransition(
+        cand('1.7.900016', '2026-11-16T10:00:10.000Z', 1010.0, 'buy',
+            '2026-11-16T10:00:00.000Z', 1000.0),
+        parseRuntimeLog(log));
+    assert.strictEqual(v.verdict, 'policy-divergence',
+        'the gate pivot passes the BUY; the intervening fill pivot must not be used');
+    assert.ok(v.pivot && v.pivot.price === 1020.0 && v.pivot.type === 'sell');
+    assert.strictEqual(v.pivot.src, 'mode', 'the gate line is the anchor pivot');
+    console.log('✓ PT-14 passed');
+}
+
+async function testFillPivotIsNeverAFallback() {
+    console.log('\n[PT-15] a fill-pivot cannot substitute for a missing gate line');
+    const log = [
+        '[2026-11-16T10:00:00.000Z] [INFO] [DEXBot] [FILL-PIVOT] pivot=1020.000000(sell) buy=1000.000000 sell=1020.000000 n=1 src=full/direct',
+        '[2026-11-16T10:00:03.000Z] [INFO] [DEXBot] Placed buy order slot-100 @1010.000000 x1.00000000 -> 1.7.900018',
+    ].join('\n');
+    const v = classifyTransition(
+        cand('1.7.900018', '2026-11-16T10:00:10.000Z', 1010.0, 'buy',
+            '2026-11-16T10:00:00.000Z', 1000.0),
+        parseRuntimeLog(log));
+    assert.strictEqual(v.verdict, 'unverifiable', 'no gate line => no verdict, not a fill-pivot verdict');
+    assert.ok(v.reason.includes('no gate pivot observation'), 'reason names the missing gate line');
+    assert.strictEqual(v.pivot, null);
+    assert.strictEqual(v.pivotSelection, 'backward');
+    console.log('✓ PT-15 passed');
+}
+
 async function main() {
     await testParseRuntimeLog();
     await testPivotLookups();
@@ -337,6 +444,11 @@ async function main() {
     await testSweepReplayShape();
     await testAllowanceBypass();
     await testUnverifiableFailsTowardReporting();
+    await testSourceAwarePivotAnchoring();
+    await testPlanActionStillUsesForwardLookup();
+    await testStaleBackwardPivotIsUnverifiable();
+    await testGateSourcePreferredOverFillPivot();
+    await testFillPivotIsNeverAFallback();
     console.log('\nAll pivot-timeline mirror regression tests passed.');
 }
 
