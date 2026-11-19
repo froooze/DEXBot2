@@ -98,7 +98,8 @@ node/connection — the guard catches transient inconsistency, not a stale node;
 next-sync re-detection remains the backstop). An inconclusive read defers
 with the entry still queued; a confirmed still-live order logs a throttled hard
 error and increments `duplicateOrphanCancelUnverifiedCount`, which is overlaid
-into `getMetrics()`. Batch-path failures surface in `results`/`failed`; deadline
+into `getMetrics()` (historical name; now shared by both cancel classes, with the
+class named in the log). Batch-path failures surface in `results`/`failed`; deadline
 deferrals appear as `deferred` rows in `results` only (never in `failed`), and the
 lagging pre-read path uses the same double-read rule. No new cancel sweep was
 introduced — the reverted P1/P2 sweep class stays reverted. Covered by

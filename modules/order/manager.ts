@@ -873,6 +873,10 @@ class OrderManager implements OrderManagerLike {
         // Fresh-placement timestamps (chainOrderId -> Date.now) for the
         // surplus-cancel grace window. Written by this lifecycle funnel only.
         this._placedAt = new Map();
+        // Pre-load placeholder only: grid load/init overwrite this with
+        // calculateGapSlots(...). A numeric 0 is finite to resolveGapSlots, so it
+        // is NOT an absent-aware sentinel — never rely on this value for live
+        // band geometry before the loader has published it.
         this._gapSlots = 0;
         // Genesis (price-ladder) state. `_genesis` is established by
         // loadGrid/initializeGrid; these records are the missing-genesis fault
@@ -2854,7 +2858,9 @@ class OrderManager implements OrderManagerLike {
             if (f.id != null) {
                 try {
                     const idx = parseSlotIndex(String(f.id));
-                    const geom = geometryTypeForSlotIndex(idx, this.boundaryIdx, this._gapSlots);
+                    // Live drain-time geometry: the published/config gap is
+                    // authoritative here, not the frozen genesis gap.
+                    const geom = geometryTypeForSlotIndex(idx, this.boundaryIdx, resolveGapSlots(this));
                     if (geom === ORDER_TYPES.SPREAD) { skippedInBand++; continue; }
                 } catch { /* unreadable geometry — treat as eligible */ }
             }
@@ -3137,7 +3143,9 @@ class OrderManager implements OrderManagerLike {
         const rawThreshold = Number(GRID_LIMITS?.GAP_EVACUATION_CANCEL_THRESHOLD);
         const cancelThreshold = Number.isFinite(rawThreshold) && rawThreshold > 0 ? Math.floor(rawThreshold) : 3;
         const boundary = this.boundaryIdx;
-        const gapSlots = this._gapSlots;
+        // Same live-geometry rule as the fill-eligibility gate above: no
+        // genesis-preferred gap, since the band may have moved since creation.
+        const gapSlots = resolveGapSlots(this);
         let queued = 0;
 
         for (const raw of candidates) {

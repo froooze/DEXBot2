@@ -1807,11 +1807,14 @@ function isEligibleAnchorFill(
     // Off-market: the exact predicate setLastFillPivot applies at every
     // fill-provenance write. A missing/stale market read returns null (fail open).
     if (Number.isFinite(price) && price > 0 && offMarketFill(manager, side, price)) return false;
-    // Gap-band residual: not a window trade. Unknown geometry -> null -> eligible.
+    // Gap-band residual: not a window trade. Only genuinely unreadable geometry
+    // (missing boundary/manager) fails open to eligible; an unpublished _gapSlots
+    // resolves from the frozen genesis gap / config instead of collapsing to 0.
     if (idx !== null) {
         try {
             const boundaryIdx = (manager as unknown as { boundaryIdx?: string | number | null }).boundaryIdx;
-            const gapSlots = (manager as unknown as { _gapSlots?: string | number | null })._gapSlots;
+            const genesisGap = (manager as unknown as { _genesis?: { gapSlots?: unknown } })._genesis?.gapSlots;
+            const gapSlots = MathUtils.resolveGapSlots(manager as never, genesisGap);
             const geo = OrderUtils.geometryTypeForSlotIndex(idx, boundaryIdx, gapSlots);
             if (geo === ORDER_TYPES.SPREAD) return false;
         } catch { /* unreadable geometry: fail open */ }
@@ -3464,7 +3467,9 @@ export async function applyGridDivergenceCorrections(manager: OrderManagerLike, 
         const optimizedActions = optimizeRebalanceActions(actions, manager.orders, {
             logger: (msg: string, level?: string) => manager.logger?.log?.(msg, level),
             boundaryIdx: pendingBoundaryIdx ?? undefined,
-            gapSlots: manager._gapSlots,
+            // Same absent-aware gap as the adopt/rotation classifier above:
+            // a raw unpublished _gapSlots would skip the rotation fold.
+            gapSlots: MathUtils.resolveGapSlots(manager as never, (manager as unknown as { _genesis?: { gapSlots?: unknown } })._genesis?.gapSlots),
             assets: manager.assets
         });
         if (optimizedActions !== actions) {

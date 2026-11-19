@@ -67,6 +67,20 @@ function createManager(ordersList, queue = []) {
     return { manager, logs };
 }
 
+/**
+ * Cancel-class entries (cancelOnly AND surplus/type-mismatch) share the
+ * verified-after-broadcast contract. Most fixtures here predate it and stub
+ * only cancelOrder; supply a confirming by-id seam by default. Fixtures that
+ * deliberately test lagging reads override these with their own stubs.
+ */
+function withCancelReads(accountOrders: any) {
+    return {
+        batchReadOrders: async () => new Map(),
+        readSingleOrder: async () => null,
+        ...accountOrders
+    };
+}
+
 function priceEntry(slotId, chainOrderId, expectedPrice, extra = {}) {
     return {
         gridOrder: { id: slotId },
@@ -94,7 +108,7 @@ async function run() {
         );
         let updateCalled = false;
         const accountOrders = { updateOrder: async () => { updateCalled = true; return {}; } };
-        const out = await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
+        const out = await correctAllPriceMismatches(manager, 'acct', 'k', withCancelReads(accountOrders));
         assert.strictEqual(updateCalled, false, 'stale re-slotted entry must not broadcast');
         assert.strictEqual(manager.ordersNeedingPriceCorrection.length, 0, 'stale entry must be dropped');
         assert.strictEqual(out.staleDropped, 1, 'summary must count the stale drop');
@@ -112,7 +126,7 @@ async function run() {
         );
         let updateCalled = false;
         const accountOrders = { updateOrder: async () => { updateCalled = true; return {}; } };
-        const out = await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
+        const out = await correctAllPriceMismatches(manager, 'acct', 'k', withCancelReads(accountOrders));
         assert.strictEqual(updateCalled, false, 'stale re-priced entry must not broadcast');
         assert.strictEqual(manager.ordersNeedingPriceCorrection.length, 0, 'stale entry must be dropped');
         assert.strictEqual(out.staleDropped, 1);
@@ -127,7 +141,7 @@ async function run() {
         );
         let updateCalled = false;
         const accountOrders = { updateOrder: async () => { updateCalled = true; return { success: true }; } };
-        const out = await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
+        const out = await correctAllPriceMismatches(manager, 'acct', 'k', withCancelReads(accountOrders));
         assert.strictEqual(updateCalled, true, 'fresh entry must broadcast');
         assert.strictEqual(out.corrected, 1);
         assert.strictEqual(out.staleDropped, 0);
@@ -153,7 +167,7 @@ async function run() {
         (manager as any)._applyOrderUpdate = async () => { applyCalled = true; return true; };
         const accountOrders = { cancelOrder: async () => { cancelCalled = true; return {}; } };
 
-        const out = await correctOrderPriceOnChain(manager, manager.ordersNeedingPriceCorrection[0], 'acct', 'k', accountOrders);
+        const out = await correctOrderPriceOnChain(manager, manager.ordersNeedingPriceCorrection[0], 'acct', 'k', withCancelReads(accountOrders));
         assert.strictEqual(out.success, true, 'surplus cancellation should still succeed');
         assert.strictEqual(cancelCalled, true, 'surplus cancellation should broadcast');
         assert.strictEqual(applyCalled, false,
@@ -185,7 +199,7 @@ async function run() {
             batchReadOrders: async () => new Map(),
             readSingleOrder: async () => null
         };
-        const out = await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
+        const out = await correctAllPriceMismatches(manager, 'acct', 'k', withCancelReads(accountOrders));
         assert.strictEqual(cancelCalled, true, 'untracked cancel-only entry must still broadcast');
         assert.strictEqual(out.corrected, 1);
         console.log('  - untracked cancel-only entries still cancel');
@@ -217,7 +231,7 @@ async function run() {
         manager._lastUnmatchedChainOrders = [{ chainOrderId }];
         let cancelCalled = false;
         const accountOrders = { cancelOrder: async () => { cancelCalled = true; return {}; } };
-        const out = await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
+        const out = await correctAllPriceMismatches(manager, 'acct', 'k', withCancelReads(accountOrders));
 
         assert.strictEqual(cancelCalled, false, 'relocated chain order must not be cancelled');
         assert.strictEqual(out.corrected, 0, 'stale cancel must not count as corrected');
@@ -252,7 +266,7 @@ async function run() {
         manager._lastUnmatchedChainOrders = [{ chainOrderId }];
         let cancelCalled = false;
         const accountOrders = { cancelOrder: async () => { cancelCalled = true; return {}; } };
-        const out = await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
+        const out = await correctAllPriceMismatches(manager, 'acct', 'k', withCancelReads(accountOrders));
 
         assert.strictEqual(cancelCalled, false, 'repaired type-mismatch order must not be cancelled');
         assert.strictEqual(out.staleDropped, 1);
@@ -284,7 +298,7 @@ async function run() {
         manager._lastUnmatchedChainOrders = [{ chainOrderId }];
         let cancelCalled = false;
         const accountOrders = { cancelOrder: async () => { cancelCalled = true; return {}; } };
-        const out = await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
+        const out = await correctAllPriceMismatches(manager, 'acct', 'k', withCancelReads(accountOrders));
 
         assert.strictEqual(cancelCalled, false, 'geometry-repaired gap-evacuation order must not be cancelled');
         assert.strictEqual(out.staleDropped, 1);
@@ -314,7 +328,7 @@ async function run() {
         );
         let cancelCalled = false;
         const accountOrders = { cancelOrder: async () => { cancelCalled = true; return {}; } };
-        const out = await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
+        const out = await correctAllPriceMismatches(manager, 'acct', 'k', withCancelReads(accountOrders));
 
         assert.strictEqual(cancelCalled, true, 'unrepaired type-mismatch must still cancel');
         assert.strictEqual(out.corrected, 1);
@@ -344,7 +358,7 @@ async function run() {
         manager._gapEvacCancelQueued = new Set(['slot-101']);
         let cancelCalled = false;
         const accountOrders = { cancelOrder: async () => { cancelCalled = true; return {}; } };
-        const out = await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
+        const out = await correctAllPriceMismatches(manager, 'acct', 'k', withCancelReads(accountOrders));
 
         assert.strictEqual(cancelCalled, true, 'still-in-band gap evacuation must cancel');
         assert.strictEqual(out.corrected, 1);
@@ -368,7 +382,7 @@ async function run() {
         );
         let updateCalled = false;
         const accountOrders = { updateOrder: async () => { updateCalled = true; return {}; } };
-        const out = await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
+        const out = await correctAllPriceMismatches(manager, 'acct', 'k', withCancelReads(accountOrders));
         assert.strictEqual(updateCalled, false, 'fill-changed entry must not broadcast stale size');
         assert.strictEqual(manager.ordersNeedingPriceCorrection.length, 0, 'stale entry must be dropped');
         assert.strictEqual(out.staleDropped, 1);
@@ -401,7 +415,7 @@ async function run() {
             updateOrder: async () => ({ success: true }),
             cancelOrder: async () => { cancelCalled = true; return { success: true }; },
         };
-        const out = await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
+        const out = await correctAllPriceMismatches(manager, 'acct', 'k', withCancelReads(accountOrders));
         // The price entry remains actionable. Its cancel-only sibling describes
         // an untracked duplicate that no longer exists because the same order is
         // now owned by the live grid, so only the UPDATE broadcasts.
@@ -436,7 +450,7 @@ async function run() {
         const accountOrders = { updateOrder: async () => ({ success: true }) };
         const priceOnly = manager.ordersNeedingPriceCorrection.find((e) => !e.isSurplus);
         const { correctOrderPriceOnChain: single } = require('../modules/order/utils/order');
-        await single(manager, priceOnly, 'acct', 'k', accountOrders);
+        await single(manager, priceOnly, 'acct', 'k', withCancelReads(accountOrders));
         assert.strictEqual(manager.ordersNeedingPriceCorrection.length, 1, 'sibling entry must survive');
         assert.strictEqual(
             manager.ordersNeedingPriceCorrection[0].cancelOnly, true, 'survivor must be the cancel sibling'
@@ -466,7 +480,7 @@ async function run() {
             [priceEntry('slot-89', '1.7.574249250', 0.312638)]
         );
         const accountOrders = { updateOrder: async () => null };
-        const out = await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
+        const out = await correctAllPriceMismatches(manager, 'acct', 'k', withCancelReads(accountOrders));
         assert.strictEqual(out.corrected, 1, 'no-op counts as corrected (resolved)');
         assert.strictEqual(out.failed, 0, 'no-op must not count as failed');
         console.log('  - no-op drain reports zero failures');
@@ -497,7 +511,7 @@ async function run() {
         manager.config = { fillProcessing: { CORRECTION_MAX_UPDATES_PER_CYCLE: 3, CORRECTION_INTER_OP_DELAY_MS: 0 } };
         let updates = 0;
         const accountOrders = { updateOrder: async () => { updates++; return {}; } };
-        const out = await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
+        const out = await correctAllPriceMismatches(manager, 'acct', 'k', withCancelReads(accountOrders));
         assert.strictEqual(updates, 3, 'only the budgeted updates broadcast');
         assert.strictEqual(out.corrected, 3);
         assert.strictEqual(out.deferredUpdates, 4, 'remainder reported as deferred');
@@ -527,7 +541,7 @@ async function run() {
         };
         let out;
         try {
-            out = await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
+            out = await correctAllPriceMismatches(manager, 'acct', 'k', withCancelReads(accountOrders));
         } finally {
             Date.now = realNow;
         }
@@ -563,7 +577,7 @@ async function run() {
             updateOrder: async () => { updates++; return {}; },
             cancelOrder: async () => { cancels++; return { success: true }; },
         };
-        const out = await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
+        const out = await correctAllPriceMismatches(manager, 'acct', 'k', withCancelReads(accountOrders));
         assert.strictEqual(cancels, 1, 'cancel-class entries must always drain');
         assert.strictEqual(updates, 0, 'zero budget suppresses updates');
         assert.strictEqual(out.deferredUpdates, 1, 'update deferred to next cycle');
@@ -581,7 +595,7 @@ async function run() {
         manager.isBroadcastingActive = () => true;
         let updates = 0;
         const accountOrders = { updateOrder: async () => { updates++; return {}; } };
-        const out = await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
+        const out = await correctAllPriceMismatches(manager, 'acct', 'k', withCancelReads(accountOrders));
         assert.strictEqual(out.deferred, true, 'drain must defer under broadcast');
         assert.strictEqual(lockAcquired, false, 'must not take _gridLock during broadcast');
         assert.strictEqual(updates, 0, 'no broadcast during defer');
@@ -597,7 +611,7 @@ async function run() {
         );
         manager.config = { fillProcessing: { CORRECTION_QUEUE_WARN_THRESHOLD: 2, CORRECTION_INTER_OP_DELAY_MS: 0 } };
         const accountOrders = { updateOrder: async () => ({}) };
-        await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
+        await correctAllPriceMismatches(manager, 'acct', 'k', withCancelReads(accountOrders));
         assert.ok(logs.some((l: string) => l.includes('Backlog')), 'backlog threshold must warn');
         console.log('  - backlog threshold emits a warn');
     }
@@ -637,7 +651,7 @@ async function run() {
             updateOrder: async () => { updates++; return {}; },
             cancelOrder: async () => { cancels++; return { success: true }; },
         };
-        const out = await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
+        const out = await correctAllPriceMismatches(manager, 'acct', 'k', withCancelReads(accountOrders));
         assert.strictEqual(cancels, 1, 'a fresh type-mismatch order must be cancelled, not deferred');
         assert.strictEqual(updates, 0, 'a wrong-side order is cancelled, never price-updated');
         assert.strictEqual(out.corrected, 1, 'the cancel must count as corrected');
@@ -667,7 +681,7 @@ async function run() {
         manager._placedAt = new Map([[freshChainId, Date.now()]]);
         let cancels = 0;
         const accountOrders = { cancelOrder: async () => { cancels++; return { success: true }; } };
-        await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
+        await correctAllPriceMismatches(manager, 'acct', 'k', withCancelReads(accountOrders));
         assert.strictEqual(cancels, 0, 'a regular fresh surplus must still be held by the grace');
         assert.strictEqual(manager.ordersNeedingPriceCorrection.length, 1, 'held entry stays queued');
         assert(logs.some((l) => l.includes('inside grace window')), 'the grace deferral must still be logged');
@@ -708,7 +722,7 @@ async function run() {
         manager._placedAt = new Map([[chainId, Date.now()]]);
         let cancels = 0;
         const accountOrders = { cancelOrder: async () => { cancels++; return { success: true }; } };
-        await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
+        await correctAllPriceMismatches(manager, 'acct', 'k', withCancelReads(accountOrders));
         assert.strictEqual(cancels, 1, 'a retagged slot on the opposite rail must still be cancelled');
         assert(!logs.some((l) => l.includes('was repaired')), 'the adopted label must not count as a repair');
         console.log('  - a fill-retagged slot on the wrong rail is still cancelled');
@@ -745,7 +759,7 @@ async function run() {
         manager._placedAt = new Map([[chainId, Date.now()]]);
         let cancels = 0;
         const accountOrders = { cancelOrder: async () => { cancels++; return { success: true }; } };
-        await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
+        await correctAllPriceMismatches(manager, 'acct', 'k', withCancelReads(accountOrders));
         assert.strictEqual(cancels, 0, 'a repaired rail must not cancel the matching order');
         assert.strictEqual(manager.ordersNeedingPriceCorrection.length, 0, 'the stale entry is dropped');
         assert(logs.some((l) => l.includes('was repaired')), 'the drop must say the rail repaired it');
@@ -785,7 +799,7 @@ async function run() {
         manager._placedAt = new Map([[chainId, Date.now()]]);
         let cancels = 0;
         const accountOrders = { cancelOrder: async () => { cancels++; return { success: true }; } };
-        await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
+        await correctAllPriceMismatches(manager, 'acct', 'k', withCancelReads(accountOrders));
         assert.strictEqual(cancels, 1, 'an in-band order must be cancelled even if its label matches');
         assert(!logs.some((l) => l.includes('was repaired')), 'the band is not a repair');
         console.log('  - an in-band level is not treated as repaired');
@@ -817,7 +831,7 @@ async function run() {
         (manager as any).boundaryIdx = null; // unknown boundary
         let cancels = 0;
         const accountOrders = { cancelOrder: async () => { cancels++; return { success: true }; } };
-        await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
+        await correctAllPriceMismatches(manager, 'acct', 'k', withCancelReads(accountOrders));
         assert.strictEqual(cancels, 0, 'unknown boundary + matching stored type => stale entry dropped');
         assert.strictEqual(manager.ordersNeedingPriceCorrection.length, 0, 'the stale entry is dropped');
         console.log('  - unknown boundary falls back to the stored type');
@@ -845,7 +859,7 @@ async function run() {
         (manager as any).boundaryIdx = null;
         let cancels = 0;
         const accountOrders = { cancelOrder: async () => { cancels++; return { success: true }; } };
-        await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
+        await correctAllPriceMismatches(manager, 'acct', 'k', withCancelReads(accountOrders));
         assert.strictEqual(cancels, 1, 'unknown boundary + disagreeing stored type => still cancelled');
         assert.strictEqual(manager.ordersNeedingPriceCorrection.length, 0, 'the cancelled entry leaves the queue');
         console.log('  - unknown boundary keeps a stored-type mismatch actionable');
@@ -873,13 +887,15 @@ async function run() {
         );
         let cancels = 0;
         const accountOrders = { cancelOrder: async () => { cancels++; return { success: true }; } };
-        await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
+        await correctAllPriceMismatches(manager, 'acct', 'k', withCancelReads(accountOrders));
         assert.strictEqual(cancels, 0, 'a non-slot id has no rail => stored-type fallback drops');
         console.log('  - non-slot ids fall back to the stored type');
     }
 
     {
-        // Missing gap width: geometryTypeForSlotIndex fails closed on null.
+        // Unpublished gap width: resolveGapSlots derives it from config instead
+        // of letting a raw null collapse the band. The in-band slot stays
+        // actionable (M2 sweep), so the wrong-side order is still cancelled.
         const chainId = '1.7.777009';
         const { manager } = createManager(
             [{ id: 'slot-80', orderId: chainId, type: ORDER_TYPES.SELL, price: 0.312638, size: 850, state: ORDER_STATES.ACTIVE }],
@@ -902,9 +918,9 @@ async function run() {
         (manager as any)._gapSlots = null;
         let cancels = 0;
         const accountOrders = { cancelOrder: async () => { cancels++; return { success: true }; } };
-        await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
-        assert.strictEqual(cancels, 0, 'unknown gap width => stored-type fallback drops');
-        console.log('  - unknown gap width falls back to the stored type');
+        await correctAllPriceMismatches(manager, 'acct', 'k', withCancelReads(accountOrders));
+        assert.strictEqual(cancels, 1, 'unpublished gap width resolves from config, keeping the in-band cancel actionable');
+        console.log('  - unpublished gap width no longer collapses the band');
     }
 
     console.log('PASS test_correction_queue_staleness');

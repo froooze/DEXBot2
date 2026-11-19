@@ -1216,7 +1216,10 @@ class SyncEngine {
                             if (Array.isArray(mgr._genesis?.priceLevels) && mgr._genesis.priceLevels.length > 0) {
                             const liveIdx = Number(slotIndexForPrice(chainOrder.price, mgr._genesis as GridGenesis));
                             inBand = Number.isFinite(liveIdx) && liveIdx >= 0
-                                && geometryTypeForSlotIndex(liveIdx, mgr.boundaryIdx, mgr._gapSlots) === ORDER_TYPES.SPREAD;
+                                // Preferred genesis gap first, same as the
+                                // adoption path below (:1608): an unpublished
+                                // _gapSlots must not collapse the band to 0.
+                                && geometryTypeForSlotIndex(liveIdx, mgr.boundaryIdx, resolveGapSlots(mgr, mgr._genesis?.gapSlots)) === ORDER_TYPES.SPREAD;
                             }
                         } catch { inBand = false; }
                         if (inBand) {

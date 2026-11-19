@@ -48,6 +48,11 @@ import { takePlanLease } from './order/placement_lock.js';
  * must be re-proven by the unstamped live probe instead of bypassing the
  * last-fill guard. Non-finite live geometry cannot disprove the stamp and
  * keeps the plan-build authority (fail-open to the stamp, never to the guard).
+ *
+ * Callers pass the raw committed _gapSlots deliberately here: an unpublished
+ * value is the "cannot disprove" case by contract, so it must NOT be replaced
+ * with a config-derived gap (unlike the resolveGapSlots geometry sweep). The
+ * same holds for forcedRetreatJustifiesEvacuation, which re-checks that state.
  */
 export function isEvacuationStampStillValid(liveBoundary: unknown, liveGapSlots: unknown, sourceId: unknown, destId: unknown, orderType: unknown): boolean {
     if (orderType !== ORDER_TYPES.BUY && orderType !== ORDER_TYPES.SELL) return false;
@@ -4512,17 +4517,6 @@ async function updateOrdersOnChainBatchCOWBody(
         ? Number(boundaryHoldTiming.BOUNDARY_HOLD_RESYNC_COOLDOWN_MS)
         : 5 * 60 * 1000;
 
-    if (bot.config.dryRun) {
-        const cancelCount = actions.filter((a: { type?: unknown }) => a.type === COW_ACTIONS.CANCEL).length;
-        const createCount = actions.filter((a: { type?: unknown }) => a.type === COW_ACTIONS.CREATE).length;
-        const updateCount = actions.filter((a: { type?: unknown }) => a.type === COW_ACTIONS.UPDATE).length;
-        if (cancelCount > 0) bot.manager.logger.log(`Dry run: would cancel ${cancelCount} orders`, 'info');
-        if (createCount > 0) bot.manager.logger.log(`Dry run: would place ${createCount} new orders`, 'info');
-        if (updateCount > 0) bot.manager.logger.log(`Dry run: would update ${updateCount} orders`, 'info');
-        popPushedWorkingGrid(bot, cowResult);
-        return { executed: true, hadRotation: false };
-    }
-
     // Exclusive placement region (shared with startup reconcile Phase 2,
     // correction drains, dust/residual cancels and pool swaps). Claim it BEFORE
     // the pre-batch drain and before any other mutation: planning is read-only,
@@ -4530,6 +4524,13 @@ async function updateOrdersOnChainBatchCOWBody(
     // in between the drain and the old late claim is exactly the duplicate
     // window this closes. Held through commit/uncertain-catch and released in
     // the body's finally (or transferred to the re-plan recursion).
+    //
+    // Declared above the dry-run exit on purpose: the inherited lease is owned
+    // by this body from entry, so every exit — including the dry-run return —
+    // must go through releasePlacement(). The wrapper's resultPlanLease release
+    // cannot cover it: dexbot_class.updateOrdersOnChainBatch takes the lease off
+    // the result and hands it back as options.placementLease, which arrives here
+    // as inheritedPlacementLease, not as a result-carried lease.
     let heldPlacementLease: PlacementLease | null = inheritedPlacementLease;
     const claimPlacement = async (stage: string): Promise<boolean> => {
         if (heldPlacementLease) return true;
@@ -4553,6 +4554,18 @@ async function updateOrdersOnChainBatchCOWBody(
         heldPlacementLease = null;
         lease?.release();
     };
+
+    if (bot.config.dryRun) {
+        const cancelCount = actions.filter((a: { type?: unknown }) => a.type === COW_ACTIONS.CANCEL).length;
+        const createCount = actions.filter((a: { type?: unknown }) => a.type === COW_ACTIONS.CREATE).length;
+        const updateCount = actions.filter((a: { type?: unknown }) => a.type === COW_ACTIONS.UPDATE).length;
+        if (cancelCount > 0) bot.manager.logger.log(`Dry run: would cancel ${cancelCount} orders`, 'info');
+        if (createCount > 0) bot.manager.logger.log(`Dry run: would place ${createCount} new orders`, 'info');
+        if (updateCount > 0) bot.manager.logger.log(`Dry run: would update ${updateCount} orders`, 'info');
+        releasePlacement();
+        popPushedWorkingGrid(bot, cowResult);
+        return { executed: true, hadRotation: false };
+    }
 
     // Claim before the entry single-flight wait: the second batch then queues
     // on placement instead of building a plan, and there is no lock-order

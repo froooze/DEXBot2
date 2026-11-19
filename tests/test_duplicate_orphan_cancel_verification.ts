@@ -5,10 +5,11 @@
  * only considered done once a bounded by-id re-read confirms the chain order is
  * gone. A lagging read defers (entry stays queued); a confirmed still-live order
  * raises a hard error and a metrics counter. No new cancel sweep is introduced —
- * only entries already queued as cancelOnly are verified.
+ * only entries already queued as a cancel class are verified (cancelOnly here;
+ * surplus/type-mismatch in test_surplus_cancel_verification.ts).
  *
  * Mutation checks:
- *  - remove the `verifyCancelOnlyGone()` call in correctOrderPriceOnChain's
+ *  - remove the `verifyCancelGone()` call in correctOrderPriceOnChain's
  *    cancelOnly branch → VERIFY-01..04, 06 fail (entry wrongly dropped/failed).
  *  - make a failed second read return "gone" → VERIFY-03 fails.
  *  - make a lone batch absence count as proof → VERIFY-05 fails.

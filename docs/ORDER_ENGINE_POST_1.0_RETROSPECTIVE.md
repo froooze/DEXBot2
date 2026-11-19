@@ -1504,8 +1504,9 @@ just at entry). A lone batch absence without the second read is never proof (als
 on the lagging pre-read and failed-chunk paths). An inconclusive read defers with
 the entry queued; a confirmed still-live order logs a throttled hard error and
 increments `duplicateOrphanCancelUnverifiedCount`, surfaced through `getMetrics()`.
-Batch
-failures reach `results`/`failed`. Only already-queued `cancelOnly` entries are
+The counter keeps its historical name but now covers both cancel classes after
+the surplus verification fix; the hard-error log names the actual class. Batch
+failures reach `results`/`failed`. Only already-queued cancel-class entries are
 verified — the P1/P2 cancel sweeps reverted in §1 stay reverted. Covered by
 `tests/test_duplicate_orphan_cancel_verification.ts` (VERIFY-01..11) plus the
 extended `test_p2_observability_counters` and updated mocks in

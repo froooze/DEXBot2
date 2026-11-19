@@ -186,7 +186,7 @@ class StrategyEngine {
                         const filledGeoType = geometryTypeForSlotIndex(
                             parseSlotIndex(currentSlot?.id),
                             mgr.boundaryIdx,
-                            mgr._gapSlots
+                            mgr ? resolveGapSlots(mgr as never, mgr._genesis?.gapSlots) : null
                         );
                         filledHole = (filledGeoType === ORDER_TYPES.BUY || filledGeoType === ORDER_TYPES.SELL)
                             ? toRailHolePlaceholder(currentSlot, filledGeoType, 0)

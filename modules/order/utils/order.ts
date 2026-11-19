@@ -798,10 +798,12 @@ function _validatePriceCorrectionEntry(manager: OrderManagerLike, entry: Pending
         // no order should rest there, so the cancel must survive. Geometry is
         // index-vs-boundary, so an unknown boundary falls back to the
         // stored-type check (fail-safe: never invent a rail).
+        // Drain-time live geometry: no genesis-preferred gap (the band may have
+        // moved since grid creation).
         const geometryType = geometryTypeForSlotIndex(
             parseSlotIndex(slot.id),
             manager?.boundaryIdx,
-            manager?._gapSlots
+            manager ? MathUtils.resolveGapSlots(manager as never) : null
         );
         const geometryContradicts = geometryType !== null && geometryType !== targetType;
         if (!targetType || (slot.type === targetType && !geometryContradicts)) {
@@ -818,7 +820,12 @@ function _validatePriceCorrectionEntry(manager: OrderManagerLike, entry: Pending
         // Live chain price first: a refused-commit adoption can leave the local
         // slot id in-rail while the order actually rests inside the band.
         const live = resolveLiveOrderLadderPosition(slot, manager?.assets, manager?._genesis);
-        const geometry = geometryTypeForSlotIndex(live.idx, manager?.boundaryIdx, manager?._gapSlots);
+        const geometry = geometryTypeForSlotIndex(
+            live.idx,
+            manager?.boundaryIdx,
+            // Live geometry again — do not prefer the frozen genesis gap.
+            manager ? MathUtils.resolveGapSlots(manager as never) : null
+        );
         if (geometry !== ORDER_TYPES.SPREAD) {
             return { valid: false, reason: `gap-evacuation target ${slotId} is no longer in the current gap band` };
         }
@@ -1040,7 +1047,7 @@ async function correctOrderPriceOnChain(manager: OrderManagerLike, correctionInf
             // Verify by id BEFORE dropping the queue entry / detection record;
             // on an unreadable or still-live order keep the entry queued so the
             // next drain retries (and the hard error makes the failure visible).
-            const verification = await verifyCancelOnlyGone(manager, accountOrders, chainOrderId, verifyDeadlineMs);
+            const verification = await verifyCancelGone(manager, accountOrders, chainOrderId, verifyDeadlineMs);
             if (!verification.gone) {
                 if (verification.deferred) {
                     // Drain budget exhausted: keep the entry, no hard error, no
@@ -1048,7 +1055,7 @@ async function correctOrderPriceOnChain(manager: OrderManagerLike, correctionInf
                     // further broadcast.
                     return { success: false, skipped: true, deferred: true, error: 'cancel-verification-deferred' };
                 }
-                recordUnverifiedDuplicateOrphanCancel(manager, correctionInfo, verification);
+                recordUnverifiedCancel(manager, correctionInfo, verification);
                 return {
                     success: false,
                     error: verification.lagging ? 'cancel-verification-lagging' : 'cancel-verification-failed',
@@ -1088,6 +1095,24 @@ async function correctOrderPriceOnChain(manager: OrderManagerLike, correctionInf
             const sideLabel = type === ORDER_TYPES.SELL ? 'SELL' : 'BUY';
             manager.logger?.log?.(`[CORRECTION] Cancelling surplus/mismatched ${sideLabel} order ${chainOrderId} for slot ${gridOrder?.id || 'unknown'}`, 'info');
             await accountOrders.cancelOrder(accountName, privateKey, chainOrderId);
+            // Same verified-after-broadcast contract as cancelOnly entries. A
+            // successful broadcast is not proof the order is gone: virtualizing
+            // the slot and filtering the unmatched id on that assumption would
+            // hide a still-resting wrong-side order until the next full sync.
+            // Verify by id BEFORE any slot mutation or queue removal; on an
+            // unreadable/still-live order keep everything untouched for retry.
+            const verification = await verifyCancelGone(manager, accountOrders, chainOrderId, verifyDeadlineMs);
+            if (!verification.gone) {
+                if (verification.deferred) {
+                    return { success: false, skipped: true, deferred: true, error: 'cancel-verification-deferred' };
+                }
+                recordUnverifiedCancel(manager, correctionInfo, verification);
+                return {
+                    success: false,
+                    error: verification.lagging ? 'cancel-verification-lagging' : 'cancel-verification-failed',
+                    verification
+                };
+            }
             const settlementGridOrder = _currentCorrectionGridOrder(manager, correctionInfo);
             if (settlementGridOrder && manager._applyOrderUpdate) {
                 const spreadOrder = convertToSpreadPlaceholder(settlementGridOrder);
@@ -1098,7 +1123,7 @@ async function correctOrderPriceOnChain(manager: OrderManagerLike, correctionInf
             }
             _filterUnmatchedChainOrders(manager, chainOrderId);
             shouldRemove = true;
-            return { success: true, cancelled: true };
+            return { success: true, cancelled: true, verification };
         } catch (error) {
             const orderGone = getErrorMessage(error)?.includes(ORDER_GONE_ERROR_FRAGMENT);
             if (orderGone) {
@@ -1211,7 +1236,7 @@ function boundedByIdRead<T>(promise: Promise<T>, timeoutMs: number, label: strin
 }
 
 /**
- * Verify that a queued duplicate-orphan cancel actually removed the chain
+ * Verify that a queued cancel-class correction actually removed the chain
  * order, instead of trusting a successful broadcast. A broadcast result says
  * "the node accepted the tx", not "the order is gone" — the live log showed the
  * same orphan detected again seconds after its cancel was reported successful.
@@ -1225,14 +1250,21 @@ function boundedByIdRead<T>(promise: Promise<T>, timeoutMs: number, label: strin
  * per-drain wall-clock budget come from PIPELINE_TIMING so an unresponsive node
  * cannot turn one verification into minutes of RPC wait.
  *
- * Only entries already queued as cancelOnly reach this helper — it never
+ * Only entries already queued as a cancel-class correction reach this helper —
+ * cancelOnly duplicate orphans AND surplus/type-mismatch cancels. It never
  * enumerates chain orders, so the reverted gap-band cancel sweeps stay reverted.
+ * Both classes finalize queue/detection bookkeeping on an assumed absence, so
+ * a successful broadcast must be read back for either. Surplus also converts a
+ * grid slot: an unapplied cancel would mark it SPREAD while the wrong-side
+ * order keeps resting, so its next fill is booked against the wrong side.
+ * CancelOnly has no owning slot; there the risk is a live orphan being dropped
+ * from duplicate detection and from the unmatched list.
  *
  * @returns {{gone: boolean, lagging: boolean, deferred: boolean}} gone = verified
  *   cancelled; lagging = inconclusive, defer; deferred = drain budget exhausted;
  *   gone=false/lagging=false = confirmed still live.
  */
-async function verifyCancelOnlyGone(
+async function verifyCancelGone(
     manager: OrderManagerLike,
     accountOrders: CorrectionAccountOrdersLike,
     chainOrderId: string,
@@ -1299,11 +1331,14 @@ const UNVERIFIED_CANCEL_LOG_RATE_LIMIT_MS = TIMING.STALE_TOTALS_WARN_RATE_LIMIT_
 const UNVERIFIED_CANCEL_LOG_MAX_IDS = 100;
 
 /** Single owner for the hard error when a queued cancel cannot be verified. */
-function recordUnverifiedDuplicateOrphanCancel(
+function recordUnverifiedCancel(
     manager: OrderManagerLike,
     entry: PendingPriceCorrection,
     verification: { gone: boolean; lagging: boolean }
 ): void {
+    // The counter keeps its historical name for metric/API stability; it counts
+    // unverified cancels of BOTH classes. The log label names the actual class.
+    const kind = entry.cancelOnly === true ? 'Duplicate-orphan' : 'Surplus/type-mismatch';
     if (manager?._metrics) {
         manager._metrics.duplicateOrphanCancelUnverifiedCount =
             (manager._metrics.duplicateOrphanCancelUnverifiedCount || 0) + 1;
@@ -1322,7 +1357,7 @@ function recordUnverifiedDuplicateOrphanCancel(
     }
     const queued = entry.queuedAt ? new Date(entry.queuedAt).toISOString() : 'unknown-time';
     manager?.logger?.log?.(
-        `[CORRECTION] Duplicate-orphan cancel NOT verified for ${id} ` +
+        `[CORRECTION] ${kind} cancel NOT verified for ${id} ` +
         `(${verification.lagging ? 'lagging chain read' : 'order still live after bounded by-id checks'}; ` +
         `queued ${entry.queuedBy || 'unknown-source'}@${queued}); entry stays queued for retry`,
         'error'
@@ -1432,12 +1467,14 @@ async function _batchCancelCorrections(manager: OrderManagerLike, entries: Pendi
                     continue;
                 }
                 // A single batch absence is not proof: a lagging pre-read used to
-                // finalize a live orphan. Only cancel-only entries need the
-                // independent read; confirmed-gone surplus entries keep the old
-                // path. Unconfirmed absence fails OPEN to the broadcast, which
-                // the post-broadcast verification then judges.
+                // finalize a live cancel target. Both cancel classes (cancelOnly
+                // duplicate orphans AND surplus/type-mismatch) drop queue and
+                // detection bookkeeping on finalization — surplus also converts
+                // the grid slot — so both need the independent read. Unconfirmed
+                // absence fails OPEN to the broadcast, which the post-broadcast
+                // verification then judges.
                 const entry = byId.get(id)!;
-                if (entry.cancelOnly === true) {
+                if (entry.cancelOnly === true || entry.isSurplus === true) {
                     if (typeof accountOrders.readSingleOrder !== 'function') {
                         presentIds.push(id);
                         continue;
@@ -1515,8 +1552,12 @@ async function _batchCancelCorrections(manager: OrderManagerLike, entries: Pendi
             await accountOrders.executeBatch(accountName, privateKey, chunk.map((o) => o.op));
             for (const { id } of chunk) {
                 const entry = byId.get(id)!;
-                if (entry.cancelOnly === true) {
-                    const verification = await verifyCancelOnlyGone(manager, accountOrders, id, deadline);
+                // Both cancel classes finalize bookkeeping, so a successful
+                // batch broadcast must be read back for surplus entries too —
+                // otherwise an unapplied cancel strands the wrong-side order
+                // and its grid slot is marked SPREAD.
+                if (entry.cancelOnly === true || entry.isSurplus === true) {
+                    const verification = await verifyCancelGone(manager, accountOrders, id, deadline);
                     if (!verification.gone) {
                         if (verification.deferred) {
                             // Drain budget exhausted: defer silently, keep the
@@ -1535,7 +1576,7 @@ async function _batchCancelCorrections(manager: OrderManagerLike, entries: Pendi
                         // Lagging: keep the entry queued without another broadcast
                         // this drain, but report it once here (the serial path never
                         // sees it).
-                        recordUnverifiedDuplicateOrphanCancel(manager, entry, verification);
+                        recordUnverifiedCancel(manager, entry, verification);
                         failed++;
                         outcomes.push({
                             entry,
@@ -1581,9 +1622,10 @@ async function _batchCancelCorrections(manager: OrderManagerLike, entries: Pendi
                 continue;
             }
             let gone = Boolean(verifyMap && !verifyMap.get(id));
-            if (gone && entry.cancelOnly === true) {
+            if (gone && (entry.cancelOnly === true || entry.isSurplus === true)) {
                 // Same second-read rule as the pre-broadcast path: one batch
-                // absence from a lagging node must not finalize a live orphan.
+                // absence from a lagging node must not finalize a live cancel
+                // target (duplicate orphan or surplus/type-mismatch order).
                 if (typeof accountOrders.readSingleOrder !== 'function') gone = false;
                 else {
                     if (Date.now() >= deadline) {

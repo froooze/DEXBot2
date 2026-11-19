@@ -22,6 +22,16 @@
  */
 
 const assert = require('assert');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+// registerAllocation() rewrites a shared JSON registry. The test runner executes
+// suites in parallel, so give this process its own profile root (set BEFORE any
+// module load — fund_registry.ts snapshots REGISTRY_FILE at load time) to keep
+// the HEAL-060 fixture hermetic.
+const TEMP_PROFILE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'dexbot-heal-'));
+process.env.DEXBOT_PROFILE_ROOT = TEMP_PROFILE_ROOT;
+
 const AccountingModule = require('../modules/order/accounting');
 const Accountant = AccountingModule.default;
 const fundRegistry = require('../modules/fund_registry');
@@ -403,4 +413,6 @@ async function runAllTests() {
     console.log('\n=== All fund-drift heal tests passed! ===');
 }
 
-runAllTests().catch((e: any) => { console.error(e); process.exit(1); });
+runAllTests()
+    .catch((e: any) => { console.error(e); process.exitCode = 1; })
+    .finally(() => { try { fs.rmSync(TEMP_PROFILE_ROOT, { recursive: true, force: true }); } catch { /* best effort */ } });

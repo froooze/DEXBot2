@@ -231,6 +231,9 @@ export function createDefaultBotMetrics(): BotMetrics {
         reloadReplacedRailCount: 0,
         lastFillPivotMovedUnderBatchCount: 0,
         lastFillGateFailOpenCount: 0,
+        // Historical name kept for metric/API stability: counts unverified
+        // cancels of both classes (cancelOnly duplicate orphans AND
+        // surplus/type-mismatch). The hard-error log names the actual class.
         duplicateOrphanCancelUnverifiedCount: 0
     };
 }
