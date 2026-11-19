@@ -2865,60 +2865,80 @@ async function executeMaintenanceLogic(bot: BotLike, context: string) {
             // between the top clear and here (nothing currently does).
             bot.manager._gridSidesUpdated?.clear();
 
-            const divergence = await grid.monitorDivergence(bot.manager, calculatedGrid, persistedGridData);
+            // Re-check the fill queue immediately before divergence detection. Fills
+            // can arrive during this tick's earlier phases (health check, dust cancels,
+            // targeted drift reconciliation) AFTER the pipeline gate above passed.
+            // Divergence sizing/corrections read the persisted grid snapshot and side
+            // budgets, so running them on pre-fill state would size a repair from stale
+            // funds. Fills are priority 1: defer so the fill consumer drains the
+            // queue on its next wake (next fill event, broadcast/COW region end or
+            // pipeline-clear drain), using the same rule the spread check applies
+            // below.
+            const queuedFillsBeforeDivergence = Array.isArray(bot?._incomingFillQueue)
+                ? bot._incomingFillQueue.length
+                : 0;
+            if (queuedFillsBeforeDivergence > 0) {
+                bot._log(
+                    `[DIVERGENCE] Deferring divergence check: ${queuedFillsBeforeDivergence} fill(s) queued since pipeline gate; ` +
+                    `processing fills first for fresh funds`,
+                    'debug'
+                );
+            } else {
+                const divergence = await grid.monitorDivergence(bot.manager, calculatedGrid, persistedGridData);
 
-            if (divergence.needsUpdate) {
-                const hasRmsDivergence = !!(divergence.buy.rms || divergence.sell.rms);
-                if (divergence.buy.ratio || divergence.sell.ratio) {
-                    const buyDir = divergence.buy.shrink ? '/shrink' : '';
-                    const sellDir = divergence.sell.shrink ? '/shrink' : '';
-                    bot._log(`Grid update triggered by funds during ${context} (buy: ${divergence.buy.ratio}${buyDir}, sell: ${divergence.sell.ratio}${sellDir})`);
-                }
-                if (hasRmsDivergence) {
-                    const rmsThresholdPct = divergence?.thresholdPct ?? grid.resolveRmsThresholdPct(bot.manager);
-                    const rmsTriggeredSides = [
-                        divergence.buy.rms ? 'buy' : null,
-                        divergence.sell.rms ? 'sell' : null,
-                    ].filter(Boolean).join('+') || 'none';
-                    bot._log(`[RMS] Grid update triggered by structural divergence during ${context}: buy=${Format.formatPercent(Number(divergence.buy.metric) * 100, 2)}% sell=${Format.formatPercent(Number(divergence.sell.metric) * 100, 2)}% (threshold=${rmsThresholdPct}%) sides=${rmsTriggeredSides} → TRIGGER-RESYNC (rms_structural_grid_resync)`);
-                    let ok;
-                    if (typeof bot._performGridResync === 'function') {
-                        ok = await bot._performGridResync(buildGridResyncOptions('rms_structural_grid_resync'));
-                    } else {
-                        ok = await performGridResync(bot, buildGridResyncOptions('rms_structural_grid_resync'));
+                if (divergence.needsUpdate) {
+                    const hasRmsDivergence = !!(divergence.buy.rms || divergence.sell.rms);
+                    if (divergence.buy.ratio || divergence.sell.ratio) {
+                        const buyDir = divergence.buy.shrink ? '/shrink' : '';
+                        const sellDir = divergence.sell.shrink ? '/shrink' : '';
+                        bot._log(`Grid update triggered by funds during ${context} (buy: ${divergence.buy.ratio}${buyDir}, sell: ${divergence.sell.ratio}${sellDir})`);
                     }
-                    if (!ok) {
-                        bot._warn(`[RMS] Structural divergence full grid resync failed during ${context}; retaining existing grid state.`);
+                    if (hasRmsDivergence) {
+                        const rmsThresholdPct = divergence?.thresholdPct ?? grid.resolveRmsThresholdPct(bot.manager);
+                        const rmsTriggeredSides = [
+                            divergence.buy.rms ? 'buy' : null,
+                            divergence.sell.rms ? 'sell' : null,
+                        ].filter(Boolean).join('+') || 'none';
+                        bot._log(`[RMS] Grid update triggered by structural divergence during ${context}: buy=${Format.formatPercent(Number(divergence.buy.metric) * 100, 2)}% sell=${Format.formatPercent(Number(divergence.sell.metric) * 100, 2)}% (threshold=${rmsThresholdPct}%) sides=${rmsTriggeredSides} → TRIGGER-RESYNC (rms_structural_grid_resync)`);
+                        let ok;
+                        if (typeof bot._performGridResync === 'function') {
+                            ok = await bot._performGridResync(buildGridResyncOptions('rms_structural_grid_resync'));
+                        } else {
+                            ok = await performGridResync(bot, buildGridResyncOptions('rms_structural_grid_resync'));
+                        }
+                        if (!ok) {
+                            bot._warn(`[RMS] Structural divergence full grid resync failed during ${context}; retaining existing grid state.`);
+                        }
+                        return;
                     }
-                    return;
-                }
 
-                let dcResult;
-                try {
-                    dcResult = await applyGridDivergenceCorrections(
-                        bot.manager,
-                        bot.accountOrders,
-                        bot.config.botKey,
-                        bot.updateOrdersOnChainBatch.bind(bot),
-                        updateGridFromBlockchainSnapshot
-                    );
-                    if (await bot._abortFlowIfIllegalState(`${context} divergence correction`)) return;
-                    bot._log(`Grid divergence corrections applied during ${context}`);
-                } catch (err) {
-                    bot._warn(`Error applying divergence corrections during ${context}: ${getErrorMessage(err)}`);
-                }
+                    let dcResult;
+                    try {
+                        dcResult = await applyGridDivergenceCorrections(
+                            bot.manager,
+                            bot.accountOrders,
+                            bot.config.botKey,
+                            bot.updateOrdersOnChainBatch.bind(bot),
+                            updateGridFromBlockchainSnapshot
+                        );
+                        if (await bot._abortFlowIfIllegalState(`${context} divergence correction`)) return;
+                        bot._log(`Grid divergence corrections applied during ${context}`);
+                    } catch (err) {
+                        bot._warn(`Error applying divergence corrections during ${context}: ${getErrorMessage(err)}`);
+                    }
 
-                // Divergence never shifts the boundary (fills move it via
-                // deriveTargetBoundary; spread promotion shifts only onto
-                // same-batch placements), so a failed commit has no pending
-                // geometry to retry — the next fill/sync cycle re-plans from
-                // the unchanged committed state.
-                if (dcResult && !dcResult.committed) {
-                    bot._log(
-                        `[DIVERGENCE-COW] Divergence corrections not executed (reason=${dcResult.reason ?? 'unknown'}); ` +
-                        `deferring to next fill/sync cycle`,
-                        'warn'
-                    );
+                    // Divergence never shifts the boundary (fills move it via
+                    // deriveTargetBoundary; spread promotion shifts only onto
+                    // same-batch placements), so a failed commit has no pending
+                    // geometry to retry — the next fill/sync cycle re-plans from
+                    // the unchanged committed state.
+                    if (dcResult && !dcResult.committed) {
+                        bot._log(
+                            `[DIVERGENCE-COW] Divergence corrections not executed (reason=${dcResult.reason ?? 'unknown'}); ` +
+                            `deferring to next fill/sync cycle`,
+                            'warn'
+                        );
+                    }
                 }
             }
 

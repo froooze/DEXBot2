@@ -742,7 +742,10 @@ function installDivergenceMocks(opts) {
         expireLastFillGuardReferences: () => {},
     });
     defineEsmMockAbs(require.resolve('../modules/order/grid'), NAMES.grid, {
-        monitorDivergence: async () => opts.divergence,
+        monitorDivergence: async () => {
+            opts.markDivergenceChecked?.();
+            return opts.divergence;
+        },
         resolveRmsThresholdPct: () => 14.3,
     });
     defineEsmMockAbs(require.resolve('../modules/order/format'), NAMES.format, {
@@ -791,6 +794,7 @@ function makeDivergenceSelf(opts) {
         accountOrders: {
             loadGrid: () => [{ id: 'buy-0', type: 'buy', price: 1, size: 1 }],
         },
+        _incomingFillQueue: opts.incomingFillQueue ?? [],
         _getPipelineSignals: () => ({}),
         _cancelDustOrders: async () => ({ cancelledCount: 0, batchResult: null }),
         _abortFlowIfIllegalState: async () => false,
@@ -893,6 +897,54 @@ async function testSpreadCheckRunsWithoutDivergence() {
     assert.strictEqual(spreadChecked, true, 'spread check must run on a pipeline-empty tick even when divergence is not flagged');
 
     console.log('✓ spread check runs without divergence (no-divergence tick)');
+}
+
+async function testDivergenceDefersWhenFillQueuedMidTick() {
+    let divergenceChecked = false;
+    let correctionCalled = false;
+    let resyncCalled = false;
+    let spreadChecked = false;
+    const logs = [];
+
+    // A fill lands after the pipeline gate passed (the gate is mocked empty) but
+    // before divergence detection. Fills are priority 1: the whole divergence
+    // phase must be skipped — including the RMS resync path — so no correction
+    // or resync runs against pre-fill budgets. The divergence fixture is flagged
+    // so an unguarded tick would definitely take the resync branch.
+    installDivergenceMocks({
+        markDivergenceChecked: () => { divergenceChecked = true; },
+        applyCorrections: async () => {
+            correctionCalled = true;
+        },
+        divergence: {
+            needsUpdate: true,
+            buy: { ratio: false, rms: true, metric: 18 },
+            sell: { ratio: false, rms: false, metric: 0 },
+        },
+    });
+
+    const { executeMaintenanceLogic } = require('../modules/dexbot_maintenance_runtime');
+    await executeMaintenanceLogic(
+        makeDivergenceSelf({
+            botKey: 'divergence-mid-tick-fill-bot-0',
+            logs,
+            incomingFillQueue: [{}],
+            markSpreadChecked: () => { spreadChecked = true; },
+            markResync: () => { resyncCalled = true; },
+        }),
+        'unit-test-mid-tick-fill'
+    );
+
+    assert.strictEqual(divergenceChecked, false, 'monitorDivergence must not run when a fill queued mid-tick');
+    assert.strictEqual(correctionCalled, false, 'divergence corrections must be deferred when a fill queued mid-tick');
+    assert.strictEqual(resyncCalled, false, 'RMS resync must be deferred when a fill queued mid-tick');
+    assert.strictEqual(spreadChecked, false, 'the spread check keeps its own queue re-check and also defers');
+    assert.ok(
+        logs.some((msg) => String(msg).includes('[DIVERGENCE] Deferring divergence check: 1 fill(s) queued since pipeline gate')),
+        'the deferral must be logged with the fill count and reason'
+    );
+
+    console.log('✓ divergence phase defers to a fill queued mid-tick');
 }
 
 async function testDexbotClassPerformGridResyncForwardsOptions() {
@@ -1004,6 +1056,7 @@ const STAGES = {
     market_adapter_slope_trigger_reset: testMarketAdapterSlopeTriggerResetRecordsSlopeSource,
     rms_divergence_runs_full_grid_resync: testRmsDivergenceRunsFullGridResync,
     spread_check_runs_without_divergence: testSpreadCheckRunsWithoutDivergence,
+    divergence_defers_when_fill_queued_mid_tick: testDivergenceDefersWhenFillQueuedMidTick,
     dexbot_class_perform_grid_resync_forwards_options: testDexbotClassPerformGridResyncForwardsOptions,
 };
 
@@ -1032,6 +1085,8 @@ const STAGE_UNITS = [
     ],
     'rms_divergence_runs_full_grid_resync',
     'spread_check_runs_without_divergence',
+    // Installs its own divergence mock (queued-fill fixture) — keep as its own unit.
+    'divergence_defers_when_fill_queued_mid_tick',
     'dexbot_class_perform_grid_resync_forwards_options',
 ];
 
