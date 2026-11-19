@@ -395,7 +395,7 @@ Debug line: `[BOUNDARY] boundary=123 sellStart=128 spread=4 anchorProjected=138 
 (a) Persistence: `recalculateGrid` persists the reconciled grid after reconcile, so the `manager._restoreBoundary` re-derivation (`grid_reconcile.ts`) survives to the next cycle. After fix: `[BOUNDARY-EVIDENCE]` contradiction fires at most once per stale boundary. (b) NO_FEASIBLE: bounded periodic re-validation (5min cooldown, 20 attempts) landed with `4838bcb0`; `a54863ca` went further — the validator enumerates straddling orders (`conflictingBuyIds/conflictingSellIds`) and the reconcile escalates a cancel ladder (smaller single side → other side → both, `grid_reconcile.ts`), re-derives the boundary and proceeds with placements; the adoption-only freeze remains only as a defensive fallback.
 
 **#6 Retry/backoff post-broadcast adoption read-back — LANDED (cooldown `4838bcb0` + retry `d808c052`).**
-`deferUncertainBroadcastRead` (`dexbot_cow_runtime.ts`) 30s escalation cooldown bounds thrash; `adoptPlacedBatchFromChain` retries lagging/failed by-id reads (3 attempts, 2s/4s backoff) before deferring with pending-broadcast protection kept. Cross-node failover remains open.
+`deferUncertainBroadcastRead` (`dexbot_cow_runtime.ts`) 30s escalation cooldown bounds thrash; `adoptPlacedBatchFromChain` retries lagging/failed by-id reads (3 attempts, 2s/4s backoff) before deferring with pending-broadcast protection kept. Cross-node failover is **closed**: a bounded one-per-5-min failover (30 s retry on a clean decline, immediate on a thrown failover) runs before deferring, with the latch stamped from completion (`9985162e`, `tests/test_adoption_cross_node_failover.ts`).
 
 **#7 Sync-lock/maintenance observability — LANDED.**
 Throttle `Structural resync defer` to first/last per cap window (was 120/30s); log/retry `[MAINT] n/m failed` with orderId/reason.
@@ -1237,13 +1237,17 @@ Amended policy (still one owner, still no cooldown):
   would otherwise skip the only guard that reads the marker. This is the incident's
   own shape: no accepted fill in the window means no persisted reference and a cold
   direction pivot, so the marker is the only protection.
-- **Reporting is not escalation.** With a cold pivot the planner's exclusion report
-  still names the refused marker (`lastFillRuleText` fallback), but the stall hint
-  deliberately stays `no-candidates` instead of `last-fill-blocked`. The maintenance
+- **Reporting is not escalation (superseded by §9.15).** With a cold pivot the
+  planner's exclusion report still names the refused marker (`lastFillRuleText`
+  fallback); the stall hint deliberately stayed `no-candidates` instead of
+  `last-fill-blocked` at the time because the maintenance
   re-center dedupes on `geometryPivotKey` from `resolveLastFillGuardReference`,
-  which is `''` on a cold pivot, so `geometryAlreadyRecentered` could never become
-  true and the bot would re-center every cycle. Anyone completing that branch must
-  fix the dedupe key first; this addendum does not.
+  which was `''` on a cold pivot, so `geometryAlreadyRecentered` could never become
+  true and the bot would re-center every cycle. Anyone completing that branch had to
+  fix the dedupe key first; this addendum did not. **Closed in §9.15:** the key is now
+  owned by `resolveGuardGenerationKey`, which uses the oldest live refused level
+  while the pivot is cold, so the one-re-center watermark sticks and the bounded
+  pivot expiry heals the side; the planner may then name the bind (`last-fill-blocked`).
 - Only levels that actually traded are vetoed. There is no band, no backoff and no
   frozen side: the next rung up and the whole counter side remain placeable, so one
   fill still yields one counter order — just not at a price the taker already took.
@@ -1590,6 +1594,67 @@ report section rather than disappearing. (2) Stage 1 was held until a reproducin
 case existed; the log supplied one and bounded by-id verification is now landed.
 (3) The working copy was folded here as §9.14 and the standalone plan removed; this
     section is the sole record.
+
+---
+
+### 9.15 Post-v1.7.3 propagation fixes: guard generation and gate ownership (2026-11-19)
+
+> **Scope:** the two fixable residuals left by the post-v1.7.3 log audits — the
+> cold-pivot re-center wedge (§9.12 Addendum 3) and the deferral gates that still
+> peeked raw in-flight counters (INV-FILL-003). Every other item in that audit set
+> is a documented non-goal (§9.13 "Deliberately not done", §9.14 Stage 3/6,
+> `FILL_PIPELINE.md` §4 verdicts) and was deliberately left untouched. Generic
+> terms only; no market, account, bot or order id is named.
+
+**Status verdicts.**
+
+| Track | Verdict | Reason |
+|---|---|---|
+| A — cold-pivot guard generation | **Landed** | The dedupe key now has one owner over both guard references; the bounded expiry is reachable on a refused sweep |
+| B — deferral/scheduling gates | **Landed** | Four gates migrated to `readBotInFlightFlags`; unreadable now defers instead of opening the gate |
+| Stale failover status line | **Landed (doc only)** | §2's "cross-node failover remains open" was superseded by `9985162e` |
+
+**Track A — one re-center per guard generation.** `resolveGuardGenerationKey`
+(`modules/order/utils/system.ts`) is the single read over the two guard owners: an
+armed pivot keeps the old `price|type` key; a cold pivot keys on the **oldest live
+refused level** (`refused:price|type`), which is stable while a sweep adds adjacent
+rungs and changes only when that generation expires. No new state, no persistence,
+no timing value. The maintenance watchdog uses it for `geometryPivotKey`, so
+`geometryAlreadyRecentered` can become true on a cold pivot; after the existing
+`SPREAD_STALE_PIVOT_EXPIRE_MS` window `expireLastFillGuardReferences` clears the
+pivot **and** the refused-level set (it calls `resetLastFillPivot`), and quoting
+resumes around the live market. The planner may therefore report the cold-pivot
+bind as `last-fill-blocked` — §9.12 Addendum 3's "reporting is not escalation"
+limit is lifted now that the dedupe key is fixed, one sweep still gets one
+re-center, and a refused SELL rung is not mistaken for a BUY-side bind (side-aware
+`hasLiveRefusedFillLevels(manager, type)`). The empty-candidate operator line
+still names the refused level; only the stall cause changed.
+
+**Track B — one liveness owner in the deferral gates.** The lightweight-sync gate
+and `drainFillQueueAfterPipelineClear` (`dexbot_maintenance_runtime.ts`), plus
+`triggerStateRecoverySync` and the post-recovery rebalance timer
+(`dexbot_state_recovery.ts`), used raw `!counter` / `(counter || 0) > 0` peeks that
+read an unreadable counter as "idle" and opened a gate while a batch or recovery
+was active. They now call `readBotInFlightFlags(bot)`: unreadable defers
+(`ok: false`), the maintenance tick / leak watchdog / rebalance timer provide the
+existing wake, and no new timing window is introduced. This closes the last
+scheduling-path residue of the INV-FILL-003 closure (§9.13 post-release addendum).
+
+**Gates and stop conditions.** Re-centering a refused sweep may happen at most
+once per generation; the next heal is the bounded expiry, not another re-center.
+If the key churns, revert the planner's stall widening before touching the
+watchdog — never add a timer. If a scheduling gate defers with no wake, revert
+that site (liveness beats symmetry). No credit, order count, sizing, boundary,
+config, TTL or guard policy changed.
+
+**Verification.** `tests/test_guard_generation_and_gate_owner.ts` (GG-001..006),
+`tests/test_spread_last_fill_planning.ts` (SLF-14), plus the existing
+`test_stale_grid_hardening`, `test_refused_level_refill_block`,
+`test_fill_one_counter_order`, `test_structural_resync_fill_gate`,
+`test_duplicate_orphan_cancel_verification`, `test_grid_update_blockers` and
+`test_fill_pipeline_contract` suites. Full suite, `typecheck`,
+`typecheck:tests`, `check:any`, `typecheck:analysis` and `verify:browser-bundle`
+green. `TIMING_INVENTORY` and the fill-pipeline ratchet counts are unchanged.
 
 ---
 

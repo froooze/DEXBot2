@@ -9,7 +9,7 @@ import { lazyShim } from './lazy_shim.js';
 
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
-import { nowIso, fireStructuralResync, resolveLastFillGuardReference, hasUnsettledFills, resolveGridUpdateBlockers, noteGridUpdateBlockers, expireLastFillGuardReferences, readBotInFlightFlags } from './order/utils/system.js';
+import { nowIso, fireStructuralResync, resolveGuardGenerationKey, hasUnsettledFills, resolveGridUpdateBlockers, noteGridUpdateBlockers, expireLastFillGuardReferences, readBotInFlightFlags } from './order/utils/system.js';
 import { withPlacement } from './order/placement_lock.js';
 import { resolveTradedSide } from './order/fill_ledger.js';
 import { path } from './path_api.js';
@@ -2715,9 +2715,14 @@ async function executeMaintenanceLogic(bot: BotLike, context: string) {
             );
         }
     }
+    // One owner for pipeline liveness (INV-FILL-003): a raw `!counter` reads an
+    // unreadable counter as "idle" and opens a sync gate on bad evidence. The
+    // gate stays shut on `ok:false`; the next maintenance tick re-evaluates it.
+    const lightweightInFlight = readBotInFlightFlags(bot);
     if (
-        !bot._recoverySyncInFlight &&
-        !bot._batchInFlight &&
+        lightweightInFlight.ok &&
+        !lightweightInFlight.recoveryInFlight &&
+        !lightweightInFlight.batchInFlight &&
         pendingBroadcastKnown &&
         pendingBroadcastCount === 0 &&
         (bot._lightweightSyncCheckAt == null || Date.now() - bot._lightweightSyncCheckAt >= TIMING.LIGHTWEIGHT_SYNC_CHECK_INTERVAL_MS)
@@ -3248,12 +3253,22 @@ export function trackOutOfSpreadStaleness(bot: BotLike, spreadChecked: boolean, 
     let geometryPivotKey = '';
     if (geometryBlocked) {
         try {
-            const ref = resolveLastFillGuardReference(bot.manager);
-            if (ref?.price != null && Number.isFinite(Number(ref.price))) geometryPivotKey = `${Number(ref.price)}|${String(ref.type ?? '')}`;
+            // One owner for the generation identity: an armed pivot, or — when
+            // a refused sweep left the pivot cold — the oldest live refused
+            // level. Without the second leg the key was '' on every cold-pivot
+            // tick, the one-re-center watermark never stuck, and the bounded
+            // pivot-expiry heal below was unreachable (§9.12 Addendum 3).
+            geometryPivotKey = resolveGuardGenerationKey(bot.manager);
         } catch { geometryPivotKey = ''; }
     }
     const geometryAlreadyRecentered = geometryBlocked && !!geometryPivotKey
         && bot._lastGeometryResyncPivotKey === geometryPivotKey;
+    // Keep the armed-pivot wording byte-identical (operator canaries and the
+    // existing LOGGING rows name "fill pivot"); a refused level gets its own
+    // label so the expiry reason is unambiguous in the log.
+    const geometryBindLabel = geometryPivotKey.startsWith('refused:')
+        ? `refused level ${geometryPivotKey.slice('refused:'.length).split('|')[0]}`
+        : `fill pivot ${geometryPivotKey.split('|')[0]}`;
     const geometryEscalateMs = Number(TIMING?.SPREAD_STALE_GEOMETRY_ESCALATE_MS) > 0
         ? Number(TIMING.SPREAD_STALE_GEOMETRY_ESCALATE_MS)
         : 10 * 60 * 1000;
@@ -3286,10 +3301,10 @@ export function trackOutOfSpreadStaleness(bot: BotLike, spreadChecked: boolean, 
     if (geometryAlreadyRecentered && staleMs >= warnMs && bot._geometryResyncWarnedPivotKey !== geometryPivotKey) {
         bot._geometryResyncWarnedPivotKey = geometryPivotKey;
         bot._log(
-            `[SPREAD-STALE] Still out of tolerance ${staleMin}min after re-centering on fill pivot ` +
-            `${geometryPivotKey.split('|')[0]}: the pivot is outside this generation's placeable side, so a re-center ` +
-            `cannot clear it. A fill (buy back below / sell above the pivot) or pivot expiry restores the side; ` +
-            `no further re-center will be requested for this pivot.`,
+            `[SPREAD-STALE] Still out of tolerance ${staleMin}min after re-centering on ${geometryBindLabel}: ` +
+            `the guard bind is outside this generation's placeable side, so a re-center ` +
+            `cannot clear it. A fill, a refused-level expiry, or pivot expiry restores the side; ` +
+            `no further re-center will be requested for this guard generation.`,
             'warn'
         );
     }
@@ -3322,7 +3337,7 @@ export function trackOutOfSpreadStaleness(bot: BotLike, spreadChecked: boolean, 
                 // again instead of staying stranded until the 24h TTL.
                 expireLastFillGuardReferences(
                     bot.manager,
-                    `out of tolerance ${staleMin}min after re-centering on fill pivot ${geometryPivotKey.split('|')[0]}`
+                    `out of tolerance ${staleMin}min after re-centering on ${geometryBindLabel}`
                 );
                 clearGeometryResyncMemory(bot);
                 bot._outOfSpreadSince = 0;
@@ -3765,8 +3780,12 @@ function setupDustHealthCheckInterval(bot: BotLike) {
 function drainFillQueueAfterPipelineClear(bot: BotLike) {
     try {
         if (!bot || bot._shuttingDown) return;
-        if ((bot._recoverySyncInFlight || 0) > 0) return;
-        if ((bot._batchInFlight || 0) > 0) return;
+        // Same owner as the destructive gates (INV-FILL-003): `(x || 0) > 0`
+        // read an unreadable counter as "cleared". `ok:false` defers; the leak
+        // watchdog force-clears malformed counters and calls this drain again,
+        // so the fail-closed answer still has a wake.
+        const inFlight = readBotInFlightFlags(bot);
+        if (!inFlight.ok || inFlight.recoveryInFlight || inFlight.batchInFlight) return;
         if (bot.manager?.isBroadcastingActive?.()) return;
         if (!bot._incomingFillQueue || bot._incomingFillQueue.length === 0) return;
         bot._log(`[FILL-QUEUE] Pipeline cleared; draining ${bot._incomingFillQueue.length} deferred fill(s).`, 'info');

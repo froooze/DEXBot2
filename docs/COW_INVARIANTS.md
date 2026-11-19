@@ -254,6 +254,10 @@ not by the seven per-site structures that used to disagree
   - Dust partials are cancelled immediately on detection — no delay, no timer.
   - Grid resync and structural maintenance wait only for the idle settle delay.
 
+- `INV-MAINT-006` One re-center per guard generation, armed or refused
+  - The spread-stale watchdog keys its one-re-center watermark on `resolveGuardGenerationKey`: the armed pivot, or the oldest live refused level when a premium sweep left the pivot cold. A cold key is never `''` while a refusal marker is live, so the bounded `SPREAD_STALE_PIVOT_EXPIRE_MS` exit stays reachable; the next level added to the same sweep does not fork the generation.
+  - Deferral and scheduling gates read pipeline liveness only through `readBotInFlightFlags`; an unreadable counter is `ok: false` and defers (INV-FILL-003), never "idle". A refused SELL level is not a BUY-side geometry bind.
+
 ---
 
 ## Grid Structure

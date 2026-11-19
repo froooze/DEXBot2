@@ -262,6 +262,16 @@ reconcile until another path GCs the map. This is the intended fail-closed answe
 **Status:** declared on `OrderManager` and `OrderManagerLike` and initialised to 0;
 writer and reader unchanged.
 
+**B5 — deferral gates peeked raw in-flight counters (post-v1.7.3 audit).**
+The lightweight-sync gate and the pipeline-clear drain (`dexbot_maintenance_runtime.ts`)
+and the recovery-sync / post-recovery-rebalance gates (`dexbot_state_recovery.ts`)
+used `!counter` / `(counter || 0) > 0`, which read an unreadable counter as "idle"
+and opened the gate — the fail-open shape C5 closed for grid mutation. They now
+call `readBotInFlightFlags(bot)`; `ok: false` defers with the existing wake sources
+(maintenance tick, leak watchdog, rebalance timer), and no timing window was added.
+**Status:** fixed; pinned by `tests/test_guard_generation_and_gate_owner.ts`
+(GG-005/006). No credit, order-count, sizing or boundary change.
+
 ### P3 — One consumer (5 d, highest risk)
 
 - **Current state (verified `71eb39ba`):** not started. No `requestFillDrain` exists; the

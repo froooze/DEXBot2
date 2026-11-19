@@ -4024,7 +4024,7 @@ export function determineOrderSideByFunds(manager: OrderManagerLike, currentMark
         // be > 0 on a COLD pivot. Name that reason in the report instead of
         // emitting "Excluded 3 candidates: " with an empty rule.
         let hasRefusedLevels = false;
-        try { hasRefusedLevels = hasLiveRefusedFillLevels(manager); } catch { /* best-effort */ }
+        try { hasRefusedLevels = hasLiveRefusedFillLevels(manager, railType); } catch { /* best-effort */ }
         const lastFillRuleText = lastFillPivot == null
             ? (hasRefusedLevels ? `${String(railType).toUpperCase()} at a just-filled (refused) level` : '')
             : `${railType === ORDER_TYPES.BUY ? 'BUY must be below' : 'SELL must be above'} the last fill ${Format.formatPrice6(lastFillPivot)}`;
@@ -4465,14 +4465,14 @@ export function determineOrderSideByFunds(manager: OrderManagerLike, currentMark
             // Name the geometry bind: the window itself is wrong (a sell slot
             // below the last sale means the boundary/crawl is behind the fill),
             // so placement cannot repair the side and a re-center can.
-            // DELIBERATELY narrow to an ARMED pivot: a refused sweep leaves the
-            // pivot cold, and the maintenance re-center dedupes on
-            // geometryPivotKey built from resolveLastFillGuardReference — ''
-            // on a cold pivot. Reporting 'last-fill-blocked' here would make
-            // geometryAlreadyRecentered never true and re-center EVERY cycle.
-            // The empty report above still names the refused-level reason; the
-            // stall stays 'no-candidates' until that dedupe key is fixed too.
-            const emptyStall: SpreadCorrectionStall = (lastFillExcluded > 0 && lastFillPivot != null)
+            // A refused sweep leaves the pivot COLD but is the same bind: every
+            // tightening slot on this side is a level the taker just took. The
+            // watchdog now keys the one-re-center dedupe on the guard GENERATION
+            // (resolveGuardGenerationKey), which includes live refused levels,
+            // so reporting 'last-fill-blocked' no longer causes a re-center
+            // every cycle — and the bounded pivot-expiry heal becomes reachable
+            // (§9.12 Addendum 3's "fix the dedupe key first" condition).
+            const emptyStall: SpreadCorrectionStall = (lastFillExcluded > 0 && (lastFillPivot != null || hasRefusedLevels))
                 ? 'last-fill-blocked'
                 : refusalStallHint;
             return { ordersToPlace: [], ordersToUpdate: [], plannedCount: 0, stallHint: emptyStall, origin: COW_ORIGINS.SPREAD_CORRECTION };

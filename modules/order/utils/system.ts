@@ -33,7 +33,7 @@
  *   - applyGridDivergenceCorrections(manager, ...) - Apply grid divergence corrections
  *   - applyPersistedPendingCrawls(...) - Apply persisted-but-uncommitted fill crawls
  *
- * SECTION 5: SPREAD-CORRECTION READINESS (7 functions)
+ * SECTION 5: SPREAD-CORRECTION READINESS (8 functions)
  *   - resolveSpreadFreshnessMs(manager) - The single freshness window for spread trust
  *   - resolveSpreadCrossingFloor(manager) - Crossing floor spread correction must not trade through
  *   - refreshLiveMarketPrice(manager) - Refresh the cached live market price
@@ -41,6 +41,7 @@
  *   - evaluateSpreadCorrectionReadiness(manager) - Evaluate whether spread correction may act
  *   - resolveSpreadMarketReference(manager) - Resolve the last real FILL price
  *   - resolveLastFillGuardReference(manager) - Resolve the reference the LAST-FILL-GUARD judges
+ *   - resolveGuardGenerationKey(manager) - Stable identity of the current guard generation
  *
  * SECTION 6: LAST-FILL / MARKET-FILL PERSISTENCE (6 functions)
  *   - restoreLastMarketFill(manager) - Restore the persisted last-market-fill reference
@@ -2004,6 +2005,40 @@ export function resolveLastFillGuardReference(manager: OrderManagerLike | null |
 }
 
 /**
+ * GUARD-GENERATION IDENTITY for the spread-stale re-center dedupe.
+ *
+ * The maintenance watchdog used to key "one re-center per guard generation"
+ * off `resolveLastFillGuardReference` alone. A refused (off-market) sweep
+ * deliberately leaves that reference COLD, so the key was `''`, the
+ * `geometryAlreadyRecentered` watermark could never be set, and the bounded
+ * pivot-expiry exit was unreachable for exactly the case it was written for
+ * (§9.12 Addendum 3 / retrospective §9.14). Derive the key from the SAME two
+ * owners the guard reads: an armed pivot wins; otherwise the oldest live
+ * refused level is the generation identity. The oldest entry is stable while a
+ * sweep adds adjacent rungs, so one sweep gets one re-center; when it expires
+ * the generation genuinely changed and a new key is correct. No new state and
+ * no timing value — this is a read contract over existing owners.
+ *
+ * @param {Object} manager - OrderManager instance
+ * @returns {string} `price|type`, `refused:price|type`, or '' when both cold
+ */
+export function resolveGuardGenerationKey(manager: OrderManagerLike | null | undefined): string {
+    const ref = resolveLastFillGuardReference(manager);
+    if (ref?.price != null && Number.isFinite(Number(ref.price))) {
+        return `${Number(ref.price)}|${String(ref.type ?? '')}`;
+    }
+    let oldest: RefusedFillLevel | null = null;
+    for (const entry of refusedFillLevels(manager)) {
+        const at = Number(entry.at);
+        if (oldest === null || at < Number(oldest.at)
+            || (at === Number(oldest.at) && Number(entry.price) < Number(oldest.price))) {
+            oldest = entry;
+        }
+    }
+    return oldest ? `refused:${Number(oldest.price)}|${String(oldest.type)}` : '';
+}
+
+/**
  * LAST-FILL-GUARD — DIRECTION ONLY, relative to the last fill price.
  *
  *   BUY  blocked if price >= pivot   (never place a higher BUY)
@@ -2045,7 +2080,7 @@ export function isLastFillGuardBlocked(price: number, type: unknown, lastPrice: 
 /** Upper bound on distinct refused levels kept in memory (one sweep batch). */
 const MAX_REFUSED_FILL_LEVELS = 64;
 
-interface RefusedFillLevel { price: number; type: string; at: number }
+export interface RefusedFillLevel { price: number; type: string; at: number }
 
 /**
  * The refused-level marker set, read with the marker TTL at read time.
@@ -2085,9 +2120,26 @@ function refusedFillLevels(manager: OrderManagerLike | null | undefined): Refuse
     return isFreshRefusedLevel(one, now, ttl) ? [one] : [];
 }
 
+/**
+ * Read the marker set through its single owner, TTL-pruned at read time. An
+ * optional side filter serves callers that need the bind for one rail only —
+ * a refused SELL rung is not a BUY-side geometry bind. The returned entries are
+ * copies so no caller can mutate the marker behind the owner's back.
+ */
+export function liveRefusedFillLevels(
+    manager: OrderManagerLike | null | undefined,
+    type?: string
+): ReadonlyArray<Readonly<RefusedFillLevel>> {
+    const levels = refusedFillLevels(manager);
+    const matching = (type === ORDER_TYPES.BUY || type === ORDER_TYPES.SELL)
+        ? levels.filter((e) => e.type === type)
+        : levels;
+    return matching.map((e) => ({ price: e.price, type: e.type, at: e.at }));
+}
+
 /** Fill evidence for the COW spread-correction bypass gate: a refused fill is a fill. */
-export function hasLiveRefusedFillLevels(manager: OrderManagerLike | null | undefined): boolean {
-    return refusedFillLevels(manager).length > 0;
+export function hasLiveRefusedFillLevels(manager: OrderManagerLike | null | undefined, type?: string): boolean {
+    return liveRefusedFillLevels(manager, type).length > 0;
 }
 
 /**

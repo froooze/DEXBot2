@@ -70,7 +70,11 @@ function getRecentFillKeysSnapshot(bot: BotLike) {
 async function triggerStateRecoverySync(bot: BotLike, reason: string = 'state recovery sync') {
     if (!bot.manager) return;
 
-    if (bot._recoverySyncInFlight) {
+    // One owner for pipeline liveness (INV-FILL-003). A raw counter read as
+    // falsy (NaN/undefined) used to start a SECOND recovery sync while one was
+    // already in flight; unreadable now defers to the next request.
+    const inFlight = readBotInFlightFlags(bot);
+    if (!inFlight.ok || inFlight.recoveryInFlight) {
         bot.manager.logger.log(`[RECOVERY] Skipping duplicate recovery request: ${reason}`, 'warn');
         return;
     }
@@ -830,7 +834,8 @@ function _schedulePostRecoveryRebalance(bot: BotLike, context: string) {
     const run = () => {
         bot._postRecoveryRebalanceTimer = null;
         if (bot._shuttingDown) return;
-        if (bot._batchInFlight > 0 || bot._recoverySyncInFlight > 0) {
+        const inFlight = readBotInFlightFlags(bot);
+        if (!inFlight.ok || inFlight.batchInFlight || inFlight.recoveryInFlight) {
             // Throttled visibility: a pipeline that never clears would
             // otherwise re-defer silently forever (the hang class of the
             // 2026-09-12 incident). First wait at debug, then a warn every
@@ -839,7 +844,7 @@ function _schedulePostRecoveryRebalance(bot: BotLike, context: string) {
             if (bot._postRecoveryRebalanceDefers === 1 || bot._postRecoveryRebalanceDefers % 120 === 0) {
                 bot.manager?.logger?.log?.(
                     `[RECOVERY] Post-recovery rebalance (${context}) waiting for pipeline to clear ` +
-                    `(batchInFlight=${bot._batchInFlight || 0}, recoverySyncInFlight=${bot._recoverySyncInFlight || 0}, waits=${bot._postRecoveryRebalanceDefers})`,
+                    `(ok=${inFlight.ok}, batchInFlight=${inFlight.batchInFlight}, recoverySyncInFlight=${inFlight.recoveryInFlight}, waits=${bot._postRecoveryRebalanceDefers})`,
                     bot._postRecoveryRebalanceDefers === 1 ? 'debug' : 'warn'
                 );
             }

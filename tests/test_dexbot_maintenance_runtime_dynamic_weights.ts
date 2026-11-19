@@ -45,7 +45,7 @@ const NAMES = {
         'restoreGapEvacStreaks', 'applyPersistedPendingCrawls',
         'resetLastFillPivot', 'restoreLastFillPivot', 'restoreLastMarketFill',
         'resolveSpreadMarketReference', 'evaluateSpreadCorrectionReadiness',
-        'resolveLastFillGuardReference', 'isLastFillGuardBlocked', 'evaluateLastFillGuard',
+        'resolveLastFillGuardReference', 'resolveGuardGenerationKey', 'isLastFillGuardBlocked', 'evaluateLastFillGuard',
         'maybeRefreshLiveMarketPrice', 'refreshLiveMarketPrice',
         'resolveSpreadFreshnessMs', 'resolveSpreadCrossingFloor',
         'setLastFillPivot', 'normalizeLastFillPivot', 'hasLiveRefusedFillLevels',
@@ -235,6 +235,7 @@ function installCoreResyncMocks({ snapshotMode = 'live' } = {}) {
         extractUpdateTargetOrderIds: () => new Set<string>(),
         sleep: async () => {},
         expireLastFillGuardReferences: () => {},
+        resolveGuardGenerationKey: () => '',
     });
 }
 
@@ -740,6 +741,7 @@ function installDivergenceMocks(opts) {
         extractUpdateTargetOrderIds: () => new Set<string>(),
         sleep: async () => {},
         expireLastFillGuardReferences: () => {},
+        resolveGuardGenerationKey: () => '',
     });
     defineEsmMockAbs(require.resolve('../modules/order/grid'), NAMES.grid, {
         monitorDivergence: async () => {

@@ -24,6 +24,7 @@ const { grid: Grid } = require('../modules/order').default;
 const { ORDER_TYPES, ORDER_STATES } = require('../modules/constants');
 const { trackOutOfSpreadStaleness } = require('../modules/dexbot_maintenance_runtime');
 const { warnCrossingCreate } = require('../modules/dexbot_cow_runtime');
+const { setLastFillPivot } = require('../modules/order/utils/system');
 
 /**
  * Mid-grid voided rail: BUY slots 0-1 ACTIVE, gap 2-4 empty (SPREAD), SELL 5-6
@@ -115,6 +116,29 @@ async function testPlannerExcludesPivotViolatingCandidate() {
 }
 
 /** The same candidate must pass when the pivot leaves headroom (no over-blocking). */
+/** SLF-14: an off-market sweep leaves the pivot cold but still binds the side. */
+async function testPlannerReportsColdPivotRefusalBind() {
+    console.log('\n[SLF-14] refused sweep (cold pivot) reports the geometry bind...');
+    const { manager, logs } = await buildVoidedMidGrid();
+    setLiveMarket(manager, 1.10);
+    // BUY at 1.02 is a premium sweep 8 steps below the live mid: the single
+    // pivot writer refuses it, so no direction pivot is armed — only the
+    // refused-level marker is live.
+    assert.strictEqual(setLastFillPivot(manager, ORDER_TYPES.BUY, 1.02, 'fill'), false);
+    assert.ok(Array.isArray(manager._lastRefusedFillLevels) && manager._lastRefusedFillLevels.length > 0,
+        'the refusal must write the single refused-level marker');
+    assert.ok(manager._lastFilledPrice == null, 'pivot must stay cold');
+
+    const result = await Grid.prepareSpreadCorrectionOrders(manager, ORDER_TYPES.BUY, 1);
+    assert.strictEqual(result.ordersToPlace.length, 0,
+        'no create may be planned at a level the taker just took');
+    assert.strictEqual(result.stallHint, 'last-fill-blocked',
+        `the cold-pivot bind must be named so the bounded expiry can heal it, got ${result.stallHint}`);
+    assert.ok(logsMatching(logs, 'just-filled (refused) level').length > 0,
+        'the empty report must still name the refused level');
+    console.log('  ✓ SLF-14 passed');
+}
+
 async function testPlannerKeepsCandidateWithHeadroom() {
     console.log('\n[SLF-2] the same candidate is planned when it sits on the permitted side...');
     const { manager } = await buildVoidedMidGrid();
@@ -412,6 +436,7 @@ async function testExcludedCountIsPerSlot() {
 
 async function main() {
     await testPlannerExcludesPivotViolatingCandidate();
+    await testPlannerReportsColdPivotRefusalBind();
     await testPlannerKeepsCandidateWithHeadroom();
     await testPlannerExcludesLowerSellAfterSellFill();
     await testOversubscribedRailIsNamed();
