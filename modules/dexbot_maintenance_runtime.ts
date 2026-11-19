@@ -2804,7 +2804,9 @@ async function executeMaintenanceLogic(bot: BotLike, context: string) {
                 bot._log('[MAINT] Deferring price-correction drain: exclusive placement region busy or shutting down', 'info');
             } else if (correctionResult.failed > 0) {
                 const failedDetails = (correctionResult.results || [])
-                    .filter((r: { result?: { success?: unknown } }) => !(r.result && r.result.success))
+                    .filter((r: { result?: { success?: unknown; skipped?: unknown; deferred?: unknown } }) =>
+                        !(r.result && r.result.success) &&
+                        !(r.result && (r.result.skipped === true || r.result.deferred === true)))
                     .slice(0, 3)
                     .map((r: { chainOrderId?: unknown; result?: { error?: unknown } }) => `${r.chainOrderId ?? '?'}: ${r.result?.error ?? 'unknown'}`)
                     .join(' | ');
@@ -4038,7 +4040,8 @@ function managerOwnedCounters(bot: BotLike): Partial<BotMetrics> {
         boundaryDriftExceedsWindowCount: mgr.boundaryDriftExceedsWindowCount ?? bot._metrics.boundaryDriftExceedsWindowCount,
         spreadCorrectionRefusedCount: mgr.spreadCorrectionRefusedCount ?? bot._metrics.spreadCorrectionRefusedCount,
         spreadCorrectionRefusalCauses: mgr.spreadCorrectionRefusalCauses ?? bot._metrics.spreadCorrectionRefusalCauses,
-        spreadCorrectionRetryCount: mgr.spreadCorrectionRetryCount ?? bot._metrics.spreadCorrectionRetryCount
+        spreadCorrectionRetryCount: mgr.spreadCorrectionRetryCount ?? bot._metrics.spreadCorrectionRetryCount,
+        duplicateOrphanCancelUnverifiedCount: mgr.duplicateOrphanCancelUnverifiedCount ?? bot._metrics.duplicateOrphanCancelUnverifiedCount
     };
 }
 

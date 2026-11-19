@@ -1355,6 +1355,22 @@ let PIPELINE_TIMING = {
     // Default: 3 minutes (180000 ms).
     RECOVERY_DECAY_FALLBACK_MS: 3 * 60 * 1000,
 
+    // CANCEL_VERIFY_*: bounds for the by-id proof that a queued duplicate-orphan
+    // cancel actually removed the chain order. The correction drain holds the
+    // grid lock and placement region, so an unresponsive node must not turn a
+    // verification into minutes of RPC waits (the generic by-id default is
+    // TIMING.CONNECTION_TIMEOUT_MS = 30s). Attempts/backoff are deliberately
+    // shorter than the COW adoption reads that run outside this lock.
+    // READ_TIMEOUT_MS clamps 0 to 1 ms (a 0 timeout would fail every read and
+    // surface permanent lagging errors); MAX_ATTEMPTS clamps 0 to 1. BACKOFF_MS
+    // accepts 0 (used by the test harness to keep drains synchronous).
+    CANCEL_VERIFY_READ_TIMEOUT_MS: 3000,
+    CANCEL_VERIFY_MAX_ATTEMPTS: 2,
+    CANCEL_VERIFY_BACKOFF_MS: 250,
+    // Total wall-clock budget for verification inside one drain; entries left
+    // over defer with their queue entry intact instead of stalling the drain.
+    CANCEL_VERIFY_DRAIN_BUDGET_MS: 10000,
+
     // RETRY defaults for generic withRetry() utility and similar patterns.
     RETRY_MAX_ATTEMPTS: 3,
     RETRY_BASE_DELAY_MS: 1000,

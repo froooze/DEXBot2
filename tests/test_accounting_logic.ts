@@ -387,6 +387,47 @@ async function runCoreTests() {
         manager.accountant._performStateRecovery = originalRecovery;
     }
 
+    // Test: recovery exhaustion is re-armed by a genuinely new fill, not by replays
+    // Mutation: remove `this.rearmRecoveryAfterNewFill(fillKey)` in
+    // processFillAccounting's `return true` path → the first assertion below fails.
+    console.log(' - Testing recovery exhaustion re-arm on new fill credit...');
+    {
+        const manager = await createManager();
+        manager.assets = {
+            assetA: { id: '1.3.0', precision: 5 },
+            assetB: { id: '1.3.1', precision: 5 }
+        };
+        (manager.config as any).pipelineTiming = {
+            RECOVERY_RETRY_INTERVAL_MS: 0,
+            MAX_RECOVERY_ATTEMPTS: 5
+        };
+        manager.accountant._performStateRecovery = async () => ({ isValid: false, reason: 'forced failure' });
+        // The max-attempt branch is evaluated on entry, so the 6th check sees
+        // a budget already consumed by 5 failed attempts.
+        for (let i = 0; i < 6; i++) {
+            await manager.accountant._attemptFundRecovery(manager, 'unit-test');
+        }
+        assert.ok(manager._recoveryExhaustedAt, 'Consumed attempt budget must set the exhausted gate');
+        assert.strictEqual(manager.accountant.isRecoveryExhausted(), true, 'Gate owner must report exhausted');
+
+        const fillKey = '1.7.999:1234:1.11.888';
+        const fillOp = {
+            pays: { asset_id: '1.3.1', amount: 100000 },
+            receives: { asset_id: '1.3.0', amount: 250000 }
+        };
+        const credited = await manager.accountant.processFillAccounting(fillOp, fillKey);
+        assert.strictEqual(credited, true, 'Fresh fill must be credited');
+        assert.strictEqual(manager._recoveryExhaustedAt, null, 'New fill credit must clear the exhausted gate');
+        assert.strictEqual(manager.accountant.isRecoveryExhausted(), false, 'Gate owner must report re-armed');
+        assert.strictEqual(manager._recoveryState.attemptCount, 0, 'A new episode must reset the attempt budget (no flapping)');
+
+        // Replay of the SAME key must not re-arm: dedupe returns false before the hook.
+        manager._recoveryExhaustedAt = Date.now();
+        const replayed = await manager.accountant.processFillAccounting(fillOp, fillKey);
+        assert.strictEqual(replayed, false, 'Same fill key must be rejected as a duplicate');
+        assert.ok(manager._recoveryExhaustedAt, 'Replay must NOT clear the exhausted gate');
+    }
+
     // Test: recalibration runs on an empty read (all-filled account)
     console.log(' - Testing fund recalibration on empty chain read...');
     {

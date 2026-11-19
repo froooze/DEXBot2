@@ -230,6 +230,7 @@ export function createDefaultBotMetrics(): BotMetrics {
         chunkAbortedOpCount: 0,
         reloadReplacedRailCount: 0,
         lastFillPivotMovedUnderBatchCount: 0,
-        lastFillGateFailOpenCount: 0
+        lastFillGateFailOpenCount: 0,
+        duplicateOrphanCancelUnverifiedCount: 0
     };
 }

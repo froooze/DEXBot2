@@ -126,11 +126,12 @@
  */
 
 
-import { ORDER_TYPES, ORDER_STATES, TIMING, FEE_PARAMETERS, GRID_LIMITS, NATIVE_CLIENT, COW_PERFORMANCE, COW_ACTIONS, FILL_PROCESSING } from '../../constants.js';
+import { ORDER_TYPES, ORDER_STATES, TIMING, FEE_PARAMETERS, GRID_LIMITS, NATIVE_CLIENT, COW_PERFORMANCE, COW_ACTIONS, FILL_PROCESSING, PIPELINE_TIMING } from '../../constants.js';
 import * as Format from '../format.js';
 import * as MathUtils from './math.js';
 import Logger from '../../order/logger.js';
 import { sleep, resolveSpreadCrossingFloor, offMarketFill } from './system.js';
+import { withTimeout } from './timeout.js';
 import { getErrorMessage, getErrorCode, getErrorName } from '../../utils/errors.js';
 import { hasGenesisLadder } from '../genesis_policy.js';
 import { parseSlotIndex } from './slot.js';
@@ -147,9 +148,14 @@ interface CorrectionAccountOrdersLike {
     cancelOrder(account: string, privateKey: string, chainOrderId: string): Promise<unknown>;
     updateOrder(account: string, privateKey: string, chainOrderId: string, params: { amountToSell: unknown; minToReceive: unknown }): Promise<unknown>;
     buildCancelOrderOp(account: string, chainOrderId: string): Promise<unknown>;
-    batchReadOrders(ids: string[]): Promise<Map<string, unknown>>;
+    batchReadOrders(ids: string[], timeoutMs?: number): Promise<Map<string, unknown>>;
+    /** Optional second independent read; a failed re-read can never prove absence. */
+    readSingleOrder?(id: string, timeoutMs?: number): Promise<unknown>;
     executeBatch(account: string, privateKey: string, ops: unknown[]): Promise<unknown>;
 }
+
+/** Per-entry result emitted by the batch cancel path for the drain's `results`. */
+type CorrectionOutcome = { entry: PendingPriceCorrection; result: Record<string, unknown> };
 
 const ORDER_GONE_ERROR_FRAGMENT = 'not found';
 
@@ -1001,9 +1007,10 @@ function _currentCorrectionGridOrder(manager: OrderManagerLike, correctionInfo: 
  * @param {string} accountName - Account name for blockchain transaction
  * @param {string} privateKey - Private key for signing
  * @param {Object} accountOrders - AccountOrders accessor for blockchain ops
- * @returns {Promise<Object>} Result {success, cancelled, skipped, error, orderGone}
+ * @param {number} [verifyDeadlineMs] - Shared by-id verification deadline for the drain
+ * @returns {Promise<Object>} Result {success, cancelled, skipped, error, orderGone, verification?}
  */
-async function correctOrderPriceOnChain(manager: OrderManagerLike, correctionInfo: PendingPriceCorrection, accountName: string, privateKey: string, accountOrders: CorrectionAccountOrdersLike) {
+async function correctOrderPriceOnChain(manager: OrderManagerLike, correctionInfo: PendingPriceCorrection, accountName: string, privateKey: string, accountOrders: CorrectionAccountOrdersLike, verifyDeadlineMs?: number) {
     const { gridOrder, chainOrderId, expectedPrice, size, type, isSurplus, cancelOnly } = correctionInfo;
     if (!chainOrderId) return { success: false, error: 'missing chainOrderId' };
     const expectedPriceNum = Number(expectedPrice);
@@ -1029,10 +1036,29 @@ async function correctOrderPriceOnChain(manager: OrderManagerLike, correctionInf
             const sideLabel = type === ORDER_TYPES.SELL ? 'SELL' : 'BUY';
             manager.logger?.log?.(`[CORRECTION] Cancelling duplicate orphan ${sideLabel} order ${chainOrderId}`, 'info');
             await accountOrders.cancelOrder(accountName, privateKey, chainOrderId);
+            // Stage 1: a successful broadcast is not proof the orphan is gone.
+            // Verify by id BEFORE dropping the queue entry / detection record;
+            // on an unreadable or still-live order keep the entry queued so the
+            // next drain retries (and the hard error makes the failure visible).
+            const verification = await verifyCancelOnlyGone(manager, accountOrders, chainOrderId, verifyDeadlineMs);
+            if (!verification.gone) {
+                if (verification.deferred) {
+                    // Drain budget exhausted: keep the entry, no hard error, no
+                    // failed count — the next drain verifies it before any
+                    // further broadcast.
+                    return { success: false, skipped: true, deferred: true, error: 'cancel-verification-deferred' };
+                }
+                recordUnverifiedDuplicateOrphanCancel(manager, correctionInfo, verification);
+                return {
+                    success: false,
+                    error: verification.lagging ? 'cancel-verification-lagging' : 'cancel-verification-failed',
+                    verification
+                };
+            }
             clearDuplicateOrphanDetection(chainOrderId);
             _filterUnmatchedChainOrders(manager, chainOrderId);
             shouldRemove = true;
-            return { success: true, cancelled: true };
+            return { success: true, cancelled: true, verification };
         } catch (error) {
             const orderGone = isOrderGoneErrorMessage(getErrorMessage(error));
             if (orderGone) {
@@ -1167,6 +1193,142 @@ async function correctOrderPriceOnChain(manager: OrderManagerLike, correctionInf
     }
 }
 
+function resolveCancelVerifyNumber(manager: OrderManagerLike, key: keyof typeof PIPELINE_TIMING): number {
+    const configured = Number(manager?.config?.pipelineTiming?.[key as string]);
+    return Number.isFinite(configured) && configured >= 0
+        ? configured
+        : Number(PIPELINE_TIMING[key]);
+}
+
+/**
+ * The chain_orders timeout only bounds the connection wait; a connected-but-slow
+ * RPC is capped separately by TRANSPORT.RPC_TIMEOUT_MS (15 s). Race every by-id
+ * read against the same short budget so the drain's lock-hold bound is real.
+ * A timeout rejects and is treated as an inconclusive/lagging read by callers.
+ */
+function boundedByIdRead<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+    return withTimeout(promise, timeoutMs, { label });
+}
+
+/**
+ * Verify that a queued duplicate-orphan cancel actually removed the chain
+ * order, instead of trusting a successful broadcast. A broadcast result says
+ * "the node accepted the tx", not "the order is gone" — the live log showed the
+ * same orphan detected again seconds after its cancel was reported successful.
+ *
+ * The by-id check mirrors the Mode C(b) pre-broadcast double read: a batch read
+ * that says absent needs a second by-id read to confirm; a failed or missing
+ * re-read is a LAGGING result (fail open), never an absence. Both reads hit the
+ * same node/connection, so this catches transient inconsistency, not a stale
+ * node — next-sync re-detection stays the backstop. Every read is raced against
+ * a short timeout because the drain holds _gridLock. Attempts, backoff and the
+ * per-drain wall-clock budget come from PIPELINE_TIMING so an unresponsive node
+ * cannot turn one verification into minutes of RPC wait.
+ *
+ * Only entries already queued as cancelOnly reach this helper — it never
+ * enumerates chain orders, so the reverted gap-band cancel sweeps stay reverted.
+ *
+ * @returns {{gone: boolean, lagging: boolean, deferred: boolean}} gone = verified
+ *   cancelled; lagging = inconclusive, defer; deferred = drain budget exhausted;
+ *   gone=false/lagging=false = confirmed still live.
+ */
+async function verifyCancelOnlyGone(
+    manager: OrderManagerLike,
+    accountOrders: CorrectionAccountOrdersLike,
+    chainOrderId: string,
+    deadlineMs?: number
+): Promise<{ gone: boolean; lagging: boolean; deferred: boolean }> {
+    const attemptsRaw = resolveCancelVerifyNumber(manager, 'CANCEL_VERIFY_MAX_ATTEMPTS');
+    // Clamp rather than silently falling back: 0 attempts is unsupported.
+    const attempts = Math.max(1, Math.floor(Number.isFinite(attemptsRaw) ? attemptsRaw : PIPELINE_TIMING.CANCEL_VERIFY_MAX_ATTEMPTS));
+    const backoffMs = resolveCancelVerifyNumber(manager, 'CANCEL_VERIFY_BACKOFF_MS');
+    // A zero timeout would make every read fail and produce permanent lagging
+    // errors; clamp to at least 1 ms.
+    const timeoutMs = Math.max(1, resolveCancelVerifyNumber(manager, 'CANCEL_VERIFY_READ_TIMEOUT_MS'));
+    const deadline = deadlineMs ?? Date.now() + resolveCancelVerifyNumber(manager, 'CANCEL_VERIFY_DRAIN_BUDGET_MS');
+    if (Date.now() >= deadline) return { gone: false, lagging: true, deferred: true };
+
+    let sawLiveFinal = false;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+        // Checked before EVERY read, not just at entry: a read that overruns the
+        // budget defers instead of being reported as a hard lagging error.
+        if (Date.now() >= deadline) return { gone: false, lagging: true, deferred: true };
+        let sawLive = false;
+        let readMap: Map<string, unknown> | null = null;
+        try {
+            readMap = await boundedByIdRead(
+                Promise.resolve(accountOrders.batchReadOrders([chainOrderId], timeoutMs)),
+                timeoutMs,
+                'cancel-verify batch read'
+            );
+        } catch {
+            readMap = null;
+        }
+        if (readMap) {
+            const present = readMap.get(chainOrderId);
+            if (present) {
+                sawLive = true;
+            } else if (typeof accountOrders.readSingleOrder === 'function') {
+                if (Date.now() >= deadline) return { gone: false, lagging: true, deferred: true };
+                try {
+                    // Only an explicit null from the second read confirms the
+                    // batch read's absence; a failed re-read is inconclusive.
+                    if (await boundedByIdRead(
+                        Promise.resolve(accountOrders.readSingleOrder(chainOrderId, timeoutMs)),
+                        timeoutMs,
+                        'cancel-verify single read'
+                    )) sawLive = true;
+                    else return { gone: true, lagging: false, deferred: false };
+                } catch { /* inconclusive: fall through to the bounded retry */ }
+            }
+            // No second read available: a lone batch absence is NOT proof.
+        }
+        sawLiveFinal = sawLive;
+        if (attempt < attempts && backoffMs > 0 && Date.now() < deadline) await sleep(backoffMs);
+    }
+    // A live read in the final attempt is a confirmed failure; anything else
+    // (no read, only inconclusive reads, or no second-read seam) defers.
+    return { gone: false, lagging: !sawLiveFinal, deferred: false };
+}
+
+/** Per-manager, per-order log throttle for unverified cancels (WeakMap: no leak). */
+const unverifiedCancelLogState = new WeakMap<object, Map<string, number>>();
+// Reuses the existing stale-totals warn cadence (60 s) as the operator-facing
+// rate limit; a distinct constant keeps the call site honest about its meaning.
+const UNVERIFIED_CANCEL_LOG_RATE_LIMIT_MS = TIMING.STALE_TOTALS_WARN_RATE_LIMIT_MS;
+const UNVERIFIED_CANCEL_LOG_MAX_IDS = 100;
+
+/** Single owner for the hard error when a queued cancel cannot be verified. */
+function recordUnverifiedDuplicateOrphanCancel(
+    manager: OrderManagerLike,
+    entry: PendingPriceCorrection,
+    verification: { gone: boolean; lagging: boolean }
+): void {
+    if (manager?._metrics) {
+        manager._metrics.duplicateOrphanCancelUnverifiedCount =
+            (manager._metrics.duplicateOrphanCancelUnverifiedCount || 0) + 1;
+    }
+    const id = entry.chainOrderId || 'unknown-order';
+    const key = manager as object;
+    const state = unverifiedCancelLogState.get(key) ?? new Map<string, number>();
+    unverifiedCancelLogState.set(key, state);
+    const now = Date.now();
+    if (now - (state.get(id) ?? 0) < UNVERIFIED_CANCEL_LOG_RATE_LIMIT_MS) return;
+    state.set(id, now);
+    if (state.size > UNVERIFIED_CANCEL_LOG_MAX_IDS) {
+        // Bound the per-manager map for long-lived bots with many order ids.
+        const oldestId = state.keys().next().value;
+        if (oldestId !== undefined) state.delete(oldestId);
+    }
+    const queued = entry.queuedAt ? new Date(entry.queuedAt).toISOString() : 'unknown-time';
+    manager?.logger?.log?.(
+        `[CORRECTION] Duplicate-orphan cancel NOT verified for ${id} ` +
+        `(${verification.lagging ? 'lagging chain read' : 'order still live after bounded by-id checks'}; ` +
+        `queued ${entry.queuedBy || 'unknown-source'}@${queued}); entry stays queued for retry`,
+        'error'
+    );
+}
+
 /**
  * Finalize bookkeeping for a correction whose chain order is confirmed gone
  * (batch-cancelled or discovered absent). Mirrors the per-entry cleanup in
@@ -1213,29 +1375,92 @@ async function _resolveCancelledCorrection(manager: OrderManagerLike, entry: Pen
  *    live are returned UNRESOLVED so the caller retries them through the
  *    single-entry path (which keeps its own verified-after-failure logic).
  *
- * @returns {Promise<{corrected: number, failed: number, unresolved: Array}>}
+ * @returns {Promise<{corrected: number, failed: number, unresolved: Array, outcomes: Array}>}
  */
-async function _batchCancelCorrections(manager: OrderManagerLike, entries: PendingPriceCorrection[], accountName: string, privateKey: string, accountOrders: CorrectionAccountOrdersLike): Promise<{ corrected: number; failed: number; unresolved: PendingPriceCorrection[] }> {
+async function _batchCancelCorrections(manager: OrderManagerLike, entries: PendingPriceCorrection[], accountName: string, privateKey: string, accountOrders: CorrectionAccountOrdersLike, verifyDeadlineMs?: number): Promise<{ corrected: number; failed: number; unresolved: PendingPriceCorrection[]; outcomes: CorrectionOutcome[] }> {
     const logger = manager?.logger;
     const unresolved: PendingPriceCorrection[] = [];
+    const outcomes: CorrectionOutcome[] = [];
     let corrected = 0;
     let failed = 0;
+    // Shared across pre-read, post-broadcast verification and failed-chunk
+    // re-reads: every by-id probe in this drain is bounded by one clock.
+    const deadline = verifyDeadlineMs ?? Date.now() + resolveCancelVerifyNumber(manager, 'CANCEL_VERIFY_DRAIN_BUDGET_MS');
 
     const byId = new Map<string, PendingPriceCorrection>();
     for (const e of entries) {
         if (e?.chainOrderId && !byId.has(e.chainOrderId)) byId.set(e.chainOrderId, e);
     }
     const ids = [...byId.keys()];
+    // A deadline skip must still be visible in `results`; otherwise a drain
+    // where every id is deferred reports nothing at all. Track the ids so a
+    // later catch cannot re-broadcast an entry that was already deferred.
+    const deferredIds = new Set<string>();
+    const deferEntry = (id: string) => {
+        deferredIds.add(id);
+        outcomes.push({
+            entry: byId.get(id)!,
+            result: { success: false, skipped: true, deferred: true, error: 'cancel-verification-deferred' }
+        });
+    };
 
     let presentIds = ids;
     const preRead = typeof accountOrders?.batchReadOrders === 'function';
     if (preRead) {
+        if (Date.now() >= deadline) {
+            for (const id of ids) deferEntry(id);
+            return { corrected, failed, unresolved, outcomes };
+        }
         try {
-            const orderMap = await accountOrders.batchReadOrders(ids);
+            const preReadTimeoutMs = Math.max(1, resolveCancelVerifyNumber(manager, 'CANCEL_VERIFY_READ_TIMEOUT_MS'));
+            const orderMap = await boundedByIdRead(
+                Promise.resolve(accountOrders.batchReadOrders(ids, preReadTimeoutMs)),
+                preReadTimeoutMs,
+                'cancel pre-read'
+            );
             const goneIds: string[] = [];
             presentIds = [];
             for (const id of ids) {
-                if (orderMap.get(id)) presentIds.push(id); else goneIds.push(id);
+                if (Date.now() >= deadline) {
+                    // Budget exhausted mid pre-read: leave the entry queued with
+                    // no broadcast and no finalization; report the deferral.
+                    deferEntry(id);
+                    continue;
+                }
+                if (orderMap.get(id)) {
+                    presentIds.push(id);
+                    continue;
+                }
+                // A single batch absence is not proof: a lagging pre-read used to
+                // finalize a live orphan. Only cancel-only entries need the
+                // independent read; confirmed-gone surplus entries keep the old
+                // path. Unconfirmed absence fails OPEN to the broadcast, which
+                // the post-broadcast verification then judges.
+                const entry = byId.get(id)!;
+                if (entry.cancelOnly === true) {
+                    if (typeof accountOrders.readSingleOrder !== 'function') {
+                        presentIds.push(id);
+                        continue;
+                    }
+                    if (Date.now() >= deadline) {
+                        deferEntry(id);
+                        continue;
+                    }
+                    try {
+                        if (await boundedByIdRead(
+                            Promise.resolve(accountOrders.readSingleOrder(id, preReadTimeoutMs)),
+                            preReadTimeoutMs,
+                            'cancel pre-read confirm'
+                        )) {
+                            presentIds.push(id);
+                            continue;
+                        }
+                    } catch {
+                        presentIds.push(id);
+                        continue;
+                    }
+                }
+                goneIds.push(id);
             }
             for (const id of goneIds) {
                 await _resolveCancelledCorrection(manager, byId.get(id)!);
@@ -1246,10 +1471,11 @@ async function _batchCancelCorrections(manager: OrderManagerLike, entries: Pendi
                 `[CORRECTION] Batch pre-read of ${ids.length} cancel candidate(s) failed; proceeding with broadcast: ${getErrorMessage(err)}`,
                 'warn'
             );
-            presentIds = ids;
+            // Never re-broadcast an id that was already deferred in the loop.
+            presentIds = ids.filter((id) => !deferredIds.has(id));
         }
     }
-    if (presentIds.length === 0) return { corrected, failed, unresolved };
+    if (presentIds.length === 0) return { corrected, failed, unresolved, outcomes };
 
     let ops: { id: string; op: unknown; }[] = [];
     try {
@@ -1263,7 +1489,12 @@ async function _batchCancelCorrections(manager: OrderManagerLike, entries: Pendi
             `[CORRECTION] Batch cancel build failed (${presentIds.length} order(s)): ${getErrorMessage(err)}; falling back to serial cancels`,
             'warn'
         );
-        return { corrected, failed, unresolved: entries.filter((e) => e.chainOrderId != null && presentIds.includes(e.chainOrderId)) };
+        return {
+            corrected,
+            failed,
+            unresolved: entries.filter((e) => e.chainOrderId != null && presentIds.includes(e.chainOrderId)),
+            outcomes
+        };
     }
 
     const configuredMax = Number(COW_PERFORMANCE?.MAX_CANCELS_PER_BROADCAST);
@@ -1283,7 +1514,37 @@ async function _batchCancelCorrections(manager: OrderManagerLike, entries: Pendi
         try {
             await accountOrders.executeBatch(accountName, privateKey, chunk.map((o) => o.op));
             for (const { id } of chunk) {
-                await _resolveCancelledCorrection(manager, byId.get(id)!);
+                const entry = byId.get(id)!;
+                if (entry.cancelOnly === true) {
+                    const verification = await verifyCancelOnlyGone(manager, accountOrders, id, deadline);
+                    if (!verification.gone) {
+                        if (verification.deferred) {
+                            // Drain budget exhausted: defer silently, keep the
+                            // entry queued, do not count it as corrected/failed.
+                            outcomes.push({ entry, result: { success: false, skipped: true, deferred: true, error: 'cancel-verification-deferred' } });
+                            continue;
+                        }
+                        if (!verification.lagging) {
+                            // Confirmed still-live: let the serial retry be the
+                            // SINGLE report (result + failed + hard error). Reporting
+                            // here too double-counts failures/counter/results even
+                            // when the serial retry resolves the entry.
+                            unresolved.push(entry);
+                            continue;
+                        }
+                        // Lagging: keep the entry queued without another broadcast
+                        // this drain, but report it once here (the serial path never
+                        // sees it).
+                        recordUnverifiedDuplicateOrphanCancel(manager, entry, verification);
+                        failed++;
+                        outcomes.push({
+                            entry,
+                            result: { success: false, error: 'cancel-verification-lagging', verification }
+                        });
+                        continue;
+                    }
+                }
+                await _resolveCancelledCorrection(manager, entry);
                 corrected++;
             }
             logger?.log?.(`[CORRECTION] Batch chunk ${i + 1}/${chunks.length} cancelled ${chunk.length} order(s)`, 'info');
@@ -1298,26 +1559,60 @@ async function _batchCancelCorrections(manager: OrderManagerLike, entries: Pendi
 
     for (const chunk of failedChunks) {
         let verifyMap: Map<string, unknown> | null = null;
-        if (preRead) {
+        if (preRead && Date.now() < deadline) {
             try {
-                verifyMap = await accountOrders.batchReadOrders(chunk.map((o) => o.id));
+                verifyMap = await boundedByIdRead(
+                    Promise.resolve(accountOrders.batchReadOrders(
+                        chunk.map((o) => o.id),
+                        Math.max(1, resolveCancelVerifyNumber(manager, 'CANCEL_VERIFY_READ_TIMEOUT_MS'))
+                    )),
+                    Math.max(1, resolveCancelVerifyNumber(manager, 'CANCEL_VERIFY_READ_TIMEOUT_MS')),
+                    'cancel chunk re-read'
+                );
             } catch (_) {
                 verifyMap = null;
             }
         }
         for (const { id } of chunk) {
-            const stillLive = verifyMap ? verifyMap.get(id) : true;
-            if (!stillLive && verifyMap) {
+            const entry = byId.get(id)!;
+            if (Date.now() >= deadline) {
+                // Whole-drain budget exhausted: leave queued, report the deferral.
+                deferEntry(id);
+                continue;
+            }
+            let gone = Boolean(verifyMap && !verifyMap.get(id));
+            if (gone && entry.cancelOnly === true) {
+                // Same second-read rule as the pre-broadcast path: one batch
+                // absence from a lagging node must not finalize a live orphan.
+                if (typeof accountOrders.readSingleOrder !== 'function') gone = false;
+                else {
+                    if (Date.now() >= deadline) {
+                        deferEntry(id);
+                        continue;
+                    }
+                    try {
+                        gone = !(await boundedByIdRead(
+                            Promise.resolve(accountOrders.readSingleOrder(
+                                id,
+                                Math.max(1, resolveCancelVerifyNumber(manager, 'CANCEL_VERIFY_READ_TIMEOUT_MS'))
+                            )),
+                            Math.max(1, resolveCancelVerifyNumber(manager, 'CANCEL_VERIFY_READ_TIMEOUT_MS')),
+                            'cancel chunk confirm'
+                        ));
+                    } catch { gone = false; }
+                }
+            }
+            if (gone) {
                 // Uncertain broadcast that actually landed — order is gone.
-                await _resolveCancelledCorrection(manager, byId.get(id)!);
+                await _resolveCancelledCorrection(manager, entry);
                 corrected++;
             } else {
-                unresolved.push(byId.get(id)!);
+                unresolved.push(entry);
             }
         }
     }
 
-    return { corrected, failed, unresolved };
+    return { corrected, failed, unresolved, outcomes };
 }
 
 /**
@@ -1509,6 +1804,9 @@ async function _correctAllPriceMismatchesLocked(manager: OrderManagerLike, accou
     return await manager._gridLock.acquire(async () => {
         const results: Array<PendingPriceCorrection & { result: unknown }> = [];
         let corrected = 0; let failed = 0; let staleDropped = 0;
+        // One shared budget for all by-id proof reads in this drain: the lock
+        // is held throughout, so leftover entries defer rather than stall it.
+        const verifyDeadline = Date.now() + resolveCancelVerifyNumber(manager, 'CANCEL_VERIFY_DRAIN_BUDGET_MS');
         // Dedupe on the full queue key (chainOrderId + surplus flag),
         // matching the sync upsert key. A chain-order-only key would drop a
         // sibling entry (price update + cancel sharing one chain id) before
@@ -1587,18 +1885,26 @@ async function _correctAllPriceMismatchesLocked(manager: OrderManagerLike, accou
         let serialCancels: PendingPriceCorrection[] = cancelEntries;
         if (canBatch) {
             const batchOutcome = await _batchCancelCorrections(
-                manager, cancelEntries, accountName, privateKey, accountOrders
+                manager, cancelEntries, accountName, privateKey, accountOrders, verifyDeadline
             );
             corrected += batchOutcome.corrected;
             failed += batchOutcome.failed;
+            // Batch-only verification outcomes must reach `results`/`failed`
+            // just like serial ones, or the pre-batch warning and maintenance
+            // failedDetails silently omit them.
+            for (const outcome of batchOutcome.outcomes) {
+                results.push({ ...outcome.entry, result: outcome.result });
+            }
             // Unresolved cancels still serialize (they must not be dropped).
             serialCancels = batchOutcome.unresolved;
         }
 
         for (const correctionInfo of serialCancels) {
-            const result = await correctOrderPriceOnChain(manager, correctionInfo, accountName, privateKey, accountOrders);
+            const result = await correctOrderPriceOnChain(manager, correctionInfo, accountName, privateKey, accountOrders, verifyDeadline);
             results.push({ ...correctionInfo, result });
-            if (result && result.success) corrected++; else failed++;
+            if (result && (result as Record<string, unknown>).deferred) {
+                // Budget deferral: entry stays queued, no success/failure count.
+            } else if (result && result.success) corrected++; else failed++;
             await sleep(interOpDelayMs);
         }
 

@@ -178,7 +178,13 @@ async function run() {
             }]
         );
         let cancelCalled = false;
-        const accountOrders = { cancelOrder: async () => { cancelCalled = true; return {}; } };
+        // Stage 1: a cancel is only resolved after a by-id read confirms the
+        // orphan is gone; a mock without this read is a lagging chain view.
+        const accountOrders = {
+            cancelOrder: async () => { cancelCalled = true; return {}; },
+            batchReadOrders: async () => new Map(),
+            readSingleOrder: async () => null
+        };
         const out = await correctAllPriceMismatches(manager, 'acct', 'k', accountOrders);
         assert.strictEqual(cancelCalled, true, 'untracked cancel-only entry must still broadcast');
         assert.strictEqual(out.corrected, 1);

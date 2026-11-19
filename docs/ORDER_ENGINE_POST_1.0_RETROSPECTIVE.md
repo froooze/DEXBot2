@@ -1434,7 +1434,7 @@ the next re-placement. This is the in-memory marker limitation already accepted 
 | Stage | Verdict | Reason |
 |---|---|---|
 | 0 — source-aware pivot anchoring | **P0, do first** | Fixes every confirmed artifact; pure audit-side change |
-| 1 — duplicate-orphan cancel verify/hard error | **Deferred, reproduction-gated** | Doc "OPEN" (§3.3 P1) with no reproducing failure; chain-mutating path with documented lag/deferral pitfalls |
+| 1 — duplicate-orphan cancel verify/hard error | **Landed** | Repro found in the audited log (re-detected orphans, repeated cancel queues); bounded by-id verification added at the drain, no new sweep |
 | 2 — plan→broadcast atomicity | **Drop the code change** | Fresh-master re-plan after the single-flight and the placement lease are already landed; §3.3 P1 is stale |
 | 3 — chunk replay | **Bounded spike** | Reproduce the partial-chunk incident before changing broadcast behavior |
 | 4 — final-gate observability | **Counters only** | The gate runs pre-broadcast; `dropped=0` is not evidence of a failure |
@@ -1484,14 +1484,32 @@ deliberately not widened: measured fill-to-detection gaps of 30–42 s showed th
 nearest `Placed` lines were re-placements *after* detection, not the original gate.
 No fallback to a `fill-pivot` line exists — a fill event is not a gate decision.
 
-**Stage 1 — duplicate-orphan cancellation (deferred).** §3.3 P1 asks to verify that a
+**Stage 1 — duplicate-orphan cancellation (landed).** §3.3 P1 asked to verify that a
 `queueCorrection` cancelOnly actually executes and to hard-error when it cannot.
-`queueCorrection` (`modules/order/sync_engine.ts:1096–1124`) only enqueues; any
-verification belongs at the drain (`modules/order/utils/order.ts:1517+`), re-reading
-the target by id with the existing lag-deferral pattern and escalating only after
-bounded retries. It must verify *already-queued* cancels — it must not reintroduce the
-P1/P2 cancel sweeps reverted in §1. Enter this stage only with a reproducing log or
-test; otherwise leave the doc status OPEN.
+The audited log supplied the reproducing evidence: the same orphan was re-detected
+(`re-detected 2×/3×; cancel may be failing or the order keeps getting re-created`)
+and queued for cancel twice seconds apart after a "successful" broadcast.
+Verification now lives at the drain (`modules/order/utils/order.ts`, shared by the
+serial cancel path and the batch-success path): a bounded by-id double read (batch
+read + a second by-id read) must confirm the order is gone before the queue entry
+and detection record are cleared. Both reads hit the same node/connection — the
+guard catches transient inconsistency, not a stale node; next-sync re-detection
+remains the backstop. Both reads are raced against an explicit 3 s `withTimeout`
+(the chain_orders timeout only bounds the connection wait; the transport RPC cap
+is 15 s, so the race is what actually enforces the drain's lock-hold bound);
+attempts, backoff and a 10 s per-drain budget are owned by
+`PIPELINE_TIMING.CANCEL_VERIFY_*` because
+the drain holds `_gridLock`, and the deadline is checked before every read (not
+just at entry). A lone batch absence without the second read is never proof (also
+on the lagging pre-read and failed-chunk paths). An inconclusive read defers with
+the entry queued; a confirmed still-live order logs a throttled hard error and
+increments `duplicateOrphanCancelUnverifiedCount`, surfaced through `getMetrics()`.
+Batch
+failures reach `results`/`failed`. Only already-queued `cancelOnly` entries are
+verified — the P1/P2 cancel sweeps reverted in §1 stay reverted. Covered by
+`tests/test_duplicate_orphan_cancel_verification.ts` (VERIFY-01..11) plus the
+extended `test_p2_observability_counters` and updated mocks in
+`test_correction_queue_staleness` / `test_surplus_cancel_grace`.
 
 **Stage 2 — atomicity status reconciliation (no runtime change).** The fresh-master
 re-plan after winning the single-flight is already implemented
@@ -1522,8 +1540,8 @@ deadlock, and the queue-refresh line remains non-evidence per §9.12. **Landed:*
 `lastFillPivotMovedUnderBatchCount` / `lastFillGateFailOpenCount`, seeded in
 `createDefaultBotMetrics()` and pinned by FG-14 — observability only, no behavior
 change. Stage 3's spike reached its stop condition (no test seam to inject a chunk-3
-failure) and changed no broadcast code; Stage 1 stays deferred without a reproducing
-case.
+failure) and changed no broadcast code; Stage 1 landed separately after the log
+supplied a reproducing case (see above).
 
 **Stage 5 — mirror provenance.** Merged into Stage 0: export anchor kind, pivot source
 and both timestamps with each candidate. Do not introduce a `queue-refresh` observation
@@ -1550,9 +1568,9 @@ Expected: 0 pivot-classified violations; the 11 reclassified candidates listed u
 `test_fill_one_counter_order`, `test_stale_grid_hardening`, `test_incident_replay`.
 
 **Decisions recorded.** (1) Reclassified candidates stay visible in a dedicated
-report section rather than disappearing. (2) Stage 1 is deferred until a reproducing
-case exists; this round is the checker fix plus the doc reconciliation. (3) The plan
-is appended here as §9.14.
+report section rather than disappearing. (2) Stage 1 was held until a reproducing
+case existed; the log supplied one and bounded by-id verification is now landed.
+(3) The plan is appended here as §9.14.
 
 ---
 

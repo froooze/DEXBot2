@@ -119,10 +119,20 @@ async function runDrainGraceTests() {
         const mgr = createManager([cancelEntry('1.7.121'), cancelEntry('1.7.122')], placedAt);
         let opBuilds = 0;
         let batches = 0;
+        let byIdReads = 0;
         const accountOrders = {
             buildCancelOrderOp: async (_acct, id) => { opBuilds++; return { id }; },
             executeBatch: async () => { batches++; return {}; },
             cancelOrder: async () => ({}),
+            // First read is the pre-broadcast existence check (orders live),
+            // later reads verify the cancel actually landed (gone).
+            batchReadOrders: async (ids) => {
+                byIdReads++;
+                return byIdReads === 1
+                    ? new Map(ids.map((id) => [id, { id }]))
+                    : new Map();
+            },
+            readSingleOrder: async () => null
         };
         const out = await correctAllPriceMismatches(mgr, 'acct', 'k', accountOrders);
         check('aged cancels reach the batch builder', opBuilds, 2);

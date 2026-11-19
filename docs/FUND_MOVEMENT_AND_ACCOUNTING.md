@@ -200,10 +200,19 @@ PIPELINE_TIMING: {
 }
 ```
 
-**Reset Points** (Called by `resetRecoveryState()` in `modules/order/accounting.ts`):
-1. **Fill-triggered**: Every fill in `processFilledOrders()` resets recovery state
-2. **Periodic**: Blockchain fetch loop resets state every 10 minutes (even if no fills)
-3. **Bootstrap completion**: After grid initialization
+**Reset Points** (all through `resetRecoveryState()` in `modules/order/accounting.ts`):
+1. **Fill-triggered**: a genuinely new fill key credited by `processFillAccounting()`
+   calls `rearmRecoveryAfterNewFill()`, clearing the exhausted CREATE gate and
+   resetting the attempt budget. Replays (dedupe returns false) cannot re-arm it.
+   This restores the documented "next fill" behavior: a live incident had the
+   exhausted flag clear only in the 240-minute periodic fetch, freezing all
+   CREATEs for ~40 minutes despite 11 fill batches, with a destructive snapshot
+   reload as the only escape.
+2. **Periodic (backstop)**: the blockchain fetch loop resets the full state at
+   `BLOCKCHAIN_FETCH_INTERVAL_MIN` (default 240 min), even with no fills.
+
+The COW CREATE gate asks the single owner `accountant.isRecoveryExhausted()` rather
+than reading the raw flag, so one question has one answer.
 
 **Impact**: 
 - ✅ If recovery fails, bot retries every 60s instead of requiring manual restart

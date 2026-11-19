@@ -606,6 +606,8 @@ export interface BotMetrics extends UnknownRecord {
   lastFillPivotMovedUnderBatchCount: number;
   /** Batches where the final pivot gate threw and its fail-open path kept the built ops (§9.14 Stage 4). */
   lastFillGateFailOpenCount: number;
+  /** Queued duplicate-orphan cancels that could not be verified as gone after bounded by-id checks (§9.14 Stage 1). */
+  duplicateOrphanCancelUnverifiedCount: number;
 }
 
 /** An unmatched chain order surfaced by a sync pass. */
@@ -795,6 +797,8 @@ interface AccountantLike {
   resetFunds(): unknown;
   _getBtsOrderType?(): string | null;
   resetRecoveryState?(): unknown;
+  isRecoveryExhausted?(): boolean;
+  rearmRecoveryAfterNewFill?(fillKey: string): void;
 }
 
 /** A pending price-correction queue entry. */

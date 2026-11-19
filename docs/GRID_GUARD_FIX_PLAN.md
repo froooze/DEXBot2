@@ -1,6 +1,8 @@
 # LAST-FILL-GUARD fix plan (working copy)
 
-> **Status:** Stages 0, 2, 3 (spike), 4, 5 done; Stage 1 deferred; Stage 6 n/a. Recorded 2026-11-19.
+> **Status:** Stages 0–5 done (Stage 3 spike); Stage 6 n/a. Stage 1 landed after a
+> reproducing log case was found (re-detected duplicate orphans with repeated cancel
+> queues). Recorded 2026-11-19.
 > **Canonical history:** `docs/ORDER_ENGINE_POST_1.0_RETROSPECTIVE.md` §9.14.
 > Generic terms only — no market, pair, account, bot or order id is named.
 
@@ -29,7 +31,7 @@ non-evidence "Pivot refreshed from N pending queued fill(s)" line.
 | # | Stage | Verdict | Status |
 |---|---|---|---|
 | 0 | Source-aware pivot anchoring + artifact section | P0 | **done** |
-| 1 | Duplicate-orphan cancel verify/hard error | Deferred, reproduction-gated | deferred (no repro) |
+| 1 | Duplicate-orphan cancel verify/hard error | Landed after repro | done (bounded by-id verification at the drain) |
 | 2 | Plan→broadcast atomicity | No runtime change; doc reconciliation | done |
 | 3 | Chunk replay | Bounded spike | spike done: stop condition met, no code change |
 | 4 | Final-gate observability | Counters only | done |
@@ -81,9 +83,28 @@ id with the existing lag-deferral pattern and escalating only after bounded retr
 Must verify *already-queued* cancels only — no reintroduction of the reverted P1/P2
 cancel sweeps (§1). Enter only with a reproducing log or test.
 
-Status: no reproducing failure surfaced in the audited window (or in the reviewed
-code paths), so the stage stays deferred. The §3.3 P1 OPEN label is not itself a
-trigger — the reverted sweep class is the reason to require evidence first.
+Status: **landed**. The audited log contains re-detected duplicate orphans
+(`re-detected 2×/3×; cancel may be failing or the order keeps getting re-created`)
+and the same chain id queued for cancel twice seconds apart — evidence that a
+"successful" broadcast was not proof the order was gone. Implementation:
+`modules/order/utils/order.ts` verifies every already-queued `cancelOnly` entry
+with a bounded by-id double read before finalizing: both reads are raced against
+an explicit 3 s `withTimeout` (the chain_orders timeout bounds only the connection
+wait; the transport RPC cap is 15 s), attempts/backoff and a 10 s per-drain
+wall-clock budget come from `PIPELINE_TIMING.CANCEL_VERIFY_*` (the drain holds
+`_gridLock`), and a lone batch absence without the second by-id read is never
+proof (both reads hit the same
+node/connection — the guard catches transient inconsistency, not a stale node;
+next-sync re-detection remains the backstop). An inconclusive read defers
+with the entry still queued; a confirmed still-live order logs a throttled hard
+error and increments `duplicateOrphanCancelUnverifiedCount`, which is overlaid
+into `getMetrics()`. Batch-path failures surface in `results`/`failed`; deadline
+deferrals appear as `deferred` rows in `results` only (never in `failed`), and the
+lagging pre-read path uses the same double-read rule. No new cancel sweep was
+introduced — the reverted P1/P2 sweep class stays reverted. Covered by
+`tests/test_duplicate_orphan_cancel_verification.ts` (VERIFY-01..11), the extended
+`test_p2_observability_counters`, and updated mocks in `test_correction_queue_staleness`
+/ `test_surplus_cancel_grace`.
 
 ### Stage 2 — atomicity status reconciliation (no runtime change)
 
@@ -160,6 +181,6 @@ to this plan — do not read a single flaky parallel run as a regression.
 ## Decisions recorded
 
 1. Reclassified candidates stay visible in a dedicated report section.
-2. Stage 1 is deferred until a reproducing case exists; this round is the checker fix
-   plus doc reconciliation.
+2. Stage 1 was held until a reproducing case existed; the log supplied one and the
+   bounded by-id verification is now landed (see Stage 1 above).
 3. The historical record is §9.14; this file is the executable working copy.

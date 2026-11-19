@@ -6,7 +6,7 @@
  * Exports a single Accountant class that manages all fund accounting operations.
  *
  * ===============================================================================
- * TABLE OF CONTENTS - Accountant Class (27 methods)
+ * TABLE OF CONTENTS - Accountant Class (29 methods)
  * ===============================================================================
  *
  * CORE INITIALIZATION & RECALCULATION (2 methods)
@@ -40,23 +40,25 @@
  * FILL PROCESSING (1 method)
  *   16. processFillAccounting(fillOp, fillKey, persistenceMode) - Process fund impact of order fill (atomically updates accountTotals)
  *
- * RECOVERY & VALIDATION (1 method)
+ * RECOVERY & VALIDATION (3 methods)
  *   17. resetRecoveryState() - Reset recovery backoff and state
+ *   18. rearmRecoveryAfterNewFill() - Close a recovery episode when a genuinely new fill is credited
+ *   19. isRecoveryExhausted() - Single read-time owner of the exhausted CREATE gate
  *
  * INTERNAL FEE / BALANCE HELPERS (9 methods - internal)
- *   18. _logThrottled(key, message, level, intervalMs) - Throttled logging helper
- *   19. _applyBalanceAdjustments(list) - Apply a list of balance adjustments
- *   20. _getBtsOrderType() - Resolve which side pays BTS fees
- *   21. _normalizeBtsFeeState(order) - Normalize an order's deferred-BTS-fee state
- *   22. _calculateUpdateDeferredCharge(oldDeferredFee, feeSchedule) - Deferred charge on update
- *   23. _resolveBtsFeeLifecycle(oldOrder, newOrder, context, explicitFee) - Resolve the
+ *   20. _logThrottled(key, message, level, intervalMs) - Throttled logging helper
+ *   21. _applyBalanceAdjustments(list) - Apply a list of balance adjustments
+ *   22. _getBtsOrderType() - Resolve which side pays BTS fees
+ *   23. _normalizeBtsFeeState(order) - Normalize an order's deferred-BTS-fee state
+ *   24. _calculateUpdateDeferredCharge(oldDeferredFee, feeSchedule) - Deferred charge on update
+ *   25. _resolveBtsFeeLifecycle(oldOrder, newOrder, context, explicitFee) - Resolve the
  *       BTS fee lifecycle for an order transition
- *   24. _buildBtsDeferredRefundAdjustment(orderId, isMaker) - Build the deferred refund
+ *   26. _buildBtsDeferredRefundAdjustment(orderId, isMaker) - Build the deferred refund
  *       adjustment for a fill
- *   25. _recalibrateTrackedFundsFromChain(mgr, openOrders) - Recalibrate tracked funds
+ *   27. _recalibrateTrackedFundsFromChain(mgr, openOrders) - Recalibrate tracked funds
  *       from a fresh chain snapshot
- *   26. _tryTrustChainFreeHeal(mgr, driftValidation) - Attempt a trust-chain-free heal
- *   27. _getBtsFeeSchedule() - Resolve the BTS fee schedule (create/update/cancel + maker refund %)
+ *   28. _tryTrustChainFreeHeal(mgr, driftValidation) - Attempt a trust-chain-free heal
+ *   29. _getBtsFeeSchedule() - Resolve the BTS fee schedule (create/update/cancel + maker refund %)
  *
  * ===============================================================================
  * FUND STRUCTURE (managed by Accountant)
@@ -1242,7 +1244,8 @@ class Accountant {
               this._logThrottled(
                   'recovery-max-attempts',
                   `[RECOVERY] Max attempts reached (${state.attemptCount}/${maxAttemptsRaw}). ` +
-                  `Entering idle-only mode — no new orders will be placed until next fill or sync cycle.`,
+                  `Entering idle-only mode — no new orders will be placed until a genuinely new fill is credited ` +
+                  `or the periodic blockchain fetch resets the episode.`,
                   'warn'
               );
               // Gap 5: Set exhausted mode to block further CREATEs until the next
@@ -1250,14 +1253,17 @@ class Accountant {
               // bot from spinning unproductively and generating more orphan orders.
               if (mgr && !mgr._recoveryExhaustedAt) {
                   mgr._recoveryExhaustedAt = Date.now();
-                  if (mgr.logger) {
-                      mgr.logger.log(
-                          '[RECOVERY-EXHAUSTED] Recovery attempts exhausted. Bot will stop placing new orders ' +
-                          'until the next fill or periodic sync cycle. Existing orders remain active and will ' +
-                          'continue to be monitored. Manual intervention may be required if this state persists.',
-                          'error'
-                      );
-                  }
+                  // Throttled like the WARN above it: a fill can re-arm the
+                  // gate and re-exhaust it inside one cycle during sustained
+                  // drift, so an unthrottled ERROR would fire on every fill.
+                  this._logThrottled(
+                      'recovery-exhausted',
+                      '[RECOVERY-EXHAUSTED] Recovery attempts exhausted. Bot will stop placing new orders ' +
+                      'until a genuinely new fill is credited or the periodic blockchain fetch runs. ' +
+                      'Existing orders remain active and will continue to be monitored. ' +
+                      'Manual intervention may be required if this state persists.',
+                      'error'
+                  );
               }
               return false;
           }
@@ -1388,6 +1394,44 @@ class Accountant {
              // persistence from scratch instead of inheriting stale geometry.
              this.manager._fundDriftLedger = null;
          }
+
+      /**
+       * Close a recovery episode when a NEW fill is actually credited.
+       *
+       * The exhausted gate used to clear only in the 240-minute periodic fetch
+       * (the docs promised "the next fill", but no fill-path caller existed), so
+       * one fund-drift exhaustion could block every CREATE for ~40 minutes while
+       * fills kept arriving — and the only escape was a destructive snapshot
+       * reload. `processFillAccounting()` calls this only on its `return true`
+       * path, which the dedupe check + synchronous claim guarantee is a newly
+       * credited fill key; replays (which return false) cannot re-arm it.
+       *
+       * The whole episode is reset, not just the timestamp: leaving
+       * `attemptCount === MAX` would make the next invariant check re-enter the
+       * max-attempt branch immediately and re-block (flapping).
+       *
+       * @param {string} fillKey - The newly credited fill key (log provenance)
+       * @returns {void}
+       */
+      rearmRecoveryAfterNewFill(fillKey: string) {
+          const mgr = this.manager;
+          if (!mgr || !mgr._recoveryExhaustedAt) return;
+          this.resetRecoveryState();
+          mgr.logger?.log?.(
+              `[RECOVERY-EXHAUSTED] Cleared by newly credited fill ${fillKey}; recovery re-armed for a fresh episode`,
+              'info'
+          );
+      }
+
+      /**
+       * Single owner of the "recovery is exhausted" answer for the COW CREATE
+       * gate. No other module should interpret `_recoveryExhaustedAt` directly.
+       *
+       * @returns {boolean} true while new CREATEs must be withheld
+       */
+      isRecoveryExhausted() {
+          return Boolean(this.manager?._recoveryExhaustedAt);
+      }
 
     /**
      * Check if sufficient funds exist AND atomically deduct (FREE portion only).
@@ -2081,6 +2125,12 @@ class Accountant {
                   }
               }
           }
+
+         // A newly credited fill is fresh chain evidence: close any stale
+         // recovery episode so the exhausted gate cannot freeze CREATEs for
+         // the whole 240-minute periodic-fetch interval. The dedupe/claim
+         // above makes this level-triggered — replays return false earlier.
+         if (fillKey) this.rearmRecoveryAfterNewFill(fillKey);
 
          return true;
     }

@@ -4008,8 +4008,16 @@ async function runPreBroadcastGuards(bot: BotLike, cowResult: CowResult): Promis
 
     const hasCreateActions = actions.some((action) => action.type === COW_ACTIONS.CREATE);
 
-    if (hasCreateActions && bot.manager?._recoveryExhaustedAt) {
-        const exhaustedAge = Date.now() - bot.manager._recoveryExhaustedAt;
+    // Single owner: the accountant decides whether recovery is exhausted.
+    // Stubs without the new method fall back to the raw flag so the gate stays
+    // fail-closed in fixtures that do not wire a full accountant.
+    const recoveryExhausted = typeof bot.manager?.accountant?.isRecoveryExhausted === 'function'
+        ? bot.manager.accountant.isRecoveryExhausted()
+        : Boolean(bot.manager?._recoveryExhaustedAt);
+    if (hasCreateActions && recoveryExhausted) {
+        const exhaustedAge = bot.manager._recoveryExhaustedAt
+            ? Date.now() - bot.manager._recoveryExhaustedAt
+            : 0;
         bot.manager.logger.log?.(
             `[RECOVERY-EXHAUSTED] Blocking ${actions.filter((a) => a.type === COW_ACTIONS.CREATE).length} CREATE(s) ` +
             `(exhausted ${(exhaustedAge / 1000).toFixed(0)}s ago). ` +
