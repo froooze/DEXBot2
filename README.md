@@ -397,6 +397,9 @@ Logs are written to `logs/` in the profiles directory in all modes: the monolith
 - **[Docs Index](docs/README.md)** - Main documentation hub
 - **[Architecture](docs/architecture.md)** - System design, fill processing pipeline, and testing strategy
 - **[Lifecycle](docs/LIFECYCLE.md)** - End-to-end walkthrough: startup, fill-driven, and AMA-driven flows with diagrams
+- **[Fill Pipeline](docs/FILL_PIPELINE.md)** - Fill contract, one owner per fact, fail-closed blockers, and the deferred P3–P5 plan
+- **[Order Lifecycle Registry](docs/ORDER_LIFECYCLE.md)** - One record per slot for on-chain existence; `unknown` is never gone
+- **[Timing Window Inventory](docs/TIMING_INVENTORY.md)** - The 86 timing knobs, classified, with the six removal targets
 - **[Copy-on-Write Plan](docs/COPY_ON_WRITE_MASTER_PLAN.md)** - Copy-on-Write grid architecture
 - **[Fund Movement & Accounting](docs/FUND_MOVEMENT_AND_ACCOUNTING.md)** - Fund accounting, grid topology, and rotation mechanics
 - **[Claw API Boundary](claw/docs/AI_BOT_LIBRARY_API.md)** - Responsibility split between the AI layer and the DEXBot2 execution layer

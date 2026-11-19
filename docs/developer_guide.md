@@ -42,7 +42,7 @@ Follow this path through the codebase:
 - `modules/constants.ts::FILL_PROCESSING` - Fill-event handling configuration (batch sizing is gap-slot derived, see `DEXBot._getGapSlotBatchSize`)
 - `modules/constants.ts::PIPELINE_TIMING` - Recovery configuration (RECOVERY_RETRY_INTERVAL_MS, MAX_RECOVERY_ATTEMPTS)
 - `modules/constants.ts::MARKET_ADAPTER` - AMA, dynamic weight, and regime detection defaults
-- `modules/constants.ts::REGIME_TABLE` - Hurst/PE regime signal-strength table
+- `modules/constants.ts::MARKET_ADAPTER.REGIME_TABLE` - Hurst/PE regime signal-strength table
 - `modules/dexbot_class.ts::_handleBatchHardAbort()` - Hard-abort recovery handler
 - `bot._staleCleanedOrderIds` (`modules/dexbot_fill_runtime.ts`, typed in `modules/types.ts`) - Orphan-fill deduplication tracking
 - `bot._cancelDustOrders()` (`modules/dexbot_maintenance_runtime.ts` / `modules/dexbot_fill_runtime.ts`) - Auto-cancel dust partials on-chain immediately (no timer)
@@ -203,8 +203,8 @@ return 1 / mid;  // Convert to B/A: 1/0.00074 ≈ 1350 (BTS per XRP)
 **`derivePoolPrice(BitShares, symA, symB)`**:
 ```javascript
 // Pool reserves come from blockchain in order [reserve_A, reserve_B]
-const floatA = safeBlockchainToFloat(amtA, aMeta.precision);
-const floatB = safeBlockchainToFloat(amtB, bMeta.precision);
+const floatA = MathUtils.blockchainToFloat(amtA, aMeta.precision);
+const floatB = MathUtils.blockchainToFloat(amtB, bMeta.precision);
 return floatB / floatA;  // Already B/A: 3000000 BTS / 20000 XRP = 150 (BTS/XRP)
 ```
 
@@ -622,12 +622,12 @@ const placeholder = convertToSpreadPlaceholder(order);
 
 ### Order Health Validation
 
-#### `isOrderHealthy(order, minSize)`
+#### `isOrderHealthy(size, type, assets, idealSize)`
 ```javascript
-// Comprehensive validation: size > 0 AND not dust-threshold
-// Prevents undersized orders that cause blockchain failures
-const minHealthySize = getMinOrderSize(ORDER_TYPES.BUY, assets, 1.0);
-if (isOrderHealthy(order, minHealthySize)) {
+// Health = positive size above the double-dust threshold derived from the
+// ideal grid size (MIN_ORDER_SIZE_FACTOR + PARTIAL_DUST_THRESHOLD_PERCENTAGE).
+// There is no precomputed minSize: the ideal size is passed in directly.
+if (isOrderHealthy(order.size, order.type, assets, idealSize)) {
     // Order is valid for placement/rotation
 } else {
     // Order is dust - skip it here; cancelDustOrders() handles it on-chain
@@ -809,11 +809,12 @@ compareGrids(calculatedGrid, persistedGrid, manager)
 
 **Grid Creation Flow**:
 ```javascript
-// 1. Calculate spread gap size
+// 1. Calculate spread gap size (mirrors calculateGapSlots)
 const stepFactor = 1 + (incrementPercent / 100);
-const minSteps = MIN_SPREAD_FACTOR; // 2
-const targetSteps = ceil(ln(1 + targetSpread/100) / ln(stepFactor));
-const gapSlots = max(minSteps, targetSteps - 1); // Account for naturally occurring center gap
+const minSpreadPercent = incrementPercent * MIN_SPREAD_FACTOR; // factor 2.1
+const effectiveTargetSpread = max(targetSpread, minSpreadPercent);
+const requiredSteps = ceil(ln(1 + effectiveTargetSpread / 100) / ln(stepFactor));
+const gapSlots = max(MIN_SPREAD_ORDERS, requiredSteps - 1); // MIN_SPREAD_ORDERS = 2
 
 // 2. Generate price levels
 const prices = [];

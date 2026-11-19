@@ -615,7 +615,7 @@ reported.
   ratio boundary, policy resolution, `loadGrid` refusing before it mutates
   anything (and honouring `'halt'`), the `loadGenesis` schema gate, and the E2
   sync-entry assert and the `'halt'` suppression of the recovery resync
-  (`tests/test_missing_genesis_policy.ts`, GEN-01..21).
+  (`tests/test_missing_genesis_policy.ts`, GEN-01..17 + GEN-20/21 — 19 cases).
 - **External gate:** `analysis/grid_correction_check.ts` — target 0 sustained
   violations at 168h/720h. **The baseline is NOT clean:** 4 of 5 bots were
   non-zero over 7 days, so this is a live signal, not a historical one.

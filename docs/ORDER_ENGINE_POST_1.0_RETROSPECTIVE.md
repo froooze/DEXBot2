@@ -10,14 +10,16 @@
 >
 > **Scope / snapshot:** v1.0.0 → v1.7.1 (`2a85a501`, 2026-11-04), extended through the
 > post-1.7.1 work at `bc20d574` (2026-11-04), the v1.7.2/v1.7.3 releases, and four
-> unpushed `test` commits (`3b9948e8`, `391ba444`, `5a703297`, `bad3cc30`, 2026-11-17)
-> recorded in §9.13. §9 is the v1.6.4 → v1.6.17 addendum; §9.10 closes the v1.6.18 review pass,
-> §9.11 carries v1.6.18 → v1.7.1, §9.12 records the revised-priority review, and
-> §9.13 records the post-1.7.3 out-of-spread incident and its fixes.
+> post-1.7.3 `test` commits (`3b9948e8`, `391ba444`, `5a703297`, `bad3cc30`, 2026-11-17)
+> recorded in §9.13. Three are now shipped in the v1.7.3 line; `bad3cc30` is on no branch,
+> its change landed as `06b9d6a4`. §9 is the v1.6.4 → v1.6.17 addendum; §9.10 closes the
+> v1.6.18 review pass, §9.11 carries v1.6.18 → v1.7.1, §9.12 records the revised-priority
+> review, §9.13 records the post-1.7.3 out-of-spread incident and its fixes, and §9.14
+> records the LAST-FILL-GUARD audit-side defect and the post-1.0 residuals.
 >
 > **Section numbering:** Part II deliberately keeps its original `§0`–`§8` numbers because
 > source-code comments and tests cite them (e.g. `… §2 fix #1`, `… §3 lineage`); §9 is a
-> later addendum (v1.6.4 → v1.6.17, with §9.10–§9.13 extending it) that adds to, and does not
+> later addendum (v1.6.4 → v1.6.17, with §9.10–§9.14 extending it) that adds to, and does not
 > renumber, that range. Part I uses `R1`–`R5` so the two never collide. The closing appendix
 > is unnumbered (`A`).
 >
@@ -370,6 +372,11 @@ Falling market Aug 28 after ~17:00 UTC: bot **placed new SELLs below own live se
 
 1. Ladder quantized to center. 2. Recovery resyncs re-anchor via two config points (see Fix #1). 3. Tolerance rounding-scale `≈0.036` at 1110 vs AMA shift `0.045%` → `~0.5` shift = 15× tolerance → pass-1 + pass-2 adoption (`sync_engine.ts`) reject. 4. `PRICE_DRIFT_TOLERANCE_MULTIPLIER 4` (`constants.ts`) → budget 0.144 < 0.43 diff → no `price-drift-orphan` → only logged (`dexbot_maintenance_runtime.ts`). 5. Regenerated ladder sell rail below orphans → self-undercut; `maxFilledSellPrice/minFilledBuyPrice` built from grid-tracked fills only → guard unenforceable once orphans unmanaged; orphans later fill outside accounting.
 
+> **Later status:** `PRICE_DRIFT_TOLERANCE_MULTIPLIER` and `ORPHAN_ADOPTION_TOLERANCE_MULTIPLIER`
+> were removed in the v1.6.8 genesis cleanup (`e7231534`), along with the `price-drift-orphan`
+> auto-cancel they fed. The tolerance account above is the historical root cause, not current
+> behaviour — see §4 and `docs/GRID_PRICE_INVARIANT.md` for the level-identity model that replaced it.
+
 #### 2.6 Ranked fixes (with 2026-08-30 landed status)
 
 **#1 Stop re-anchoring on recovery resyncs (two config points, highest leverage) — LANDED 2026-08-30 (`4838bcb0`).**
@@ -405,7 +412,7 @@ Throttle `Structural resync defer` to first/last per cap window (was 120/30s); l
 
 ### 3. Orphan-Fill & Fund-Invariant — Root Cause & Fix Plan
 
-> **Source:** former `ORPHAN_FILL_INVARIANT_ROOT_CAUSE_AND_FIX.md` (deleted 2026-08-31; merged here) · **Status:** P0s + rotation landed `1b27f6eb`/`4838bcb0`/`d808c052`; P1 atomicity partial; duplicate-cancel hard-error and P2 counters still open.
+> **Source:** former `ORPHAN_FILL_INVARIANT_ROOT_CAUSE_AND_FIX.md` (deleted 2026-08-31; merged here) · **Status:** P0s + rotation landed `1b27f6eb`/`4838bcb0`/`d808c052`; P1 atomicity code change dropped as already covered (§9.14 Stage 2); duplicate-cancel hard-error landed (§9.14 Stage 1); P2 observability counters landed (§3.3 P2, §9.14 Stage 4).
 > **Scope:** `dexbot_cow_runtime.ts`, `sync_engine.ts`, `chain_orders.ts`, `dexbot_state_recovery.ts`, `dexbot_maintenance_runtime.ts`, `strategy.ts`, `constants.ts` · **Evidence:** `profiles/logs/<bot>.log` Aug 28 17:40–17:57, Aug 29 15:13–15:19.
 
 #### 3.1 TL;DR — one cascade
@@ -436,7 +443,7 @@ Slot-90 loop is *proximate* form; rotation suppression is mechanism, cascade is 
 
 **P1 Rotation same-slot — LANDED core (`1b27f6eb`); sub-fixes superseded.** (1) `skipBoundaryShift:true` removed from both dust synthetic fills (was `dexbot_maintenance_runtime.ts`) — dust fills are shift-eligible again; regression guard `tests/test_rotation_no_same_slot.ts` now 4 cases (ROT-4 same-slot loop case removed this commit, guard deleted); no defensive `skipBoundaryShift` check remains (`order/utils/order.ts` + `manager.ts` removed). Reintroduction of the flag would silently restore the same-slot fill loop. (2) moot — dust fills now trigger the crawl naturally. (3) SUPERSEDED — the Phase-2 projection override was removed entirely (`3713c496`); `ANCHOR.PROJECTION_ENABLED` no longer exists at all — it was deleted with the anchor in `e7231534`, so it is not merely an unused constant. (4) SUPERSEDED — the `d808c052` anchor-refill/price-sanity guard extensions were removed `e2898e51`; the original `calculateTargetGrid` fill-range rotation (`strategy.ts`) remains.
 
-**P1 Duplicate-orphan cancellation reliable — OPEN (partially mitigated).** Verify `queueCorrection` cancelOnly (`sync_engine.ts`) executes, not blocked by in-flight; hard error if cannot cancel. `d808c052` mitigates the consequences (unknown-fill adoption-before-credit + empty-read guard) but the explicit verify/hard-error behavior is still open.
+**P1 Duplicate-orphan cancellation reliable — LANDED (§9.14 Stage 1; status corrected 2026-11-19).** Verification lives at the cancel drain (`modules/order/utils/order.ts`): a bounded by-id double read must confirm the order is gone before the queue entry and detection record are cleared; an inconclusive read defers with the entry still queued, and a confirmed still-live order logs a throttled hard error and increments `duplicateOrphanCancelUnverifiedCount` (exposed through `getMetrics()`). Only entries already queued as a cancel class are verified — the reverted P1/P2 cancel sweeps stay reverted. Covered by `tests/test_duplicate_orphan_cancel_verification.ts` (VERIFY-01..11). `d808c052` remains the consequence mitigation (unknown-fill adoption-before-credit + empty-read guard), not the fix.
 
 **P2 Observability — PARTIAL (counters landed 2026-09-13).** `d808c052` added anchor price-outlier rejection with rate-limited warns (that warn surface was later removed `e2898e51`). Since then the GRID-PRICE-INVARIANT guard added per-batch/per-site emitted-price counters and **blocks** an off-grid emission (`[GRID-PRICE-INVARIANT] site=<site> checked=N violated=M unchecked=K`, six emission sites) and a `pivotSlot=`/`pivotOffGrid=true` marker plus a numeric `pivotOffGrid=<n>` per-action count on the LAST-FILL-GUARD batch summary (the count says how many guarded probes used an unsnapped pivot) — see `docs/GRID_PRICE_INVARIANT.md`. Two self-healing escalations now sit on top of those counters: a slot rejected off-grid for
 `GRID_PRICE_INVARIANT_RESYNC_THRESHOLD` (3) **consecutive** batches escalates to the structural resync
@@ -476,7 +483,7 @@ All eight surface through `getMetrics()`; the five baseline counters via the exi
 
 ### 4. Price-First Alignment Plan
 
-> **Source:** former `PRICE_FIRST_ALIGNMENT_PLAN.md` (deleted 2026-08-31; merged here) · **Status:** Phase 1 shipped and live as shadow telemetry; Phase 2 projection was enabled (`1bbf1a23`) then **removed** (`3713c496`) after a live-bot incident — the anchor veto overrode chain evidence and drove destructive gap-band cancels. The anchor is now observability-only; the boundary is chain-evidence-derived. Phase 3 is moot (no second write path to retire); boundary geometry is pinned by `tests/test_boundary_anchor_recovery.ts` (ANCHOR-001..004) and `tests/test_grid_price_slot_invariant.ts`.
+> **Source:** former `PRICE_FIRST_ALIGNMENT_PLAN.md` (deleted 2026-08-31; merged here) · **Status:** Phase 1 shipped as shadow telemetry, then removed with the whole anchor layer in the v1.6.8 genesis cleanup (`e7231534`); Phase 2 projection was enabled (`1bbf1a23`) then **removed** (`3713c496`) after a live-bot incident — the anchor veto overrode chain evidence and drove destructive gap-band cancels. No market-anchor code remains (`marketAnchor`, `computePriceAnchoredBoundaryTarget`, `ANCHOR_FRESHNESS`, `[ANCHOR-DIVERGENCE]`/`[ANCHOR-STALE]` logs were all deleted); the boundary is chain-evidence-derived. Phase 3 is moot (no second write path to retire); boundary geometry is pinned by `tests/test_boundary_anchor_recovery.ts` (ANCHOR-001..004) and `tests/test_grid_price_slot_invariant.ts`.
 > **Scope:** grid boundary state `modules/order/` · **Related:** three-layer crawl/anchor/guard fix.
 
 #### 4.1 Goal
@@ -504,14 +511,15 @@ I1 No order on wrong side of just-filled price (`sell ≤ maxFill, buy > minFill
 
 #### 4.5 Phase 1 — MarketAnchor + divergence telemetry (no behavior change)
 
-*Status: SHIPPED.*
-In-memory `marketAnchor` on manager (`dexbot_fill_runtime.ts`) `lastFillPrice/maxFilledSellPrice/minFilledBuyPrice/lastFillSide/updatedAt` updated on eligible fill (`isShiftEligibleFill`), `buildFillKey` deduped, block ordered (D4, D5); book-seeding; shadow log `[ANCHOR-DIVERGENCE] projected=X bookkept=Y drift=Z` `|Z|>1` warn (>~3), thresholds `constants.ts`; freshness 15 min OR >3 increments beyond anchor (`ANCHOR_FRESHNESS`); replay protection history uses latest only; tagging replay vs live via `sync_engine.ts`. Gate: suite green + unit for idempotent/block/replay/freshness/book-seeding.
+*Status: REMOVED (`e7231534`) — historical design only; none of these fields or log lines exist in current code.*
+*Historical design:* in-memory `marketAnchor` on manager (`dexbot_fill_runtime.ts`) `lastFillPrice/maxFilledSellPrice/minFilledBuyPrice/lastFillSide/updatedAt` updated on eligible fill (`isShiftEligibleFill`), `buildFillKey` deduped, block ordered (D4, D5); book-seeding; shadow log `[ANCHOR-DIVERGENCE] projected=X bookkept=Y drift=Z` `|Z|>1` warn (>~3), thresholds `constants.ts`; freshness 15 min OR >3 increments beyond anchor (`ANCHOR_FRESHNESS`); replay protection history uses latest only; tagging replay vs live via `sync_engine.ts`. Gate: suite green + unit for idempotent/block/replay/freshness/book-seeding.
 
 #### 4.6 Phase 2 — Projection live (goal)
 
 *Status: SUPERSEDED — landed `1bbf1a23` (flag on), REMOVED `3713c496`.*
 Pure `projectAnchorToGrid(anchor, allSlots, gapSlots)` via `computePriceAnchoredBoundaryTarget` (`order/utils/order.ts`), gap centered on traded range + I4 ceiling; `calculateTargetGrid` (`strategy.ts`): `boundaryIdx = anchorFresh ? project(...) : legacyDeriveTargetBoundary(...)` gated `projectionEnabled` (D3); fund floor D1 at most ½ window (`syncBoundaryToFunds/calculateFundDrivenBoundary` `utils/system.ts`); placement guard unchanged as enforcement I1; stale-anchor continues from last range decayed to AMA center (not fall back to crawl). Gate: suite green flag on/off + property harness random bursts/re-plans/replays/empty-book all I1–I6; flip per-bot start smaller, 48h soak watcher `ANCHOR-DIVERGENCE`/`PLACEMENT-GUARD`/fund friction. **Done = incident class closed, rollback = flag flip.**
-**Post-mortem (`3713c496`):** the projection override plus the anchor's veto role let a fresh fill-anchor override chain evidence under a stale boundary, and the gap-band sweep then cancelled legitimate orders. Removed: the `projectionEnabled` gating, the `projectAnchorToGrid` boundary override, and the fund-floor pull in `calculateTargetGrid`. `strategy.ts` records the decision — the anchor is shadow telemetry only (`[ANCHOR-DIVERGENCE]`/`[ANCHOR-STALE]`). The original fill-range rotation guard remains at `strategy.ts`; the `d808c052` price-sanity/anchor-refill guard extensions were removed `e2898e51`.
+**Post-mortem (`3713c496`):** the projection override plus the anchor's veto role let a fresh fill-anchor override chain evidence under a stale boundary, and the gap-band sweep then cancelled legitimate orders. Removed: the `projectionEnabled` gating, the `projectAnchorToGrid` boundary override, and the fund-floor pull in `calculateTargetGrid`. `strategy.ts` recorded the decision — the anchor was shadow telemetry only until the whole
+market-anchor layer was removed with the genesis cleanup (`e7231534`). The original fill-range rotation guard remains at `strategy.ts`; the `d808c052` price-sanity/anchor-refill guard extensions were removed `e2898e51`.
 
 #### 4.7 Phase 3 — Conditional deletion
 
@@ -542,11 +550,11 @@ Goal (Phase 2): I1–I6 property pass, full suite green, harness random, 48h per
 ### 5. Cross-doc fix lineup (deduplicated, dependency order)
 
 1. **GAP P1+P2+P4** + **LADDER #1** earliest (gap writer + re-anchor stop — highest leverage, prevents Aug 28 cascade 7 regs×orphaning). — *GAP P1/P2 landed `f94d6ec4` then reverted (`3713c496`/`e2898e51`); GAP P4 + LADDER #1 live.*
-2. **LADDER #4 / PRICE Phase 1** log-only, parallel. — *done (`4838bcb0`; Phase 1 telemetry live).*
+2. **LADDER #4 / PRICE Phase 1** log-only, parallel. — *done (`4838bcb0`; Phase 1 telemetry landed, later removed with the anchor layer `e7231534`).*
 3. **PRICE Phase 2** flag per-bot 48h (Mode B lag) — price-first truth. — *SUPERSEDED: landed `1bbf1a23`, removed `3713c496` (see §4).*
 4. **LADDER #2/#3** identity + update-first hardening. — *done (`4838bcb0`).*
 5. **LADDER #5 / ORPHAN P0 recovery-by-ID** persistence (long freeze). — *done (`4838bcb0`, extended `a54863ca`; recovery-by-ID `1b27f6eb`).*
-6. **ORPHAN P0 ID-based adoption** + **P1 atomicity** (stale-plan race). — *P0 done (`1b27f6eb`, retry `d808c052`); atomicity partial.*
+6. **ORPHAN P0 ID-based adoption** + **P1 atomicity** (stale-plan race). — *P0 done (`1b27f6eb`, retry `d808c052`); atomicity code change dropped — the fresh-master re-plan and placement lease already cover it (§9.14 Stage 2).*
 7. **ORPHAN P1 rotation + P1 duplicate + GAP P3/P5 + Mode C guards + P2 guardrails** fast-follow. — *rotation + GAP P5 done; GAP P3 reverted `e7231534` (`validateBoundaryAgainstChainEvidence`/`placementsAllowed` removed); Mode C pre-broadcast UPDATE guard and P2 counters LANDED `552b3ed7` (§9.2); the in-gap reject ships as a shadow, not a block.*
 8. **PRICE Phase 3/4** only after evidence (`grid_correction_check` see §7). If soak never clean, stop at Phase 2. — *Phase 3 moot; Phase 4 golden tests landed.*
 
@@ -595,7 +603,7 @@ Original doc regression excerpts preserved: GAP P6 A/B/C; LADDER §2.8 checks (1
 - [x] Stale `*.md` filename references in code comments/tests updated to the consolidated doc (9 module files, 6 test files), then re-pointed to this hub when it absorbed the summary.
 
 *Generated 2026-08-31 from the 4 test-only docs at their HEAD contents; statuses corrected against `test` HEAD `a54863ca` the same day, then refreshed against `1382f267` (2026-09-13), extended through v1.6.14 at `f6c0df32` (2026-10-12), through v1.6.17 at `78ccbb8e`, through the v1.6.18 review pass (`§9.10`: `f4d6da8c`, `a2bf6ba5`, `56481b16`, `3d16f9e4`), and through v1.7.1 at `2a85a501` plus the post-1.7.1 arc (`§9.11`, HEAD `bc20d574`), the v1.7.2/v1.7.3 releases, and the
-post-1.7.3 `test` arc (`§9.13`: `3b9948e8`, `391ba444`, `5a703297`, `bad3cc30`). Landed/reverted/superseded annotations carry commit hashes where known; **line references in §§1-4 were re-verified at `a54863ca` and are subject to drift** — treat them as pointers, not assertions. The GRID-PRICE-INVARIANT guard is **BLOCKING** at all six emission sites (CREATE / UPDATE / CREATE-FALLBACK in `modules/dexbot_cow_runtime.ts`, RECONCILE-CREATE / RECONCILE-UPDATE / STARTUP-CREATE in `modules/order/grid_reconcile_internal.ts`): an off-grid emission is skipped, not merely counted, so a `violated>0` line means an emission was *prevented* rather than a writer merely *pinned*. Counters are still reported (`site=`, `checked=`, `violated=`, `unchecked=`) for observability — see `docs/GRID_PRICE_INVARIANT.md`.*
+post-1.7.3 `test` arc (`§9.13`: `3b9948e8`, `391ba444`, `5a703297`; `bad3cc30` superseded by `06b9d6a4`). Landed/reverted/superseded annotations carry commit hashes where known; **line references in §§1-4 were re-verified at `a54863ca` and are subject to drift** — treat them as pointers, not assertions. The GRID-PRICE-INVARIANT guard is **BLOCKING** at all six emission sites (CREATE / UPDATE / CREATE-FALLBACK in `modules/dexbot_cow_runtime.ts`, RECONCILE-CREATE / RECONCILE-UPDATE / STARTUP-CREATE in `modules/order/grid_reconcile_internal.ts`): an off-grid emission is skipped, not merely counted, so a `violated>0` line means an emission was *prevented* rather than a writer merely *pinned*. Counters are still reported (`site=`, `checked=`, `violated=`, `unchecked=`) for observability — see `docs/GRID_PRICE_INVARIANT.md`.*
 
 ---
 
@@ -758,10 +766,10 @@ required is no longer reachable at runtime.
 | `b2f43d8a` | post-1.7.1 | One fill contract, fail-closed grid blockers, one fill identity (P0–P2) |
 | `39675d8a` | post-1.7.1 | Claim the fill key at credit time; drop the duplicate amount channel (P2 tail) |
 | `bc20d574` | post-1.7.1 | One grace-stamp writer, ledger side in export, single-winner fill claim |
-| `3b9948e8` | post-1.7.3 (`test`, unpushed) | Re-anchor extremum uses the pivot writer's eligibility (§9.13/C1) |
-| `391ba444` | post-1.7.3 (`test`, unpushed) | Market-bound eligibility injected into the crawl and pending-crawl writer (§9.13/F1) |
-| `5a703297` | post-1.7.3 (`test`, unpushed) | Stale clock clears only at zero excess; partial progress re-arms the recheck (§9.13/F2) |
-| `bad3cc30` | post-1.7.3 (`test`, unpushed) | Size-drift gone targets route to the in-place repair, not stale cleanup (§9.13/C3) |
+| `3b9948e8` | post-1.7.3 (shipped) | Re-anchor extremum uses the pivot writer's eligibility (§9.13/C1) |
+| `391ba444` | post-1.7.3 (shipped) | Market-bound eligibility injected into the crawl and pending-crawl writer (§9.13/F1) |
+| `5a703297` | post-1.7.3 (shipped) | Stale clock clears only at zero excess; partial progress re-arms the recheck (§9.13/F2) |
+| `bad3cc30` | post-1.7.3 (superseded by `06b9d6a4`) | Size-drift gone targets route to the in-place repair, not stale cleanup (§9.13/C3) |
 
 #### 9.6 Invariants added
 
@@ -1262,7 +1270,8 @@ spread-correction gates) alongside `tests/test_refused_level_refill_block.ts`
 ### 9.13 Post-1.7.3 out-of-spread incident: sweep eligibility and the silent watchdog
 
 > **Source:** a live market-pair bot's log/snapshot (2026-11-17, generic terms),
-> `CHANGELOG.md` v1.7.3, and four unpushed `test` commits:
+> `CHANGELOG.md` v1.7.3, and four post-1.7.3 `test` commits (three shipped; the fourth,
+> `bad3cc30`, superseded by `06b9d6a4`):
 > `3b9948e8` (C1), `391ba444` (F1), `5a703297` (F2), `bad3cc30` (C3). This section absorbs the former
 > standalone integration plan; no live market, account or order ids are named.
 
@@ -1389,8 +1398,10 @@ timing window, veto, config or sizing change was introduced.
 
 ### 9.14 Fix plan — LAST-FILL-GUARD audit-side defect and post-1.0 residuals
 
-> **Working copy:** [GRID_GUARD_FIX_PLAN.md](GRID_GUARD_FIX_PLAN.md) carries the
-> checkbox status and stage progress; this section is the canonical historical record.
+> **Record:** This section is the single record of the LAST-FILL-GUARD audit fix.
+> The former working copy (`GRID_GUARD_FIX_PLAN.md`) carried the checkbox status while
+> the work was in flight; it was folded here on completion and removed. Stage verdicts
+> and outcomes below are final.
 
 > **Source:** a policy-aware `grid_correction_check` run over a live market-pair bot's
 > runtime log (2026-10-14 → 2026-11-18), cross-referenced with §3.3, §2, §9.12 and
@@ -1414,7 +1425,8 @@ candidates → 104 policy divergences (expected under the §9.12/P1 arming polic
 **Root cause (audit side, not runtime).** `analysis/pivot_timeline.ts` calls
 `pivotAtOrAfter(index.observations, placement.t)` for both `plan-action` and `placed`
 anchors. A `Placed` line is emitted at commit, i.e. AFTER `runFinalPivotGate`
-(`modules/dexbot_cow_runtime.ts:5605`) and the broadcast (`:5966`), so the first
+(called at `modules/dexbot_cow_runtime.ts:5626`, defined at `:7056`) and the broadcast
+(`:5996`), so the first
 observation after a `Placed` event can belong to the NEXT batch. In the audited window
 a placement was judged against a pivot logged a fraction of a second later by the
 following batch, while the pivot actually held a few seconds earlier would have passed
@@ -1442,7 +1454,7 @@ the next re-placement. This is the in-memory marker limitation already accepted 
 | 6 — non-goals | **Unchanged** | §9.12 Addendum 2/3, §9.13 "Deliberately not done" |
 
 **Stage 0 — source-aware pivot anchoring (P0).** In `classifyTransition`
-(`analysis/pivot_timeline.ts:343–396`), choose the pivot by anchor kind:
+(`analysis/pivot_timeline.ts:382`), choose the pivot by anchor kind:
 `kind === 'plan-action'` keeps `pivotAtOrAfter` (the gate follows the plan);
 `kind === 'placed'` uses `pivotAtOrBefore` (the gate precedes the commit). Bound the
 backward search with a maximum lookback so a distant observation yields `unverifiable`
@@ -1514,11 +1526,11 @@ extended `test_p2_observability_counters` and updated mocks in
 
 **Stage 2 — atomicity status reconciliation (no runtime change).** The fresh-master
 re-plan after winning the single-flight is already implemented
-(`modules/dexbot_cow_runtime.ts:5917–5960`), and the placement lease is claimed before
+(`modules/dexbot_cow_runtime.ts:5947–5975`), and the placement lease is claimed before
 planning and held through commit (`PLAN_LEASE_RESULT_KEY`, `claimPlacement`). Fill-less
 stale plans are deliberately dropped with a deferred region-end re-derivation
-(`replanStaleBatch:3594`, v1.7.3 changelog). §3.3 P1 line 434 must be annotated as
-superseded except for the dust-cancel `checkGridHealth` waits. The log signature
+(`replanStaleBatch` at `:3543`, v1.7.3 changelog). §3.3 P1 is annotated as superseded above
+except for the dust-cancel `checkGridHealth` waits. The log signature
 `Plan stale pre-broadcast … dropping the batch` is the intended safe path, not a bug.
 Gate: doc status corrected and a test for the wait→re-plan path exists.
 
@@ -1531,9 +1543,9 @@ reproduce the `2/8` partial-chunk incident in a test; if it cannot be reproduced
 the current tree, record that and do not change broadcast behavior.
 
 **Stage 4 — final-gate observability (counters only).** `runFinalPivotGate`
-(`:6888–6954`) already re-checks built ops against the refreshed pivot before
+(`:7056`) already re-checks built ops against the refreshed pivot before
 broadcast; `dropped=0` means no built op violated it. Add counters for "pivot moved
-under batch" and for the fail-open gate catch (`:5651`), using the existing
+under batch" and for the fail-open gate catch (`:7069`), using the existing
 `bot._metrics` pattern. Do not add a veto or freeze the fill queue: §9.13's
 "Deliberately not done" (3) forbids a hard reject that re-opens the counter-order
 deadlock, and the queue-refresh line remains non-evidence per §9.12. **Landed:**
@@ -1568,10 +1580,16 @@ Expected: 0 pivot-classified violations; the 11 reclassified candidates listed u
 `test_refused_level_refill_block`, `test_same_level_refill_check`,
 `test_fill_one_counter_order`, `test_stale_grid_hardening`, `test_incident_replay`.
 
+**Runner note (from the working copy).** The four-way parallel runner has an
+intermittent cross-file fixture race in two fund tests (they pass standalone; a re-run
+was 371/371). It is pre-existing and unrelated to this fix — do not read a single
+flaky parallel run as a regression.
+
 **Decisions recorded.** (1) Reclassified candidates stay visible in a dedicated
 report section rather than disappearing. (2) Stage 1 was held until a reproducing
 case existed; the log supplied one and bounded by-id verification is now landed.
-(3) The plan is appended here as §9.14.
+(3) The working copy was folded here as §9.14 and the standalone plan removed; this
+    section is the sole record.
 
 ---
 

@@ -300,7 +300,7 @@ and range tilt unchanged.
 AMA slope values are stored and compared in percent per bar. The value itself
 is a **Huber-robust linear regression of `ln(AMA)` over the lookback window**
 (`DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS`, default `16` bars; `computeHuberWindowSlopePct` in
-`core/strategies/dynamic_weight_series.ts`; its tuning lives in
+`market_adapter/core/strategies/dynamic_weight_series.ts`; its tuning lives in
 `MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_HUBER`) — a smooth, robust fit whose influence
 function is bounded, so one outlier bar cannot drag it, which is what a plain
 mean (and the older two-point endpoint difference it is equivalent to) would do.

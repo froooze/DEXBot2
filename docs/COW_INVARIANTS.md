@@ -279,7 +279,7 @@ not by the seven per-site structures that used to disagree
   - Range guards (`isChainPriceOutOfGrid`) are bounds checks, not membership checks — they cannot substitute for this invariant.
   - Adoption keeps the slot's own level (a fill/chain price is metadata, not the slot's price); `loadGrid` repairs a pre-existing off-grid slot price at load.
   - A snapshot carrying orders but no usable ladder is **refused** before any mutation (`loadGrid`, before the startup resume decision, and at the persisted-row schema), and the sync entry refuses to reconcile a ladder-less grid at all — without a ladder no consumer has authority for a slot's price, which is what this invariant exists to prevent. The tolerance matcher that used to cover that state has been removed. `config.gridLimits.MISSING_GENESIS_POLICY` picks the response: `'rebuild'` (default, structural resync) or `'halt'` (manual reset). One decision, one module: `modules/order/genesis_policy.ts`.
-  - Tests: GPI-001..015 (`tests/test_grid_price_invariant_guard.ts`), GPI-WIRE-001..009 (`tests/test_grid_price_invariant_wiring.ts`), LEGACY-ADOPT/MATERIALIZE/ADOPT-NAME (`tests/test_sync_out_of_grid_defer.ts`), GEN-01..21 (`tests/test_missing_genesis_policy.ts`).
+  - Tests: GPI-001..015 (`tests/test_grid_price_invariant_guard.ts`), GPI-WIRE-001..009 (`tests/test_grid_price_invariant_wiring.ts`), LEGACY-ADOPT/MATERIALIZE/ADOPT-NAME (`tests/test_sync_out_of_grid_defer.ts`), GEN-01..17 + GEN-20/21 (19 cases, `tests/test_missing_genesis_policy.ts`).
 
 ---
 

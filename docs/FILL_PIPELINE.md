@@ -207,7 +207,7 @@ sorted by kind, not by age:
 | **P4 — epoch fence** | **do not start** | Must not land before P3: it deletes `INV-COW-003`'s "proceed anyway" branch, which is only sound once P3 carries the invalidating fills forward. Its log-only pre-step is the only safe P4 piece — and that is instrumentation, not a bug fix. |
 | **P5 — watermark / retire timers** | **do not start** | Every removal needs live evidence first, and `FILL_DEDUPE_WINDOW_MS` needs a chain-evidence design (recompute a crash-restored claim from chain truth, not by age). |
 | **C3 — boundary-budget base/current + six save/restore sites** | **do not touch** | This *is* P3's work. Half-migrating the budget is the coupling the phase exists to remove. |
-| Older open items (duplicate-orphan cancel hard-error, full plan→broadcast mutex) | **leave out** | Each is a behaviour change with its own incident history; bundling them re-opens the regression class this arc closed. |
+| Older items (duplicate-orphan cancel hard-error, full plan→broadcast mutex) | **no longer open — keep out of this arc** | Both were resolved outside it: [ORDER_ENGINE_POST_1.0_RETROSPECTIVE.md §9.14](ORDER_ENGINE_POST_1.0_RETROSPECTIVE.md) Stages 1–2 records the bounded by-id cancel verification/hard error as landed and the plan→broadcast mutex as dropped in favour of the already-landed fresh-master re-plan + placement lease. Do not re-open them here. |
 
 ### Bug-only queue (independent of P3–P5)
 
@@ -289,7 +289,7 @@ writer and reader unchanged.
 ### P4 — Epoch fence (5 d, depends on P3)
 
 - **Current state (verified `71eb39ba`):** not started. No `gridEpoch` exists, and even the
-  log-only pre-step is missing — `replanStaleBatch` (`modules/dexbot_cow_runtime.ts:3550`)
+  log-only pre-step is missing — `replanStaleBatch` (`modules/dexbot_cow_runtime.ts:3543`)
   logs the reason string only, not the four signals; `recon_fuzz` has no
   `mutate-before-commit` op.
 - Before the fence lands: log the "proceed anyway" branch once per batch with its four
@@ -315,8 +315,8 @@ writer and reader unchanged.
 ### P5 — Chain watermark, retire timers (5–10 d, last)
 
 - **Current state (verified `71eb39ba`):** not started. No plan watermark; the four
-  fill-path windows are still live `TIMING` entries (`modules/timing_policy.ts:155, 172,
-  177, 192`) and `FILL_DEDUPE_WINDOW_MS` still resolves crash-restored claims by age.
+  fill-path windows are still live `TIMING` entries (`modules/timing_policy.ts:157, 174,
+  179, 194`) and `FILL_DEDUPE_WINDOW_MS` still resolves crash-restored claims by age.
 - Record `{ height, openOrderIdsHash, balancesHash }` per plan; commit requires a read at
   ≥ plan height. `getLivePendingBroadcasts`' TTL becomes "unknown until a watermark newer
   than the record".

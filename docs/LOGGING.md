@@ -43,7 +43,7 @@ Module → Logger.log() ──┬→ console (stdout/stderr)
                               + JSON lines (optional)
 ```
 
-**Under PM2** the console branch is the only active sink: PM2 captures stdout/stderr into `profiles/logs/<app>.log`, so the Logger suppresses its own file writes and its timestamps (PM2's `log_date_format` prefixes each line). Keep console output enabled under PM2 — auto-quieting it would leave PM2 with nothing to capture. Use `quietUnderPm2: true` only if you deliberately want a silent process.
+**Under PM2** the console branch is the only active sink: PM2 captures stdout/stderr into `profiles/logs/<app>.log`, so the Logger suppresses its own file writes and its timestamps (PM2's `log_date_format` prefixes each line). Keep console output enabled under PM2 — auto-quieting it would leave PM2 with nothing to capture. The former `quietUnderPm2` option was removed; console output is auto-quieted only for non-PM2 runs that also write a log file.
 
 ---
 
@@ -203,10 +203,10 @@ const child = new Logger('Accounting', { correlationId: parent.correlationId });
 
 ## Change Detection
 
-`LoggerState` prevents redundant logs by tracking previous values:
-
-- Ignores fund changes < 0.00000001 (8 decimals)
-- Ignores price changes < 0.0001 (4 decimals)
+`LoggerState` prevents redundant logs by comparing previous values with a JSON-stringify
+deep diff. Any change counts as significant: the `ignoreMinor.fundPrecision` and
+`ignoreMinor.pricePrecision` settings still appear in config but are **not consumed** by the
+diff, so they do not suppress anything. Only `changeTracking.enabled` gates suppression.
 
 | Config Profile | Output Reduction | Lines/Cycle |
 |---|---|---|

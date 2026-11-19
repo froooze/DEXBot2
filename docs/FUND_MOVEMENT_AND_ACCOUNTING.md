@@ -412,59 +412,51 @@ targetSlot.orderId = newOrderId;
 
 **Location**: `modules/dexbot_class.ts` — constructor, `_recoverExplicitStaleOrders()`; orphan-fill guard in the fill drain loop and pruning pass after each cycle now live in `modules/dexbot_fill_runtime.ts` (the orphan-fill guard and the post-cycle pruning pass).
 
-#### Stale-Cleaned Order ID Tracking with TTL + Recycled-Slot Guard
+#### Stale-Cleaned Order ID Tracking (TTL)
 
-**Mechanism**: Track which orders were cleaned up during batch failure recovery using timestamp + grid-slot retention.
+**Mechanism**: After batch-failure recovery virtualizes an order, its id is marked with a
+timestamp. A late orphan fill for that id is skipped while the mark is inside the retention
+window (the funds were already freed by cleanup); once the mark ages out it is deleted and
+the fill is credited as an ordinary orphan.
 
-**Data Structure** (`modules/dexbot_class.ts`):
+**Data Structure** (`modules/dexbot_class.ts:160`):
 ```javascript
-// Map of orderId → { markedAt: number, gridId: string | null }
-_staleCleanedOrderIds = new Map();
+// Map of orderId → mark timestamp (ms)
+_staleCleanedOrderIds = new Map();   // Map<string, number>
 
 // Retention window (set in the constructor):
 _staleCleanupRetentionMs = Math.max(_fillDedupeWindowMs, 5 * 60 * 1000);  // ≥5 minutes
 ```
 
-**Cleanup Process** (in `_recoverExplicitStaleOrders()`):
+**Cleanup Process** (in `_recoverExplicitStaleOrders()`, `modules/dexbot_state_recovery.ts:223,229`):
 ```javascript
 1. Parse error message for stale order IDs (e.g., "Limit order 12345 does not exist")
-2. For each stale ID matching a grid slot:
-   - Virtualize the grid slot (state → VIRTUAL, size 0)
-   - Record: _staleCleanedOrderIds.set(orderId, { markedAt: Date.now(), gridId })
-3. For stale IDs with no matching grid slot:
-   - Record: _staleCleanedOrderIds.set(orderId, { markedAt: Date.now(), gridId: null })
+2. For each stale ID (with or without a matching grid slot):
+   - Virtualize the grid slot if one matches
+   - Record: _staleCleanedOrderIds.set(orderId, Date.now())
 ```
 
-**Orphan-Fill Handler Check** (in the drain loop):
+**Orphan-Fill Handler Check** (in the drain loop, `modules/dexbot_fill_runtime.ts:1249–1261`):
 ```javascript
-const entry = _staleCleanedOrderIds.get(orderId);
-if (entry) {
-    const ageMs = Date.now() - entry.markedAt;
+const staleMarkedAt = _staleCleanedOrderIds.get(orderId);
+if (staleMarkedAt != null) {
+    const ageMs = Date.now() - staleMarkedAt;
     if (ageMs <= _staleCleanupRetentionMs) {
-        // Within retention: skip credit entirely (funds already freed)
+        // Funds already freed by batch cleanup — skip this credit
         continue;
     }
-    if (entry.gridId) {
-        const currentOrder = manager.orders.get(entry.gridId);
-        if (currentOrder?.orderId && currentOrder.orderId !== orderId) {
-            // Slot recycled: funds already redeployed — skip credit
-            continue;
-        }
-    }
-    // Expired and slot not recycled: drop the tombstone and credit as normal orphan
-    _staleCleanedOrderIds.delete(orderId);
+    _staleCleanedOrderIds.delete(orderId);  // expired: fall through to normal orphan credit
 }
-// Credit proceeds only if NOT protected above
 await adjustTotalBalance(orderType, proceeds, `orphan-fill-${orderId}`);
 ```
 
 #### Why This Works
 
 1. **Delayed Orphans**: Fill events can arrive minutes after batch failure (network latency); the retention window covers the dedupe interval.
-2. **Recycled-Slot Tombstones**: Entries *with* a `gridId` are kept indefinitely as tombstones — a fill arriving after TTL is still skipped if the slot has been redeployed, preventing a late orphan from double-counting freed-and-redeployed capital.
-3. **Bounded Entry Pruning**: Entries *without* a `gridId` (no slot to check) are pruned once `ageMs > _staleCleanupRetentionMs`, so the map stays bounded. Pruning runs after each fill-processing cycle, not on a fixed timer.
+2. **No Tombstones**: A mark is a timestamp only. There is no grid-id field, no recycled-slot guard, and no indefinite retention — a recycled slot does not change the decision.
+3. **Bounded Entry Pruning**: A post-cycle pruning pass (`modules/dexbot_fill_runtime.ts:1603–1618`) deletes every entry past the retention window and logs `[STALE-CLEANUP] Pruned N expired stale-cleaned order IDs` at `debug` level.
 4. **ID-Based**: Works with any error format (different BitShares versions have different error messages).
-5. **Explicit Logging**: `[ORPHAN-FILL] Skipping double-credit` / `slot recycled` / `Pruned N expired` messages create an audit trail.
+5. **Explicit Logging**: `[ORPHAN-FILL] Skipping double-credit …` is logged at `warn` for a suppressed credit, so the decision is auditable.
 
 #### Fund State Verification
 

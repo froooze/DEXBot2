@@ -242,8 +242,9 @@ validated before use or before any stale path is removed.
 ### Directory
 
 The runtime directory defaults to `$XDG_RUNTIME_DIR/dexbot2/` when
-`$XDG_RUNTIME_DIR` is usable; otherwise it falls back to `profiles/run/` under
-the repository root. In both cases it is created with mode **0700** (owner
+`$XDG_RUNTIME_DIR` is usable; otherwise it falls back to `run/` under the
+**resolved profiles directory** (by default `~/.config/dexbot2/profiles/run`), never
+inside the repository or package tree. In both cases it is created with mode **0700** (owner
 read/write/execute only) and verified at every startup.
 
 ### Socket and ready file

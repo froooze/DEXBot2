@@ -6,6 +6,16 @@ This directory contains the comprehensive technical documentation for the DEXBot
 
 ---
 
+## Documentation map
+
+These docs fall into three tiers:
+
+- **Current contracts & references** — the present-tense specs and guides listed below (architecture, lifecycle, COW invariants, the grid/order/fill contracts, accounting, security, logging, and the user guides). These are the docs to read and keep current.
+- **History hubs** — [Order Engine Retrospective](ORDER_ENGINE_POST_1.0_RETROSPECTIVE.md) (why the engine behaved as it did, with the incident/fix ledger) and [Evolution](EVOLUTION.md) (project timeline). A completed fix plan is folded into one of these and its standalone file removed; `FILL_PIPELINE.md`, `ORDER_LIFECYCLE.md`, `TIMING_INVENTORY.md` and `GRID_PRICE_INVARIANT.md` are the four current fill/order contracts and cross-link each other.
+- **Proposals & one-off notes** — [DEXBot2 vs the Power-Law Liquidity Curve](DEXBOT2_VS_POWER_LAW_CURVE.md) and `XBTSX_NODE_FEEDBACK.md` (a draft message, intentionally not indexed). These are not runtime contracts.
+
+---
+
 ## User-Facing Workflows
 
 ### 🎓 [BitShares Onboarding](BITSHARES_ONBOARDING.md)
@@ -140,6 +150,13 @@ This directory contains the comprehensive technical documentation for the DEXBot
 - **The model**: one record per slot, six phases, `unknown` as a real state that never reads as "gone"
 - **The wiring**: legacy maps are live views onto the record; every mutation funnels through `_applyOrderUpdate`
 - **Invariants**: `INV-LIFE-001…007` in [COW_INVARIANTS.md](COW_INVARIANTS.md#order-lifecycle-order_lifecyclemd)
+
+### 🔗 [Fill Pipeline](FILL_PIPELINE.md)
+*The single fill-pipeline document: contract, decisions, remaining plan, regression canaries.*
+- **Contract**: six stages, four fill states, one writer per fact (`INV-FILL-001…007`), pinned by a ratchet test
+- **Decisions**: D1–D12 — a same-fact second answer is deleted; two different facts get two named owners
+- **Remaining work**: P3–P5 are deferred refactors (not bug fixes), plus a separate bug-only queue; each phase carries a gate and a stop condition
+- **Cross-links**: [ORDER_LIFECYCLE](ORDER_LIFECYCLE.md) · [COW_INVARIANTS](COW_INVARIANTS.md) · [GRID_PRICE_INVARIANT](GRID_PRICE_INVARIANT.md) · [TIMING_INVENTORY](TIMING_INVENTORY.md)
 
 ### ⏱ [Timing Window Inventory](TIMING_INVENTORY.md)
 *Every timing knob classified, with the self-healing ones marked as removal targets.*

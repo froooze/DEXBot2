@@ -5,7 +5,7 @@ otherwise spread across `architecture.md` and `developer_guide.md` into two conc
 lifecycles (fill-driven and maintenance-driven) plus the startup sequence. Read this
 first; follow the file/function references into the deeper docs.
 
-> All code references use `file:line` so you can jump straight to the source.
+> Code references are given as file paths and section names; follow the linked docs for line-level detail.
 
 ---
 

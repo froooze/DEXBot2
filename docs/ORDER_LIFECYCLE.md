@@ -91,8 +91,9 @@ order. A PHASE CHANGE is new information, so it adopts its own evidence.
 
 ## Legacy structures are views, not copies
 
-Six of the seven are now live `Map`/`Set` views onto the registry
-(`LifecycleMapView` / `LifecycleSetView`):
+Five of the seven are now live `Map`/`Set` views onto the registry
+(`LifecycleMapView` / `LifecycleSetView`); the seventh, `_committedOrderIdsBuiltAt`,
+is a scalar getter/setter onto the same record (see below):
 
 | Structure | View |
 |---|---|

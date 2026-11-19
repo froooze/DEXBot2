@@ -8,7 +8,7 @@ Source of truth: `modules/timing_policy.ts` (`TIMING_CLASSIFICATIONS`).
 
 ## Why an inventory
 
-The engine has **84** timing knobs. That number grew because every "the state
+The engine has **86** timing knobs. That number grew because every "the state
 was briefly wrong" bug was fixed by adding a wait, and nothing ever removed one.
 A wait is a substitute for evidence: it says *wait, then guess*. Some of that is
 unavoidable — a block takes as long as it takes — but most of it is not, and the
@@ -30,7 +30,7 @@ difference has to be written down or it will keep growing.
 ```
 external      33
 bound         19
-policy        26
+policy        28
 self-healing   6
 ```
 
