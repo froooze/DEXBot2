@@ -41,7 +41,7 @@ export interface PlacementLease {
  */
 const leaseTokens = new WeakMap<PlacementLease, number>();
 
-export interface PlacementAcquireOptions {
+interface PlacementAcquireOptions {
     timeoutMs?: number;
     isShuttingDown?: () => boolean;
 }
@@ -50,7 +50,7 @@ export interface PlacementAcquireOptions {
  * Minimal manager surface needed by {@link withPlacement}. Kept structural so
  * callers in utils/ can use it without importing OrderManager (cycle safety).
  */
-export interface PlacementCapableManager {
+interface PlacementCapableManager {
     acquirePlacement?(kind: string, options?: PlacementAcquireOptions): Promise<PlacementLease | null>;
     tryAcquirePlacement?(kind: string): PlacementLease | null;
     isPlacementActive?(): boolean;

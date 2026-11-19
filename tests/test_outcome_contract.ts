@@ -24,7 +24,7 @@ function check(name: string, actual: any, expected: any) {
 }
 
 function testUnknownOutcomeShape() {
-    console.log('\n[1] Outcome<T> gives the third case a name');
+    console.log('\n[1] unknown outcomes carry a named cause');
     const outcome = unknownOutcome('ambiguous-read');
     check('kind discriminates', outcome.kind, 'unknown');
     check('cause is required', outcome.cause, 'ambiguous-read');

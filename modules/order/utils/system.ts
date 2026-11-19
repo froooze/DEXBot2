@@ -2169,7 +2169,7 @@ export function hasLiveRefusedFillLevels(manager: OrderManagerLike | null | unde
  * @param {string} type - ORDER_TYPES.BUY / ORDER_TYPES.SELL
  * @returns {{blocked: boolean, level: number|null}} Verdict + the matched level
  */
-export function isRefusedLevelRefillBlocked(manager: OrderManagerLike | null | undefined, price: unknown, type: unknown): { blocked: boolean; level: number | null } {
+function isRefusedLevelRefillBlocked(manager: OrderManagerLike | null | undefined, price: unknown, type: unknown): { blocked: boolean; level: number | null } {
     const p = Number(price);
     if (!Number.isFinite(p) || p <= 0) return { blocked: false, level: null };
     if (type !== ORDER_TYPES.BUY && type !== ORDER_TYPES.SELL) return { blocked: false, level: null };

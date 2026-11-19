@@ -36,7 +36,7 @@
 import { ORDER_TYPES } from '../constants.js';
 
 /** Minimal shape the key builder reads (a chain fill op, a history row, or a queue entry). */
-export interface FillKeySource {
+interface FillKeySource {
     op?: unknown[];
     orderId?: string;
     block_num?: number;
@@ -46,13 +46,13 @@ export interface FillKeySource {
 }
 
 /** Minimal asset-pair shape needed to map a paid asset onto a side. */
-export interface FillSideAssets {
+interface FillSideAssets {
     assetA?: { id?: unknown } | null;
     assetB?: { id?: unknown } | null;
 }
 
 /** Persisted dedupe store shape (`OrderManager.processedFillStore`). */
-export interface FillBookedStore {
+interface FillBookedStore {
     tracker?: Map<string, number> | null;
 }
 

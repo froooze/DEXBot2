@@ -1540,9 +1540,7 @@ async function consumeFillQueue(bot: BotLike, chainOrders: ChainOrdersLike) {
                     const shouldRunDustDetection = !abortedFillCycle && !deferredFillCycle && hasAnyFills;
 
                     if (shouldRunDustDetection) {
-                        const healthResult = await bot.manager.checkGridHealth(
-                            bot.updateOrdersOnChainPlan.bind(bot)
-                        );
+                        const healthResult = await bot.manager.checkGridHealth();
                         const allDust = [
                             ...(healthResult.buyDustOrders || []),
                             ...(healthResult.sellDustOrders || []),

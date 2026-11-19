@@ -41,7 +41,7 @@ export interface BotInstanceLock {
     lockPath: string;
 }
 
-export interface AcquireInstanceLockOptions {
+interface AcquireInstanceLockOptions {
     /** Best-effort logger (manager logger or launcher console shim). */
     log?: (message: string, level?: string) => void;
 }

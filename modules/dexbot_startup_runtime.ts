@@ -307,9 +307,7 @@ async function finishStartupSequence(bot: BotLike, startupState: Awaited<ReturnT
 
                             if (!bot._shuttingDown) {
                                 try {
-                                    const reconnectHealth = await bot.manager.checkGridHealth(
-                                        bot.updateOrdersOnChainPlan.bind(bot)
-                                    );
+                                    const reconnectHealth = await bot.manager.checkGridHealth();
                                     await bot._cancelDustOrders({
                                         buy: reconnectHealth.buyDustOrders,
                                         sell: reconnectHealth.sellDustOrders,
@@ -464,9 +462,7 @@ async function finishStartupSequence(bot: BotLike, startupState: Awaited<ReturnT
 
                 if (!bot._shuttingDown) {
                     try {
-                        const postResetHealth = await bot.manager.checkGridHealth(
-                            bot.updateOrdersOnChainPlan.bind(bot)
-                        );
+                        const postResetHealth = await bot.manager.checkGridHealth();
                         await bot._cancelDustOrders({
                             buy: postResetHealth.buyDustOrders,
                             sell: postResetHealth.sellDustOrders,
@@ -818,9 +814,7 @@ async function finishStartupSequence(bot: BotLike, startupState: Awaited<ReturnT
 
                 await bot._runGridMaintenance('startup');
 
-                const startupHealth = await bot.manager.checkGridHealth(
-                    bot.updateOrdersOnChainPlan.bind(bot)
-                );
+                const startupHealth = await bot.manager.checkGridHealth();
                 await bot._cancelDustOrders({
                     buy: startupHealth.buyDustOrders,
                     sell: startupHealth.sellDustOrders,

@@ -1622,9 +1622,7 @@ function performGridResync(bot: BotLike, options: {
             // Re-detect and cancel dust immediately after full resync.
             if (!self._shuttingDown) {
                 try {
-                    const resyncHealth = await self.manager.checkGridHealth(
-                        self.updateOrdersOnChainPlan?.bind(self)
-                    );
+                    const resyncHealth = await self.manager.checkGridHealth();
                     await cancelDustOrders(self, {
                         buy: resyncHealth.buyDustOrders as ManagedOrder[] | undefined,
                         sell: resyncHealth.sellDustOrders as ManagedOrder[] | undefined,
@@ -2837,14 +2835,14 @@ async function executeMaintenanceLogic(bot: BotLike, context: string) {
 
     // Dust detection runs before the pipeline gate. Cancellation is immediate
     // (no 30s delay) and stays inside the empty-pipeline branch to avoid racing.
-    let healthResult = await bot.manager.checkGridHealth(bot.updateOrdersOnChainPlan.bind(bot));
+    let healthResult = await bot.manager.checkGridHealth();
     if (await bot._abortFlowIfIllegalState(`${context} health check`)) return;
 
     const pipelineStatus = bot.manager.isPipelineEmpty(bot._getPipelineSignals());
     if (pipelineStatus.isEmpty) {
         const repairedFromTarget = await maybeRunTargetedDriftReconciliation(bot, context);
         if (repairedFromTarget) {
-            const freshHealth = await bot.manager.checkGridHealth(bot.updateOrdersOnChainPlan.bind(bot));
+            const freshHealth = await bot.manager.checkGridHealth();
             if (await bot._abortFlowIfIllegalState(`${context} post-reconcile health check`)) return;
             healthResult = freshHealth;
         }
@@ -3719,9 +3717,7 @@ async function acquireBts(bot: BotLike, deficit: number) {
 async function runDustHealthCheck(bot: BotLike) {
     if (bot._shuttingDown || !bot.manager) return;
     try {
-        const health = await bot.manager.checkGridHealth(
-            bot.updateOrdersOnChainPlan?.bind(bot)
-        );
+        const health = await bot.manager.checkGridHealth();
         const buyDust = health.buyDustOrders || [];
         const sellDust = health.sellDustOrders || [];
         const totalDust = buyDust.length + sellDust.length;

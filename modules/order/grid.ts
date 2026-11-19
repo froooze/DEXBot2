@@ -55,7 +55,7 @@
  *  15. checkSpreadCondition(manager, BitShares, updateOrdersOnChainBatch) - Check and flag spread condition
  *
  * GRID HEALTH MONITORING (4 functions)
- *  16. checkGridHealth(manager, updateOrdersOnChainBatch) - Monitor grid health
+ *  16. checkGridHealth(manager) - Monitor grid health
  *  17. checkWindowDust(manager) - Dust check scoped to the active buy/sell window
  *  18. hasAnyDust(manager, partials, side) - Check for dust orders
  *  19. getDustOrders(manager, partials, side) - Get dust order IDs
@@ -3082,7 +3082,7 @@ export function calculateCurrentSpread(manager: OrderManagerLike): number {
      * @param {import('../types.js').OrderManagerLike} manager - Manager instance
      * @returns {{ currentSpread: number, nominalSpread: number, excess: number, buyCount: number, sellCount: number }}
      */
-export function measureSpreadExcess(manager: OrderManagerLike): { currentSpread: number; nominalSpread: number; excess: number; buyCount: number; sellCount: number } {
+function measureSpreadExcess(manager: OrderManagerLike): { currentSpread: number; nominalSpread: number; excess: number; buyCount: number; sellCount: number } {
         const { onChainBuys, onChainSells } = _getOnChainOrders(manager);
         const currentSpread = calculateSpreadFromOrders(onChainBuys, onChainSells);
         const nominalSpread = manager.config.targetSpreadPercent ?? DEFAULT_CONFIG.targetSpreadPercent;
@@ -3518,10 +3518,9 @@ export async function checkSpreadCondition(manager: OrderManagerLike, _BitShares
      * creates these gaps to maximize grid coverage during fund expansion.
      *
      * @param {import('../types.js').OrderManagerLike} manager - The manager instance.
-     * @param {Function|null} [updateOrdersOnChainBatch=null] - Optional batch update function.
-     * @returns {Promise<any>}
+     * @returns {Promise<{buyDust: boolean, sellDust: boolean, buyDustOrders: unknown[], sellDustOrders: unknown[]}>}
      */
-export async function checkGridHealth(manager: OrderManagerLike, _updateOrdersOnChainBatch: ((correction: SpreadCorrection) => Promise<{ executed?: boolean }>) | null = null): Promise<{ buyDust: boolean; sellDust: boolean; buyDustOrders: unknown[]; sellDustOrders: unknown[] }> {
+export async function checkGridHealth(manager: OrderManagerLike): Promise<{ buyDust: boolean; sellDust: boolean; buyDustOrders: unknown[]; sellDustOrders: unknown[] }> {
         if (!manager) return { buyDust: false, sellDust: false, buyDustOrders: [], sellDustOrders: [] };
 
         // Skip health checks during bootstrap to prevent spamming warnings

@@ -998,37 +998,22 @@ interface ManagerRecoveryState {
   [key: string]: unknown;
 }
 
-/**
- * Three-valued result of an operation whose outcome is not always knowable.
- *
- * The engine used to encode this as an ad-hoc `uncertain: true` property next
- * to a second ad-hoc flag (`ambiguousRead`), so the two could disagree and no
- * consumer was forced to handle the third case. `unknown` is now a real
- * alternative in the type: code that branches on "applied or not" fails to
- * compile until it says what it does when it does not know.
- */
-export type OutcomeKind = 'applied' | 'rejected' | 'unknown';
-
 /** Why the outcome is unknown. Every `unknown` must say which one it is. */
 export type UnknownCause = 'timeout' | 'ambiguous-read' | 'lost-receipt' | 'unavailable';
 
-export interface AppliedOutcome<T> {
-  kind: 'applied';
-  value: T;
-}
-
-export interface RejectedOutcome {
-  kind: 'rejected';
-  reason: string;
-}
-
+/**
+ * An outcome whose effect cannot be known: the operation may or may not have
+ * applied.
+ *
+ * Historically such sites returned ad-hoc `uncertain` / `ambiguousRead` flags
+ * that could disagree. `outcome.ts` now builds these objects from a single
+ * `cause` and derives the legacy booleans, so they cannot drift apart.
+ */
 export interface UnknownOutcome {
   kind: 'unknown';
   cause: UnknownCause;
   detail?: string;
 }
-
-export type Outcome<T = unknown> = AppliedOutcome<T> | RejectedOutcome | UnknownOutcome;
 
 /**
  * Structural mirror of `LifecycleView` (modules/order/lifecycle.ts).
@@ -1036,7 +1021,7 @@ export type Outcome<T = unknown> = AppliedOutcome<T> | RejectedOutcome | Unknown
  * Declared here rather than imported so `types.ts` stays dependency-free; the
  * registry's own view type is structurally assignable to it.
  */
-export interface OrderLifecycleViewLike {
+interface OrderLifecycleViewLike {
   slotId: string | null;
   orderId: string | null;
   phase: 'intent' | 'broadcasting' | 'landed' | 'filling' | 'gone' | 'unknown';
@@ -1331,7 +1316,7 @@ export interface OrderManagerLike {
   _fetchAccountBalancesAndSetTotals(...args: unknown[]): Promise<unknown>;
   getInitialOrdersToActivate(): ManagedOrder[];
   seedLastFilledPricesFromBook(...args: unknown[]): void;
-  checkGridHealth(...args: unknown[]): Promise<GridHealthResult>;
+  checkGridHealth(): Promise<GridHealthResult>;
   processFilledOrders(orders: unknown, excl: unknown, options?: UnknownRecord): Promise<unknown>;
   performSafeRebalance(fills?: unknown, excludeIds?: Set<string>, options?: UnknownRecord): Promise<RebalanceResult>;
   consumeIllegalStateSignal(): IllegalStateSignal | null;

@@ -2997,11 +2997,10 @@ class OrderManager implements OrderManagerLike {
     }
 
     /**
-     * @param {Function} batchCb - Batch callback
      * @returns {Promise<Object>}
      */
-    async checkGridHealth(batchCb: ((correction: unknown) => Promise<{ executed?: boolean }>) | null = null) {
-        return await checkGridHealth(this, batchCb);
+    async checkGridHealth() {
+        return await checkGridHealth(this);
     }
 
     /**

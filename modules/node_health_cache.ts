@@ -272,5 +272,5 @@ function orderNodesForSettings(settings: NodeSettings, options: HealthCacheOptio
     });
 }
 
-export { compareNodeHealth, nodeRankLatency, orderNodesFromHealthCache, orderNodesForSettings, readHealthCache, removeNodesFromHealthCache, resolveConfiguredNodes, resolveHealthCacheFile, writeHealthCache }
+export { orderNodesFromHealthCache, orderNodesForSettings, readHealthCache, removeNodesFromHealthCache, resolveConfiguredNodes, resolveHealthCacheFile, writeHealthCache }
 

@@ -152,7 +152,6 @@ export {
     DEFAULT_FLAP_PENALTY_MAX_MS,
     DEFAULT_FLAP_PENALTY_MS_PER_DROP,
     DEFAULT_FLAP_WINDOW_MS,
-    DROP_RATE_WINDOW_MS,
     MAX_DROP_TIMES,
     dropCounters,
     effectiveLatencyMs,

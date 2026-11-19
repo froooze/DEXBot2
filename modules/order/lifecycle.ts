@@ -44,7 +44,7 @@ import { TIMING } from '../constants.js';
  * an ambiguous read, or a persisted `createUncertain` marker. Consumers must
  * treat it as "may exist on chain" — never as "gone", never as "absent".
  */
-export type LifecyclePhase =
+type LifecyclePhase =
     | 'intent'        // planned locally; nothing was broadcast
     | 'broadcasting'  // CREATE sent, no receipt yet
     | 'landed'        // chain snapshot confirmed an open order
@@ -53,7 +53,7 @@ export type LifecyclePhase =
     | 'unknown';      // receipt lost / ambiguous read — may exist
 
 /** What backs the current phase. `none` means nothing was ever observed. */
-export type LifecycleEvidence =
+type LifecycleEvidence =
     | 'none'
     | 'local'
     | 'broadcast-receipt'
@@ -62,7 +62,7 @@ export type LifecycleEvidence =
     | 'adoption';
 
 /** Minimal shape of a pending CREATE entry (mirrors `PendingBroadcast`). */
-export interface PendingBroadcastLike {
+interface PendingBroadcastLike {
     slotId?: string | null;
     order?: unknown;
     fingerprint?: string | null;
@@ -72,7 +72,7 @@ export interface PendingBroadcastLike {
 }
 
 /** One lifecycle record. All clocks live here; nothing else owns a copy. */
-export interface OrderLifecycleRecord {
+interface OrderLifecycleRecord {
     /** Stable registry key. */
     key: string;
     slotId: string | null;
@@ -475,7 +475,7 @@ class LifecycleSetView extends Set<string> {
 // SECTION 6: REGISTRY
 // ===============================================================================
 
-export interface LifecycleRegistryOptions {
+interface LifecycleRegistryOptions {
     /** Clock seam for tests. Defaults to `Date.now`. */
     now?: () => number;
     /** Hard cap on retained records (GC bound, not a correctness gate). */

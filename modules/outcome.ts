@@ -8,9 +8,8 @@
  * flag describing the same fact (`ambiguousRead`), so the two could disagree
  * and no consumer was forced to handle the third case at all.
  *
- * `Outcome<T>` (modules/types.ts) gives that third case a name. This module is
- * the only place those result objects are constructed, so the flags cannot
- * drift apart: one `cause` in, both legacy booleans derived out.
+ * This module is the only place those result objects are constructed, so the
+ * flags cannot drift apart: one `cause` in, both legacy booleans derived out.
  *
  * Browser-safe: no Node APIs.
  */
@@ -39,13 +38,13 @@ export function unknownOutcome(cause: UnknownCause, detail?: string): UnknownOut
 // `unknownCowOutcome`, which derives the legacy booleans from `cause` so they
 // are consistent by construction.
 
-export interface CowOutcomeShape {
+interface CowOutcomeShape {
     executed: boolean;
     hadRotation: boolean;
     [key: string]: unknown;
 }
 
-export interface UnknownCowOutcome extends CowOutcomeShape {
+interface UnknownCowOutcome extends CowOutcomeShape {
     /** Canonical discriminator. */
     kind: 'unknown';
     /** Canonical reason. */
