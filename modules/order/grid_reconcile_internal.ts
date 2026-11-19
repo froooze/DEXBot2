@@ -15,7 +15,7 @@ import { parseSlotIndex } from './utils/slot.js';
 import { resolveAccountRef, isLastFillPlacementBlocked, hasUnsettledFills } from './utils/system.js';
 import * as Format from './format.js';
 import { getErrorMessage, getErrorCode, getErrorName } from '../utils/errors.js';
-import type { OrderManagerLike, ManagedOrder, ChainOrder, ParsedChainEntry, ParsedChainOrder, ChainOrdersLike, AssetPair, LoggerLike, UnknownRecord, StartupCreatePlan, StartupUpdatePlan, StartupCancelPlan, OrderType } from '../types.js';
+import type { OrderManagerLike, ManagedOrder, ChainOrder, ParsedChainEntry, ParsedChainOrder, ChainOrdersLike, AssetPair, LoggerLike, UnknownRecord, StartupCreatePlan, StartupUpdatePlan, StartupCancelPlan, OrderType, PipelineSourceLike } from '../types.js';
 
 interface CrossedOrderLike {
     id?: string;
@@ -1951,6 +1951,7 @@ async function _reconcileStartupSide({
     plannedUpdates,
     plannedCancels,
     planOnly = false,
+    pipelineSource,
 }: {
     orderType: OrderType;
     targetCount: number;
@@ -1965,6 +1966,8 @@ async function _reconcileStartupSide({
     plannedUpdates: StartupUpdatePlan[];
     plannedCancels: StartupCancelPlan[];
     planOnly?: boolean;
+    /** Bot-owned pipeline source; a bare manager keeps the legacy manager-only gate. */
+    pipelineSource?: PipelineSourceLike;
 }): Promise<{ chainCount: number }> {
     const logger = manager?.logger;
     const sideUpper = orderType === ORDER_TYPES.SELL ? 'SELL' : 'BUY';
@@ -2255,18 +2258,15 @@ async function _reconcileStartupSide({
     // the top-up to the cycle after the fills (and their crawl) are committed;
     // 1:1 repairs (cancelled-slot replacement, vacated-rail refill) still run.
     //
-    // SCOPE: a bare manager exposes only MANAGER-level state here
-    // (`_pendingFillCrawls`, `_fillBatchInFlight`). The bot-level queue
-    // (`_incomingFillQueue`) and the deferred-drain flag
-    // (`_deferredFillsPending`) are invisible from this source, so "queued" is
-    // covered by the CALLER's gate, not by this one. The startup and
-    // targeted-sync callers drain fills before they reconcile (the bootstrap
-    // consumer / _syncOpenOrdersAndProcessFills); the rebuild caller
-    // (recalculateGrid) has no bot and relies on the structural-rebuild
-    // bracket. That leaves only a fill arriving during this reconcile's chain
-    // read. Widening it belongs at a caller that owns the bot
-    // (docs/FILL_PIPELINE.md B2) — not a second counter here.
-    const unsettled = hasUnsettledFills(manager);
+    // SCOPE: by default a bare manager exposes only MANAGER-level state here
+    // (`_pendingFillCrawls`, `_fillBatchInFlight`). Callers that own a bot pass
+    // it as `pipelineSource` so the SAME fail-closed reader also sees the bot's
+    // `_incomingFillQueue` / `_deferredFillsPending` — a fill accepted during
+    // this reconcile's chain read is then visible to the top-up gate (B2 route
+    // b). The rebuild caller (recalculateGrid) has no bot and keeps the
+    // manager-only gate plus the structural-rebuild bracket; this is a partial
+    // fence, but adding visibility can only defer more, never less.
+    const unsettled = hasUnsettledFills(pipelineSource ?? manager);
     if (unsettled.unsettled && createCount > 0) {
         logger?.log?.(
             `Startup: Deferring ${Math.min(createCount, remainingSlots.length)} ${sideUpper} window top-up create(s): ` +

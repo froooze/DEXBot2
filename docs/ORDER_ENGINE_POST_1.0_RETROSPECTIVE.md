@@ -1545,6 +1545,14 @@ id, then re-plan only the unlanded remainder, and must respect §2 Mode C's cave
 "never half-applied" is an invariant of the refusal path only. Stop condition:
 reproduce the `2/8` partial-chunk incident in a test; if it cannot be reproduced with
 the current tree, record that and do not change broadcast behavior.
+**Outcome (corrected 2026-11-19):** the incident IS reproducible with the existing
+in-test `executeBatch` seam (`tests/test_cow_ops_per_broadcast.ts`, mutable
+`executeBatchImpl` at `:28-46`) — OPSCAP-011 (`:404+`) lands 2 of 8 chunks,
+fails chunk 3 definitively and aborts the other five, with no production change.
+The earlier "no test seam" record was wrong. The second half of the verdict is
+unchanged: this pins the fact pattern only — no broadcast or replay code changed.
+Those remain a separate, chain-mutating decision (adopt landed ops by id, then
+re-plan the unlanded remainder).
 
 **Stage 4 — final-gate observability (counters only).** `runFinalPivotGate`
 (`:7056`) already re-checks built ops against the refreshed pivot before
@@ -1556,9 +1564,10 @@ deadlock, and the queue-refresh line remains non-evidence per §9.12. **Landed:*
 `recordFinalGateMetric` (`dexbot_cow_runtime.ts`) is the single owner for
 `lastFillPivotMovedUnderBatchCount` / `lastFillGateFailOpenCount`, seeded in
 `createDefaultBotMetrics()` and pinned by FG-14 — observability only, no behavior
-change. Stage 3's spike reached its stop condition (no test seam to inject a chunk-3
-failure) and changed no broadcast code; Stage 1 landed separately after the log
-supplied a reproducing case (see above).
+change. Stage 3's spike changed no broadcast code: it first recorded "no test seam",
+then a reproducing fixture was found and landed (see Stage 3 outcome above); the
+decision to leave replay behaviour alone is unchanged. Stage 1 landed separately
+after the log supplied a reproducing case (see above).
 
 **Stage 5 — mirror provenance.** Merged into Stage 0: export anchor kind, pivot source
 and both timestamps with each candidate. Do not introduce a `queue-refresh` observation
@@ -1601,10 +1610,11 @@ case existed; the log supplied one and bounded by-id verification is now landed.
 
 > **Scope:** the two fixable residuals left by the post-v1.7.3 log audits — the
 > cold-pivot re-center wedge (§9.12 Addendum 3) and the deferral gates that still
-> peeked raw in-flight counters (INV-FILL-003). Every other item in that audit set
-> is a documented non-goal (§9.13 "Deliberately not done", §9.14 Stage 3/6,
-> `FILL_PIPELINE.md` §4 verdicts) and was deliberately left untouched. Generic
-> terms only; no market, account, bot or order id is named.
+> peeked raw in-flight counters (INV-FILL-003). The remaining audit items stay
+> non-goals (§9.13 "Deliberately not done", §9.14 Stage 3/6, `FILL_PIPELINE.md`
+> §4 verdicts); two verdict details were later revisited — see the follow-up note
+> at the end of this section. Generic terms only; no market, account, bot or order
+> id is named.
 
 **Status verdicts.**
 
@@ -1655,6 +1665,22 @@ config, TTL or guard policy changed.
 `test_fill_pipeline_contract` suites. Full suite, `typecheck`,
 `typecheck:tests`, `check:any`, `typecheck:analysis` and `verify:browser-bundle`
 green. `TIMING_INVENTORY` and the fill-pipeline ratchet counts are unchanged.
+
+**Follow-up review of the non-goal list (same date).** Two verdicts were re-checked
+against the current tree: (1) §9.14 Stage 3's "no test seam" reason for not
+reproducing the `2/8` incident was **wrong** — the mutable `executeBatchImpl` seam
+in `tests/test_cow_ops_per_broadcast.ts` reproduces it without production changes
+(OPSCAP-011); the *decision* to leave broadcast/replay code alone is unchanged, and
+the Stage 3 outcome text above is corrected. (2) `FILL_PIPELINE.md` B2 route (b) is
+now landed: an optional `pipelineSource` on `reconcileGridOrders` lets the three
+bot-owning callers pass the bot into the reconcile's unsettled-fill gate, so a fill
+queued during its chain read defers the window top-up. It is strictly additive
+fail-closed visibility; liveness for the one-shot startup reconciles relies on
+the per-tick targeted reconcile to re-derive the deferred top-up, and no soak was
+run for this change. Pinned by `tests/test_reconcile_pipeline_source.ts`. All other non-goals stand: the C3/C4
+refactors still depend on P3, D2/P5 still need soak/live evidence, and the marker
+persistence, cooldown, crossing veto, BUY exemption and one-cycle marker race stay
+rejected or accepted as recorded.
 
 ---
 

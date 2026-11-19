@@ -244,7 +244,17 @@ recommended now; **(b)** thread an optional pipeline source through
 — the `recalculateGrid` reconcile has no bot — so it buys a partial fence for a few extra
 beats of deferral; take it only if a soak shows the race.
 **Status:** route (a) applied — the gate comment now names its scope and points here.
-Route (b) stays open until a soak shows the race.
+Route (b) is **landed**: `reconcileGridOrders` accepts an optional
+`options.pipelineSource`, passed to `_reconcileStartupSide` so the same fail-closed
+reader sees bot-level queue/deferred state. The three bot-owning callers (two startup
+reconciles, targeted sync) pass `bot`; `recalculateGrid` omits it and keeps the
+manager-only gate plus the structural-rebuild bracket. It is strictly additive
+visibility — it can only defer more, never less. The two startup reconciles are
+one-shot, so a fill queued across their chain read defers the window top-up with
+no dedicated re-trigger of its own; liveness is covered by the per-tick targeted
+reconcile, which re-derives the same top-up once the fill drains. No soak was run
+for this change; the safety case is a strict superset of the previous gate.
+Pinned by `tests/test_reconcile_pipeline_source.ts` (RG-PIPE-1..4).
 
 **B3 — record the `gc:false` conservatism (doc only; do not "fix").**
 `getLivePendingBroadcasts(mgr, { gc: false })` returns entries that a GC pass would drop:

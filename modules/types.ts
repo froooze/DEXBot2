@@ -398,6 +398,14 @@ export interface BotLike {
   updateOrdersOnChainPlan(...args: unknown[]): unknown;
 }
 
+/**
+ * Minimal bot surface needed by `readFillPipelineState`: the bot-level queue
+ * and deferred flag plus the SAME manager the caller is reconciling. Passing
+ * this type (instead of `unknown`) means a misspelled field is a compile error
+ * rather than a silent fail-open "settled" answer.
+ */
+export type PipelineSourceLike = Pick<BotLike, 'manager' | '_incomingFillQueue' | '_deferredFillsPending'>;
+
 // ============================================================
 // DOMAIN: ORDER (DISCRIMINATED UNION)
 // ============================================================

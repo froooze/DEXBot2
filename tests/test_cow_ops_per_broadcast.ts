@@ -401,6 +401,48 @@ async function testLaterChunkPartialMarkersAccumulate() {
     console.log('✓ OPSCAP-010 passed');
 }
 
+/**
+ * OPSCAP-011 reproduces the 2026-11-17 `2/8` live incident with the existing
+ * in-test executeBatch seam — no production change. Two chunks land, the third
+ * fails definitively, and the remaining five are aborted. This pins the
+ * fact pattern §9.14 Stage 3 wanted reproduced; it deliberately does NOT
+ * change broadcast/replay behaviour.
+ */
+async function testTwoOfEightPartialChunkIncident() {
+    console.log('[OPSCAP-011] reproduce the 2-of-8 partial-chunk incident (test-only seam)...');
+    const bot = makeBot({ maxOps: 2 }); // 2 ops per chunk => 16 ops = 8 chunks
+    const broadcastSizes: number[] = [];
+    executeBatchImpl = async (account: any, key: any, ops: any) => {
+        broadcastSizes.push(ops.length);
+        if (ops[0]?.op_data?.testMarker === 4) {
+            // First op of chunk 3: a definitive chain rejection after two
+            // chunks already landed (the vanished-update-target signature).
+            throw new Error('opscap-011-object-does-not-exist');
+        }
+        return makeResult(ops);
+    };
+
+    const { operations, opContexts } = makeOps(16);
+    await assert.rejects(
+        () => bot._executeChunkedWithRetryOnUncertain(operations, opContexts),
+        (err: any) => {
+            assert.ok(!(err instanceof BroadcastUncertainError), 'definitive failure passes through as-is');
+            assert.match(err.message, /object-does-not-exist/, 'original definitive error preserved');
+            assert.strictEqual(err.partialOnChainState, true, 'two chunks already landed');
+            assert.strictEqual(err.chunkedBroadcast, true, 'marked as chunked broadcast');
+            assert.strictEqual(err.chunksTotal, 8, 'eight chunks total');
+            assert.strictEqual(err.chunksFailed, 1, 'the third chunk failed');
+            assert.strictEqual(err.chunksAborted, 5, 'chunks 4..8 were aborted');
+            assert.strictEqual(err.broadcastedOperationCount, 4, 'two chunks (2 ops each) landed');
+            return true;
+        }
+    );
+    // The failing chunk IS attempted (and rejected); only the five after it
+    // are aborted. Two chunks (4 ops) actually landed on chain.
+    assert.deepStrictEqual(broadcastSizes, [2, 2, 2], 'chunks 1-3 attempted, chunks 4-8 aborted');
+    console.log('✓ OPSCAP-011 passed');
+}
+
 async function testHardAbortLogUsesChunkedFields() {
     console.log('[OPSCAP-007] Partial-state log summary uses chunk fields (not stale groups fields)...');
     const { formatPartialBroadcastSummary } = require('../modules/dexbot_cow_runtime');
@@ -442,6 +484,7 @@ async function main() {
     await testDefinitiveFailureAbortsRemaining();
     await testPairModePartialNotDowngraded();
     await testLaterChunkPartialMarkersAccumulate();
+    await testTwoOfEightPartialChunkIncident();
     console.log('All COW ops-per-broadcast tests passed');
 }
 

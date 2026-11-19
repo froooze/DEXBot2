@@ -668,7 +668,7 @@ async function finishStartupSequence(bot: BotLike, startupState: Awaited<ReturnT
                                 chainOpenOrders,
                                 // This path IS the rebuild: it owns update-first
                                 // placement and must not defer on its own flag.
-                                options: { allowDuringRebuild: true },
+                                options: { allowDuringRebuild: true, pipelineSource: bot },
                             });
 
                             await bot._executeBatchIfNeeded(rebalanceResult, 'startup reconcile (regenerated grid)');
@@ -781,6 +781,7 @@ async function finishStartupSequence(bot: BotLike, startupState: Awaited<ReturnT
                             privateKey: bot.privateKey,
                             chainOrders,
                             chainOpenOrders: startupChainOpenOrders,
+                            options: { pipelineSource: bot },
                         });
 
                         await bot._executeBatchIfNeeded(rebalanceResult, 'startup reconcile (loaded grid)');

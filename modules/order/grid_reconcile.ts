@@ -19,7 +19,7 @@ import {
 } from './utils/order.js';
 import * as Format from './format.js';
 import { getErrorField, getErrorMessage } from '../utils/errors.js';
-import type { OrderManagerLike, ChainOrder, ChainOrdersLike, ManagedOrder, ParsedChainEntry, PendingPriceCorrection, GridConfig, LoggerLike, StartupCancelPlan, StartupUpdatePlan, StartupCreatePlan } from '../types.js';
+import type { OrderManagerLike, ChainOrder, ChainOrdersLike, ManagedOrder, ParsedChainEntry, PendingPriceCorrection, GridConfig, LoggerLike, StartupCancelPlan, StartupUpdatePlan, StartupCreatePlan, PipelineSourceLike } from '../types.js';
 import { readSlotLifecycle } from './lifecycle.js';
 import type { PlacementLease } from '../order/placement_lock.js';
 
@@ -240,6 +240,8 @@ export async function reconcileGridOrders({
     options?: {
         /** Rebuild callers own the rebuild and must be allowed to reconcile. */
         allowDuringRebuild?: boolean;
+        /** Bot-owned pipeline source for the startup top-up's unsettled-fill gate (B2). */
+        pipelineSource?: PipelineSourceLike;
     };
 }) {
     // Parameter validation
@@ -529,6 +531,7 @@ export async function reconcileGridOrders({
 
         const sellResult = await _reconcileStartupSide({
             orderType: ORDER_TYPES.SELL,
+            pipelineSource: options.pipelineSource,
             targetCount: targetSell,
             chainSideOrders: chainSells,
             unmatchedSideOrders: unmatchedSells,
@@ -545,6 +548,7 @@ export async function reconcileGridOrders({
 
         const buyResult = await _reconcileStartupSide({
             orderType: ORDER_TYPES.BUY,
+            pipelineSource: options.pipelineSource,
             targetCount: targetBuy,
             chainSideOrders: chainBuys,
             unmatchedSideOrders: unmatchedBuys,

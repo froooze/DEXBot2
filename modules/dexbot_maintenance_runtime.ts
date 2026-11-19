@@ -918,6 +918,7 @@ async function maybeRunTargetedDriftReconciliation(bot: BotLike, context: string
                 privateKey: bot.privateKey,
                 chainOrders,
                 chainOpenOrders: openOrders,
+                options: { pipelineSource: bot },
             });
             await bot._executeBatchIfNeeded(reconcileResult, `targeted ${context} reconcile`);
         }
