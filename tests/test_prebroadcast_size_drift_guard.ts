@@ -19,6 +19,10 @@ function makeGetObjectsMock() {
     const orders = new Map([
         ['1.7.1000', { id: '1.7.1000', sell_price: { base: { asset_id: '1.3.1', amount: 1000 }, quote: { asset_id: '1.3.2', amount: 1 } }, for_sale: '1000' }],
         ['1.7.1001', { id: '1.7.1001', sell_price: { base: { asset_id: '1.3.1', amount: 1000 }, quote: { asset_id: '1.3.2', amount: 1 } }, for_sale: '500' }],
+        // A size-reducing update already landed: both for_sale and
+        // sell_price.base dropped to 700. A builder holding the stale 1000
+        // baseline must be refused before broadcast.
+        ['1.7.1002', { id: '1.7.1002', sell_price: { base: { asset_id: '1.3.1', amount: 700 }, quote: { asset_id: '1.3.2', amount: 1 } }, for_sale: '700' }],
     ]);
     return {
         calls: 0,
@@ -28,7 +32,10 @@ function makeGetObjectsMock() {
     };
 }
 
-function makeUpdateOp(orderId: string, deltaAmount: number, sellAssetId = '1.3.1') {
+function makeUpdateOp(orderId: string, deltaAmount: number, sellAssetId = '1.3.1', newBase?: number) {
+    // A builder reading a for_sale of 1000 emits new_price.base = 1000 + delta.
+    // `newBase` overrides it to simulate a stale read (an update landed after
+    // the builder read but before broadcast).
     return {
         op_name: 'limit_order_update',
         op_data: {
@@ -36,7 +43,7 @@ function makeUpdateOp(orderId: string, deltaAmount: number, sellAssetId = '1.3.1
             seller: '1.2.1',
             order: orderId,
             new_price: {
-                base: { amount: 900, asset_id: sellAssetId },
+                base: { amount: newBase ?? 1000 + deltaAmount, asset_id: sellAssetId },
                 quote: { amount: 1, asset_id: '1.3.2' },
             },
             delta_amount_to_sell: { amount: deltaAmount, asset_id: sellAssetId },
@@ -128,15 +135,40 @@ async function main() {
         );
         console.log('  ✓ Missing on-chain order detected as stale (not size drift)');
 
-        // ── no negative-delta update ops → no pre-read RPC ────────────────────
-        const before = getObjects.calls;
-        const noNegative = await chainOrders.findOverReducingUpdateOpError([
-            { op_name: 'limit_order_create', op_data: { amount_to_sell: { amount: 100, asset_id: '1.3.1' } } },
-            makeUpdateOp('1.7.1000', 50), // positive delta — no reduction risk
+        // ── stale base size → rejected pre-broadcast (live max_amount assert) ─
+        // Chain order shrank to 700, but the op was built from the stale 1000
+        // baseline: new_price.base=1050 > max(700,700)+50=750. The chain would
+        // reject the chunk with o.new_price->base.amount <= max_amount_for_sale.
+        const staleBaseResult = await chainOrders.findOverReducingUpdateOpError([
+            makeUpdateOp('1.7.1002', 50, '1.3.1', 1050),
         ]);
-        assert.strictEqual(noNegative, null, 'batches without over-reduction risk must pass');
-        assert.strictEqual(getObjects.calls, before, 'no pre-read RPC should fire without a negative delta');
-        console.log('  ✓ No pre-read RPC for batches without negative deltas');
+        assert.ok(staleBaseResult instanceof Error,
+            'a stale for_sale baseline must yield a size-drift error pre-broadcast');
+        assert.ok(
+            /new_price\.base above max_amount_for_sale[\s\S]*detected pre-broadcast size-drift/.test(staleBaseResult.message),
+            'error must route to the size-drift repair path, got: ' + staleBaseResult.message
+        );
+        console.log('  ✓ Stale new_price.base detected before broadcast');
+
+        // ── a legitimate growth on a fresh read passes, with the new pre-read ─
+        const beforeGrowth = getObjects.calls;
+        const freshGrowth = await chainOrders.findOverReducingUpdateOpError([
+            makeUpdateOp('1.7.1000', 50), // chain for_sale=1000, sell_price.base=1000
+        ]);
+        assert.strictEqual(freshGrowth, null, 'growth derived from a fresh read must pass');
+        assert.strictEqual(getObjects.calls, beforeGrowth + 1,
+            'the new_price.base check must pre-read even for non-reducing updates');
+        console.log('  ✓ Fresh-read growth passes the new_price.base check (and is pre-read)');
+
+        // ── no update ops → no pre-read RPC ───────────────────────────────────
+        const before = getObjects.calls;
+        const noUpdate = await chainOrders.findOverReducingUpdateOpError([
+            { op_name: 'limit_order_create', op_data: { amount_to_sell: { amount: 100, asset_id: '1.3.1' } } },
+            { op_name: 'limit_order_cancel', op_data: { order: '1.7.1000' } },
+        ]);
+        assert.strictEqual(noUpdate, null, 'batches without update ops must pass');
+        assert.strictEqual(getObjects.calls, before, 'no pre-read RPC without update ops');
+        console.log('  ✓ No pre-read RPC for batches without update ops');
 
         // ── executeBatch surfaces the drift error BEFORE any broadcast ────────
         // The guard throws before createAccountClient/broadcast, so the raw

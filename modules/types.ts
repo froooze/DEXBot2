@@ -224,6 +224,10 @@ export interface BotLike {
   _structuralGridResyncRunning: number;
   _structuralGridResyncDeferCount: number;
   _structuralGridResyncDeferStartedAt: number | null;
+  // Per-cause-class defer windows plus one global ceiling for a resync episode.
+  _structuralGridResyncDeferClass?: 'short' | 'long' | null;
+  _structuralGridResyncDeferClocks?: Record<'short' | 'long', { startedAt: number; count: number }>;
+  _structuralGridResyncDeferGlobalStartedAt?: number;
   _postRecoveryRebalanceDefers: number;
   _lastDeferredDustCount: number;
   _deferredFillRetryWaits: number;

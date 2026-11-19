@@ -373,16 +373,17 @@ async function runCoreTests() {
         assert.strictEqual(attempts >= 2, true, 'Recovery should have executed at least twice after cooldown expiry');
 
         manager.accountant._performStateRecovery = async () => ({ isValid: true, reason: null });
+        // A real drift validation must have run for the budget to close.
+        (manager as any).checkFundDriftAfterFills = () => ({ isValid: true, reason: null });
         manager._recoveryState = { ...manager._recoveryState, lastAttemptAt: Date.now() - 61000 };
         const success = await manager.accountant._attemptFundRecovery(manager, 'unit-test');
         assert.strictEqual(success, true, 'Successful recovery should return true');
-        // NOTE: Successful recovery does NOT reset attempt count immediately.
-        // This prevents infinite "attempt 1/5" loops when fund invariants are violated
-        // but sync "succeeds" (no errors) without actually fixing the invariant.
-        // The counter is reset by:
-        // 1. resetRecoveryState() called at start of each periodic fetch cycle
-        // 2. Decay logic if enough time passes without violations
-        assert.strictEqual(manager._recoveryState.attemptCount, 3, 'Successful recovery should NOT reset attempt count (counter is 3 from previous attempts)');
+        // A validated recovery closes the episode: the attempt budget is per
+        // episode, not lifetime. Otherwise a slow market with five successful
+        // recoveries followed by one drift would enter the exhausted gate and
+        // block CREATEs until the periodic fetch (live 2026-11-18 incident).
+        assert.strictEqual(manager._recoveryState.attemptCount, 0, 'Successful recovery resets the per-episode attempt count');
+        assert.strictEqual(manager._recoveryState.lastFailureAt, 0, 'Successful recovery clears the failure decay anchor');
 
         manager.accountant._performStateRecovery = originalRecovery;
     }
@@ -426,6 +427,61 @@ async function runCoreTests() {
         const replayed = await manager.accountant.processFillAccounting(fillOp, fillKey);
         assert.strictEqual(replayed, false, 'Same fill key must be rejected as a duplicate');
         assert.ok(manager._recoveryExhaustedAt, 'Replay must NOT clear the exhausted gate');
+    }
+
+    // Test: a run of successful recoveries does not consume the lifetime budget
+    // Mutation: remove the attemptCount/lastFailureAt reset in the success branch
+    // of _attemptFundRecovery -> the 6th entry below trips the exhausted gate.
+    console.log(' - Testing recovery budget is per-episode, not lifetime...');
+    {
+        const manager = await createManager();
+        (manager.config as any).pipelineTiming = {
+            RECOVERY_RETRY_INTERVAL_MS: 0,
+            MAX_RECOVERY_ATTEMPTS: 5
+        };
+        manager.accountant._performStateRecovery = async () => ({ isValid: true, reason: null });
+        (manager as any).checkFundDriftAfterFills = () => ({ isValid: true, reason: null });
+
+        for (let i = 0; i < 5; i++) {
+            const ok = await manager.accountant._attemptFundRecovery(manager, 'unit-test');
+            assert.strictEqual(ok, true, `Success ${i + 1} must be accepted`);
+            assert.strictEqual(manager._recoveryState.attemptCount, 0,
+                `Success ${i + 1} must close the episode (no lifetime budget accumulation)`);
+        }
+        assert.ok(!manager._recoveryExhaustedAt, 'Five successes must not set the exhausted gate');
+
+        manager.accountant._performStateRecovery = async () => ({ isValid: false, reason: 'forced failure' });
+        for (let i = 0; i < 5; i++) {
+            await manager.accountant._attemptFundRecovery(manager, 'unit-test');
+        }
+        assert.ok(!manager._recoveryExhaustedAt,
+            'A fresh failure episode must still have its full budget after earlier successes');
+        await manager.accountant._attemptFundRecovery(manager, 'unit-test');
+        assert.ok(manager._recoveryExhaustedAt,
+            'Five consecutive failures in the new episode must still exhaust and fail closed');
+    }
+
+    // Test: a persistence-only "success" must not close the attempt episode
+    console.log(' - Testing skipped drift validation keeps the attempt budget...');
+    {
+        const manager = await createManager();
+        (manager.config as any).pipelineTiming = {
+            RECOVERY_RETRY_INTERVAL_MS: 0,
+            MAX_RECOVERY_ATTEMPTS: 5
+        };
+        manager.accountant._performStateRecovery = async () => ({ isValid: true, reason: null });
+        (manager as any).checkFundDriftAfterFills = () => ({
+            isValid: true,
+            reason: 'Skipped: missing assets or totals'
+        });
+        (manager as any)._recoveryState = {
+            attemptCount: 3, lastAttemptAt: Date.now() - 61000, lastFailureAt: Date.now(),
+            inFlight: false, structuralResyncRequested: false
+        };
+        await manager.accountant._attemptFundRecovery(manager, 'unit-test');
+        assert.strictEqual(manager._recoveryState.attemptCount, 4,
+            'a skipped drift check validates persistence only; the budget must keep counting');
+        assert.ok(manager._recoveryState.lastFailureAt > 0, 'the failure anchor must be preserved');
     }
 
     // Test: recalibration runs on an empty read (all-filled account)

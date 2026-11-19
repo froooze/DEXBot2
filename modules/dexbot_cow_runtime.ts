@@ -6338,12 +6338,17 @@ async function updateOrdersOnChainBatchCOWBody(
         // repair owner; a vanished cancel target is already gone and may still
         // use stale cleanup. No guard weakened — structural resync stays the
         // fallback when the repair fails.
-        const preBroadcastSizeDriftGone = /\(detected pre-broadcast size-drift\)/.test(errMsg)
-            && /does not exist/i.test(errMsg);
+        // Every error from the pre-broadcast guard carries the size-drift
+        // marker — a missing target, an over-reducing delta, AND the
+        // new_price.base/max_amount_for_sale rejection. All of them mean the
+        // op was built from stale chain state, so all reach the single
+        // in-place repair owner instead of falling through to a replay of the
+        // same stale op on the next cycle.
+        const preBroadcastSizeDrift = /\(detected pre-broadcast size-drift\)/.test(errMsg);
         const updateTargetIds = extractUpdateTargetOrderIds(opContexts);
         const goneUpdateTarget = [...goneOrderIds].some((id) => updateTargetIds.has(id));
         if (/Cannot deduct all or more from order than order contains/.test(errMsg)
-            || preBroadcastSizeDriftGone || goneUpdateTarget) {
+            || preBroadcastSizeDrift || goneUpdateTarget) {
             return await bot._recoverBatchSizeDrift(err, opContexts) as JsonObj;
         }
 
@@ -6425,6 +6430,31 @@ async function restoreBoundaryAfterAdoption(bot: BotLike, workingBoundary: numbe
     }
 }
 
+// A lagging node can miss freshly broadcast CREATEs for longer than the by-id
+// retry budget (live: both bots deferred adoption after 3 reads on the same
+// node, which cascaded into duplicate levels, fund drift and a forced reload).
+// Ask the node manager for a failover once per cooldown, then retry by id on
+// the replacement node before giving up. Bounded so a slow node cannot turn
+// adoption into a reconnect loop.
+const ADOPTION_FAILOVER_COOLDOWN_MS = 5 * 60 * 1000;
+// A clean decline (internal cooldown, in-flight reconnect, no better node) is
+// transient: retry after this much shorter interval instead of burning the
+// full per-bot cooldown. A thrown failover clears the latch entirely.
+const ADOPTION_FAILOVER_DECLINE_RETRY_MS = 30 * 1000;
+const adoptionFailoverAt = new WeakMap<object, number>();
+
+async function defaultAdoptionNodeFailover(): Promise<boolean> {
+    try {
+        const client = await import('./bitshares_client.js');
+        if (typeof client._assessFailover !== 'function') return false;
+        return Boolean(await client._assessFailover(
+            'by-id adoption reads lagging: fresh CREATEs absent after the full retry budget'
+        ));
+    } catch {
+        return false;
+    }
+}
+
 /**
  * Converge master with the chain after a COW commit was refused (master moved
  * during broadcast) or an uncertain broadcast was poll-confirmed.
@@ -6455,7 +6485,14 @@ async function restoreBoundaryAfterAdoption(bot: BotLike, workingBoundary: numbe
  * @returns {Promise<boolean>} true if master was adopted from the chain
  */
 async function adoptPlacedBatchFromChain(bot: BotLike, chainOrders: typeof chainOrdersModule, logPrefix: string, opts: JsonObj = {}): Promise<boolean> {
-    const { placedResults = null, placedContexts = null, polledCreateIds = null } = opts || {};
+    const {
+        placedResults = null, placedContexts = null, polledCreateIds = null, nodeFailover = null,
+        // Test seams: the production retry budget/backoff come from the frozen
+        // COW_PERFORMANCE constants; callers in tests inject small values so the
+        // lagging-read paths do not sleep for seconds.
+        adoptionReadMaxAttempts = null, adoptionReadBackoffMs = null,
+        failoverCooldownMs = null, failoverDeclineRetryMs = null,
+    } = opts || {};
     try {
         const mgr = bot.manager;
         const accountRef = bot.accountId || (bot.account as unknown as { id?: string } | null)?.id || bot.account;
@@ -6476,8 +6513,14 @@ async function adoptPlacedBatchFromChain(bot: BotLike, chainOrders: typeof chain
             // is a lagging node, not a missing order; a read error is equally
             // transient. Retry with backoff before deferring to the structural
             // resync path — deferral blocks CREATEs for minutes.
-            const maxAttempts = Math.max(1, Number(COW_PERFORMANCE.ADOPTION_READ_MAX_ATTEMPTS) || 3);
-            const baseBackoff = Math.max(250, Number(COW_PERFORMANCE.ADOPTION_READ_BACKOFF_MS) || 2000);
+            const attemptsRaw = Number(adoptionReadMaxAttempts ?? COW_PERFORMANCE.ADOPTION_READ_MAX_ATTEMPTS);
+            const maxAttempts = Number.isFinite(attemptsRaw) && attemptsRaw >= 1 ? Math.floor(attemptsRaw) : 3;
+            const backoffRaw = Number(adoptionReadBackoffMs ?? COW_PERFORMANCE.ADOPTION_READ_BACKOFF_MS);
+            // Keep the production 250ms floor; test seams may inject 0 for
+            // instant replays.
+            const baseBackoff = Number.isFinite(backoffRaw) && backoffRaw >= 0
+                ? (adoptionReadBackoffMs == null ? Math.max(250, backoffRaw) : backoffRaw)
+                : 2000;
             let chainMap: Map<string, ChainOrderLike> | null = null;
             let laggingCreateIds: string[] = [];
             let lastReadError: string | null = null;
@@ -6513,6 +6556,86 @@ async function adoptPlacedBatchFromChain(bot: BotLike, chainOrders: typeof chain
                         'warn'
                     );
                     await sleep(wait);
+                }
+            }
+            // Cross-node fallback: every attempt above went to the SAME node.
+            // A lagging node is a node problem, not proof the orders are gone;
+            // request a bounded failover and give the by-id read one more shot
+            // on a caught-up node before deferring (the 2026-11-18 cascade hit
+            // both bots simultaneously with "absent from 3 chain read(s)").
+            if ((chainMap && laggingCreateIds.length > 0) || !chainMap) {
+                const failover = typeof nodeFailover === 'function'
+                    ? nodeFailover as () => Promise<boolean>
+                    : defaultAdoptionNodeFailover;
+                const cooldownRaw = Number(failoverCooldownMs ?? ADOPTION_FAILOVER_COOLDOWN_MS);
+                const failoverCooldown = Number.isFinite(cooldownRaw) && cooldownRaw >= 1
+                    ? cooldownRaw : ADOPTION_FAILOVER_COOLDOWN_MS;
+                const declineRaw = Number(failoverDeclineRetryMs ?? ADOPTION_FAILOVER_DECLINE_RETRY_MS);
+                const declineRetryRaw = Number.isFinite(declineRaw) && declineRaw >= 0
+                    ? declineRaw : ADOPTION_FAILOVER_DECLINE_RETRY_MS;
+                // Monotonic even if a seam passes a larger retry than the
+                // cooldown: never collapse back to the full 5-minute latch.
+                const declineRetry = Math.min(declineRetryRaw, Math.max(1, failoverCooldown - 1));
+                const now = Date.now();
+                const lastAt = adoptionFailoverAt.get(bot) || 0;
+                if (now - lastAt >= failoverCooldown) {
+                    adoptionFailoverAt.set(bot, now);
+                    bot.manager?.logger?.log?.(
+                        `${logPrefix} By-id adoption lagging after ${maxAttempts} read(s); requesting cross-node failover before deferring`,
+                        'warn'
+                    );
+                    let failoverSucceeded = false;
+                    try {
+                        const didFailover = await failover();
+                        if (didFailover !== true) {
+                            // assessFailover declines on its own short cooldown,
+                            // an in-flight reconnect, or no better node. Those are
+                            // transient: shorten this bot's latch so the next
+                            // adoption cycle can try again. Never claim a node
+                            // switch that did not happen. Cost: a permanently
+                            // declined failover repeats the health sweep every
+                            // 30 s (no reconnects — only a successful failover
+                            // reconnects, and that keeps the 5-minute latch).
+                            adoptionFailoverAt.set(bot, Date.now() - (failoverCooldown - declineRetry));
+                            bot.manager?.logger?.log?.(
+                                `${logPrefix} Cross-node failover unavailable (cooldown/disabled/no alternative); ` +
+                                `retrying after ${declineRetry}ms; deferring as before`,
+                                'warn'
+                            );
+                        } else {
+                            // Re-stamp after the awaited reconnect so a slow
+                            // successful failover still holds the full latch
+                            // from completion (same accounting as the decline).
+                            failoverSucceeded = true;
+                            adoptionFailoverAt.set(bot, Date.now());
+                            chainMap = await chainOrders.batchReadOrders(knownIds);
+                            if (chainMap) {
+                                laggingCreateIds = createIds.filter((id) => chainMap?.get(id) == null);
+                                if (laggingCreateIds.length === 0) {
+                                    bot.manager?.logger?.log?.(
+                                        `${logPrefix} By-id adoption recovered on the replacement node; proceeding with adoption`,
+                                        'info'
+                                    );
+                                }
+                            }
+                        }
+                    } catch (failoverErr) {
+                        // Only a failover that actually THREW is transient —
+                        // release its latch. A by-id read failing AFTER a
+                        // successful reconnect keeps the full latch the success
+                        // branch stamped, so a fresh-connection read error
+                        // cannot turn into a reconnect loop.
+                        if (!failoverSucceeded) adoptionFailoverAt.delete(bot);
+                        bot.manager?.logger?.log?.(
+                            `${logPrefix} Cross-node adoption read failed: ${getErrorMessage(failoverErr)}; deferring as before`,
+                            'warn'
+                        );
+                    }
+                } else {
+                    bot.manager?.logger?.log?.(
+                        `${logPrefix} Cross-node adoption failover suppressed by cooldown (${failoverCooldown}ms)`,
+                        'debug'
+                    );
                 }
             }
             if (!chainMap) {

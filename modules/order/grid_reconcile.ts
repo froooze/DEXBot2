@@ -18,7 +18,7 @@ import {
     reviveVirtualSlotFromChain, getLivePendingBroadcasts,
 } from './utils/order.js';
 import * as Format from './format.js';
-import { getErrorMessage } from '../utils/errors.js';
+import { getErrorField, getErrorMessage } from '../utils/errors.js';
 import type { OrderManagerLike, ChainOrder, ChainOrdersLike, ManagedOrder, ParsedChainEntry, PendingPriceCorrection, GridConfig, LoggerLike, StartupCancelPlan, StartupUpdatePlan, StartupCreatePlan } from '../types.js';
 import { readSlotLifecycle } from './lifecycle.js';
 import type { PlacementLease } from '../order/placement_lock.js';
@@ -706,6 +706,10 @@ export async function reconcileGridOrders({
                         break;
                     } catch (err) {
                         logger?.log?.(`Startup: Update batch attempt ${attempt}/${maxBatchAttempts} failed: ${getErrorMessage(err)}`, 'error');
+                        // getErrorMessage() strips the stack; keep it at debug so a
+                        // TypeError from a shared guard/log helper is pinpointable.
+                        const stack = getErrorField<string>(err, 'stack');
+                        if (stack) logger?.log?.(`Startup: Update batch attempt ${attempt}/${maxBatchAttempts} stack: ${stack}`, 'debug');
 
                         const refreshedChainOrders = await _recoverStartupSyncFailure({
                             chainOrders,

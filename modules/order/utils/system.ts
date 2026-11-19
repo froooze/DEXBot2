@@ -2160,8 +2160,12 @@ export function evaluateLastFillGuard(manager: OrderManagerLike | null | undefin
         // does: a broken marker must never veto a healthy placement.
         try {
             const refused = isRefusedLevelRefillBlocked(manager, price, type);
-            if (refused.blocked) {
-                return { blocked: true, pivot: refused.level, threshold: refused.level, refusedLevel: true };
+            if (refused?.blocked) {
+                // Defensive: an undefined marker result must not throw out of
+                // this best-effort check (the old unguarded `.level` read on a
+                // guard object is the exact shape of a live startup error).
+                const level = Number.isFinite(Number(refused?.level)) ? Number(refused.level) : null;
+                return { blocked: true, pivot: level, threshold: level, refusedLevel: true };
             }
         } catch { /* marker is best-effort */ }
     }
@@ -2288,7 +2292,10 @@ export function isLastFillPlacementBlocked(manager: OrderManagerLike | null | un
         // live and must keep blocking the same-level re-fill (§9.12/P2 amended).
         try {
             const refused = isRefusedLevelRefillBlocked(manager, numPrice, type);
-            if (refused.blocked) return { blocked: true, pivot: refused.level, reason: 'refused-level' };
+            if (refused?.blocked) {
+                const level = Number.isFinite(Number(refused?.level)) ? Number(refused.level) : null;
+                return { blocked: true, pivot: level, reason: 'refused-level' };
+            }
         } catch { /* fail-open */ }
         return { blocked: false, pivot: null };
     }

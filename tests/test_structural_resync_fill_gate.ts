@@ -13,9 +13,13 @@
  * between them turned a completed order into a phantom parked in the gap band,
  * which froze the boundary crawl so the spread could not be closed.
  *
- * The deferral reuses the existing batch-in-flight defer (same retry timer,
- * same max-defer escape hatch), so a permanently unsettled pipeline still
- * forces the resync instead of parking it forever.
+ * The deferral reuses the existing batch-in-flight retry timer, but an
+ * unsettled pipeline gets its own longer max-defer cap: forcing a reload at
+ * the ordinary 30 s cap reintroduces the rollback this gate exists to prevent.
+ * A permanently unsettled pipeline still forces the resync eventually (5 min),
+ * and a global ceiling bounds the whole episode even if the defer cause keeps
+ * alternating between short-cap and long-cap classes, so recovery cannot park
+ * forever.
  */
 
 const assert = require('assert');
@@ -172,12 +176,124 @@ async function testDeferredDrainDefersReload() {
     check('reload ran once after the drain cleared', calls, ['reload']);
 }
 
+// ---------------------------------------------------------------------------
+// 3. An unsettled fill pipeline gets a dedicated max-defer cap
+// ---------------------------------------------------------------------------
+async function testUnsettledFillHasLongerCap() {
+    console.log('\n[3] an unsettled fill pipeline is not forced at the 30s cap');
+    const { bot, calls } = makeBot('test_structural_resync_long_cap');
+    bot._wireStructuralGridResyncRequest();
+    bot._incomingFillQueue.push({ op: { order_id: '1.7.900' }, block_num: 1, id: '1.1.1' });
+
+    await bot.manager.requestStructuralGridResync('fund invariant drift', {});
+    await sleep(300);
+    // Pretend the ordinary 30s cap has elapsed: the fill cause must still defer.
+    bot._structuralGridResyncDeferStartedAt = Date.now() - 31_000;
+    await sleep(450);
+    check('no forced reload at 30s with an unsettled pipeline', calls, []);
+    check('resync still scheduled under the longer cap', Boolean(bot._structuralGridResyncTimer), true);
+
+    // The dedicated 5-minute cap still bounds the deferral.
+    bot._structuralGridResyncDeferStartedAt = Date.now() - (5 * 60 * 1000 + 1000);
+    await waitFor(() => calls.length >= 1, 'forced reload after the dedicated fill cap');
+    check('reload eventually forced', calls, ['reload']);
+    bot._incomingFillQueue.length = 0;
+    if (bot._structuralGridResyncTimer) clearTimeout(bot._structuralGridResyncTimer);
+
+    // Other causes keep the ordinary 30s cap.
+    const { bot: placementBot, calls: placementCalls } = makeBot('test_structural_resync_short_cap');
+    placementBot._wireStructuralGridResyncRequest();
+    let held = true;
+    (placementBot.manager as any).isPlacementActive = () => held;
+    (placementBot.manager as any).placementKind = () => 'spread-correction';
+    await placementBot.manager.requestStructuralGridResync('fund invariant drift', {});
+    await sleep(300);
+    placementBot._structuralGridResyncDeferStartedAt = Date.now() - 31_000;
+    await waitFor(() => placementCalls.length >= 1, 'forced reload at 30s for a placement region');
+    check('ordinary causes still force at 30s', placementCalls, ['reload']);
+    held = false;
+    if (placementBot._structuralGridResyncTimer) clearTimeout(placementBot._structuralGridResyncTimer);
+}
+
+// ---------------------------------------------------------------------------
+// 4. A cause-class change restarts the defer clock
+// ---------------------------------------------------------------------------
+async function testDeferClassChangeRestoresClock() {
+    console.log('\n[4] switching cause classes saves and restores each clock');
+    const { bot, calls } = makeBot('test_structural_resync_class_switch');
+    bot._wireStructuralGridResyncRequest();
+    let held = true;
+    (bot.manager as any).isPlacementActive = () => held;
+    (bot.manager as any).placementKind = () => 'spread-correction';
+
+    await bot.manager.requestStructuralGridResync('fund invariant drift', {});
+    await sleep(300);
+    const shortStart = bot._structuralGridResyncDeferStartedAt;
+
+    // Short -> long: placement ends, a fill queues.
+    held = false;
+    bot._incomingFillQueue.push({ op: { order_id: '1.7.901' }, block_num: 1, id: '1.1.2' });
+    await sleep(450);
+    check('no reload after the first switch', calls, []);
+    check('defer class switched to long', bot._structuralGridResyncDeferClass, 'long');
+    check('long clock started fresh', bot._structuralGridResyncDeferStartedAt > shortStart, true);
+    const longStart = bot._structuralGridResyncDeferStartedAt;
+
+    // Long -> short: returning to a used class must restore its OWN window,
+    // not restart from now (a mutation of `saved.startedAt || now` breaks this).
+    held = true;
+    bot._incomingFillQueue.length = 0;
+    await sleep(450);
+    check('no reload after the second switch', calls, []);
+    check('defer class switched back to short', bot._structuralGridResyncDeferClass, 'short');
+    check('short clock restored to its original start', bot._structuralGridResyncDeferStartedAt, shortStart);
+    check('long clock saved for a future switch',
+        bot._structuralGridResyncDeferClocks.long.startedAt, longStart);
+
+    if (bot._structuralGridResyncTimer) clearTimeout(bot._structuralGridResyncTimer);
+}
+
+// ---------------------------------------------------------------------------
+// 5. Alternating causes cannot park the resync forever
+// ---------------------------------------------------------------------------
+async function testAlternatingCauseStillForces() {
+    console.log('\n[5] an alternating defer cause still reaches the global ceiling');
+    const { bot, calls } = makeBot('test_structural_resync_alternating');
+    bot._wireStructuralGridResyncRequest();
+    let placementHeld = true;
+    (bot.manager as any).isPlacementActive = () => placementHeld;
+    (bot.manager as any).placementKind = () => 'spread-correction';
+
+    await bot.manager.requestStructuralGridResync('fund invariant drift', {});
+    await sleep(300);
+    // Simulate a long episode, then flip between the short-cap and long-cap
+    // causes faster than the defer tick. With one resettable clock this would
+    // never force; the global ceiling must still end the episode.
+    bot._structuralGridResyncDeferGlobalStartedAt = Date.now() - (5 * 60 * 1000 + 1000);
+    const flip = setInterval(() => {
+        placementHeld = !placementHeld;
+        if (placementHeld) bot._incomingFillQueue.length = 0;
+        else bot._incomingFillQueue.push({ op: { order_id: '1.7.902' }, block_num: 1, id: '1.1.3' });
+    }, 40);
+    try {
+        await waitFor(() => calls.length >= 1, 'forced reload despite alternating causes');
+        check('global ceiling forces reload under alternating causes', calls, ['reload']);
+    } finally {
+        clearInterval(flip);
+        bot._incomingFillQueue.length = 0;
+        if (bot._structuralGridResyncTimer) clearTimeout(bot._structuralGridResyncTimer);
+    }
+}
+
 async function run() {
     console.log('Running structural-resync fill-gate tests...');
     await testQueuedFillDefersReload();
     await testPlacementRegionDefersReload();
     await testOtherInFlightFlagsDeferReload();
     await testDeferredDrainDefersReload();
+    await testUnsettledFillHasLongerCap();
+    await testDeferClassChangeRestoresClock();
+    await testAlternatingCauseStillForces();
 
     if (failures > 0) {
         console.error(`\n❌ ${failures} structural-resync fill-gate assertion(s) failed`);

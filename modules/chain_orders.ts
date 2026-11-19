@@ -1290,36 +1290,76 @@ async function findOverReducingUpdateOpError(operations: unknown): Promise<Error
     // against the already-decremented for_sale, not the pre-batch value.
     // Checking each op independently against the original for_sale would miss
     // a cumulative over-reduction that the chain still rejects.
+    //
+    // Also validate the chain's new_price assertion for EVERY update op (not
+    // only reductions): limit_order_update_evaluator requires
+    //   new_price.base.amount <= max(for_sale, sell_price.base.amount) + delta
+    // An update built from a stale for_sale read (a size-reducing update landed
+    // between build and broadcast) otherwise aborts the whole chunk after the
+    // earlier chunks have already landed. Both checks use one fresh chain read.
     const orderDeltas = new Map<string, number>();
+    const updateOpsByOrder = new Map<string, OperationLike[]>();
     for (const op of (operations as OperationLike[]) || []) {
-        if (op?.op_name === 'limit_order_update' && op?.op_data?.delta_amount_to_sell) {
-            const deltaData = op.op_data.delta_amount_to_sell as { amount?: unknown };
-            const delta = toFiniteNumber(deltaData.amount);
-            if (delta < 0) {
-                const orderKey = String(op.op_data.order);
-                orderDeltas.set(orderKey, (orderDeltas.get(orderKey) || 0) + delta);
-            }
+        if (op?.op_name !== 'limit_order_update') continue;
+        const orderKey = String(op.op_data?.order);
+        const deltaData = op.op_data?.delta_amount_to_sell as { amount?: unknown } | undefined;
+        const delta = toFiniteNumber(deltaData?.amount);
+        if (delta < 0) {
+            orderDeltas.set(orderKey, (orderDeltas.get(orderKey) || 0) + delta);
         }
+        const ops = updateOpsByOrder.get(orderKey) || [];
+        ops.push(op);
+        updateOpsByOrder.set(orderKey, ops);
     }
-    if (orderDeltas.size === 0) return null;
+    if (updateOpsByOrder.size === 0) return null;
 
-    const orderMap = await batchReadOrders([...orderDeltas.keys()], TIMING.CONNECTION_TIMEOUT_MS);
-    for (const [orderId, totalDelta] of orderDeltas) {
+    const orderMap = await batchReadOrders([...updateOpsByOrder.keys()], TIMING.CONNECTION_TIMEOUT_MS);
+    for (const [orderId, ops] of updateOpsByOrder) {
         const chainOrder = orderMap.get(orderId);
+        const allDelta = ops.reduce((sum, op) => {
+            const d = op.op_data?.delta_amount_to_sell as { amount?: unknown } | undefined;
+            return sum + toFiniteNumber(d?.amount);
+        }, 0);
         if (!chainOrder) {
             return new Error(
                 `object ${orderId} does not exist: ` +
-                `limit_order_update delta=${totalDelta} targets an order missing on chain ` +
+                `limit_order_update delta=${allDelta} targets an order missing on chain ` +
                 `(detected pre-broadcast size-drift)`
             );
         }
         const currentForSale = toFiniteNumber(chainOrder.for_sale);
+        const totalDelta = orderDeltas.get(orderId) || 0;
         if (currentForSale + totalDelta <= 0) {
             return new Error(
                 `Cannot deduct all or more from order than order contains: ` +
                 `order ${orderId} current for_sale=${currentForSale} ` +
                 `delta=${totalDelta} (detected pre-broadcast size-drift)`
             );
+        }
+
+        // Mirror the chain evaluator sequentially: each op is validated against
+        // the state left by the previous op in the same batch, then applies
+        // (sell_price.base <- new_price.base, for_sale += delta).
+        let simForSale = currentForSale;
+        let simBase = toFiniteNumber(chainOrder.sell_price?.base?.amount);
+        for (const op of ops) {
+            const deltaData = op.op_data?.delta_amount_to_sell as { amount?: unknown } | undefined;
+            const delta = toFiniteNumber(deltaData?.amount);
+            const priceData = op.op_data?.new_price as { base?: { amount?: unknown } } | undefined;
+            const newBase = Number(priceData?.base?.amount);
+            if (Number.isFinite(newBase)) {
+                const maxForSale = Math.max(simForSale, simBase) + delta;
+                if (newBase > maxForSale) {
+                    return new Error(
+                        `Cannot set new_price.base above max_amount_for_sale: ` +
+                        `order ${orderId} new_price.base=${newBase} > ` +
+                        `max(for_sale=${simForSale}, sell_price.base=${simBase}) + delta=${delta} ` +
+                        `(detected pre-broadcast size-drift)`
+                    );
+                }
+                simBase = newBase;
+            }
+            simForSale += delta;
         }
     }
     return null;

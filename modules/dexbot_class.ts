@@ -262,7 +262,10 @@ class DEXBot implements BotLike {
     _spreadCorrectionStall!: SpreadCorrectionStall | null;
     _strandedHoldSince!: Map<string, number>;
     _structuralGridResyncDeferCount!: number;
-    _structuralGridResyncDeferStartedAt!: number;
+    _structuralGridResyncDeferStartedAt!: number | null;
+    _structuralGridResyncDeferClass?: 'short' | 'long' | null;
+    _structuralGridResyncDeferClocks?: Record<'short' | 'long', { startedAt: number; count: number }>;
+    _structuralGridResyncDeferGlobalStartedAt?: number;
     _testPollIntervalMs!: number;
     _getPm2ProcessNames!: (...args: unknown[]) => Promise<string[]>;
     _listenForFillsHook!: (...args: unknown[]) => unknown;

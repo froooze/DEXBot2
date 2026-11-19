@@ -32,7 +32,7 @@ const { BitShares } = bitsharesModule;
 import { BroadcastUncertainError } from './dexbot_credential_client.js';
 import * as configModule from './config.js';
 const { Config } = configModule;
-import { getErrorMessage } from './utils/errors.js';
+import { getErrorField, getErrorMessage } from './utils/errors.js';
 import type { BotLike, OrderManagerLike, ManagedOrder, OrderType, SpreadCorrectionStall, BotMetrics } from './types.js';
 
 /**
@@ -2824,6 +2824,8 @@ async function executeMaintenanceLogic(bot: BotLike, context: string) {
             }
         } catch (correctionErr) {
             bot._warn(`[MAINT] Price-correction drain failed: ${getErrorMessage(correctionErr)}`);
+            const correctionStack = getErrorField<string>(correctionErr, 'stack');
+            if (correctionStack) bot.manager?.logger?.log?.(`[MAINT] Price-correction drain stack: ${correctionStack}`, 'debug');
         }
     }
 
@@ -3840,6 +3842,12 @@ function wireStructuralGridResyncRequest(bot: BotLike) {
         // the resync forever (a fill-storm defer loop once kept the flag armed
         // indefinitely). After the cap, the resync forces instead of re-arming.
         const STRUCTURAL_RESYNC_MAX_DEFER_MS = 30000;
+        // An unsettled fill pipeline is not a benign "wait a tick" cause: the
+        // on-disk snapshot can still describe pre-fill sizes, so forcing at 30 s
+        // rolls applied fills back (the 2026-11-18 cascade forced after 121
+        // defers). Give that cause its own longer bound; it still cannot park
+        // the resync forever, and every other cause keeps the 30 s cap.
+        const UNSETTLED_FILL_DEFER_MAX_MS = 5 * 60 * 1000;
         const runStructuralResync = async () => {
             bot._structuralGridResyncTimer = null;
             if (bot._shuttingDown) return;
@@ -3879,9 +3887,10 @@ function wireStructuralGridResyncRequest(bot: BotLike) {
                 ? (bot.manager?.placementKind?.() || 'unknown')
                 : null;
             // Same four deferrals as the snapshot-reject gate (batch, recovery,
-            // deferred rebalance, pipeline) plus the placement region: the
-            // max-defer cap bounds all of them, so this symmetry cannot park
-            // a resync forever.
+            // deferred rebalance, pipeline) plus the placement region. Each
+            // cause class has its own max-defer cap and the whole episode is
+            // bounded by a global ceiling, so this symmetry cannot park a
+            // resync forever even when causes alternate.
             const deferCause = !inFlight.ok
                 ? 'pipeline activity unreadable'
                 : (inFlight.batchInFlight ? `batch in flight`
@@ -3889,20 +3898,66 @@ function wireStructuralGridResyncRequest(bot: BotLike) {
                         : (inFlight.deferredRebalance ? 'deferred rebalance pending'
                             : (fillPipeline.unsettled ? `fill pipeline not settled: ${fillPipeline.reason}`
                                 : (placementKind ? `placement region held by ${placementKind}` : null)))));
+            const clearDeferBookkeeping = () => {
+                bot._structuralGridResyncDeferStartedAt = null;
+                bot._structuralGridResyncDeferCount = 0;
+                bot._structuralGridResyncDeferGlobalStartedAt = 0;
+                bot._structuralGridResyncDeferClass = null;
+                const clocks = bot._structuralGridResyncDeferClocks;
+                if (clocks) {
+                    clocks.short = { startedAt: 0, count: 0 };
+                    clocks.long = { startedAt: 0, count: 0 };
+                }
+            };
             if (deferCause) {
+                // "pipeline activity unreadable" is the one cause where we
+                // cannot tell whether fills are unsettled — forcing a reload
+                // on uncertainty is the rollback this gate prevents, so it
+                // gets the long cap too.
+                const longCapCause = deferCause.startsWith('fill pipeline not settled')
+                    || deferCause === 'pipeline activity unreadable';
+                const maxDeferMs = longCapCause ? UNSETTLED_FILL_DEFER_MAX_MS : STRUCTURAL_RESYNC_MAX_DEFER_MS;
                 const now = Date.now();
+                const causeClass = longCapCause ? 'long' : 'short';
+                // Keep one clock PER CLASS plus one global ceiling. A cause
+                // that alternates (batch in flight <-> fill pipeline) would
+                // otherwise reset a single clock every tick and never reach
+                // either cap, parking the resync forever under sustained
+                // activity. Switching classes saves/restores progress instead,
+                // and the global ceiling bounds the whole episode.
+                const clocks = bot._structuralGridResyncDeferClocks ??= {
+                    short: { startedAt: 0, count: 0 },
+                    long: { startedAt: 0, count: 0 },
+                };
+                if (!bot._structuralGridResyncDeferGlobalStartedAt) {
+                    bot._structuralGridResyncDeferGlobalStartedAt = now;
+                }
+                const previousClass = bot._structuralGridResyncDeferClass;
+                if (previousClass !== causeClass) {
+                    if (previousClass && clocks[previousClass]) {
+                        clocks[previousClass].startedAt = bot._structuralGridResyncDeferStartedAt || 0;
+                        clocks[previousClass].count = bot._structuralGridResyncDeferCount || 0;
+                    }
+                    const saved = clocks[causeClass];
+                    bot._structuralGridResyncDeferStartedAt = saved.startedAt || now;
+                    bot._structuralGridResyncDeferCount = saved.count || 0;
+                    bot._structuralGridResyncDeferClass = causeClass;
+                }
                 if (!bot._structuralGridResyncDeferStartedAt) {
                     bot._structuralGridResyncDeferStartedAt = now;
                     bot._structuralGridResyncDeferCount = 0;
                 }
                 bot._structuralGridResyncDeferCount = (bot._structuralGridResyncDeferCount || 0) + 1;
                 const deferredMs = now - bot._structuralGridResyncDeferStartedAt;
-                if (deferredMs >= STRUCTURAL_RESYNC_MAX_DEFER_MS) {
+                const globalMs = now - (bot._structuralGridResyncDeferGlobalStartedAt ?? now);
+                const globalCeiling = Math.max(STRUCTURAL_RESYNC_MAX_DEFER_MS, UNSETTLED_FILL_DEFER_MAX_MS);
+                if (deferredMs >= maxDeferMs || globalMs >= globalCeiling) {
                     bot._warn(
-                        `[RECOVERY] Structural resync max-defer reached (${deferredMs}ms, cap ${STRUCTURAL_RESYNC_MAX_DEFER_MS}ms, deferred ${bot._structuralGridResyncDeferCount}x) — forcing despite ${deferCause}: ${reason}`
+                        `[RECOVERY] Structural resync max-defer reached (${deferredMs}ms, cap ${maxDeferMs}ms, ` +
+                        `global ${globalMs}ms/${globalCeiling}ms, deferred ${bot._structuralGridResyncDeferCount}x) — ` +
+                        `forcing despite ${deferCause}: ${reason}`
                     );
-                    bot._structuralGridResyncDeferStartedAt = null;
-                    bot._structuralGridResyncDeferCount = 0;
+                    clearDeferBookkeeping();
                 } else {
                     // Fix #7 (docs/ORDER_ENGINE_POST_1.0_RETROSPECTIVE.md §2): throttle the defer log to the
                     // first occurrence per cap window (a fill storm can emit hundreds of
@@ -3910,11 +3965,11 @@ function wireStructuralGridResyncRequest(bot: BotLike) {
                     // the final forced message.
                     if (bot._structuralGridResyncDeferCount === 1) {
                         bot._warn(
-                            `[RECOVERY] Structural resync defer (${deferCause}, deferred ${deferredMs}ms/${STRUCTURAL_RESYNC_MAX_DEFER_MS}ms): ${reason}`
+                            `[RECOVERY] Structural resync defer (${deferCause}, deferred ${deferredMs}ms/${maxDeferMs}ms): ${reason}`
                         );
                     } else {
                         bot.manager?.logger?.log?.(
-                            `[RECOVERY] Structural resync defer (suppressed; ${deferCause}, count=${bot._structuralGridResyncDeferCount}, deferred ${deferredMs}ms/${STRUCTURAL_RESYNC_MAX_DEFER_MS}ms): ${reason}`,
+                            `[RECOVERY] Structural resync defer (suppressed; ${deferCause}, count=${bot._structuralGridResyncDeferCount}, deferred ${deferredMs}ms/${maxDeferMs}ms): ${reason}`,
                             'debug'
                         );
                     }
@@ -3922,8 +3977,7 @@ function wireStructuralGridResyncRequest(bot: BotLike) {
                     return;
                 }
             } else {
-                bot._structuralGridResyncDeferStartedAt = null;
-                bot._structuralGridResyncDeferCount = 0;
+                clearDeferBookkeeping();
             }
 
             bot._structuralGridResyncRunning++;

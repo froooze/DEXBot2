@@ -1312,11 +1312,34 @@ class Accountant {
                   mgr.logger?.log?.('[RECOVERY] State recovery succeeded', 'info');
                   state.structuralResyncRequested = false;
                   mgr._fundDriftLedger = null;
-                  // NOTE: Do NOT reset attemptCount here. The fund invariant check will
-                  // run again after recovery returns. If the invariant is still violated,
-                  // we want the counter to increment properly (2/5, 3/5, etc.) rather
-                  // than resetting to 1/5 each time. The decay logic (line ~402) will
-                  // reset the counter if enough time passes without violations.
+                  // A recovery that actually re-validated the fund invariant
+                  // closes the episode. isValid alone is not enough: a manager
+                  // without checkFundDriftAfterFills, or a "Skipped: ..." drift
+                  // result, validates persistence only. Keeping the counter
+                  // there preserves the fail-closed max-attempt gate for a
+                  // "successful" but ineffective recovery. Conversely, counting
+                  // genuine successes made MAX_RECOVERY_ATTEMPTS a lifetime
+                  // budget (live: successes consumed attempts 4/5 and the next
+                  // drift blocked every CREATE until a destructive reload).
+                  // Consequence: a drift that recurs but keeps validating clean
+                  // is no longer bounded by MAX_RECOVERY_ATTEMPTS, and the zero
+                  // count also opens the RECOVERY_RETRY_INTERVAL_MS cooldown
+                  // gate — each clean validation is fresh evidence that closes
+                  // the episode (still once per fill cycle via _recoveryAttempted).
+                  let fundsValidated = false;
+                  try {
+                      if (typeof mgr.checkFundDriftAfterFills === 'function') {
+                          const drift = mgr.checkFundDriftAfterFills() as { isValid?: unknown; reason?: unknown } | null | undefined;
+                          const reason = String(drift?.reason ?? '');
+                          fundsValidated = drift?.isValid === true && !reason.startsWith('Skipped:');
+                      }
+                  } catch {
+                      fundsValidated = false;
+                  }
+                  if (fundsValidated) {
+                      state.attemptCount = 0;
+                      state.lastFailureAt = 0;
+                  }
                   return true;
               }
 

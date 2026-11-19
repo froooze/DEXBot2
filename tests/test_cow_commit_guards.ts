@@ -1291,6 +1291,77 @@ async function testSizeDriftGoneTargetRoutesToInPlaceRepair() {
     console.log('✓ COW-COMMIT-018 passed');
 }
 
+async function testNewPriceBaseSizeDriftRoutesToInPlaceRepair() {
+    console.log('\n[COW-COMMIT-020] a new_price.base size-drift rejection routes to in-place repair...');
+
+    const masterOrders = new Map([
+        ['slot-1', createOrder('slot-1', { type: ORDER_TYPES.BUY, price: 1.0, orderId: '1.7.1001' })]
+    ]);
+    const { bot, manager } = createCowExecutionFixture(masterOrders);
+    (manager as any)._gapSlots = 2;
+    (manager as any).performSafeRebalance = async () => ({ aborted: false });
+    let resyncRequests = 0;
+    (manager as any).requestStructuralGridResync = async () => { resyncRequests += 1; return { scheduled: true }; };
+
+    const originalBatchRead = chainOrders.batchReadOrders;
+    const originalExecuteBatch = chainOrders.executeBatch;
+    const originalBuildUpdate = chainOrders.buildUpdateOrderOp;
+    chainOrders.batchReadOrders = async (_ids: string[]) => new Map([['1.7.1001', { id: '1.7.1001' }]]);
+    chainOrders.buildUpdateOrderOp = async () => ({
+        op: { op_name: 'limit_order_update', op_data: { order: '1.7.1001' } },
+        finalInts: null
+    });
+    let executeCalls = 0;
+    chainOrders.executeBatch = async () => {
+        executeCalls += 1;
+        // The guard's new check refuses an update built from a stale for_sale
+        // baseline. Same single repair owner as the other size-drift paths.
+        throw new Error(
+            'Cannot set new_price.base above max_amount_for_sale: order 1.7.1001 ' +
+            'new_price.base=1050 > max(for_sale=700, sell_price.base=700) + delta=50 ' +
+            '(detected pre-broadcast size-drift)'
+        );
+    };
+
+    let repairIds: string[] = [];
+    (bot as any)._targetedOrderRepair = async (ids: string[]) => {
+        repairIds = ids;
+        return true;
+    };
+    let staleCleanupCalls = 0;
+    (bot as any)._recoverExplicitStaleOrders = async () => {
+        staleCleanupCalls += 1;
+        return { executed: false, stale: true };
+    };
+
+    const workingGrid = new WorkingGrid(manager.orders, { baseVersion: 0 });
+    try {
+        const result: any = await bot._updateOrdersOnChainBatchCOW({
+            workingGrid,
+            workingIndexes: workingGrid.getIndexes(),
+            workingBoundary: (manager as any).boundaryIdx,
+            actions: [{
+                type: COW_ACTIONS.UPDATE,
+                id: 'slot-1',
+                orderId: '1.7.1001',
+                order: { id: 'slot-1', type: ORDER_TYPES.BUY, price: 1.0, size: 100, state: ORDER_STATES.ACTIVE, orderId: '1.7.1001' }
+            }]
+        });
+        assert.strictEqual(executeCalls >= 1, true, 'the batch must have reached the chain');
+        assert.deepStrictEqual(repairIds, ['1.7.1001'], 'the stale-base target must go to in-place repair');
+        assert.strictEqual(staleCleanupCalls, 0, 'stale cleanup must not run for a size-drift refusal');
+        assert.strictEqual(result.reason, 'ORDER_SIZE_DRIFT_TARGETED', 'the targeted repair result must survive');
+        assert.strictEqual(resyncRequests, 0, 'no snapshot reload for a repaired slot');
+        await waitFor(() => !bot._postRecoveryRebalanceTimer, 'deferred post-repair re-plan to settle', 2000);
+    } finally {
+        chainOrders.batchReadOrders = originalBatchRead;
+        chainOrders.executeBatch = originalExecuteBatch;
+        chainOrders.buildUpdateOrderOp = originalBuildUpdate;
+    }
+
+    console.log('✓ COW-COMMIT-020 passed');
+}
+
 async function testMarkerlessGoneUpdateTargetRoutesToInPlaceRepair() {
     console.log('\n[COW-COMMIT-019] a marker-less chain rejection of an UPDATE target still uses in-place repair...');
 
@@ -1607,6 +1678,7 @@ async function run() {
     await testRejectsMissingUpdateTargetBeforeBroadcast();
     await testRepairsMissingUpdateTargetInPlace();
     await testSizeDriftGoneTargetRoutesToInPlaceRepair();
+    await testNewPriceBaseSizeDriftRoutesToInPlaceRepair();
     await testMarkerlessGoneUpdateTargetRoutesToInPlaceRepair();
     await testUnrepairableMissingTargetStillEscalates();
     await testAllowsPresentUpdateTargetThroughGuard();
