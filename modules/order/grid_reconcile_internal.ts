@@ -1966,7 +1966,12 @@ async function _reconcileStartupSide({
     plannedUpdates: StartupUpdatePlan[];
     plannedCancels: StartupCancelPlan[];
     planOnly?: boolean;
-    /** Bot-owned pipeline source; a bare manager keeps the legacy manager-only gate. */
+    /**
+     * Bot-owned pipeline source; a bare manager keeps the legacy manager-only gate.
+     * When present, `pipelineSource.manager` must be THIS `manager` — the reader
+     * reads manager-level crawls through it, so a detached stub reads the wrong
+     * pipeline instead of failing closed.
+     */
     pipelineSource?: PipelineSourceLike;
 }): Promise<{ chainCount: number }> {
     const logger = manager?.logger;

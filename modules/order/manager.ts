@@ -88,6 +88,7 @@ import type {
     IllegalStateSignal,
     AccountingFailureSignal,
     BotMetrics,
+    PipelineSignals,
     AccountOrdersLike,
     CowAction,
     RebalanceResult,
@@ -3024,10 +3025,13 @@ class OrderManager implements OrderManagerLike {
      * @param {Object|number} [pipelineSignals] - Pipeline state signals or queue length
      * @returns {unknown}
      */
-    isPipelineEmpty(pipelineSignals: number | Record<string, unknown> = 0) {
+    isPipelineEmpty(pipelineSignals: number | PipelineSignals | Record<string, unknown> = 0) {
+        // PipelineSignals is a strict interface (no index signature), so cast
+        // at this single read boundary instead of weakening the exported type;
+        // the keys consumed below are fixed and typed in PipelineSignals.
         const normalizedSignals: Record<string, unknown> = (typeof pipelineSignals === 'number')
             ? { incomingFillQueueLength: pipelineSignals }
-            : (pipelineSignals || {});
+            : ((pipelineSignals as unknown as Record<string, unknown>) || {});
 
         const incomingFillQueueLength = toFiniteNumber(normalizedSignals.incomingFillQueueLength);
         const shadowLocks = toFiniteNumber(normalizedSignals.shadowLocks);

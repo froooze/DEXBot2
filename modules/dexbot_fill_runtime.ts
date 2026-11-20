@@ -6,7 +6,7 @@ import { PROCESSED_FILL_PERSISTENCE_MODES } from './order/processed_fill_store.j
 import { NATIVE_CLIENT, FILL_PROCESSING, TIMING, MAINTENANCE, ORDER_TYPES } from './constants.js';
 import { getErrorMessage, resolveSeamMsOrNull, getErrorField } from './utils/errors.js';
 import type { BotLike, ManagerLogger, IncomingFill, ManagedOrder } from './types.js';
-import { isOrderDoesNotExistError } from './dexbot_maintenance_runtime.js';
+import { isOrderDoesNotExistError, checkPipelineInFlightWatchdogs } from './dexbot_maintenance_runtime.js';
 import { slotIndexForPrice, isChainPriceOutOfGrid, isSlotInRail, resolveGapSlots } from './order/utils/math.js';
 import { attributeUnmatchedFillToGrid } from './order/utils/order.js';
 
@@ -18,6 +18,7 @@ const correctAllPriceMismatches = lazyShim('./order/utils/order', 'correctAllPri
 const parseChainOrder = lazyShim('./order/utils/order', 'parseChainOrder');
 const retryPersistenceIfNeeded = lazyShim('./order/utils/system', 'retryPersistenceIfNeeded');
 const getPipelineInFlightAgeMs = lazyShim('./order/utils/system', 'getPipelineInFlightAgeMs');
+const readBotInFlightFlags = lazyShim('./order/utils/system', 'readBotInFlightFlags');
 const { readOpenOrdersGuarded } = chainOrders;
 
 type ChainOrdersLike = typeof chainOrders;
@@ -805,6 +806,17 @@ function scheduleDeferredFillRetry(bot: BotLike, chainOrders: ChainOrdersLike, r
                 bot.manager._clearStaleBroadcastFlag();
             }
         } catch { /* watchdog must never break the retry */ }
+        // Heal malformed pipeline counters from the ONLY path guaranteed to run
+        // while the queue is parked: a non-empty queue holds the maintenance
+        // idle gate shut, so executeMaintenanceLogic (and its leak watchdog)
+        // never gets here. Without this, a NaN counter wedges every fail-closed
+        // gate with no wake — the exact shape this retry helper was written
+        // for. Idempotent for finite counters (stale age + placement still
+        // apply). No separate drain wake: the consume below IS the drain once
+        // the counter is readable; scheduling another would double-drain.
+        try {
+            checkPipelineInFlightWatchdogs(bot, { wakeDrain: false });
+        } catch { /* watchdog must never break the retry */ }
         const consume = typeof bot._consumeFillQueue === 'function'
             ? () => bot._consumeFillQueue(chainOrders)
             : () => consumeFillQueue(bot, chainOrders);
@@ -1130,7 +1142,13 @@ async function consumeFillQueue(bot: BotLike, chainOrders: ChainOrdersLike) {
         }
     } catch { /* watchdog must never break fill consumption */ }
 
-    if (bot._batchInFlight || bot._recoverySyncInFlight) {
+    // One owner for pipeline liveness (INV-FILL-003): the raw truthiness check
+    // used here read NaN/undefined as "idle" and let the CONSUMER — the one
+    // component that definitely runs while the queue is non-empty — process a
+    // fill against a half-rebuilt grid. `ok: false` defers just like an active
+    // counter; the level-triggered retry below supplies the wake.
+    const inFlight = readBotInFlightFlags(bot);
+    if (!inFlight.ok || inFlight.batchInFlight || inFlight.recoveryInFlight) {
         bot.manager?.logger?.log?.(
             `Fill processing deferred: order pipeline active (${bot._incomingFillQueue.length} queued)`,
             'debug'

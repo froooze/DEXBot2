@@ -399,12 +399,58 @@ export interface BotLike {
 }
 
 /**
- * Minimal bot surface needed by `readFillPipelineState`: the bot-level queue
- * and deferred flag plus the SAME manager the caller is reconciling. Passing
- * this type (instead of `unknown`) means a misspelled field is a compile error
- * rather than a silent fail-open "settled" answer.
+ * Minimal bot surface accepted by `options.pipelineSource` on
+ * `reconcileGridOrders`: the bot-level queue and deferred flag plus the SAME
+ * manager the caller is reconciling. Typing the option makes a misspelled field
+ * at a caller a compile error; the reader keeps a defensive `unknown` boundary
+ * and does its own field access through a typed local (`FillPipelineFields` in
+ * `order/utils/system.ts`), so both sides of the seam are checked. A detached
+ * manager here silently reads the wrong manager's crawls — see the option JSDoc.
  */
 export type PipelineSourceLike = Pick<BotLike, 'manager' | '_incomingFillQueue' | '_deferredFillsPending'>;
+
+/**
+ * Congestion signals read by `OrderManager.isPipelineEmpty` and surfaced in the
+ * metrics snapshot / shutdown log. `livenessOk: false` means a field was UNREADABLE —
+ * distinct from the known flags being false (INV-FILL-003). Deliberately NOT an
+ * `UnknownRecord`: a strict shape keeps excess-property checking on literals.
+ */
+export interface PipelineSignals {
+    incomingFillQueueLength: number;
+    shadowLocks: number;
+    batchInFlight: boolean;
+    recoveryInFlight: boolean;
+    livenessOk: boolean;
+    broadcasting: boolean;
+}
+
+/**
+ * Field-level view shared by `readBotInFlightFlags` and the leak watchdog.
+ * Every field name is declared, not reached through a `Record<string, unknown>`
+ * index signature: a misspelled counter/stamp is a compile error rather than a
+ * silent `undefined` read (the fail-open class `FillPipelineFields` closes for
+ * the fill reader).
+ */
+export interface InFlightFields {
+    _batchInFlight?: unknown;
+    _batchInFlightStartedAt?: unknown;
+    _recoverySyncInFlight?: unknown;
+    _recoverySyncInFlightStartedAt?: unknown;
+    _deferredRebalanceAt?: unknown;
+}
+
+/**
+ * Watchdog check shape: each counter key is paired with its own `*StartedAt`
+ * stamp via a mapped type, so a swapped or misspelled pair cannot compile.
+ */
+export type InFlightCounterCheck = {
+    [K in '_batchInFlight' | '_recoverySyncInFlight']: {
+        countKey: K;
+        startedKey: `${K}StartedAt`;
+        label: string;
+        staleMs: number;
+    };
+}['_batchInFlight' | '_recoverySyncInFlight'];
 
 // ============================================================
 // DOMAIN: ORDER (DISCRIMINATED UNION)
@@ -586,6 +632,11 @@ export interface BotMetrics extends UnknownRecord {
   fillProcessingTimeMs: number;
   lockContentionEvents: number;
   maxQueueDepth: number;
+  /**
+   * Derived by `getMetrics()` from `readBotInFlightFlags`, not a stored counter:
+   * false means a liveness field was unreadable (INV-FILL-003), not "idle".
+   */
+  pipelineLivenessOk?: boolean;
   gridLockContention: number;
   fundRecalcCount: number;
   /** Genuine post-broadcast commit refusals (working grid rejected). Excludes a poll-confirmed success that merely reuses the recovery funnel for adoption. */

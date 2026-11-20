@@ -108,7 +108,7 @@ import { runtime } from '../../runtime.js';
 import { getErrorMessage, sleepMs } from '../../utils/errors.js';
 import { normalizeAssetRef } from '../../utils/asset_symbols.js';
 import { withTimeout } from './timeout.js';
-import type { OrderManagerLike, BotLike, AccountOrdersLike, ManagedOrder, AccountTotals, CowAction } from '../../types.js';
+import type { OrderManagerLike, BotLike, AccountOrdersLike, ManagedOrder, AccountTotals, CowAction, PipelineSourceLike, InFlightFields } from '../../types.js';
 import type { WorkingGrid as WorkingGridType } from '../working_grid.js';
 const { ensureDir, readJSON } = storage;
 const systemLogger = new Logger('System');
@@ -2435,6 +2435,18 @@ export function extractUpdateTargetOrderIds(opContexts: unknown): Set<string> {
     return ids;
 }
 
+/**
+ * Field-level view for `readFillPipelineState`. The reader keeps a defensive
+ * `unknown` boundary (callers may hand it anything), but EVERY field access
+ * happens through this typed local: a misspelled field is a compile error on
+ * both sides of the `pipelineSource` seam, not a silent fail-open "settled".
+ */
+type FillPipelineFields = Pick<PipelineSourceLike, '_incomingFillQueue' | '_deferredFillsPending'> & {
+    manager?: unknown;
+    _pendingFillCrawls?: unknown;
+    _fillBatchInFlight?: unknown;
+};
+
 /** Pipeline state the fill blockers are derived from. `ok: false` means UNREADABLE, not settled. */
 export interface FillPipelineState {
     ok: boolean;
@@ -2463,15 +2475,19 @@ export function readFillPipelineState(source: unknown): FillPipelineState {
     const settled: FillPipelineState = { ok: true, queued: 0, deferred: false, inFlight: 0, owed: 0 };
     if (!source || typeof source !== 'object') return settled;
     try {
-        const outer = source as { manager?: unknown; _incomingFillQueue?: unknown; _deferredFillsPending?: unknown };
+        // Typed locals, not inline anonymous casts: every field below is part
+        // of FillPipelineFields, so a typo fails to compile instead of reading
+        // `undefined` and reporting a settled pipeline (the fail-open class
+        // this reader exists to close).
+        const outer = source as unknown as FillPipelineFields;
         const mgr = (outer.manager && typeof outer.manager === 'object'
             ? outer.manager
-            : outer) as { _pendingFillCrawls?: unknown; _fillBatchInFlight?: unknown };
+            : outer) as unknown as FillPipelineFields;
         const queue = outer._incomingFillQueue;
         if (queue !== undefined && queue !== null && !Array.isArray(queue)) {
             return { ...settled, ok: false, error: '_incomingFillQueue is not an array' };
         }
-        const crawls = (mgr as { _pendingFillCrawls?: unknown })._pendingFillCrawls;
+        const crawls = mgr._pendingFillCrawls;
         if (crawls !== undefined && crawls !== null && !Array.isArray(crawls)) {
             return { ...settled, ok: false, error: '_pendingFillCrawls is not an array' };
         }
@@ -2669,7 +2685,7 @@ export function readBotInFlightFlags(source: unknown): {
 } {
     const outer = source as { manager?: unknown } | null | undefined;
     const hasManager = !!(outer?.manager && typeof outer.manager === 'object');
-    const bot = (hasManager ? outer : source) as Record<string, unknown> | null | undefined;
+    const bot = (hasManager ? outer : source) as unknown as InFlightFields | null | undefined;
     if (!bot || typeof bot !== 'object') {
         return { ok: false, batchInFlight: false, recoveryInFlight: false, deferredRebalance: false };
     }
@@ -2681,7 +2697,7 @@ export function readBotInFlightFlags(source: unknown): {
     // Batch/recovery counters are bot-scoped; the deferred-rebalance stamp is
     // manager-scoped (manager.ts:3297 etc). Reading it from the bot would make
     // the "deferred rebalance pending" branch dead code.
-    const mgr = hasManager ? outer!.manager as Record<string, unknown> : null;
+    const mgr = hasManager ? outer!.manager as unknown as InFlightFields | null : null;
     const batch = count(bot._batchInFlight);
     const recovery = count(bot._recoverySyncInFlight);
     const deferred = count(mgr?._deferredRebalanceAt);

@@ -249,12 +249,19 @@ Route (b) is **landed**: `reconcileGridOrders` accepts an optional
 reader sees bot-level queue/deferred state. The three bot-owning callers (two startup
 reconciles, targeted sync) pass `bot`; `recalculateGrid` omits it and keeps the
 manager-only gate plus the structural-rebuild bracket. It is strictly additive
-visibility — it can only defer more, never less. The two startup reconciles are
-one-shot, so a fill queued across their chain read defers the window top-up with
-no dedicated re-trigger of its own; liveness is covered by the per-tick targeted
-reconcile, which re-derives the same top-up once the fill drains. No soak was run
-for this change; the safety case is a strict superset of the previous gate.
-Pinned by `tests/test_reconcile_pipeline_source.ts` (RG-PIPE-1..4).
+visibility — it can only defer more, never less. `pipelineSource.manager` MUST be
+the manager being reconciled: the reader falls back to `source.manager` for
+manager-level crawls, so a detached stub would read the wrong pipeline. The
+reader keeps a defensive `unknown` boundary but does every field access through
+a typed local, so a typo is a compile error on both sides of the seam. The two
+startup reconciles are one-shot, so a fill queued across their chain read defers
+the window top-up with no dedicated re-trigger of its own; liveness comes from
+the targeted reconcile when its trigger fires (a triggered path, NOT an
+unconditional per-tick top-up), which re-derives the same top-up once the fill
+drains. The regenerated-grid startup path (the initial placement after a rebuild)
+goes through the same deferred gate, not only the loaded-grid path. No soak was
+run for this change; the safety case is a strict superset of the previous gate.
+Pinned by `tests/test_reconcile_pipeline_source.ts` (RG-PIPE-1..5).
 
 **B3 — record the `gc:false` conservatism (doc only; do not "fix").**
 `getLivePendingBroadcasts(mgr, { gc: false })` returns entries that a GC pass would drop:
@@ -273,14 +280,34 @@ reconcile until another path GCs the map. This is the intended fail-closed answe
 writer and reader unchanged.
 
 **B5 — deferral gates peeked raw in-flight counters (post-v1.7.3 audit).**
-The lightweight-sync gate and the pipeline-clear drain (`dexbot_maintenance_runtime.ts`)
-and the recovery-sync / post-recovery-rebalance gates (`dexbot_state_recovery.ts`)
-used `!counter` / `(counter || 0) > 0`, which read an unreadable counter as "idle"
-and opened the gate — the fail-open shape C5 closed for grid mutation. They now
-call `readBotInFlightFlags(bot)`; `ok: false` defers with the existing wake sources
-(maintenance tick, leak watchdog, rebalance timer), and no timing window was added.
+Seven gates across four modules used raw `!counter` / `counter || 0` peeks that
+read an unreadable counter as "idle" and opened the gate — the fail-open shape C5
+closed for grid mutation. The four originally converted were the lightweight-sync
+gate, the pipeline-clear drain (`dexbot_maintenance_runtime.ts`) and the recovery-sync
+/ post-recovery-rebalance gates (`dexbot_state_recovery.ts`). The three that
+remained raw were the fill CONSUMER (`dexbot_fill_runtime.ts`, the highest-stakes:
+it runs whenever the queue is non-empty), the open-orders sync loop and the
+broadcast region-end drain. All now call `readBotInFlightFlags(bot)`; `ok: false`
+defers with the existing wake sources (retry timer, maintenance tick, leak
+watchdog, rebalance timer), and no timing window was added. The leak watchdog
+also force-clears non-finite counters and the manager deferred-rebalance stamp
+(previously `Number(x) || 0` mapped NaN to "zero" and skipped it). Crucially,
+maintenance is idle-gated by a non-empty queue, so the watchdog is unreachable in
+the very state the drain gate cares about; `scheduleDeferredFillRetry` now calls
+the watchdog with `wakeDrain: false` on each parked-queue tick and re-consumes,
+so the documented fail-closed wake is real. The retry path runs the WHOLE
+watchdog, so it also applies the normal stale-finite clear (same age bound and
+placement veto) to a leaked counter parked with the queue — not only the
+non-finite clear; that is the watchdog policy, just reached from a new caller.
+`getPipelineSignals` uses the same
+owner and exposes typed `livenessOk` (mirrored as `pipelineLivenessOk` in
+`getMetrics`, which the shutdown log prints — there is no status command that
+reads the metrics snapshot);
+both liveness readers now use declared field/keyof-union types, so a misspelled
+counter or stamp is a compile error instead of a silent `undefined`.
+The recovery request log now distinguishes "unreadable" from an actual duplicate.
 **Status:** fixed; pinned by `tests/test_guard_generation_and_gate_owner.ts`
-(GG-005/006). No credit, order-count, sizing or boundary change.
+(GG-005..010). No credit, order-count, sizing or boundary change.
 
 ### P3 — One consumer (5 d, highest risk)
 

@@ -74,7 +74,18 @@ async function triggerStateRecoverySync(bot: BotLike, reason: string = 'state re
     // falsy (NaN/undefined) used to start a SECOND recovery sync while one was
     // already in flight; unreadable now defers to the next request.
     const inFlight = readBotInFlightFlags(bot);
-    if (!inFlight.ok || inFlight.recoveryInFlight) {
+    if (!inFlight.ok) {
+        // Not a duplicate: we cannot tell whether anything is in flight. Keep
+        // the unreadable answer visible (same `ok=` convention as the
+        // post-recovery rebalance gate) instead of mislabelling it.
+        bot.manager.logger.log(
+            `[RECOVERY] Skipping recovery request (${reason}): pipeline activity unreadable ` +
+            `(ok=${inFlight.ok}); the next request re-evaluates it`,
+            'warn'
+        );
+        return;
+    }
+    if (inFlight.recoveryInFlight) {
         bot.manager.logger.log(`[RECOVERY] Skipping duplicate recovery request: ${reason}`, 'warn');
         return;
     }

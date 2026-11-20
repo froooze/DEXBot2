@@ -1621,7 +1621,7 @@ case existed; the log supplied one and bounded by-id verification is now landed.
 | Track | Verdict | Reason |
 |---|---|---|
 | A — cold-pivot guard generation | **Landed** | The dedupe key now has one owner over both guard references; the bounded expiry is reachable on a refused sweep |
-| B — deferral/scheduling gates | **Landed** | Four gates migrated to `readBotInFlightFlags`; unreadable now defers instead of opening the gate |
+| B — deferral/scheduling gates | **Landed** | Seven gates across four modules migrated to `readBotInFlightFlags`; unreadable now defers instead of opening the gate |
 | Stale failover status line | **Landed (doc only)** | §2's "cross-node failover remains open" was superseded by `9985162e` |
 
 **Track A — one re-center per guard generation.** `resolveGuardGenerationKey`
@@ -1640,15 +1640,28 @@ re-center, and a refused SELL rung is not mistaken for a BUY-side bind (side-awa
 `hasLiveRefusedFillLevels(manager, type)`). The empty-candidate operator line
 still names the refused level; only the stall cause changed.
 
-**Track B — one liveness owner in the deferral gates.** The lightweight-sync gate
-and `drainFillQueueAfterPipelineClear` (`dexbot_maintenance_runtime.ts`), plus
-`triggerStateRecoverySync` and the post-recovery rebalance timer
-(`dexbot_state_recovery.ts`), used raw `!counter` / `(counter || 0) > 0` peeks that
-read an unreadable counter as "idle" and opened a gate while a batch or recovery
-was active. They now call `readBotInFlightFlags(bot)`: unreadable defers
-(`ok: false`), the maintenance tick / leak watchdog / rebalance timer provide the
-existing wake, and no new timing window is introduced. This closes the last
-scheduling-path residue of the INV-FILL-003 closure (§9.13 post-release addendum).
+**Track B — one liveness owner in the deferral gates.** Seven gates used raw
+`!counter` / `(counter || 0) > 0` peeks that read an unreadable counter as "idle"
+and opened a gate while a batch or recovery was active: the lightweight-sync
+gate, `drainFillQueueAfterPipelineClear` and the open-orders sync loop
+(`dexbot_maintenance_runtime.ts`), `triggerStateRecoverySync` and the
+post-recovery rebalance timer (`dexbot_state_recovery.ts`), the fill consumer
+(`dexbot_fill_runtime.ts`) and the broadcast region-end drain (`dexbot_class.ts`).
+They now call `readBotInFlightFlags(bot)`: unreadable defers (`ok: false`), the
+retry timer / maintenance tick / leak watchdog / rebalance timer provide the
+existing wake, and no new timing window is introduced. The leak watchdog now
+force-clears non-finite counters and the manager deferred-rebalance stamp (they
+used to be skipped by `Number(x) || 0`). Since a parked queue idle-gates
+maintenance, the fill retry path calls the watchdog too (`wakeDrain: false`, so
+there is no double drain) and re-consumes — that is the wake that makes the
+fail-closed gates safe. `getPipelineSignals` shares the owner and reports
+`livenessOk` (declared `PipelineSignals`, mirrored as `pipelineLivenessOk` in
+`getMetrics` and printed in the shutdown log), both liveness readers use
+declared field/keyof-union types so a
+misspelled counter/stamp cannot silently read `undefined`, and the
+recovery-request log no longer calls an unreadable pipeline a "duplicate".
+This closes the last scheduling-path residue of the INV-FILL-003
+closure (§9.13 post-release addendum).
 
 **Gates and stop conditions.** Re-centering a refused sweep may happen at most
 once per generation; the next heal is the bounded expiry, not another re-center.
@@ -1657,7 +1670,7 @@ watchdog — never add a timer. If a scheduling gate defers with no wake, revert
 that site (liveness beats symmetry). No credit, order count, sizing, boundary,
 config, TTL or guard policy changed.
 
-**Verification.** `tests/test_guard_generation_and_gate_owner.ts` (GG-001..006),
+**Verification.** `tests/test_guard_generation_and_gate_owner.ts` (GG-001..010),
 `tests/test_spread_last_fill_planning.ts` (SLF-14), plus the existing
 `test_stale_grid_hardening`, `test_refused_level_refill_block`,
 `test_fill_one_counter_order`, `test_structural_resync_fill_gate`,
@@ -1675,10 +1688,15 @@ the Stage 3 outcome text above is corrected. (2) `FILL_PIPELINE.md` B2 route (b)
 now landed: an optional `pipelineSource` on `reconcileGridOrders` lets the three
 bot-owning callers pass the bot into the reconcile's unsettled-fill gate, so a fill
 queued during its chain read defers the window top-up. It is strictly additive
-fail-closed visibility; liveness for the one-shot startup reconciles relies on
-the per-tick targeted reconcile to re-derive the deferred top-up, and no soak was
-run for this change. Pinned by `tests/test_reconcile_pipeline_source.ts`. All other non-goals stand: the C3/C4
-refactors still depend on P3, D2/P5 still need soak/live evidence, and the marker
+fail-closed visibility: `pipelineSource.manager` must be the manager being
+reconciled, and the reader now does all field access through a typed local so a
+misspelled field is a compile error on both sides. Liveness for the one-shot
+startup reconciles relies on the targeted reconcile when its trigger fires (not
+an unconditional per-tick top-up) to re-derive the deferred top-up; the
+regenerated-grid startup path defers through the same gate. No soak was run for
+this change. Pinned by `tests/test_reconcile_pipeline_source.ts` (RG-PIPE-1..5).
+All other non-goals stand: the C3/C4 refactors still depend on P3, D2/P5 still
+need soak/live evidence, and the marker
 persistence, cooldown, crossing veto, BUY exemption and one-cycle marker race stay
 rejected or accepted as recorded.
 

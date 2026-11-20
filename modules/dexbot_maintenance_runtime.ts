@@ -33,7 +33,7 @@ import { BroadcastUncertainError } from './dexbot_credential_client.js';
 import * as configModule from './config.js';
 const { Config } = configModule;
 import { getErrorField, getErrorMessage } from './utils/errors.js';
-import type { BotLike, OrderManagerLike, ManagedOrder, OrderType, SpreadCorrectionStall, BotMetrics } from './types.js';
+import type { BotLike, OrderManagerLike, ManagedOrder, OrderType, SpreadCorrectionStall, BotMetrics, PipelineSignals, InFlightFields, InFlightCounterCheck } from './types.js';
 
 /**
  * Gap-evac stranding sweep (lazy import: the recovery module pulls the
@@ -2013,8 +2013,14 @@ function startOpenOrdersSyncLoop(bot: BotLike) {
                     // the lock gate alone would let this loop synchronizeWithChain
                     // (and even fire a rebalance broadcast) into a half-rebuilt
                     // grid. Same isolation the fill consumer gets via
-                    // _recoverySyncInFlight.
-                    if (!bot._recoverySyncInFlight &&
+                    // _recoverySyncInFlight. Read it through the one owner
+                    // (INV-FILL-003): a raw `!counter` treats an unreadable
+                    // counter as idle and lets this loop sync into a half-rebuilt
+                    // grid. `ok: false` skips this tick; the next loop tick
+                    // re-evaluates it.
+                    const inFlight = readBotInFlightFlags(bot);
+                    if (inFlight.ok &&
+                        !inFlight.recoveryInFlight &&
                         !shouldDeferMaintenanceForBroadcast(bot) &&
                         !bot.manager._fillProcessingLock.isLocked() &&
                         bot.manager._fillProcessingLock.getQueueLength() === 0) {
@@ -2552,15 +2558,27 @@ function lowerRecoveryInFlight(bot: BotLike) {
  * Leak watchdog for the bot-level pipeline counters. A missed decrement parks
  * the fill queue indefinitely; there is no stale-clear equivalent for
  * _batchInFlight / _recoverySyncInFlight. Surface the age every tick, and only
- * force-clear when nothing actually holds the placement region (a live batch
- * owns it, so resetting there would allow a second concurrent broadcast).
+ * force-clear a STALE FINITE counter when nothing actually holds the placement
+ * region (a live batch owns it, so resetting there would allow a second
+ * concurrent broadcast). A NON-FINITE counter has no coherent live holder — it
+ * can never be decremented to zero — so it is cleared at once; so is a non-finite
+ * manager `_deferredRebalanceAt` stamp, which makes `readBotInFlightFlags.ok`
+ * false without being a counter. Both are the wake the fail-closed gates rely on.
+ *
+ * Maintenance is idle-gated by a non-empty queue, so the fill retry path calls
+ * this too. `wakeDrain: false` there avoids scheduling a second drain: the
+ * retry re-consumes immediately after the clear.
  * @param {import('./dexbot_class.js').DEXBot} bot
+ * @param {{wakeDrain?: boolean}} [options] - default true; false when the caller re-consumes itself
  */
-function checkPipelineInFlightWatchdogs(bot: BotLike) {
+function checkPipelineInFlightWatchdogs(bot: BotLike, options: { wakeDrain?: boolean } = {}) {
+    const wakeDrain = options.wakeDrain !== false;
     const now = Date.now();
     const placementHeld = typeof bot.manager?.isPlacementActive === 'function'
         && bot.manager.isPlacementActive() === true;
-    const checks: Array<{ countKey: string; startedKey: string; label: string; staleMs: number }> = [
+    // Keyof-union pairs (not bare strings): a misspelled or swapped
+    // counter/stamp fails to compile instead of silently reading undefined.
+    const checks: InFlightCounterCheck[] = [
         {
             countKey: '_batchInFlight',
             startedKey: '_batchInFlightStartedAt',
@@ -2574,10 +2592,29 @@ function checkPipelineInFlightWatchdogs(bot: BotLike) {
             staleMs: Number(TIMING.RECOVERY_INFLIGHT_STALE_MS) > 0 ? Number(TIMING.RECOVERY_INFLIGHT_STALE_MS) : 10 * 60 * 1000,
         },
     ];
-    const botAny = bot as unknown as Record<string, unknown>;
+    const botAny = bot as unknown as InFlightFields;
     for (const check of checks) {
-        const count = Number(botAny[check.countKey]) || 0;
-        if (count <= 0) continue;
+        const rawCount = botAny[check.countKey];
+        const count = Number(rawCount);
+        // `Number(x) || 0` mapped NaN (and other non-numeric garbage) to 0 and
+        // skipped it, so a counter unreadable to `readBotInFlightFlags`
+        // (ok:false) was NEVER cleared and its fail-closed gates had no wake.
+        // No live holder can be represented by a malformed value, so clear it
+        // immediately — the placement-region veto applies only to stale FINITE
+        // counts, where a genuine batch may still own the region.
+        if (rawCount != null && rawCount !== '' && !Number.isFinite(count)) {
+            bot._warn?.(
+                `[WATCHDOG] Force-clearing malformed ${check.label} counter (${String(rawCount)}); ` +
+                `it cannot be decremented to zero and would park the pipeline`
+            );
+            botAny[check.countKey] = 0;
+            botAny[check.startedKey] = 0;
+            // Wake the same drain the stale-counter path wakes: a gate that
+            // deferred on ok:false must not stay parked after the clear.
+            if (wakeDrain) drainFillQueueAfterPipelineClear(bot);
+            continue;
+        }
+        if (!Number.isFinite(count) || count <= 0) continue;
         const startedAt = Number(botAny[check.startedKey]) || 0;
         if (!startedAt) continue;
         const ageMs = now - startedAt;
@@ -2598,7 +2635,24 @@ function checkPipelineInFlightWatchdogs(bot: BotLike) {
         // Wake the fill consumer: the deferred branch gates on this counter
         // without rescheduling, so a force-clear that does not drain would
         // leave the queue parked until an unrelated event.
-        drainFillQueueAfterPipelineClear(bot);
+        if (wakeDrain) drainFillQueueAfterPipelineClear(bot);
+    }
+    // `readBotInFlightFlags.ok` also covers the manager-scoped deferred-rebalance
+    // stamp (system.ts). It is not a counter, so the stale-age rules above do
+    // not apply: a non-finite value is unusable and wedges EVERY ok:false gate
+    // with no wake. 0 is the established "none pending" value.
+    const mgrAny = bot.manager as unknown as InFlightFields | null | undefined;
+    if (mgrAny) {
+        const rawDeferred = mgrAny._deferredRebalanceAt;
+        const deferred = Number(rawDeferred);
+        if (rawDeferred != null && rawDeferred !== '' && !Number.isFinite(deferred)) {
+            mgrAny._deferredRebalanceAt = 0;
+            bot._warn?.(
+                '[WATCHDOG] Force-clearing malformed deferred-rebalance stamp; ' +
+                'it cannot be read by the liveness gates'
+            );
+            if (wakeDrain) drainFillQueueAfterPipelineClear(bot);
+        }
     }
 }
 
@@ -3779,8 +3833,9 @@ function drainFillQueueAfterPipelineClear(bot: BotLike) {
         if (!bot || bot._shuttingDown) return;
         // Same owner as the destructive gates (INV-FILL-003): `(x || 0) > 0`
         // read an unreadable counter as "cleared". `ok:false` defers; the leak
-        // watchdog force-clears malformed counters and calls this drain again,
-        // so the fail-closed answer still has a wake.
+        // watchdog force-clears non-finite counters/stamps and calls this drain
+        // again, or the fill retry path calls the watchdog with wakeDrain:false
+        // and re-consumes itself — so the fail-closed answer always has a wake.
         const inFlight = readBotInFlightFlags(bot);
         if (!inFlight.ok || inFlight.recoveryInFlight || inFlight.batchInFlight) return;
         if (bot.manager?.isBroadcastingActive?.()) return;
@@ -4072,15 +4127,20 @@ function wireStructuralGridResyncRequest(bot: BotLike) {
 /**
  * Get current pipeline signal state for congestion checks.
  * @param {import('./dexbot_class.js').DEXBot} bot
- * @returns {Object}
+ * @returns {PipelineSignals}
  */
-function getPipelineSignals(bot: BotLike) {
+function getPipelineSignals(bot: BotLike): PipelineSignals {
     bot.manager?._cleanExpiredLocks?.();
+    // Same owner as the gates (INV-FILL-003): raw `> 0` reads an unreadable
+    // counter as idle, so telemetry disagreed with every fail-closed gate.
+    // Expose the unreadable answer alongside the known flags for diagnosis.
+    const inFlight = readBotInFlightFlags(bot);
     return {
         incomingFillQueueLength: bot._incomingFillQueue.length,
         shadowLocks: bot.manager?.getActiveShadowLockCount?.() || 0,
-        batchInFlight: bot._batchInFlight > 0,
-        recoveryInFlight: bot._recoverySyncInFlight > 0,
+        batchInFlight: inFlight.batchInFlight,
+        recoveryInFlight: inFlight.recoveryInFlight,
+        livenessOk: inFlight.ok,
         broadcasting: bot.manager?.isBroadcastingActive?.() || false
     };
 }
@@ -4138,6 +4198,10 @@ function getMetrics(bot: BotLike) {
         // a new engine-owned counter here, not as another inline fallback.
         ...managerOwnedCounters(bot),
         queueDepth: bot._incomingFillQueue.length,
+        // Unreadable liveness is NOT a quiet pipeline (INV-FILL-003): surface
+        // the owner's answer so the metrics snapshot / shutdown log cannot
+        // report an idle bot while gates defer on `ok: false`.
+        pipelineLivenessOk: readBotInFlightFlags(bot).ok,
         fillProcessingLockActive: bot.manager?._fillProcessingLock?.isLocked() || false,
         divergenceLockActive: bot.manager?._divergenceLock?.isLocked() || false,
         shadowLocksActive: bot.manager?.getActiveShadowLockCount?.() || 0,
@@ -4230,7 +4294,7 @@ async function syncOpenOrdersAndProcessFillsImpl(bot: BotLike, tag: string) {
         return { syncResult: null, aborted: true, hasUnmatched: -1, openOrders: null };
     }
 }
-export { loadBotsConfigSnapshot, isWrapperAdapterOwner, checkAndApplyBotConfigChanges, buildBotConfigFingerprint, refreshDynamicWeightDistribution, performGridResync, updateBotGridResetMetadata, handlePendingTriggerReset, setupTriggerFileDetection, performPeriodicGridChecks, isOpenOrdersSyncLoopEnabled, startOpenOrdersSyncLoop, stopOpenOrdersSyncLoop, setupBlockchainFetchInterval, stopBlockchainFetchInterval, setupBotsConfigPollInterval, stopBotsConfigPollInterval, executeMaintenanceLogic, getTargetedSyncReason, maybeRunTargetedDriftReconciliation, countLiveEdgeOrders, cancelDustOrders, isOrderDoesNotExistError, runGridMaintenance, releaseMarketAdapterRuntime, syncMarketAdapterOnPeriodicConfigCheck, usesAmaGridPrice, runDustHealthCheck, setupDustHealthCheckInterval, requestGridReset, wireStructuralGridResyncRequest, getPipelineSignals, markGridActivity, getMetrics, syncOpenOrdersAndProcessFills, shouldDeferMaintenanceForBroadcast, checkGridLockHoldDuration };
+export { loadBotsConfigSnapshot, isWrapperAdapterOwner, checkAndApplyBotConfigChanges, buildBotConfigFingerprint, refreshDynamicWeightDistribution, performGridResync, updateBotGridResetMetadata, handlePendingTriggerReset, setupTriggerFileDetection, performPeriodicGridChecks, isOpenOrdersSyncLoopEnabled, startOpenOrdersSyncLoop, stopOpenOrdersSyncLoop, setupBlockchainFetchInterval, stopBlockchainFetchInterval, setupBotsConfigPollInterval, stopBotsConfigPollInterval, executeMaintenanceLogic, getTargetedSyncReason, maybeRunTargetedDriftReconciliation, countLiveEdgeOrders, cancelDustOrders, isOrderDoesNotExistError, runGridMaintenance, releaseMarketAdapterRuntime, syncMarketAdapterOnPeriodicConfigCheck, usesAmaGridPrice, runDustHealthCheck, setupDustHealthCheckInterval, requestGridReset, wireStructuralGridResyncRequest, getPipelineSignals, markGridActivity, getMetrics, syncOpenOrdersAndProcessFills, shouldDeferMaintenanceForBroadcast, checkGridLockHoldDuration, checkPipelineInFlightWatchdogs };
 
 
 export default {
@@ -4259,5 +4323,6 @@ export default {
     markGridActivity,
     getMetrics,
     syncOpenOrdersAndProcessFills,
+    checkPipelineInFlightWatchdogs,
     _internalDeferredHold: { logDeferredHoldSummary, describeDeferredHolds, considerDeferredHoldEscalation },
 };

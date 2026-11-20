@@ -132,7 +132,8 @@ const NAMES = {
         'selectActiveBotEntries',
     ],
     marketAdapterRuntime: ['isLikelyMarketAdapterProcess', 'isLockStale', 'getSharedMarketAdapterRuntime'],
-    maintenanceRuntime: ['isOrderDoesNotExistError', 'usesAmaGridPrice'],
+    // checkPipelineInFlightWatchdogs is statically imported by dexbot_fill_runtime.
+    maintenanceRuntime: ['isOrderDoesNotExistError', 'usesAmaGridPrice', 'checkPipelineInFlightWatchdogs'],
 };
 
 function requireStorage() {
@@ -797,7 +798,14 @@ function makeDivergenceSelf(opts) {
             loadGrid: () => [{ id: 'buy-0', type: 'buy', price: 1, size: 1 }],
         },
         _incomingFillQueue: opts.incomingFillQueue ?? [],
-        _getPipelineSignals: () => ({}),
+        _getPipelineSignals: () => ({
+            incomingFillQueueLength: 0,
+            shadowLocks: 0,
+            batchInFlight: false,
+            recoveryInFlight: false,
+            livenessOk: true,
+            broadcasting: false,
+        }),
         _cancelDustOrders: async () => ({ cancelledCount: 0, batchResult: null }),
         _abortFlowIfIllegalState: async () => false,
         _performGridResync: async (_options?: any) => {
@@ -956,6 +964,7 @@ async function testDexbotClassPerformGridResyncForwardsOptions() {
     defineEsmMockAbs(require.resolve('../modules/dexbot_maintenance_runtime'), NAMES.maintenanceRuntime, {
         isOrderDoesNotExistError: () => false,
         usesAmaGridPrice: (bot) => /^ama(?:[1-4])?$/.test(String(bot?.gridPrice || '').trim().toLowerCase()),
+        checkPipelineInFlightWatchdogs: () => {},
         performGridResync(bot, options = {}) {
             forwardedThis = bot;
             forwardedOptions = options;

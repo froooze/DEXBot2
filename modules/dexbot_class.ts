@@ -107,6 +107,7 @@ const hasExecutableActions = lazyShim('./order/utils/validate', 'hasExecutableAc
 const getRecalculateTriggerFile = lazyShim('./paths', 'getRecalculateTriggerFile');
 const cloneWeightDistribution = lazyShim('./order/utils/math', 'cloneWeightDistribution');
 const resolveBotRuntimeSettings = lazyShim('./runtime_settings', 'resolveBotRuntimeSettings');
+const readBotInFlightFlags = lazyShim('./order/utils/system', 'readBotInFlightFlags');
 
 /**
  * Resolve the COALESCE_BACKLOG_REPLAY opt-in.
@@ -2057,9 +2058,13 @@ class DEXBot implements BotLike {
                 );
             }
             // A recovery sync wrapping the region keeps the consumer gated;
-            // requestGridReset's finally drains once the counter clears.
-            if (this._recoverySyncInFlight) return;
-            if (this._batchInFlight) return;
+            // requestGridReset's finally drains once the counter clears. One
+            // owner for pipeline liveness (INV-FILL-003): raw truthiness reads
+            // an unreadable counter as "cleared" and could drain fills into a
+            // half-rebuilt grid. `ok: false` skips this region-end; later wakes
+            // (counter clearing edge / retry timer / next region end) re-check.
+            const inFlight = readBotInFlightFlags(this);
+            if (!inFlight.ok || inFlight.recoveryInFlight || inFlight.batchInFlight) return;
             if (!this._incomingFillQueue || this._incomingFillQueue.length === 0) return;
             this._log(`[FILL-QUEUE] Broadcasting region ended; draining ${this._incomingFillQueue.length} deferred fill(s).`, 'info');
             // Region-ended drain residue: the parked fills run against
@@ -2402,7 +2407,8 @@ class DEXBot implements BotLike {
         this._log(`Shutdown complete. Final metrics: fills=${metrics.fillsProcessed}, batches=${metrics.batchesExecuted}, ` +
             `avgProcessingTime=${metrics.fillsProcessed > 0 ? Format.formatMetric2(metrics.fillProcessingTimeMs / metrics.fillsProcessed) : 0}ms, ` +
             `lockContentions=${metrics.lockContentionEvents}, maxQueueDepth=${metrics.maxQueueDepth}, ` +
-            `heldChainOrders=${metrics.heldChainOrders ?? 0}, blockingChainOrders=${metrics.blockingChainOrders ?? 0}` +
+            `heldChainOrders=${metrics.heldChainOrders ?? 0}, blockingChainOrders=${metrics.blockingChainOrders ?? 0}, ` +
+            `pipelineLivenessOk=${metrics.pipelineLivenessOk ?? 'unknown'}` +
             refusalSuffix);
 
         // SINGLE-CONTROLLER LOCK: released last so a restart twin cannot slip

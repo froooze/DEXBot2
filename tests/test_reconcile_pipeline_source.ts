@@ -9,6 +9,8 @@
  */
 
 const assert = require('assert');
+const fs = require('fs');
+const path = require('path');
 const { reconcileGridOrders } = require('../modules/order/grid_reconcile');
 const { ORDER_TYPES, ORDER_STATES } = require('../modules/constants');
 
@@ -98,6 +100,20 @@ async function main() {
     defers = await reconcile({ withBot: true, deferred: true });
     assert.ok(defers.length > 0, 'the deferred-drain flag must defer the top-up too');
     console.log('   ✓ RG-PIPE-4 deferred-drain flag defers the top-up');
+
+    // RG-PIPE-1..4 inject pipelineSource themselves; deleting the optional
+    // one-liner at a production call site would keep them green. Pin the three
+    // bot-owning callers directly (recalculateGrid legitimately omits it).
+    const callers: Array<[string, number]> = [
+        ['dexbot_startup_runtime.ts', 2],
+        ['dexbot_maintenance_runtime.ts', 1],
+    ];
+    for (const [file, expected] of callers) {
+        const text = fs.readFileSync(path.join(__dirname, '../../modules', file), 'utf8');
+        const count = (text.match(/pipelineSource:\s*bot\b/g) || []).length;
+        assert.ok(count >= expected, `${file} must pass pipelineSource: bot at ${expected} call site(s)`);
+    }
+    console.log('   ✓ RG-PIPE-5 bot-owning callers pass pipelineSource');
 
     console.log('\n✅ All reconcile pipeline-source tests passed');
 }

@@ -81,6 +81,7 @@ async function runTests() {
                 shadowLocks: 0,
                 batchInFlight: false,
                 recoveryInFlight: false,
+                livenessOk: true,
                 broadcasting: false,
             }),
             _processFillsWithBatching: async () => ({ aborted: false }),

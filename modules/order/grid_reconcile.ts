@@ -240,7 +240,14 @@ export async function reconcileGridOrders({
     options?: {
         /** Rebuild callers own the rebuild and must be allowed to reconcile. */
         allowDuringRebuild?: boolean;
-        /** Bot-owned pipeline source for the startup top-up's unsettled-fill gate (B2). */
+        /**
+         * Bot-owned pipeline source for the startup top-up's unsettled-fill gate (B2).
+         * Its `manager` MUST be the `manager` passed to this call: the reader falls
+         * back to `source.manager` for manager-level crawls, and a detached stub
+         * would silently read the wrong manager's pipeline (a fail-open top-up).
+         * Bot-owning callers pass the bot; `recalculateGrid` omits it and keeps the
+         * manager-only gate plus the structural-rebuild bracket.
+         */
         pipelineSource?: PipelineSourceLike;
     };
 }) {

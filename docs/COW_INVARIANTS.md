@@ -256,7 +256,7 @@ not by the seven per-site structures that used to disagree
 
 - `INV-MAINT-006` One re-center per guard generation, armed or refused
   - The spread-stale watchdog keys its one-re-center watermark on `resolveGuardGenerationKey`: the armed pivot, or the oldest live refused level when a premium sweep left the pivot cold. A cold key is never `''` while a refusal marker is live, so the bounded `SPREAD_STALE_PIVOT_EXPIRE_MS` exit stays reachable; the next level added to the same sweep does not fork the generation.
-  - Deferral and scheduling gates read pipeline liveness only through `readBotInFlightFlags`; an unreadable counter is `ok: false` and defers (INV-FILL-003), never "idle". A refused SELL level is not a BUY-side geometry bind.
+  - Deferral and scheduling gates read pipeline liveness only through `readBotInFlightFlags` (all seven: the four destructive/scheduling gates, the fill consumer, the open-orders sync loop and the broadcast region-end drain); an unreadable counter is `ok: false` and defers (INV-FILL-003), never "idle". The leak watchdog force-clears non-finite counters and the deferred-rebalance stamp and re-invokes the drain; because a non-empty queue idle-gates maintenance, the fill retry path also calls it (without a second drain wake) and re-consumes, so a fail-closed gate still has a wake even while the queue is parked. Both liveness readers use declared field/keyof-union types (a typo cannot silently read `undefined`), and the unreadable answer is surfaced as `pipelineLivenessOk` in the metrics snapshot and the shutdown log. A refused SELL level is not a BUY-side geometry bind.
 
 ---
 

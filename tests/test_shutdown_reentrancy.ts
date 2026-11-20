@@ -68,6 +68,7 @@ console.log('=== Shutdown Reentrancy Tests ===\n');
                 fillProcessingTimeMs: 0,
                 lockContentionEvents: 0,
                 maxQueueDepth: 0,
+                pipelineLivenessOk: false,
             }),
         };
 
@@ -84,6 +85,8 @@ console.log('=== Shutdown Reentrancy Tests ===\n');
         assert.strictEqual(skippedLogs.length, 1, 'second call should log the re-entrant skip');
         assert.strictEqual(blockStops.length, 1, '_stopBlockchainFetchInterval should run exactly once');
         assert.strictEqual(lockAcquired.length, 1, 'fill-processing lock should be acquired exactly once');
+        assert.ok(logCalls.some((m) => m.includes('pipelineLivenessOk=false')),
+            'the operator-facing shutdown line must print pipeline liveness, not just the metrics object');
         assert.strictEqual(stub._shuttingDown, true, '_shuttingDown should be set after the first call');
         assert.strictEqual(stopCalls.filter(([k]) => k === 'setShuttingDown').length, 1,
             '_processedFillStore.setShuttingDown should be called exactly once');

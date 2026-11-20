@@ -21,7 +21,14 @@ const maintenanceStaticNoops = {
     seedDustTimersFromPartialUpdates: async () => {},
     executeMaintenanceLogic: async () => {},
     getMetrics: () => ({}),
-    getPipelineSignals: () => ({}),
+    getPipelineSignals: () => ({
+        incomingFillQueueLength: 0,
+        shadowLocks: 0,
+        batchInFlight: false,
+        recoveryInFlight: false,
+        livenessOk: true,
+        broadcasting: false,
+    }),
     handlePendingTriggerReset: async () => {},
     isOpenOrdersSyncLoopEnabled: () => false,
     markGridActivity: () => {},
@@ -44,9 +51,13 @@ const maintenanceStaticNoops = {
 defineEsmMockAbs(require.resolve('../modules/dexbot_maintenance_runtime'), [
     'isOrderDoesNotExistError',
     'usesAmaGridPrice',
+    // dexbot_fill_runtime statically imports the leak watchdog for its
+    // parked-queue retry path; the mock must expose the new named export.
+    'checkPipelineInFlightWatchdogs',
 ], {
     ...maintenanceStaticNoops,
     isOrderDoesNotExistError: () => false,
+    checkPipelineInFlightWatchdogs: () => {},
     // market_adapter named-imports this from the maintenance runtime module;
     // replicate grid_price_source's canonical helper so runtime_settings
     // resolution keeps working under the mock.
