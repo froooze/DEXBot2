@@ -40,6 +40,9 @@
  *       PT-14 a fill-pivot between the gate line and the commit does not
  *             become the anchor's pivot (gate lines are preferred).
  *       PT-15 a fill-pivot is never a fallback when no gate line exists.
+ *       PT-16 a cold->armed Final gate line records the post pivot (a fill
+ *             arriving between the cold freeze and the gate still arms it);
+ *             armed->cold has no usable post value and stays unmatched.
  */
 
 const assert = require('assert');
@@ -433,6 +436,41 @@ async function testFillPivotIsNeverAFallback() {
     console.log('✓ PT-15 passed');
 }
 
+async function testColdArmedFinalGateIsObservation() {
+    console.log('\n[PT-16] a cold->armed final gate records the post pivot for a placed anchor');
+    const log = [
+        '[2026-11-16T10:00:02.000Z] [INFO] [DEXBot] [LAST-FILL-GUARD] Final gate: queue 0->0 pivot none(cold)->1005.000000(buy) changed=true refreshed=true',
+        '[2026-11-16T10:00:03.000Z] [INFO] [DEXBot] Placed buy order slot-100 @1003.000000 x1.00000000 -> 1.7.900020',
+    ].join('\n');
+    const idx = parseRuntimeLog(log);
+    const gate = idx.observations.find((o: { src: string }) => o.src === 'final-gate');
+    assert.ok(gate, 'cold->armed final gate must be indexed as a gate observation');
+    assert.strictEqual(gate.price, 1005.0);
+    assert.strictEqual(gate.type, 'buy');
+
+    const v = classifyTransition(
+        cand('1.7.900020', '2026-11-16T10:00:10.000Z', 1003.0, 'buy',
+            '2026-11-16T10:00:00.000Z', 1010.0),
+        idx);
+    assert.strictEqual(v.verdict, 'policy-divergence', 'the runtime pivot passes this BUY');
+    assert.ok(v.pivot && v.pivot.price === 1005.0 && v.pivot.src === 'final-gate');
+    assert.strictEqual(v.pivotSelection, 'backward');
+
+    // Armed->cold has no usable post value: no observation, hence no verdict.
+    const coldIdx = parseRuntimeLog(log.replace(
+        'pivot none(cold)->1005.000000(buy)',
+        'pivot 1005.000000(buy)->none(cold)'
+    ));
+    assert.strictEqual(coldIdx.observations.length, 0, 'armed->cold final gate is not an observation');
+    const cv = classifyTransition(
+        cand('1.7.900020', '2026-11-16T10:00:10.000Z', 1003.0, 'buy',
+            '2026-11-16T10:00:00.000Z', 1010.0),
+        coldIdx);
+    assert.strictEqual(cv.verdict, 'unverifiable');
+    assert.ok(cv.reason.includes('no gate pivot observation'), 'reason names the missing gate line');
+    console.log('✓ PT-16 passed');
+}
+
 async function main() {
     await testParseRuntimeLog();
     await testPivotLookups();
@@ -449,6 +487,7 @@ async function main() {
     await testStaleBackwardPivotIsUnverifiable();
     await testGateSourcePreferredOverFillPivot();
     await testFillPivotIsNeverAFallback();
+    await testColdArmedFinalGateIsObservation();
     console.log('\nAll pivot-timeline mirror regression tests passed.');
 }
 

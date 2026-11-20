@@ -21,6 +21,10 @@
  *                   [FILL-PIVOT] pivot=P(type) ...                (INFO)
  *                   [LAST-FILL-GUARD] mode=... pivot=P(type) ...  (INFO)
  *                   [LAST-FILL-GUARD] Final gate: queue .. pivot A(type)->B(type) (DEBUG, post value)
+ *                   A may be `none(cold)`: a fill arriving between a cold
+ *                   freeze and the gate still arms the pivot, so the post value
+ *                   B is a real gate observation (the batch summary's mode=
+ *                   line is logged after Placed and cannot serve a placed anchor).
  *                   [LAST-FILL-GUARD] Re-armed on the new generation: P(type)
  *                 ("Pivot refreshed from N pending queued fill(s)" is NOT an
  *                 observation: it logs the queue content, which may be a fill
@@ -173,7 +177,10 @@ function num(raw: string): number | null {
 
 const FILL_PIVOT_RE = /\[FILL-PIVOT\] pivot=([\d.,eE+-]+)\((buy|sell)\)/;
 const MODE_RE = /\[LAST-FILL-GUARD\] mode=\S+ pivot=([\d.,eE+-]+)\((buy|sell)\)/;
-const FINAL_GATE_RE = /\[LAST-FILL-GUARD\] Final gate: queue \S+ pivot [\d.,eE+-]+\((?:buy|sell)\)->([\d.,eE+-]+)\((buy|sell)\)/;
+// The frozen side may be `none(cold)` (a fill armed the pivot mid-batch); only
+// the POST value is an observation. An armed->cold line has no usable post value
+// and intentionally stays unmatched.
+const FINAL_GATE_RE = /\[LAST-FILL-GUARD\] Final gate: queue \S+ pivot (?:[\d.,eE+-]+\((?:buy|sell)\)|none\(cold\))->([\d.,eE+-]+)\((buy|sell)\)/;
 const REARM_RE = /\[LAST-FILL-GUARD\] Re-armed on the new generation: ([\d.,eE+-]+)\((buy|sell)\)/;
 const REFUSAL_RE = /\[LAST-FILL-GUARD\] Refusing to arm pivot ([\d.,eE+-]+)\((buy|sell)\)/;
 const PLACED_RE = /\[DEXBot\] Placed (buy|sell) order slot-[\w-]+ @([\d.,eE+-]+) x[\d.,eE+-]+ -> (1\.7\.\d+)/;
