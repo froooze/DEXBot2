@@ -2,14 +2,14 @@
 
 ## Executive Summary
 
-DEXBot2 is a sophisticated decentralized exchange trading bot for the BitShares blockchain. This report documents the complete evolution of the project from its inception in December 2025 through the current 1.7.3 stable release.
+DEXBot2 is a sophisticated decentralized exchange trading bot for the BitShares blockchain. This report documents the complete evolution of the project from its inception in December 2025 through the current 1.7.4 stable release.
 
 ### Key Milestones
 - **Project Inception**: December 2, 2025
-- **Growth Phase**: 2,517 commits over ~11 active months
+- **Growth Phase**: 2,538 commits over ~11 active months
 - **Code Maturity**: Evolution from basic utilities to a ~100,000+ LoC intelligent TypeScript system
 - **Stability**: Progression from manual testing to a suite of 366 automated test files (live tests included in `test:live`)
-- **Releases**: 154 changelog entries (v0.1.0 to v1.7.3)
+- **Releases**: 155 changelog entries (v0.1.0 to v1.7.4)
 
 > **Post-1.0.0 "why":** the thematic story behind the hardening releases — root cause, recurring
 > bug families, and lessons — lives in
@@ -149,7 +149,7 @@ Evolved from a basic README to a comprehensive framework (50+ docs entries, 80%+
 
 ## Version History
 
-Compact, era-level view; commit counts are `git rev-list --count <tag>..<tag>` over the current history (2026-11-17). The 107 commits up to and including the `v0.1.0` tag are not attributed to an era, so the current totals are 2,410 (`v0.1.0..HEAD`) and 2,517 (`HEAD`); the `v1.4.x` era rows overlap slightly because `v1.4.13` is not an ancestor of `v1.4.25` in the current history. Per-release detail lives in [CHANGELOG.md](../CHANGELOG.md); the thematic post-1.0.0 story in [ORDER_ENGINE_POST_1.0_RETROSPECTIVE.md](ORDER_ENGINE_POST_1.0_RETROSPECTIVE.md).
+Compact, era-level view; commit counts are `git rev-list --count <tag>..<tag>` over the current history (2026-11-20). The 107 commits up to and including the `v0.1.0` tag are not attributed to an era, so the current totals are 2,431 (`v0.1.0..HEAD`) and 2,538 (`HEAD`); the `v1.4.x` era rows overlap slightly because `v1.4.13` is not an ancestor of `v1.4.25` in the current history. Per-release detail lives in [CHANGELOG.md](../CHANGELOG.md); the thematic post-1.0.0 story in [ORDER_ENGINE_POST_1.0_RETROSPECTIVE.md](ORDER_ENGINE_POST_1.0_RETROSPECTIVE.md).
 
 | Era | Commits | Theme |
 |-----|--------:|-------|
@@ -180,11 +180,12 @@ Compact, era-level view; commit counts are `git rev-list --count <tag>..<tag>` o
 | v1.7.0 → v1.7.1 | 22 | One existence record per slot (life-cycle registry, unknown-is-never-gone), typed three-valued broadcast outcome, timing-window policy inventory, reconciliation interleaving fuzzer, one writer per life-cycle clock, serialized placement region with lease re-verification, fill-marker idempotency, forced-retreat gap evacuation + committed-geometry sweep, unknown-gap-geometry fix, replay-safe stranded-boundary repair, stability-ranked node selection + flap scoring, chain-account `<bot>` targets for `credit`/`order`, fee-adjusted pool depth chart with both spreads, atomic branch promotion preflight |
 | v1.7.1 → v1.7.2 | 14 | One fill contract + fill-pipeline ratchet, fail-closed grid-update blockers with bounded escalation, single fill identity (`fill_ledger`), credit-time fill-key claim with all-or-nothing balance credits, single-winner concurrent claim, removal of the duplicate applied-amount channel and the second grace-stamp writer, COW broadcast-region leak repair, chain-observed wrong-side cancel exemptions, fill side derived from the paid asset + rail-geometry repair check, fill-anchored rebuild/load boundary, spread rotation into orphaned rail slots, consecutive grid-blocked escalation counter, live-suite env fix |
 | v1.7.2 → v1.7.3 | 10 | Plan-region serialization (`plan → broadcast → commit`), per-account single-controller lock & cross-runtime start guards, market-bounded last-fill pivot + stale pivot expiry, refused-fill same-level refill guard & policy-aware audit mirror, in-place missing UPDATE target repair, settled-pipeline structural resync gate, snapshot reload absence-grace preservation, clamped PARTIAL-growth update skip |
+| v1.7.3 → v1.7.4 | 20 | Live-log audit closures: fill-eligible boundary crawl & re-anchor, refused-sweep level blocking, recovery/cancel verification, in-place size-drift repair, fail-closed liveness & gate ownership, quiet B2/reconcile visibility, dead-code purge, test-speedup |
 
 ---
 
 **Report Originally Generated**: February 19, 2026
-**Last Updated**: November 17, 2026
-**Total Commits**: 2,517
-**Date Range**: December 2, 2025 – November 17, 2026
+**Last Updated**: November 20, 2026
+**Total Commits**: 2,538
+**Date Range**: December 2, 2025 – November 20, 2026
 **Repository**: DEXBot2 (BitShares DEX Trading Bot)
