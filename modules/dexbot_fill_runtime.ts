@@ -93,8 +93,9 @@ async function isUnknownFillOrderAdoptable(bot: BotLike, fillOp: FillOpLike): Pr
                 const boundaryIdx = bot.manager.boundaryIdx;
                 // Gap 0 is not a valid geometry (it makes the slot above the
                 // boundary a SELL rail member); resolveGapSlots supplies the
-                // config-derived band width when neither source has one.
-                const gapSlots = genesis.gapSlots ?? resolveGapSlots(bot.manager);
+                // config-derived band width when neither the frozen genesis
+                // gap nor _gapSlots has a usable value.
+                const gapSlots = resolveGapSlots(bot.manager, genesis.gapSlots);
                 if (boundaryIdx != null && !isSlotInRail(boundaryIdx, gapSlots, parsed.type, { id: slotId })) return false;
                 return slot.state === ORDER_STATES.VIRTUAL || !slot.orderId;
             } catch { return false; }

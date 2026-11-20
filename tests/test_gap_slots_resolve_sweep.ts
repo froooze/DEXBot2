@@ -122,6 +122,33 @@ async function run() {
             'M2-04: raw gap still read by anchor eligibility');
     }
 
+    // M2-05 — a frozen genesis gap must go through the same absent-aware
+    // reader as _gapSlots. `genesis.gapSlots ?? resolveGapSlots(...)` lets an
+    // empty / non-numeric / fractional value through as a band width, while
+    // resolveGapSlots(manager, genesis.gapSlots) validates, floors and falls
+    // back to _gapSlots then config-derived geometry.
+    {
+        const preferred = [
+            ['modules/order/sync_engine.ts', /resolveGapSlots\s*\(\s*mgr\s*,\s*genesis\?\.gapSlots\s*\)/],
+            ['modules/order/accounting.ts', /resolveGapSlots\s*\(\s*mgr\s*,\s*genesis\?\.gapSlots\s*\)/],
+            ['modules/dexbot_fill_runtime.ts', /resolveGapSlots\s*\(\s*bot\.manager\s*,\s*genesis\.gapSlots\s*\)/],
+        ] as const;
+        for (const [rel, pattern] of preferred) {
+            const src = source(rel);
+            assert.ok(!/gapSlots\s*\?\?\s*resolveGapSlots\s*\(/.test(src),
+                `M2-05: ${rel} still bypasses the absent-aware gap reader`);
+            assert.ok(pattern.test(src),
+                `M2-05: ${rel} must pass the genesis gap as resolveGapSlots' preferred argument`);
+        }
+        // Behaviour: a fractional genesis gap is floored, an empty one falls
+        // through to the config-derived width rather than collapsing the band.
+        const cfgManager = makeManager();
+        assert.strictEqual(resolveGapSlots(cfgManager, ''), resolveGapSlots(cfgManager),
+            'M2-05: an empty genesis gap must fall back to the config-derived gap');
+        assert.strictEqual(resolveGapSlots(cfgManager, 2.9), 2,
+            'M2-05: a fractional genesis gap is floored by the shared reader');
+    }
+
     console.log('  ✓ gap-slot resolve sweep');
 }
 

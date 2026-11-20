@@ -447,8 +447,9 @@ class Accountant {
               // Never fall back to gap 0: a 0-wide band classifies the slot just
               // above the boundary as a SELL rail slot and would book a SPREAD
               // placeholder's size on the wrong side. resolveGapSlots keeps the
-              // config-derived geometry as the fallback.
-              const gapSlots = genesis?.gapSlots ?? resolveGapSlots(mgr);
+              // config-derived geometry as the fallback when neither the frozen
+              // genesis gap nor _gapSlots has a usable value.
+              const gapSlots = resolveGapSlots(mgr, genesis?.gapSlots);
               let spreadSide: string | null = null;
               if (order.type === ORDER_TYPES.SPREAD && genesis && boundaryIdx != null && Number.isFinite(Number(boundaryIdx))) {
                   if (isSlotInRail(boundaryIdx, gapSlots, ORDER_TYPES.BUY, order)) spreadSide = ORDER_TYPES.BUY;

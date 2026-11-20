@@ -1607,8 +1607,11 @@ class SyncEngine {
             // Unknown geometry must NOT read as gap 0 (a 0-wide band turns the
             // slot just above the boundary into a SELL rail slot, so an in-band
             // orphan could be adopted onto the wrong rail). resolveGapSlots is
-            // the single source of truth (_gapSlots ?? config-derived).
-            const gapSlots = genesis?.gapSlots ?? resolveGapSlots(mgr);
+            // the single source of truth: a usable frozen genesis gap takes
+            // priority, then _gapSlots, then config-derived geometry. Passing
+            // genesis as `preferred` keeps the absent-aware read for empty /
+            // non-numeric values instead of letting them through as a band.
+            const gapSlots = resolveGapSlots(mgr, genesis?.gapSlots);
             const boundaryIdx = mgr.boundaryIdx;
             // Pre-boundary sync: gap geometry is unknown, so adoption is
             // deferred entirely — touch nothing (no adopt, no cancelOnly).
