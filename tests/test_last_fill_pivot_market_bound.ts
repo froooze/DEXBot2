@@ -253,6 +253,17 @@ run('EXPIRE-3 missing persistence hooks must not throw', () => {
     assert.strictEqual(mgr._lastMarketFillPrice, null);
 });
 
+run('EXPIRE-4 skipPersistedClear leaves the disk rows for the caller to erase', () => {
+    const mgr: any = makeManager({
+        _lastFilledPrice: 1100, _lastFilledType: ORDER_TYPES.BUY, _lastFilledAt: NOW,
+        _lastMarketFillPrice: 1100, _lastMarketFillType: ORDER_TYPES.BUY, _lastMarketFillAt: NOW
+    });
+    expireLastFillGuardReferences(mgr, 'manual full reset', { skipPersistedClear: true });
+    assert.strictEqual(mgr._lastFilledPrice, null, 'live pivot must still be cleared');
+    assert.strictEqual(mgr._lastMarketFillPrice, null, 'live market row must still be cleared');
+    assert.deepStrictEqual(mgr.cleared, [], 'disk deletes belong to the awaiting caller on this path');
+});
+
 // ── 6. Market-crossing observation ────────────────────────────────
 
 function createAction(over: Record<string, unknown>) {

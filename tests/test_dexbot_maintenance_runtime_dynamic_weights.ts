@@ -194,7 +194,7 @@ function guardedReadOpenOrdersReplica(chainOrdersModule: any, accountId: any, op
     })();
 }
 
-function installCoreResyncMocks({ snapshotMode = 'live' } = {}) {
+function installCoreResyncMocks({ snapshotMode = 'live', expireSpy = null, guardedRead = null } = {}) {
     defineEsmMockAbs(require.resolve('../modules/bitshares_client'), NAMES.bitsharesClient, {
         BitShares: {},
         waitForConnected: async () => {},
@@ -202,7 +202,7 @@ function installCoreResyncMocks({ snapshotMode = 'live' } = {}) {
     });
     defineEsmMockAbs(require.resolve('../modules/chain_orders'), NAMES.chainOrders, {
         readOpenOrders: async () => [],
-        readOpenOrdersGuarded: (mod, accountId, opts) => guardedReadOpenOrdersReplica(mod, accountId, opts),
+        readOpenOrdersGuarded: guardedRead || ((mod, accountId, opts) => guardedReadOpenOrdersReplica(mod, accountId, opts)),
         listenForFills: async () => async () => {},
         executeBatch: async () => ({ tx_id: 'noop' }),
     });
@@ -235,7 +235,7 @@ function installCoreResyncMocks({ snapshotMode = 'live' } = {}) {
         extractGoneOrderIds: () => new Set<string>(),
         extractUpdateTargetOrderIds: () => new Set<string>(),
         sleep: async () => {},
-        expireLastFillGuardReferences: () => {},
+        expireLastFillGuardReferences: expireSpy || (() => {}),
         resolveGuardGenerationKey: () => '',
     });
 }
@@ -433,7 +433,7 @@ async function testUpdateBotGridResetMetadataRecordsActualReset() {
 
     const { updateBotGridResetMetadata } = require('../modules/dexbot_maintenance_runtime');
 
-    const botKey = `metadata-reset-${Date.now()}`;
+    const botKey = `metadata-reset-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const snapshotFile = path.join(PATHS.ORDERS_DIR, `${botKey}.dynamicgrid.json`);
     ensureDir(path.dirname(snapshotFile));
     writeJSON(snapshotFile, {
@@ -484,7 +484,7 @@ async function testUpdateBotGridResetMetadataRejectsInvalidSnapshot() {
     const { ensureDir, readJSON, writeJSON } = requireStorage();
     const { updateBotGridResetMetadata } = require('../modules/dexbot_maintenance_runtime');
 
-    const botKey = `metadata-invalid-${Date.now()}`;
+    const botKey = `metadata-invalid-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const snapshotFile = path.join(PATHS.ORDERS_DIR, `${botKey}.dynamicgrid.json`);
     ensureDir(path.dirname(snapshotFile));
     writeJSON(snapshotFile, {
@@ -514,10 +514,10 @@ async function testUpdateBotGridResetMetadataRejectsInvalidSnapshot() {
 // promoteAmaCenterSnapshotForGridReset against real snapshot files; only the
 // resync collaborators (grid recalculation, open-order reads, AMA snapshot
 // source) are mocked.
-function installTriggerResetMocks() {
-    installCoreResyncMocks({ snapshotMode: 'live' });
+function installTriggerResetMocks({ expireSpy = null, recalculateSpy = null, guardedRead = null } = {}) {
+    installCoreResyncMocks({ snapshotMode: 'live', expireSpy, guardedRead });
     defineEsmMockAbs(require.resolve('../modules/order/grid'), NAMES.grid, {
-        recalculateGrid: async () => {},
+        recalculateGrid: recalculateSpy || (async () => {}),
     });
     defineEsmMockAbs(require.resolve('../modules/launcher/market_adapter_runtime'), NAMES.marketAdapterRuntime, {
         getSharedMarketAdapterRuntime: () => ({
@@ -527,7 +527,7 @@ function installTriggerResetMocks() {
     });
 }
 
-async function runManualTriggerScenario({ botName, botKey, snapshotPayload, triggerPayload = null, assertUpdated }) {
+async function runManualTriggerScenario({ botName, botKey, snapshotPayload, triggerPayload = null, assertUpdated, mocks = {}, assertState = null }) {
     const PATHS = requirePaths();
     const { ensureDir, readJSON, writeJSON } = requireStorage();
 
@@ -544,7 +544,7 @@ async function runManualTriggerScenario({ botName, botKey, snapshotPayload, trig
 
     const wl = makeTempWhitelist({ [botKey]: { ama: true, dynamicWeight: true } });
     const restoreFs = patchBotsJson([{ name: botName, weightDistribution: { sell: 0.6, buy: 0.4 } }]);
-    installTriggerResetMocks();
+    installTriggerResetMocks(mocks);
     const logs = [];
 
     const self = {
@@ -568,6 +568,10 @@ async function runManualTriggerScenario({ botName, botKey, snapshotPayload, trig
             startBootstrap: () => {},
             finishBootstrap: () => {},
             persistGrid: async () => {},
+            _lastFilledPrice: 7.7,
+            _lastFilledType: 'sell',
+            _lastMarketFillPrice: 7.7,
+            lastFillPivotSource: 'fill',
         },
         accountId: '1.2.345',
         account: { id: '1.2.345' },
@@ -581,6 +585,7 @@ async function runManualTriggerScenario({ botName, botKey, snapshotPayload, trig
         const { handlePendingTriggerReset } = require('../modules/dexbot_maintenance_runtime');
         const ok = await handlePendingTriggerReset(self);
         assert.strictEqual(ok, true, 'trigger reset should succeed');
+        if (assertState) await assertState(self);
         await assertUpdated(readJSON(snapshotFile), logs);
     } finally {
         restoreFs();
@@ -590,10 +595,309 @@ async function runManualTriggerScenario({ botName, botKey, snapshotPayload, trig
     }
 }
 
+// Manual CLI reset is a clean slate: both guard references (live + persisted)
+// are dropped, the rebuild is told not to re-arm/anchor, and watchdog memory
+// keyed to the old pivot is cleared. Automatic resync sources must not take
+// this path — that invariant stays pinned by the other stages here.
+async function runFullResetScenario({
+    ambiguous = false,
+    ambiguousConfirm = false,
+    eraseFails = false,
+    noApi = false,
+    genesisMismatch = false,
+} = {}) {
+    const PATHS = requirePaths();
+    const { ensureDir, readJSON, writeJSON } = requireStorage();
+
+    const botName = 'Full Reset Bot';
+    // Multiple parallel stage workers can start in the same millisecond.
+    const botKey = `manual-full-reset-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const triggerFile = path.join(os.tmpdir(), `${botKey}.trigger`);
+    const snapshotFile = path.join(PATHS.ORDERS_DIR, `${botKey}.dynamicgrid.json`);
+
+    ensureDir(path.dirname(snapshotFile));
+    writeJSON(snapshotFile, {
+        centerPrice: 100,
+        amaCenterPrice: 123.45,
+        gridPriceOffsetPct: 0.8,
+        source: _adapterSource,
+        updatedAt: '2026-01-01T00:00:00Z',
+    });
+    writeJSON(triggerFile, { source: 'manual_grid_full_reset' });
+
+    const expireCalls: Array<{ reason: string; manager: unknown; options: unknown }> = [];
+    const persistedClears: string[] = [];
+    const restoredRows: unknown[] = [];
+    const recalcOptions: any[] = [];
+    const expireSpy = (manager: any, reason: string, options: unknown) => {
+        expireCalls.push({ manager, reason, options });
+        // Mirror the production helper's in-memory half.
+        manager._lastFilledPrice = null;
+        manager._lastFilledType = null;
+        manager._lastFilledAt = 0;
+        manager.lastFillPivotSource = null;
+        manager._lastFilledBuyPrice = null;
+        manager._lastFilledSellPrice = null;
+        manager._lastMarketFillPrice = null;
+        manager._lastMarketFillType = null;
+        manager._lastMarketFillAt = 0;
+    };
+    let guardedReadCalls = 0;
+    let readResult: unknown = 'unset';
+    const guardedRead = ambiguousConfirm
+        ? (async () => { guardedReadCalls++; return guardedReadCalls === 1 ? [] : null; })
+        : (ambiguous || genesisMismatch)
+            ? (async () => { guardedReadCalls++; return null; })
+            : null;
+    installTriggerResetMocks({
+        expireSpy,
+        guardedRead,
+        recalculateSpy: async (manager: any, opts: any) => {
+            recalcOptions.push(opts);
+            // Drive the guarded read inside recalculateGrid so the truncated
+            // read flag is actually set for the rollback scenarios.
+            if (ambiguousConfirm) {
+                readResult = await opts.readOpenOrdersFn();
+            } else if (ambiguous || genesisMismatch) {
+                await opts.readOpenOrdersFn();
+                if (genesisMismatch) manager._genesis = { priceLevelsHash: 'new-genesis' };
+            }
+        },
+    });
+
+    const wl = makeTempWhitelist({ [botKey]: { ama: true, dynamicWeight: true } });
+    const restoreFs = patchBotsJson([{ name: botName, weightDistribution: { sell: 0.6, buy: 0.4 } }]);
+    const logs: string[] = [];
+    const persistedPivotRow = { price: 123.45, type: 'sell', fillsAt: 1700000000000, genesisHash: 'old-genesis' };
+    const persistedMarketRow = { price: 123.45, type: 'sell', fillsAt: 1700000000000 };
+    const accountOrders: any = noApi ? {} : {
+        loadLastFillPivot: async () => persistedPivotRow,
+        loadLastMarketFill: async () => persistedMarketRow,
+        clearLastFillGuardRows: async () => {
+            // Resolve on a later tick: the caller must AWAIT this before
+            // recording success or clearing the trigger.
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            if (eraseFails) throw new Error('simulated persistence failure');
+            persistedClears.push('both');
+        },
+        restoreLastFillGuardRows: async (pivot: unknown, marketFill: unknown) => { restoredRows.push(pivot, marketFill); },
+    };
+    const manager: any = {
+        config: { name: botName, botKey, botIndex: 0, weightDistribution: { sell: 0.6, buy: 0.4 } },
+        funds: { btsFeesOwed: 2 },
+        accountOrders,
+        _fillProcessingLock: { acquire: async (fn: () => Promise<void>) => fn() },
+        _fundLock: { acquire: async (fn: () => Promise<void>) => fn() },
+        startBootstrap: () => {},
+        finishBootstrap: () => {},
+        persistGrid: async () => {},
+        _spreadRailOversubscribed: { side: 'sell', virtual: 1, free: 2, at: 3 },
+        _lastFilledPrice: 123.45,
+        _lastFilledType: 'sell',
+        _lastFilledAt: 1700000000000,
+        lastFillPivotSource: 'fill',
+        _lastFilledBuyPrice: 100,
+        _lastFilledSellPrice: 123.45,
+        _lastMarketFillPrice: 123.45,
+        _lastMarketFillType: 'sell',
+        _lastMarketFillAt: 1700000000000,
+    };
+    const self: any = {
+        config: manager.config,
+        _baseWeightDistribution: { sell: 0.6, buy: 0.4 },
+        manager,
+        accountOrders,
+        accountId: '1.2.345',
+        account: { id: '1.2.345' },
+        privateKey: 'test-key',
+        triggerFile,
+        _lastGeometryResyncPivotKey: 'old-pivot',
+        _geometryResyncWarnedPivotKey: 'old-warn-pivot',
+        _lastSpreadStaleResyncAt: 1,
+        _outOfSpreadSince: 1,
+        _outOfSpreadStaleWarned: true,
+        _outOfSpreadTransientCount: 3,
+        _outOfSpreadToleranceSince: 5,
+        _outOfSpreadNoProgressWarned: true,
+        _spreadCorrectionStall: 'last-fill-blocked',
+        _spreadStallArmed: true,
+        _log: (msg: string) => logs.push(msg),
+        _warn: (msg: string) => logs.push(`WARN:${msg}`),
+    };
+
+    try {
+        const { handlePendingTriggerReset } = require('../modules/dexbot_maintenance_runtime');
+        const ok = await handlePendingTriggerReset(self);
+
+        if (noApi) {
+            assert.strictEqual(ok, false, 'missing guard persistence API must refuse the reset');
+            assert.strictEqual(expireCalls.length, 0, 'no live clear when the API preflight fails');
+            assert.deepStrictEqual(persistedClears, []);
+            assert.strictEqual(manager._lastFilledPrice, 123.45, 'guard must stay intact');
+            assert.strictEqual(self._lastGeometryResyncPivotKey, 'old-pivot');
+            assert.ok(fs.existsSync(triggerFile), 'trigger must be retained for retry');
+            assert.ok(
+                logs.some((msg) => String(msg).includes('Guard persistence API unavailable')),
+                'missing API must be warned loudly'
+            );
+            return;
+        }
+
+        assert.strictEqual(expireCalls.length, 1, 'guard expiry should run exactly once');
+        assert.strictEqual(expireCalls[0].reason, 'manual full grid reset');
+        assert.strictEqual(expireCalls[0].manager, manager);
+        assert.deepStrictEqual(expireCalls[0].options, { skipPersistedClear: true }, 'disk deletes must be deferred to the reset caller');
+        assert.strictEqual(recalcOptions.length, 1, 'recalculateGrid should receive the resync options');
+        assert.strictEqual(recalcOptions[0]?.clearLastFillGuards, true, 'rebuild must be told to skip re-arm/fill anchor');
+
+        if (ambiguous || ambiguousConfirm || eraseFails || genesisMismatch) {
+            assert.strictEqual(ok, false, 'a failed rebuild must not commit the reset');
+            assert.deepStrictEqual(persistedClears, [], 'disk rows must survive a failed rebuild');
+            assert.strictEqual(restoredRows.length, 2, 'both row slots must be passed to the restore helper');
+            assert.deepStrictEqual(
+                restoredRows[0],
+                genesisMismatch ? null : persistedPivotRow,
+                'a pivot bound to a superseded genesis must NOT be restored'
+            );
+            assert.deepStrictEqual(restoredRows[1], persistedMarketRow, 'market-fill row must always be restored');
+            assert.strictEqual(manager._lastFilledPrice, 123.45, 'live pivot must be restored');
+            assert.strictEqual(manager._lastMarketFillPrice, 123.45, 'live market row must be restored');
+            assert.strictEqual(manager.lastFillPivotSource, 'fill');
+            assert.strictEqual(self._lastGeometryResyncPivotKey, 'old-pivot', 'watchdog state must not be cleared on failure');
+            assert.strictEqual(self._spreadCorrectionStall, 'last-fill-blocked');
+            assert.ok(fs.existsSync(triggerFile), 'trigger must be retained for retry');
+            assert.strictEqual(readJSON(snapshotFile).lastGridResetSource, undefined, 'no reset metadata on failure');
+            assert.ok(
+                logs.some((msg) => String(msg).includes('[FULL-RESET] Guard state rolled back; trigger retained')),
+                'a successful rollback must be auditable'
+            );
+            if (ambiguousConfirm) {
+                assert.strictEqual(readResult, null, 'a truncated confirm must abort recalculateGrid before rebuilding');
+                assert.strictEqual(guardedReadCalls, 2, 'empty read + confirm read must both be attempted');
+            }
+            if (genesisMismatch) {
+                assert.ok(
+                    logs.some((msg) => String(msg).includes('genesis changed during the failed rebuild')),
+                    'dropping the dead pivot must be logged'
+                );
+            }
+            if (eraseFails) {
+                assert.ok(
+                    logs.some((msg) => String(msg).includes('Failed to clear persisted guard rows')),
+                    'erase failure must be warned loudly'
+                );
+            }
+        } else {
+            assert.strictEqual(ok, true, 'full-reset trigger should succeed');
+            assert.deepStrictEqual(persistedClears, ['both'], 'both persisted rows must be erased in ONE awaited call');
+            assert.strictEqual(restoredRows.length, 0, 'a successful reset must not roll back');
+            assert.strictEqual(manager._lastFilledPrice, null);
+            assert.strictEqual(manager.lastFillPivotSource, null);
+            assert.strictEqual(manager._lastMarketFillPrice, null);
+            assert.strictEqual(self._lastGeometryResyncPivotKey, '');
+            assert.strictEqual(self._geometryResyncWarnedPivotKey, '');
+            assert.strictEqual(self._lastSpreadStaleResyncAt, 0);
+            assert.strictEqual(self._outOfSpreadSince, 0);
+            assert.strictEqual(self._outOfSpreadStaleWarned, false);
+            assert.strictEqual(self._outOfSpreadTransientCount, 0);
+            assert.strictEqual(self._outOfSpreadToleranceSince, 0);
+            assert.strictEqual(self._outOfSpreadNoProgressWarned, false);
+            assert.strictEqual(self._spreadCorrectionStall, null);
+            assert.strictEqual(self._spreadStallArmed, false, 'stall cause and flag must never drift');
+            assert.strictEqual(manager._spreadRailOversubscribed, null);
+            const updated = readJSON(snapshotFile);
+            assert.strictEqual(updated.lastGridResetSource, 'manual_grid_full_reset');
+            assert.ok(
+                logs.some((msg) => String(msg).includes('[FULL-RESET] Cleared persisted guard rows and spread watchdog memory.')),
+                'full reset should log the committed guard clear'
+            );
+        }
+    } finally {
+        restoreFs();
+        wl.cleanup();
+        try { fs.unlinkSync(triggerFile); } catch (_) {}
+        try { fs.unlinkSync(snapshotFile); } catch (_) {}
+    }
+}
+
+async function testManualFullResetTriggerClearsLastFillGuards() {
+    await runFullResetScenario();
+}
+
+async function testManualFullResetRollsBackOnFailedRebuild() {
+    await runFullResetScenario({ ambiguous: true });
+}
+
+async function testManualFullResetAbortsOnTruncatedConfirm() {
+    await runFullResetScenario({ ambiguousConfirm: true });
+}
+
+async function testManualFullResetRollsBackOnEraseFailure() {
+    await runFullResetScenario({ eraseFails: true });
+}
+
+async function testManualFullResetDropsDeadPivotOnRollback() {
+    await runFullResetScenario({ genesisMismatch: true });
+}
+
+async function testManualFullResetRejectsMissingPersistenceApi() {
+    await runFullResetScenario({ noApi: true });
+}
+
+async function testForeignSourcedTriggerStaysManual() {
+    const recalcOptions: any[] = [];
+    await runManualTriggerScenario({
+        botName: 'Foreign Source Bot',
+        botKey: `foreign-source-reset-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        snapshotPayload: {
+            centerPrice: 100,
+            amaCenterPrice: 123.45,
+            source: _adapterSource,
+            updatedAt: '2026-01-01T00:00:00Z',
+        },
+        triggerPayload: { source: 'rms_structural_grid_resync' },
+        mocks: { recalculateSpy: async (_manager: unknown, opts: unknown) => { recalcOptions.push(opts); } },
+        assertUpdated: async (updated) => {
+            assert.strictEqual(updated.lastGridResetSource, 'manual_grid_resync', 'foreign sources must keep legacy manual provenance');
+            assert.strictEqual(updated.centerPrice, 123.45, 'foreign sources must keep the manual center refresh');
+            assert.strictEqual(recalcOptions[0]?.clearLastFillGuards, false, 'foreign sources must not clear guards');
+        },
+    });
+}
+
+async function testManualNormalResetKeepsLastFillGuard() {
+    const recalcOptions: any[] = [];
+    const expireCalls: any[] = [];
+    await runManualTriggerScenario({
+        botName: 'Normal Reset Bot',
+        botKey: `manual-normal-reset-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        snapshotPayload: {
+            centerPrice: 100,
+            amaCenterPrice: 123.45,
+            source: _adapterSource,
+            updatedAt: '2026-01-01T00:00:00Z',
+        },
+        mocks: {
+            expireSpy: (...args: any[]) => { expireCalls.push(args); },
+            recalculateSpy: async (_manager: unknown, opts: unknown) => { recalcOptions.push(opts); },
+        },
+        assertState: async (self) => {
+            assert.strictEqual(expireCalls.length, 0, 'a plain manual reset must not clear guard references');
+            assert.strictEqual(recalcOptions.length, 1);
+            assert.strictEqual(recalcOptions[0]?.clearLastFillGuards, false, 'normal reset must keep the guard');
+            assert.strictEqual(self.manager._lastFilledPrice, 7.7, 'live pivot must survive a normal reset');
+            assert.strictEqual(self.manager.lastFillPivotSource, 'fill');
+        },
+        assertUpdated: async (updated) => {
+            assert.strictEqual(updated.lastGridResetSource, 'manual_grid_resync');
+        },
+    });
+}
+
 async function testManualTriggerResetRefreshesCenterPrice() {
     await runManualTriggerScenario({
         botName: 'Manual Reset Bot',
-        botKey: `manual-reset-${Date.now()}`,
+        botKey: `manual-reset-${Date.now()}-${Math.random().toString(36).slice(2)}`,
         snapshotPayload: {
             centerPrice: 100,
             amaCenterPrice: 123.45,
@@ -617,7 +921,7 @@ async function testManualTriggerResetRefreshesCenterPrice() {
 async function testManualTriggerResetKeepsOffsetWhenCenterAlreadyCurrent() {
     await runManualTriggerScenario({
         botName: 'Manual Reset Current Bot',
-        botKey: `manual-reset-current-${Date.now()}`,
+        botKey: `manual-reset-current-${Date.now()}-${Math.random().toString(36).slice(2)}`,
         snapshotPayload: {
             gridCenterPrice: 123.45,
             centerPrice: 123.45,
@@ -636,7 +940,7 @@ async function testManualTriggerResetKeepsOffsetWhenCenterAlreadyCurrent() {
 async function testMarketAdapterTriggerResetRefreshesAmaCenterPrice() {
     await runManualTriggerScenario({
         botName: 'Market Adapter Reset Bot',
-        botKey: `market-adapter-reset-${Date.now()}`,
+        botKey: `market-adapter-reset-${Date.now()}-${Math.random().toString(36).slice(2)}`,
         snapshotPayload: {
             gridCenterPrice: 100,
             centerPrice: 100,
@@ -666,7 +970,7 @@ async function testMarketAdapterTriggerResetRefreshesAmaCenterPrice() {
 async function testMarketAdapterBootstrapTriggerResetRecordsBootstrapSource() {
     await runManualTriggerScenario({
         botName: 'Market Adapter Bootstrap Bot',
-        botKey: `market-adapter-bootstrap-${Date.now()}`,
+        botKey: `market-adapter-bootstrap-${Date.now()}-${Math.random().toString(36).slice(2)}`,
         snapshotPayload: {
             gridCenterPrice: 100,
             centerPrice: 100,
@@ -695,7 +999,7 @@ async function testMarketAdapterBootstrapTriggerResetRecordsBootstrapSource() {
 async function testMarketAdapterSlopeTriggerResetRecordsSlopeSource() {
     await runManualTriggerScenario({
         botName: 'Market Adapter Slope Bot',
-        botKey: `market-adapter-slope-${Date.now()}`,
+        botKey: `market-adapter-slope-${Date.now()}-${Math.random().toString(36).slice(2)}`,
         snapshotPayload: {
             gridCenterPrice: 100,
             centerPrice: 100,
@@ -858,7 +1162,8 @@ async function testRmsDivergenceRunsFullGridResync() {
         centerRefreshContext: 'RMS structural grid resync',
         centerRefreshLabel: 'RMS structural grid resync',
         resetSource: 'rms_structural_grid_resync',
-    }, 'RMS divergence should run full grid resync as state repair WITHOUT re-anchoring (docs/ORDER_ENGINE_POST_1.0_RETROSPECTIVE.md §2 fix #1: re-anchoring orphaned live orders)');
+        clearLastFillGuards: false,
+    }, 'RMS divergence should run full grid resync as state repair WITHOUT clearing the last-fill guards or re-anchoring (docs/ORDER_ENGINE_POST_1.0_RETROSPECTIVE.md §2 fix #1: re-anchoring orphaned live orders)');
     assert.strictEqual(correctionCalled, false, 'RMS divergence should not use correction-only path');
     assert.strictEqual(spreadChecked, false, 'maintenance should stop after full RMS resync');
     assert.ok(
@@ -1060,6 +1365,14 @@ const STAGES = {
     refresh_rejects_stale_base_weights: testRefreshDynamicWeightDistributionRejectsStaleBaseWeights,
     metadata_records_actual_reset: testUpdateBotGridResetMetadataRecordsActualReset,
     metadata_rejects_invalid_snapshot: testUpdateBotGridResetMetadataRejectsInvalidSnapshot,
+    manual_full_reset_clears_last_fill_guards: testManualFullResetTriggerClearsLastFillGuards,
+    manual_full_reset_rolls_back_on_failed_rebuild: testManualFullResetRollsBackOnFailedRebuild,
+    manual_full_reset_aborts_on_truncated_confirm: testManualFullResetAbortsOnTruncatedConfirm,
+    manual_full_reset_rolls_back_on_erase_failure: testManualFullResetRollsBackOnEraseFailure,
+    manual_full_reset_drops_dead_pivot_on_rollback: testManualFullResetDropsDeadPivotOnRollback,
+    manual_full_reset_rejects_missing_persistence_api: testManualFullResetRejectsMissingPersistenceApi,
+    foreign_sourced_trigger_stays_manual: testForeignSourcedTriggerStaysManual,
+    manual_normal_reset_keeps_guard: testManualNormalResetKeepsLastFillGuard,
     manual_trigger_reset_refreshes_center_price: testManualTriggerResetRefreshesCenterPrice,
     manual_trigger_reset_keeps_offset_when_current: testManualTriggerResetKeepsOffsetWhenCenterAlreadyCurrent,
     market_adapter_trigger_reset_refreshes_center: testMarketAdapterTriggerResetRefreshesAmaCenterPrice,
@@ -1087,6 +1400,16 @@ const STAGE_UNITS = [
     'refresh_stale_fallback',
     'refresh_rejects_stale_base_weights',
     ['metadata_records_actual_reset', 'metadata_rejects_invalid_snapshot'],
+    // Own units: custom guard-expiry spy, recalculateGrid capture, and (for the
+    // rollback case) a truncated-open-orders read.
+    'manual_full_reset_clears_last_fill_guards',
+    'manual_full_reset_rolls_back_on_failed_rebuild',
+    'manual_full_reset_aborts_on_truncated_confirm',
+    'manual_full_reset_rolls_back_on_erase_failure',
+    'manual_full_reset_drops_dead_pivot_on_rollback',
+    'manual_full_reset_rejects_missing_persistence_api',
+    'foreign_sourced_trigger_stays_manual',
+    'manual_normal_reset_keeps_guard',
     [
         'manual_trigger_reset_refreshes_center_price',
         'manual_trigger_reset_keeps_offset_when_current',

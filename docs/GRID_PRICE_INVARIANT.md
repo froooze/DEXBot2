@@ -133,7 +133,10 @@ and the pivot is also the absolute geometry anchor for
 that edge. PARTIAL fills do arm it (a real trade at a real price). The pivot
 then survives a grid rebuild: `_resetLastFillPivot` clears it with the
 old generation and `rearmLastFillPivotFromMarketFill` re-arms it immediately
-from the bot-scoped last-market-fill row, provenance `'fill'`.
+from the bot-scoped last-market-fill row, provenance `'fill'`. The one exception
+is an explicit `dexbot reset`: it passes `clearLastFillGuards` through the
+resync so the rebuild skips both the re-arm and the fill-derived boundary
+anchor, leaving the new ladder purely structural and the guard cold.
 
 *Operational consequence (deliberate):* after an edge fill the affected side
 stays vetoed relative to the last WINDOW trade until a window fill (or the 24h

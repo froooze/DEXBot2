@@ -252,7 +252,7 @@ the canonical name is preferred in scripts and docs.
 |---------|---------|---------|
 | `dexbot test <bot>` | — | Run a single bot in live mode (one-shot; not a dry run) |
 | `dexbot drystart <bot>` | — | Same as `test` but forces dry-run execution |
-| `dexbot reset <bot>` | — | Trigger a grid reset (applies live or on next start; `reset all` for all) |
+| `dexbot reset <bot>` | — | Trigger a clean-slate grid reset, including last-fill guard state (applies live or on next start; `reset all` for all) |
 | `dexbot default` | `defaults` | Reset settings to defaults (deletes generated settings files) |
 | `dexbot disable <bot>` | — | Mark a bot inactive in config (`disable all` for all) |
 | `dexbot enable <bot>` | — | Mark a bot active in config (`enable all` for all) |

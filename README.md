@@ -333,7 +333,7 @@ First-run details and common mistakes are covered in the [BitShares Onboarding T
 dexbot key                    # Master password/keyring
 dexbot bot                    # Interactive bot configurator
 
-dexbot reset {all|<bot>}      # Regenerate grid
+dexbot reset {all|<bot>}      # Full grid reset, clears last-fill guards
 dexbot disable {all|<bot>}    # Disable bot in config
 dexbot enable {all|<bot>}     # Enable bot in config
 

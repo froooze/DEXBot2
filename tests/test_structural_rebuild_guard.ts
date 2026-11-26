@@ -102,11 +102,58 @@ async function testRebalanceDefersWhilePlacementHeld() {
     console.log('  PASS');
 }
 
+async function testFullResetSkipsGuardRearmAndAnchor() {
+    console.log('\n - full reset skips pivot re-arm and fill-derived anchor...');
+    const control = new OrderManager(cfg);
+    await control.setAccountTotals({ buy: 1000, sell: 10, buyFree: 1000, sellFree: 10 });
+    control.assets = { assetA: { id: '1.3.0', precision: 5 }, assetB: { id: '1.3.1', precision: 5 } };
+    await Grid.initializeGrid(control);
+
+    const sellPrices = Array.from(control.orders.values())
+        .map((order: any) => Number(order.price))
+        .filter((price: number) => Number.isFinite(price) && price > Number(control.config.startPrice))
+        .sort((a: number, b: number) => a - b);
+    assert.ok(sellPrices.length > 0, 'control grid must contain sell levels');
+    const lastSell = sellPrices[0];
+
+    const reset = new OrderManager(cfg);
+    await reset.setAccountTotals({ buy: 1000, sell: 10, buyFree: 1000, sellFree: 10 });
+    reset.assets = { assetA: { id: '1.3.0', precision: 5 }, assetB: { id: '1.3.1', precision: 5 } };
+    // Arm BOTH representations: a normal rebuild would re-arm the pivot from
+    // the market row and anchor the fresh boundary to this sell price.
+    const at = Date.now();
+    (reset as any)._lastFilledPrice = lastSell;
+    (reset as any)._lastFilledType = 'sell';
+    (reset as any)._lastFilledAt = at;
+    (reset as any).lastFillPivotSource = 'fill';
+    (reset as any)._lastFilledSellPrice = lastSell;
+    (reset as any)._lastMarketFillPrice = lastSell;
+    (reset as any)._lastMarketFillType = 'sell';
+    (reset as any)._lastMarketFillAt = at;
+
+    await Grid.initializeGrid(reset, { skipLastFillGuard: true });
+
+    assert.strictEqual((reset as any)._lastFilledPrice, null, 'full reset must leave the pivot cold');
+    assert.strictEqual((reset as any).lastFillPivotSource, null, 'full reset must not re-arm the pivot');
+    assert.strictEqual(
+        (reset as any)._lastMarketFillPrice,
+        lastSell,
+        'initializeGrid itself must not erase the market row — the reset caller does that before the rebuild'
+    );
+    assert.strictEqual(
+        reset.boundaryIdx,
+        control.boundaryIdx,
+        'full reset must keep the structural boundary instead of anchoring it to the old last fill'
+    );
+    console.log('  PASS');
+}
+
 (async () => {
     console.log('Running structural rebuild guard tests...');
     testStaleReasonClassifier();
     await testRebalanceDefersDuringRebuild();
     await testRebalanceDefersWhilePlacementHeld();
+    await testFullResetSkipsGuardRearmAndAnchor();
     console.log('\n✓ All structural rebuild guard tests passed');
 })().catch((err) => {
     console.error('❌ Structural rebuild guard test failed:', err);

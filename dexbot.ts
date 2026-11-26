@@ -225,7 +225,7 @@ function printCLIUsage() {
         ['Trading', [
             ['test <bot>', 'Run a bot live once.'],
             ['drystart <bot>', 'Run a bot without broadcasting.'],
-            ['reset {all|<bot>}', 'Reset grid state (applies now or on next start).'],
+            ['reset {all|<bot>}', 'Full grid reset incl. last-fill guards (applies now or on next start).'],
         ]],
         ['Config', [
             ['bot', 'Interactive bots.json configurator.'],
@@ -854,13 +854,13 @@ async function setBotActiveState(botName: string | null | undefined, active: boo
 }
 
 /**
- * Reset a bot by regenerating its grid and starting it fresh.
+ * Fully reset a bot: regenerate its grid and clear the last-fill guards.
  * This method creates a trigger file that signals the bot instance
- * (whether running locally or via PM2) to perform a full grid resync.
+ * (whether running locally or via PM2) to perform a clean-slate grid resync.
  *
- * 1. Creates profiles/recalculate.<botKey>.trigger
- * 2. If bot is running, it detects file -> resyncs grid -> deletes file
- * 3. If bot is stopped, it detects file on startup -> resyncs grid -> deletes file
+ * 1. Creates profiles/recalculate.<botKey>.trigger with a full-reset source
+ * 2. If bot is running, it detects file -> clears guards + resyncs -> deletes file
+ * 3. If bot is stopped, it detects file on startup -> same -> deletes file
  *
  * @param {string|null|undefined} botName - Name of the bot to reset, or null/undefined for all active
  */
@@ -880,8 +880,16 @@ async function resetBotByName(botName: string | null | undefined) {
     for (const bot of targets) {
         try {
             const triggerFile = getRecalculateTriggerFile(bot.botKey);
-            storage.writeFile(triggerFile, '');
-            console.log(startupSuccess(`✓ Trigger set for '${bot.name}' (${path.basename(triggerFile)})`));
+            // Manual CLI reset is a clean slate: the new source makes the runtime
+            // drop both last-fill guard references (live + persisted) and rebuild
+            // without anchoring geometry to the old last fill. Empty triggers
+            // remain the legacy/normal reset for other trigger writers (claw,
+            // market adapter, hand-made files).
+            // writeJSON is atomic (tmp + rename): a running bot's trigger
+            // watcher must never parse a half-written trigger as a legacy
+            // empty/manual reset.
+            storage.writeJSON(triggerFile, { source: 'manual_grid_full_reset' });
+            console.log(startupSuccess(`✓ Full-reset trigger set for '${bot.name}' (${path.basename(triggerFile)})`));
         } catch (err) {
             console.warn(`Failed to set trigger for '${bot.name}': ${getErrorMessage(err)}`);
         }
@@ -890,7 +898,7 @@ async function resetBotByName(botName: string | null | undefined) {
     console.log();
     console.log(startupSuccess('Action complete.'));
     console.log('- If the bot is running (CLI or PM2), it will detect the trigger and reset automatically.');
-    console.log('- If the bot is stopped, the grid will be regenerated the next time you run `dexbot test`.');
+    console.log('- If the bot is stopped, the clean-slate grid will be regenerated the next time you run `dexbot test`.');
 }
 
 /**

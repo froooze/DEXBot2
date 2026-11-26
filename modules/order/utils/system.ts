@@ -3093,8 +3093,16 @@ export function resetLastFillPivot(manager: OrderManagerLike, reason: string = '
  *
  * @param {Object} manager - OrderManager instance
  * @param {string} reason - Log/debug label for the expiry
+ * @param {Object} [options] - `{ skipPersistedClear: true }` leaves BOTH disk
+ *   rows untouched for the caller. The manual full-reset path owns a single
+ *   runtime-safe `clearLastFillGuardRows()` commit (or
+ *   `restoreLastFillGuardRows()` rollback) after the rebuild outcome is known.
  */
-export function expireLastFillGuardReferences(manager: OrderManagerLike, reason: string = 'unspecified'): void {
+export function expireLastFillGuardReferences(
+    manager: OrderManagerLike,
+    reason: string = 'unspecified',
+    options: { skipPersistedClear?: boolean } = {}
+): void {
     if (!manager) return;
     const pivotArmed = manager._lastFilledPrice != null && manager._lastFilledType != null;
     const fillRefArmed = manager._lastMarketFillPrice != null;
@@ -3102,20 +3110,22 @@ export function expireLastFillGuardReferences(manager: OrderManagerLike, reason:
     manager._lastMarketFillPrice = null;
     manager._lastMarketFillType = null;
     manager._lastMarketFillAt = 0;
-    try {
-        const acct = manager.accountOrders;
-        if (acct && typeof acct.clearPersistedLastMarketFill === 'function') {
-            void acct.clearPersistedLastMarketFill();
-        }
-        if (acct && typeof acct.clearPersistedLastFillPivot === 'function') {
-            void acct.clearPersistedLastFillPivot();
-        }
-    } catch { /* best-effort */ }
+    if (options.skipPersistedClear !== true) {
+        try {
+            const acct = manager.accountOrders;
+            if (acct && typeof acct.clearPersistedLastMarketFill === 'function') {
+                void acct.clearPersistedLastMarketFill();
+            }
+            if (acct && typeof acct.clearPersistedLastFillPivot === 'function') {
+                void acct.clearPersistedLastFillPivot();
+            }
+        } catch { /* best-effort */ }
+    }
     if (pivotArmed || fillRefArmed) {
         try {
             manager.logger?.log?.(
                 `[LAST-FILL-GUARD] Expired guard references (${reason}): pivot and last-market-fill ` +
-                `cleared live and persisted — spread correction trades around the live market ` +
+                `cleared live${options.skipPersistedClear === true ? '' : ' and persisted'} — spread correction trades around the live market ` +
                 `again; both re-arm on the next real fill`,
                 'warn'
             );

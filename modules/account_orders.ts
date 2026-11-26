@@ -19,7 +19,7 @@
  *      syncMeta(botConfig), storeMasterGrid(orders, btsFeesOwed, boundaryIdx, assets, debugInputs, recentFillKeys, genesis, gapEvacStreaks, pendingFillCrawls, lastFillPivot, lastMarketFill)
  *      loadGrid(forceReload), loadRecentFillKeys(forceReload), loadPersistedAssets(forceReload), loadPendingFillCrawls(forceReload)
  *      loadBoundaryIdx(forceReload), loadBtsBalance(forceReload), loadBtsFeesOwed(forceReload), loadGapEvacStreaks(forceReload), loadGenesis(forceReload), loadLastFillPivot(forceReload), loadLastMarketFill(forceReload)
- *      clearGrid(), clearPersistedBoundary(), clearPersistedLastFillPivot(), clearPersistedLastMarketFill(), backupSnapshot(reason)
+ *      clearGrid(), clearPersistedBoundary(), clearPersistedLastFillPivot(), clearPersistedLastMarketFill(), clearLastFillGuardRows(), restoreLastFillGuardRows(pivot, marketFill), backupSnapshot(reason)
  *      loadProcessedFills(options), updateProcessedFillsBatch(fills), cleanOldProcessedFills(olderThanMs)
  *      getAssetBalances(forceReload)
  *
@@ -562,12 +562,48 @@ class AccountOrders {
    * lock, discarding any unsaved in-memory mutations — safe at the
    * loadGrid/restore call site (startup load and recovery reload, both
    * before fills mutate state) but do NOT invoke from an arbitrary runtime
-   * path.
+   * path. Runtime callers must use clearLastFillGuardRows()/restoreLastFillGuardRows().
    */
   async clearPersistedLastFillPivot() {
     await this._persistenceLock.acquire(async () => {
       this._reload();
       delete this.data.lastFillPivot;
+      this.data.lastUpdated = nowIso();
+      this._persist();
+    });
+  }
+
+  /**
+   * Runtime-safe atomic erase of BOTH last-fill guard rows. Unlike the two
+   * load-time single-row helpers this is one locked reload+write, so a caller
+   * cannot leave a half-cleared guard pair. Safe from the reset path because
+   * the reload happens under `_persistenceLock` and `storeMasterGrid` already
+   * reloads before every write: no in-memory mutation can be clobbered.
+   */
+  async clearLastFillGuardRows() {
+    await this._persistenceLock.acquire(async () => {
+      this._reload();
+      delete this.data.lastFillPivot;
+      delete this.data.lastMarketFill;
+      this.data.lastUpdated = nowIso();
+      this._persist();
+    });
+  }
+
+  /**
+   * Runtime-safe rollback counterpart of clearLastFillGuardRows: restore the
+   * pre-reset guard rows (already validated by the shared normalizers) after
+   * a failed rebuild. Same lock/reload argument as the erase method.
+   */
+  async restoreLastFillGuardRows(pivot: unknown, marketFill: unknown) {
+    await this._persistenceLock.acquire(async () => {
+      this._reload();
+      const normalizedPivot = normalizeLastFillPivot(pivot);
+      const normalizedMarket = normalizeLastMarketFill(marketFill);
+      if (normalizedPivot) this.data.lastFillPivot = normalizedPivot;
+      else delete this.data.lastFillPivot;
+      if (normalizedMarket) this.data.lastMarketFill = normalizedMarket;
+      else delete this.data.lastMarketFill;
       this.data.lastUpdated = nowIso();
       this._persist();
     });
@@ -691,7 +727,8 @@ class AccountOrders {
    * Erase a persisted last-market-fill row that restoreLastMarketFill
    * rejected (TTL expiry / malformed). Mirrors clearPersistedLastFillPivot:
    * without an explicit erase a dead row would re-arm the same rejection on
-   * every restart. Load-time only.
+   * every restart. Load-time only; runtime callers must use
+   * clearLastFillGuardRows()/restoreLastFillGuardRows().
    */
   async clearPersistedLastMarketFill() {
     await this._persistenceLock.acquire(async () => {

@@ -1603,11 +1603,20 @@ export function applyRebuildFillAnchor(
 /**
      * Initialize and orchestrate the order grid.
      *
+     * @param {Object} [options] - Rebuild options
+     * @param {boolean} [options.skipLastFillGuard=false] - Full manual reset:
+     *   leave the guard cold after dropping the old pivot, and keep the new
+     *   boundary structural (no re-arm, no fill-derived anchor). Automatic
+     *   rebuilds must not set this.
      * @return {Promise<void>}
      * @throws {Error} If initialization fails or account totals are missing.
      */
-export async function initializeGrid(manager: OrderManagerLike): Promise<void> {
+export async function initializeGrid(manager: OrderManagerLike, options: { skipLastFillGuard?: boolean } = {}): Promise<void> {
         if (!manager) throw new Error('initializeGrid requires a manager instance');
+        // A manual clean-slate reset (dexbot reset) deliberately drops both
+        // last-fill guard references instead of re-arming/fill-anchoring the
+        // rebuilt generation against the old last real fill.
+        const skipLastFillGuard = options.skipLastFillGuard === true;
 
         try {
             await withBlockchainRetry(
@@ -1968,20 +1977,22 @@ export async function initializeGrid(manager: OrderManagerLike): Promise<void> {
 
         // Same generation contract for the LAST-FILL-GUARD pivot: it was
         // armed against the previous ladder, and restoreLastFillPivot would
-        // refuse it against the new genesis anyway. Drop it now, then RE-ARM it
-        // from the bot-scoped last real fill (rearmLastFillPivotFromMarketFill)
-        // — the guard must not stay cold after a rebuild, and the re-arm is an
-        // explicit, logged, persistable write instead of the read-time fallback
-        // in resolveLastFillGuardReference doing the same job silently for the
+        // refuse it against the new genesis anyway. Drop it now. Normal
+        // rebuilds then RE-ARM it from the bot-scoped last real fill
+        // (rearmLastFillPivotFromMarketFill) — the guard must not stay cold
+        // after a rebuild, and the re-arm is an explicit, logged, persistable
+        // write instead of the read-time fallback in
+        // resolveLastFillGuardReference doing the same job silently for the
         // rest of the run. Provenance stays 'fill', so a book seed never
-        // qualifies.
+        // qualifies. A full manual reset deliberately leaves the guard cold:
+        // the operator asked for a blank slate, not a re-armed veto.
         try {
             if (typeof manager._resetLastFillPivot === 'function') {
                 manager._resetLastFillPivot('grid rebuild');
             } else {
                 resetLastFillPivot(manager, 'grid rebuild');
             }
-            rearmLastFillPivotFromMarketFill(manager);
+            if (!skipLastFillGuard) rearmLastFillPivotFromMarketFill(manager);
         } catch {}
 
         // FILL-DERIVED GEOMETRY ON REBUILD: a fresh generation centers the
@@ -1994,12 +2005,16 @@ export async function initializeGrid(manager: OrderManagerLike): Promise<void> {
         // BUY fill at f => boundary <= f-1, SELL fill at f => boundary >= f-gap.
         // This is a no-op for a cold pivot and for a fill already outside the
         // window; unsafe candidates are refused by the shared validator.
-        const anchoredGeometry = applyRebuildFillAnchor(
-            manager,
-            boundaryIdx,
-            orders as ManagedOrder[],
-            gapSlots
-        );
+        // Skipped on a full manual reset: the derived boundary stays purely
+        // structural so the new generation does not inherit the old fill.
+        const anchoredGeometry = skipLastFillGuard
+            ? { boundaryIdx, slots: orders as ManagedOrder[] }
+            : applyRebuildFillAnchor(
+                manager,
+                boundaryIdx,
+                orders as ManagedOrder[],
+                gapSlots
+            );
         const anchoredBoundary = anchoredGeometry.boundaryIdx;
         orders = anchoredGeometry.slots as typeof orders;
 
@@ -2101,9 +2116,11 @@ export async function initializeGrid(manager: OrderManagerLike): Promise<void> {
      * @param {Object} opts.chainOrders - Chain orders module.
      * @param {string} opts.account - Account name.
      * @param {string} opts.privateKey - Private key.
+     * @param {boolean} [opts.clearLastFillGuards=false] - Forwarded to initializeGrid
+     *   as `skipLastFillGuard` for a manual clean-slate reset.
      * @returns {Promise<void>}
      */
-export async function recalculateGrid(manager: OrderManagerLike, opts: { readOpenOrdersFn: () => Promise<unknown>; chainOrders: unknown; account: string; privateKey: string; [key: string]: unknown }): Promise<void> {
+export async function recalculateGrid(manager: OrderManagerLike, opts: { readOpenOrdersFn: () => Promise<unknown>; chainOrders: unknown; account: string; privateKey: string; clearLastFillGuards?: boolean; [key: string]: unknown }): Promise<void> {
         const { readOpenOrdersFn, chainOrders, account, privateKey } = opts;
 
         // Suppress invariant warnings during full resync
@@ -2175,7 +2192,7 @@ export async function recalculateGrid(manager: OrderManagerLike, opts: { readOpe
                 await manager.persistGrid(undefined, undefined, fundSnapshot);
 
                 if (_resyncAborted) return;
-                await initializeGrid(manager);
+                await initializeGrid(manager, { skipLastFillGuard: opts.clearLastFillGuards === true });
 
                 if (_resyncAborted) return;
                 const { reconcileGridOrders } = require('./grid_reconcile');

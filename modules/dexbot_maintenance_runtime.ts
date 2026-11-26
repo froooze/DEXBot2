@@ -167,6 +167,16 @@ const MARKET_ADAPTER_TRIGGER_RESETS = Object.freeze({
 const GRID_RESYNC_REASONS = Object.freeze({
     ...MARKET_ADAPTER_TRIGGER_RESETS,
     manual_grid_resync: MANUAL_TRIGGER_METADATA,
+    // Explicit operator clean slate: unlike every automatic resync source,
+    // this one drops the last-fill guard references (live and persisted) and
+    // rebuilds geometry without anchoring it to the old last fill.
+    manual_grid_full_reset: {
+        shouldRefreshCenterPrice: true,
+        centerRefreshContext: 'manual full grid reset',
+        centerRefreshLabel: 'manual full grid reset',
+        clearLastFillGuards: true,
+        resetSource: 'manual_grid_full_reset',
+    },
     rms_structural_grid_resync: {
         shouldRefreshCenterPrice: false,
         centerRefreshContext: 'RMS structural grid resync',
@@ -898,10 +908,9 @@ async function maybeRunTargetedDriftReconciliation(bot: BotLike, context: string
         // order shortfall. The spread check later this tick re-derives the flag
         // from fresh state, so a genuinely empty balance re-arms it for the next
         // tick (subject to the cooldown below).
-        if (bot._spreadStallArmed === true) bot._spreadStallArmed = false;
-        // Clear the companion cause with the flag so the two never drift apart
+        // Clear the companion cause WITH the flag so the two never drift apart
         // (a leftover cause would mislabel the next tick's reason).
-        bot._spreadCorrectionStall = null;
+        mirrorSpreadStall(bot, null);
 
         const remaining = getTargetedSyncReason(bot);
         const unmatchedCount = Number(syncResult?.unmatchedChainOrders?.length || 0);
@@ -1349,9 +1358,15 @@ function readTriggerMetadata(triggerFile: string) {
 
         const payload = JSON.parse(raw);
         const source = String(payload?.source || '').trim();
-        return source === MARKET_ADAPTER_TRIGGER_SOURCE
-            ? marketAdapterTriggerMetadata(payload)
-            : manualTriggerMetadata(payload);
+        if (source === MARKET_ADAPTER_TRIGGER_SOURCE) return marketAdapterTriggerMetadata(payload);
+        // ONLY the CLI's clean-slate source gets special handling: hand-written
+        // or foreign sources keep the legacy/manual interpretation, so a stray
+        // `rms_structural_grid_resync` payload cannot silently skip the AMA
+        // center refresh or clear the guards.
+        if (source === 'manual_grid_full_reset') {
+            return { ...buildGridResyncMetadata(source), payload };
+        }
+        return manualTriggerMetadata(payload);
     } catch (_) {
         return manualTriggerMetadata();
     }
@@ -1394,6 +1409,7 @@ function buildGridResyncOptions(reasonOrMetadata: unknown): {
     centerRefreshContext?: string;
     centerRefreshLabel?: string;
     resetSource?: string;
+    clearLastFillGuards?: boolean;
 } {
     const metadata = (typeof reasonOrMetadata === 'string'
         ? buildGridResyncMetadata(reasonOrMetadata)
@@ -1403,6 +1419,7 @@ function buildGridResyncOptions(reasonOrMetadata: unknown): {
         centerRefreshContext: metadata?.centerRefreshContext as string | undefined,
         centerRefreshLabel: metadata?.centerRefreshLabel as string | undefined,
         resetSource: metadata?.resetSource as string | undefined,
+        clearLastFillGuards: metadata?.clearLastFillGuards === true,
     };
 }
 
@@ -1488,6 +1505,8 @@ function updateBotGridResetMetadata(botKey: string | undefined, options: { reset
  * @param {import('./dexbot_class.js').DEXBot} bot
  * @param {unknown} [options] - Grid resync options
  * @param {boolean} [options.skipIdle=false] - Skip the idle-cooldown deferral
+ * @param {boolean} [options.clearLastFillGuards=false] - Clean-slate manual reset: drop both
+ *   guard references (live + persisted) and skip the rebuild's re-arm/fill anchor
  * @returns {Promise<boolean>} True if resync succeeded
  */
 function performGridResync(bot: BotLike, options: {
@@ -1496,6 +1515,7 @@ function performGridResync(bot: BotLike, options: {
     centerRefreshLabel?: string;
     resetSource?: string;
     skipIdle?: boolean;
+    clearLastFillGuards?: boolean;
 } = {}) {
     const self = bot;
     let success = false;
@@ -1504,6 +1524,7 @@ function performGridResync(bot: BotLike, options: {
     const centerRefreshLabel = options.centerRefreshLabel || (refreshCenterPrice ? 'grid reset' : 'grid resync');
     const resetSource = options.resetSource || (refreshCenterPrice ? 'manual_grid_resync' : 'dexbot_grid_resync');
     const skipIdle = options.skipIdle === true;
+    const clearLastFillGuards = options.clearLastFillGuards === true;
     const idleDelayMs = getMaintenanceIdleDelayMs(self as unknown as MaintenanceCtx);
     if (!skipIdle && idleDelayMs > 0) {
         self._log(
@@ -1522,7 +1543,61 @@ function performGridResync(bot: BotLike, options: {
     self.manager.beginStructuralRebuild?.('trigger-file resync');
     self._log('Grid regeneration triggered. Performing full grid resync...');
     return (async () => {
+        // A full reset commits only after the rebuild succeeds. Until then keep
+        // a rollback closure: a truncated read or an exception must not leave a
+        // running bot on the old grid with a permanently cold guard.
+        let rollbackGuard: (() => Promise<void>) | null = null;
         try {
+            if (clearLastFillGuards) {
+                const mgr = self.manager;
+                // Prefer the same accountOrders instance the manager persists
+                // through; warn instead of silently no-op-ing on a stub.
+                const acct = mgr?.accountOrders ?? self.accountOrders;
+                if (!acct || typeof acct.clearLastFillGuardRows !== 'function'
+                    || typeof acct.restoreLastFillGuardRows !== 'function'
+                    || typeof acct.loadLastFillPivot !== 'function'
+                    || typeof acct.loadLastMarketFill !== 'function') {
+                    self._warn('[FULL-RESET] Guard persistence API unavailable; refusing to clear guard state.');
+                    return false;
+                }
+                const liveFields = [
+                    '_lastFilledPrice', '_lastFilledType', '_lastFilledAt', 'lastFillPivotSource',
+                    '_lastFilledBuyPrice', '_lastFilledSellPrice',
+                    '_lastRefusedFillPrice', '_lastRefusedFillType', '_lastRefusedFillAt', '_lastRefusedFillLevels',
+                    '_lastMarketFillPrice', '_lastMarketFillType', '_lastMarketFillAt',
+                ];
+                const liveSnapshot: Record<string, unknown> = {};
+                for (const key of liveFields) liveSnapshot[key] = (mgr as unknown as Record<string, unknown>)[key];
+                // Load-time validated rows, kept in memory only until commit.
+                const restoreRows = acct.restoreLastFillGuardRows;
+                const persistedPivot = (await acct.loadLastFillPivot?.(true)) ?? null;
+                const persistedMarket = (await acct.loadLastMarketFill?.(true)) ?? null;
+                // Live-only clear: the shared helper's fire-and-forget deletes
+                // are skipped so the disk rows remain our rollback evidence.
+                expireLastFillGuardReferences(mgr, 'manual full grid reset', { skipPersistedClear: true });
+                rollbackGuard = async () => {
+                    for (const key of liveFields) (mgr as unknown as Record<string, unknown>)[key] = liveSnapshot[key];
+                    // A failed rebuild may already have published a new genesis.
+                    // Restoring a pivot bound to the OLD ladder would be dead on
+                    // the next restart (restoreLastFillPivot genesis gate), so
+                    // drop that row and keep only the bot-scoped market fill.
+                    const newGenesisHash = (mgr as unknown as { _genesis?: { priceLevelsHash?: unknown } })._genesis?.priceLevelsHash;
+                    // No new genesis means no generation changed, so keep the
+                    // original row; only a KNOWN new hash invalidates it.
+                    const pivotRow = typeof newGenesisHash !== 'string'
+                        ? persistedPivot
+                        : (persistedPivot && typeof persistedPivot === 'object'
+                            && (persistedPivot as { genesisHash?: unknown }).genesisHash === newGenesisHash
+                            ? persistedPivot
+                            : null);
+                    await restoreRows.call(acct, pivotRow, persistedMarket);
+                    self._log('[FULL-RESET] Guard state rolled back; trigger retained for retry.', 'info');
+                    if (pivotRow === null && persistedPivot !== null) {
+                        self._warn('[FULL-RESET] Rolled back guard without the persisted pivot: genesis changed during the failed rebuild.');
+                    }
+                };
+                self._log('[FULL-RESET] Live last-fill references cleared; disk rows and watchdog memory clear after a successful rebuild.', 'info');
+            }
             try {
                 const content = storage.readFile(PROFILES_BOTS_FILE);
                 const allBotsConfig = parseJsonWithComments(content).bots || [];
@@ -1578,7 +1653,11 @@ function performGridResync(bot: BotLike, options: {
                 const confirmed = await readOpenOrdersForResync('GRID-RESYNC-CONFIRM');
                 if (confirmed === null) {
                     resyncReadAmbiguous = true;
-                    return orders;
+                    // MUST return null: an ambiguous confirm must abort
+                    // recalculateGrid BEFORE it syncs/rebuilds over an empty
+                    // snapshot (phantom reset). The post-rebuild flag check
+                    // alone was too late once a new generation existed.
+                    return null;
                 }
                 if (confirmed.length > 0) {
                     self._log(
@@ -1597,11 +1676,46 @@ function performGridResync(bot: BotLike, options: {
                 account: self.account,
                 privateKey: self.privateKey,
                 config: self.config,
+                clearLastFillGuards,
             });
 
             if (resyncReadAmbiguous) {
+                if (rollbackGuard) {
+                    try { await rollbackGuard(); } catch (err) {
+                        self._warn(`[FULL-RESET] Failed to roll back guard state: ${getErrorMessage(err)}`);
+                    }
+                    rollbackGuard = null;
+                }
                 self._warn('[GRID-RESYNC] Aborted trigger-file resync: open-order read ambiguous (truncated); retaining trigger file for retry.');
                 return false;
+            }
+
+            if (clearLastFillGuards && rollbackGuard) {
+                const acct = self.manager?.accountOrders ?? self.accountOrders;
+                if (!acct || typeof acct.clearLastFillGuardRows !== 'function') {
+                    self._warn('[FULL-RESET] Guard persistence API unavailable at commit; retaining trigger file for retry.');
+                    try { await rollbackGuard(); } catch (err) {
+                        self._warn(`[FULL-RESET] Failed to roll back guard state: ${getErrorMessage(err)}`);
+                    }
+                    rollbackGuard = null;
+                    return false;
+                }
+                try {
+                    // One locked reload+write for BOTH rows — no half-cleared pair.
+                    await acct.clearLastFillGuardRows();
+                } catch (err) {
+                    self._warn(`[FULL-RESET] Failed to clear persisted guard rows: ${getErrorMessage(err)}; retaining trigger file for retry.`);
+                    try { await rollbackGuard(); } catch (rollbackErr) {
+                        self._warn(`[FULL-RESET] Failed to roll back guard state: ${getErrorMessage(rollbackErr)}`);
+                    }
+                    rollbackGuard = null;
+                    return false;
+                }
+                // Only now, after the rebuild is known good, clear the whole
+                // watchdog family through the shared helper (no half-armed stall).
+                clearSpreadWatchdogMemory(self);
+                rollbackGuard = null;
+                self._log('[FULL-RESET] Cleared persisted guard rows and spread watchdog memory.', 'info');
             }
 
             await self.manager._fundLock.acquire(async () => {
@@ -1642,6 +1756,12 @@ function performGridResync(bot: BotLike, options: {
                 self.manager._lastUnmatchedChainOrdersAt = 0;
             }
         } catch (err) {
+            if (rollbackGuard) {
+                try { await rollbackGuard(); } catch (rollbackErr) {
+                    self._warn(`[FULL-RESET] Failed to roll back guard state: ${getErrorMessage(rollbackErr)}`);
+                }
+                rollbackGuard = null;
+            }
             self._log(`Error during triggered resync: ${getErrorMessage(err)}`, 'error');
         } finally {
             self.manager.finishBootstrap();
@@ -3077,6 +3197,30 @@ function clearGeometryResyncMemory(bot: BotLike) {
     if (!bot) return;
     bot._lastGeometryResyncPivotKey = '';
     bot._geometryResyncWarnedPivotKey = '';
+}
+
+/**
+ * Clear the ENTIRE spread watchdog memory after a clean-slate full reset.
+ *
+ * The single-field reset drifted from the heal path: `_spreadCorrectionStall`
+ * was cleared without `_spreadStallArmed`, so the targeted-sync gate still
+ * forced a reconciliation; `_outOfSpreadSince` was zeroed while
+ * `_outOfSpreadStaleWarned` stayed armed, suppressing the next warning. This
+ * helper mirrors every flag the normal heal path clears (plus the resync
+ * cooldown), so a reset cannot leave a half-armed watchdog behind.
+ * @param {Object} bot - DEXBot instance
+ */
+function clearSpreadWatchdogMemory(bot: BotLike) {
+    if (!bot) return;
+    clearGeometryResyncMemory(bot);
+    mirrorSpreadStall(bot, null);
+    bot._lastSpreadStaleResyncAt = 0;
+    bot._outOfSpreadSince = 0;
+    bot._outOfSpreadStaleWarned = false;
+    bot._outOfSpreadTransientCount = 0;
+    bot._outOfSpreadToleranceSince = 0;
+    bot._outOfSpreadNoProgressWarned = false;
+    try { if (bot.manager) bot.manager._spreadRailOversubscribed = null; } catch { /* best-effort */ }
 }
 
 /**

@@ -1002,6 +1002,8 @@ export interface AccountOrdersLike {
   clearPersistedBoundary(...args: unknown[]): Promise<unknown>;
   clearPersistedLastFillPivot(...args: unknown[]): Promise<unknown>;
   clearPersistedLastMarketFill?(...args: unknown[]): Promise<unknown>;
+  clearLastFillGuardRows?(...args: unknown[]): Promise<unknown>;
+  restoreLastFillGuardRows?(...args: unknown[]): Promise<unknown>;
   backupSnapshot?(reason?: string): Promise<string | null>;
   loadProcessedFills(options?: boolean | { forceReload?: boolean; minTimestamp?: number | null }): Map<string, number>;
   updateProcessedFillsBatch(fills: Map<string, number>): Promise<unknown>;
