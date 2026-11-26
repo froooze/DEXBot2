@@ -8,7 +8,7 @@ import { isSameBotName } from './utils/sanitize_key.js';
 import { isPositiveNumber, isPositiveNumberOrPercent, toDecimal } from './order/utils/math.js';
 import { resolveMinCollateralIncreaseThreshold } from './cr_planner.js';
 import { getErrorMessage } from './utils/errors.js';
-import { canonicalizeBotAssetSymbols } from './utils/asset_symbols.js';
+import { canonicalizeBotAssetSymbols, normalizeAssetRef } from './utils/asset_symbols.js';
 import type { UnknownRecord } from './types.js';
 import { isUnknownRecord } from './types.js';
 const storage = getStorage();
@@ -368,6 +368,14 @@ function collectValidationIssues(entries: BotEntry[], sourceName: string): { err
         errors.push(duplicateIssue);
     }
 
+    // Two active grids on one account AND one market would keep independent
+    // snapshots over the same chain orders and cancel each other's orders as
+    // orphans — the double-controller incident the instance lock exists to
+    // prevent. Different markets are fine (separate order sets + fund split).
+    for (const issue of findDuplicateAccountPairIssues(entries)) {
+        errors.push(issue);
+    }
+
     // Cross-bot validation: check if botFunds percentages sum > 100% per account
     const accountFunds: Record<string, { buy: number; sell: number; botNames: string[] }> = {};
     for (const entry of entries) {
@@ -420,6 +428,40 @@ function findDuplicateBotKeyIssues(entries: BotEntry[]): string[] {
         }
     });
     return duplicates;
+}
+
+/**
+ * Two active bots sharing an account and the same market pair (order-insensitive)
+ * would double-trade that account. Report an error so the unsafe combination is
+ * rejected at config time, rather than relying on the runtime lock to bound the
+ * damage. Bots without a market (credit-only), inactive bots and dry-run
+ * copies are skipped — a dry run places no orders, so it cannot double-trade.
+ */
+function findDuplicateAccountPairIssues(entries: BotEntry[]): string[] {
+    const seen = new Map<string, number>();
+    const issues: string[] = [];
+    entries.forEach((entry, index) => {
+        if (entry.active === false || entry.dryRun === true) return;
+        const account = entry.preferredAccount;
+        if (!account || !entry.assetA || !entry.assetB) return;
+        const a = normalizeAssetRef(entry.assetA);
+        const b = normalizeAssetRef(entry.assetB);
+        if (!a || !b || a === b) return;
+        const [first, second] = a < b ? [a, b] : [b, a];
+        const key = `${account}\0${first}/${second}`;
+        const earlier = seen.get(key);
+        if (earlier !== undefined) {
+            issues.push(
+                `Bot[${earlier}] '${entries[earlier].name || `bot-${earlier}`}' and Bot[${index}] ` +
+                `'${entry.name || `bot-${index}`}' both trade account '${account}' on market ` +
+                `${first}/${second} — two grids on the same account and market corrupt each ` +
+                `other's orders; use distinct accounts or distinct markets.`
+            );
+        } else {
+            seen.set(key, index);
+        }
+    });
+    return issues;
 }
 
 function assertNoDuplicateBotKeys(entries: BotEntry[], sourceName: string): void {

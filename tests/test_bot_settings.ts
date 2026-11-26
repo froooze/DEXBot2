@@ -12,6 +12,7 @@ const {
     selectBotEntry,
     validateBotEntry,
     loadSettingsFile,
+    collectValidationIssues,
 } = require('../modules/bot_settings');
 
 const raw = {
@@ -672,6 +673,51 @@ assert(
     assert.ok(!('activeOrders' in onDisk.bots[0]), 'activeOrders must be removed from disk');
     assert.ok(!('reserveOrders' in onDisk.bots[0]), 'reserveOrders must be removed from disk');
     fs.rmSync(tmpDir, { recursive: true, force: true });
+}
+
+// Cross-bot guard: two active bots on one account AND one market would keep
+// independent grids over the same chain orders. Different markets and inactive
+// bots on the same account/market stay valid.
+{
+    const marketBot = (name: string, account: string, assetA: string, assetB: string, active = true) => ({
+        name, active, preferredAccount: account, assetA, assetB,
+        coreOrders: { sell: 5, buy: 5 }, botFunds: { sell: '100%', buy: '100%' },
+    });
+    const sameMarket = collectValidationIssues([
+        marketBot('GRID-A', 'account-one', 'BTS', 'USD'),
+        marketBot('GRID-B', 'account-one', 'usd', 'bts'),
+    ], 'test');
+    assert.ok(
+        sameMarket.errors.some((e: string) => e.includes('both trade account') && e.includes('BTS/USD')),
+        'collectValidationIssues must reject two active bots on the same account and market (order-insensitive)'
+    );
+
+    const differentMarkets = collectValidationIssues([
+        marketBot('GRID-A', 'account-one', 'BTS', 'USD'),
+        marketBot('GRID-B', 'account-one', 'BTS', 'TKN'),
+    ], 'test');
+    assert.ok(
+        !differentMarkets.errors.some((e: string) => e.includes('both trade account')),
+        'different markets on the same account are allowed'
+    );
+
+    const inactiveSibling = collectValidationIssues([
+        marketBot('GRID-A', 'account-one', 'BTS', 'USD'),
+        marketBot('GRID-B', 'account-one', 'BTS', 'USD', false),
+    ], 'test');
+    assert.ok(
+        !inactiveSibling.errors.some((e: string) => e.includes('both trade account')),
+        'an inactive bot does not create a duplicate-market conflict'
+    );
+
+    const dryRunSibling = collectValidationIssues([
+        marketBot('GRID-A', 'account-one', 'BTS', 'USD'),
+        { ...marketBot('GRID-B', 'account-one', 'BTS', 'USD'), dryRun: true },
+    ], 'test');
+    assert.ok(
+        !dryRunSibling.errors.some((e: string) => e.includes('both trade account')),
+        'a dry-run copy places no orders and does not create a duplicate-market conflict'
+    );
 }
 
 console.log('bot settings tests passed');

@@ -47,11 +47,21 @@ interface AcquireInstanceLockOptions {
     log?: (message: string, level?: string) => void;
 }
 
+/** Internal process-level lock that can refresh its payload's sharer list. */
+interface ProcessInstanceLock extends BotInstanceLock {
+    setBotNames(names: string[]): void;
+}
+
 interface HeldInstanceLock {
     /** The single process-level file lock shared by every bot on this account. */
-    lock: BotInstanceLock;
+    lock: ProcessInstanceLock;
     /** Live handle count per bot name (bot names are unique per config). */
     shares: Map<string, number>;
+}
+
+/** Configured bot names currently sharing this lock (hide unnamed fallbacks). */
+function _sharedBotNames(held: HeldInstanceLock): string[] {
+    return [...held.shares.keys()].filter((name) => !name.startsWith('\0'));
 }
 
 /** Logging is best-effort: a throwing logger must never leak a lock or a share. */
@@ -111,6 +121,8 @@ function lockPathForAccount(account: string): string {
 interface LockPayload {
     pid?: number;
     botName?: string;
+    /** Every in-process bot currently sharing this account lock. */
+    botNames?: string[];
     account?: string;
     starttime?: number;
     at?: string;
@@ -142,7 +154,7 @@ function readLockPayload(lockPath: string): LockPayload | null {
  * @param {Object} [options]
  * @returns {BotInstanceLock} Handle with release()
  */
-function acquireProcessInstanceLock(account: string, botName: string = '', options: AcquireInstanceLockOptions = {}): BotInstanceLock {
+function acquireProcessInstanceLock(account: string, botName: string = '', options: AcquireInstanceLockOptions = {}): ProcessInstanceLock {
     const lockPath = lockPathForAccount(account);
     const discovery = getProcessDiscovery();
     try {
@@ -175,7 +187,16 @@ function acquireProcessInstanceLock(account: string, botName: string = '', optio
 
     const alreadyRunningMsg = () => {
         const info = readLockPayload(lockPath);
-        const holderBot = info?.botName ? ` (bot ${info.botName})` : '';
+        const names = Array.isArray(info?.botNames)
+            ? info.botNames.filter((name): name is string => typeof name === 'string' && name.length > 0)
+            : [];
+        // Prefer the live sharer list: `botName` records the FIRST holder and
+        // stays stale after it leaves while siblings keep the lock.
+        const holderBot = names.length === 1
+            ? ` (bot ${names[0]})`
+            : names.length > 1
+                ? ` (bots ${names.join(', ')})`
+                : info?.botName ? ` (bot ${info.botName})` : '';
         const holderAt = info?.at ? `, started ${info.at}` : '';
         return (
             `account '${account}' is already controlled by another bot process ` +
@@ -200,14 +221,26 @@ function acquireProcessInstanceLock(account: string, botName: string = '', optio
 
     _safeLog(options, `Instance lock acquired for account '${account}' (bot ${botName || 'n/a'}, pid ${runtime.pid})`);
 
-    return _lockHandle(lockPath, () => {
+    const handle = _lockHandle(lockPath, () => {
         try {
             releaseFileLockSync({ fd: lock.fd, lockPath: lock.lockPath, heartbeat: lock.heartbeat, ownerId: lock.ownerId });
             _safeLog(options, `Instance lock released for account '${account}'`);
         } catch (err) {
             _safeLog(options, `Instance lock release failed for account '${account}': ${getErrorMessage(err)}`, 'warn');
         }
-    });
+    }) as ProcessInstanceLock;
+
+    // Refresh the sharer list on the lock we actually own; a stolen lock cannot
+    // be rewritten by us. Keep `at` (holder start time) intact for diagnostics.
+    handle.setBotNames = (names: string[]): void => {
+        try {
+            const info = readLockPayload(lockPath);
+            if (!info || info.ownerId !== lock.ownerId) return;
+            storage.writeJSON(lockPath, { ...info, botNames: names });
+        } catch (_) { /* diagnostics only — never affect trading */ }
+    };
+
+    return handle;
 }
 
 /** Drop one handle's share; release the underlying file lock only when nobody is left. */
@@ -215,7 +248,10 @@ function _releaseSharedInstanceLock(account: string, held: HeldInstanceLock, ide
     const count = held.shares.get(identity) ?? 0;
     if (count > 1) held.shares.set(identity, count - 1);
     else held.shares.delete(identity);
-    if (held.shares.size > 0) return;
+    if (held.shares.size > 0) {
+        held.lock.setBotNames(_sharedBotNames(held));
+        return;
+    }
     if (_heldInstanceLocks.get(account) === held) _heldInstanceLocks.delete(account);
     // Underlying release is ownership-checked and idempotent, so a stale
     // handle cannot release a lock a later controller now owns.
@@ -243,6 +279,7 @@ export function acquireBotInstanceLock(account: string, botName: string = '', op
     const held = _heldInstanceLocks.get(account);
     if (held) {
         held.shares.set(identity, (held.shares.get(identity) ?? 0) + 1);
+        held.lock.setBotNames(_sharedBotNames(held));
         _safeLog(options, `Instance lock for account '${account}' already held by this process — sharing with bot ${botName || 'n/a'} (${held.shares.size} bots)`);
         return _lockHandle(lockPath, () => _releaseSharedInstanceLock(account, held, identity));
     }
@@ -250,5 +287,6 @@ export function acquireBotInstanceLock(account: string, botName: string = '', op
     const lock = acquireProcessInstanceLock(account, botName, options);
     const entry: HeldInstanceLock = { lock, shares: new Map([[identity, 1]]) };
     _heldInstanceLocks.set(account, entry);
+    lock.setBotNames(_sharedBotNames(entry));
     return _lockHandle(lockPath, () => _releaseSharedInstanceLock(account, entry, identity));
 }

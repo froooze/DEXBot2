@@ -17,7 +17,8 @@
  *   3. Release frees the lock for the next controller and is idempotent.
  *   4. A dead holder (crashed process) is taken over, never blocks restart.
  *   5. A recycled pid (payload starttime mismatch) is treated as dead.
- *   6. The payload records account + bot for operator diagnostics.
+ *   6. The payload records account + bot(s) for diagnostics, and the refusal
+ *      message names the CURRENT sharers, not a departed holder.
  */
 
 const assert = require('assert');
@@ -186,6 +187,7 @@ test('LOCK-7 the payload records account + bot + pid for diagnostics', () => {
         const payload = JSON.parse(fs.readFileSync(path.join(tmpDir, 'account-eight.lock'), 'utf8'));
         assert.strictEqual(payload.account, 'account-eight');
         assert.strictEqual(payload.botName, 'bot-diag');
+        assert.deepStrictEqual(payload.botNames, ['bot-diag'], 'the payload lists the sharer');
         assert.ok(Number(payload.pid) > 0);
         assert.ok(Number(payload.starttime) > 0, 'the pid-recycle identity must be recorded');
     } finally {
@@ -202,10 +204,14 @@ test('LOCK-8 two bots in this process share one account lock', () => {
         assert.ok(fs.existsSync(lockPath), 'a lock file exists');
         const payload = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
         assert.strictEqual(payload.botName, 'bot-a', 'the underlying file lock is acquired only once');
+        assert.deepStrictEqual(payload.botNames, ['bot-a', 'bot-b'], 'the payload lists every in-process sharer');
+        assert.ok(payload.ownerId && Number(payload.starttime) > 0, 'refresh preserves holder identity');
         assert.strictEqual(typeof a.release, 'function');
         assert.strictEqual(typeof b.release, 'function');
     } finally {
         a.release();
+        const afterFirstRelease = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+        assert.deepStrictEqual(afterFirstRelease.botNames, ['bot-b'], 'a released bot is removed from the payload');
         b.release();
     }
     assert.ok(!fs.existsSync(lockPath), 'the lock is released after the last sharer shuts down');
@@ -330,6 +336,54 @@ test('LOCK-13 distinct accounts colliding on the sanitized filename still conten
     } finally {
         first.release();
     }
+});
+
+test('LOCK-14 a multi-bot foreign holder names every sharer in the refusal', () => {
+    useTempLocksDir();
+    const lockPath = path.join(tmpDir, 'account-seventeen.lock');
+    const starttime = Number(getProcessDiscovery().readStat(process.pid)?.starttime ?? 0);
+    fs.writeFileSync(lockPath, JSON.stringify({
+        pid: process.pid,
+        botName: 'bot-a',
+        botNames: ['bot-a', 'bot-b'],
+        account: 'account-seventeen',
+        starttime,
+        at: new Date().toISOString(),
+        ownerId: 'foreign-holder',
+    }));
+    assert.throws(
+        () => acquireBotInstanceLock('account-seventeen', 'bot-c'),
+        (err: any) => {
+            assert.match(String(err.message), /already controlled by another bot process/);
+            assert.match(String(err.message), /\(bots bot-a, bot-b\)/, 'every sharer is named');
+            return true;
+        }
+    );
+});
+
+test('LOCK-15 the refusal names the current sharer, not a departed holder', () => {
+    useTempLocksDir();
+    const lockPath = path.join(tmpDir, 'account-eighteen.lock');
+    const starttime = Number(getProcessDiscovery().readStat(process.pid)?.starttime ?? 0);
+    // bot-a acquired first, bot-b joined, then bot-a left: `botName` is stale
+    // while `botNames` still identifies the live holder.
+    fs.writeFileSync(lockPath, JSON.stringify({
+        pid: process.pid,
+        botName: 'bot-a',
+        botNames: ['bot-b'],
+        account: 'account-eighteen',
+        starttime,
+        at: new Date().toISOString(),
+        ownerId: 'foreign-holder',
+    }));
+    assert.throws(
+        () => acquireBotInstanceLock('account-eighteen', 'bot-c'),
+        (err: any) => {
+            assert.match(String(err.message), /\(bot bot-b\)/, 'the surviving sharer is named');
+            assert.ok(!String(err.message).includes('(bot bot-a)'), 'the departed holder is not named');
+            return true;
+        }
+    );
 });
 
 // Run sequentially.
