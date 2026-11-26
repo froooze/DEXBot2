@@ -734,9 +734,9 @@ function resolveConfigValue(value: unknown, total: unknown) {
  * @param {'buy'|'sell'} side - Trade side
  * @returns {number} Resolved numeric value or 0 if uninterpretable
  */
-function resolveConfigValueWithRegistry(value: unknown, chainTotal: number, account: string | undefined, botName: string | undefined, side: string) {
+function resolveConfigValueWithRegistry(value: unknown, chainTotal: number, account: string | undefined, botName: string | undefined, side: string, assetKey?: string) {
     if (account === undefined || botName === undefined) return resolveConfigValue(value, chainTotal);
-    const effective = fundRegistry.getEffectiveAllocationSync(account, botName, side as 'buy' | 'sell', chainTotal);
+    const effective = fundRegistry.getEffectiveAllocationSync(account, botName, side as 'buy' | 'sell', chainTotal, assetKey);
     if (effective !== null) return effective;
     return resolveConfigValue(value, chainTotal);
 }

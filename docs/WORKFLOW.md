@@ -233,9 +233,9 @@ dexbot start credit
 ### Shared accounts
 
 Several bots may trade the **same blockchain account** in the monolithic runtime,
-but only on **different markets**: balances are split proportionally by
-`fund_registry`, and the account lock is shared between the bots in that one
-process. Two active bots with the same account and the same `assetA`/`assetB`
+but only on **different markets**: `fund_registry` splits assets proportionally
+between bots trading the *same* asset (other assets stay separate), and the
+account lock is shared between the bots in that one process. Two active bots with the same account and the same `assetA`/`assetB`
 pair are rejected at startup — they would keep independent grids over the same
 open orders, cancel each other's orders and double-book fills. Give the second
 bot a different account or a different market. Spell `preferredAccount`

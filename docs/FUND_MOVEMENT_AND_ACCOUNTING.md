@@ -41,7 +41,8 @@ accountTotals.buyFree / sellFree           (raw chain free)
         → computeChainFundTotals()
           → chainTotalBuy / chainTotalSell  (total capital per side)
 
-chainTotal × botFunds%                      (apply botFunds cap)
+chainTotal × proportional share            (registry, scoped by asset:
+        buy→assetB, sell→assetA; bots.json fallback when registry empty)
         → resolveConfigValueWithRegistry()
           → funds.allocated.{buy,sell}      (bot's capital budget)
 
@@ -51,6 +52,7 @@ funds.allocated → _getSizingContext()       (budget for spread correction)
 
 **Key points:**
 - `botFunds` percentage applies to **total** capital (free + locked in orders), not just free. A bot at `"50%"` gets half of everything, not half of what's currently idle.
+- On a shared account the share is normalized across bots trading the **same** asset (different sell assets do not split each other); an explicitly registered `0%` caps the budget at zero.
 - `funds.allocated` is the ceiling for each side. Existing orders already consume part of it; the remaining free portion is available for new placements.
 - The downstream `applyBotFundsAllocation()` (`order/manager.ts`) also caps `funds.available` to `<= allocated` as a safety net, but the primary budget chokepoint is `getSideBudget` / `_getSizingContext` reading `allocated` directly (v1.2.6).
 - `funds.available[side] = max(0, chainFree − virtualReservation − fees)`. When the empty rail already reserves more than the chain holds, this reads 0 while the side still holds inventory — the **rail oversubscribed** state. Spread correction names it in the log, flags it on the manager, and the out-of-spread watchdog escalates it on `TIMING.SPREAD_STALE_FUND_ESCALATE_MS`: the durable repair is re-sizing the rail from chain truth (structural re-center).

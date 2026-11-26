@@ -62,7 +62,8 @@ const { runtime } = require('./modules/runtime');
 const { createPm2AwareLogger } = require('./modules/order/logger');
 const DEXBot = require('./modules/dexbot_class').default;
 const { normalizeBotEntry } = require('./modules/dexbot_class').default;
-const { loadSettingsFile, resolveRawBotEntries, selectBotEntry } = require('./modules/bot_settings');
+const { loadSettingsFile, resolveRawBotEntries, selectBotEntry, collectValidationIssues } = require('./modules/bot_settings');
+const fundRegistry = require('./modules/fund_registry');
 const { setupGracefulShutdown, registerCleanup, unregisterCleanup } = require('./modules/graceful_shutdown');
 const chainKeys = require('./modules/chain_keys');
 const { getKeyStore } = require('./modules/key_store');
@@ -176,6 +177,24 @@ async function getSigningSecretForAccount(accountName: string) {
           const { config: allBotsConfigData } = loadSettingsFile(PROFILES_BOTS_FILE);
           const allBotsConfig = resolveRawBotEntries(allBotsConfigData);
          
+         // Normalized entries carry botKey and the default active=true that
+         // raw profile entries omit. Both the warnings and the prune below
+         // must use the same canonical definition of an active bot.
+         let normalizedAll: any[] = [];
+         try {
+             normalizedAll = allBotsConfig.map((entry: any, idx: number) => normalizeBotEntry(entry, idx));
+         } catch { /* fall back to raw keys below */ }
+
+         // Surface shared-account allocation warnings that the monolithic
+         // launcher prints but the PM2 path used to drop silently. The check
+         // is optional when bot_settings is stubbed in startup tests.
+         if (typeof collectValidationIssues === 'function') {
+             try {
+                 const validation = collectValidationIssues(normalizedAll.filter((b: any) => b.active !== false), 'bots.json');
+                 for (const warning of validation.warnings || []) launcherLogger.warn(warning);
+             } catch { /* non-fatal: profile validation already ran */ }
+         }
+
          // Find the current bot's index in the unfiltered bots.json array
           const botIndex = allBotsConfig.findIndex((b: { name?: string }) => isSameBotName(b.name, botName));
          if (botIndex === -1) {
@@ -187,6 +206,20 @@ async function getSigningSecretForAccount(accountName: string) {
 
         // Get signing secret from daemon or interactively
         const preferredAccount = normalizedConfig.preferredAccount;
+
+        // Remove stale registry entries for bots no longer active. The bot's
+        // own entry is (re-)registered idempotently during startup.
+        if (typeof fundRegistry?.pruneAccount === 'function') {
+            try {
+                const activeKeys = (normalizedAll.length ? normalizedAll : allBotsConfig)
+                    .filter((entry: any) => entry.active !== false && entry.preferredAccount === preferredAccount)
+                    .map((entry: any) => entry.botKey || entry.name)
+                    .map((key: unknown) => typeof key === 'string' ? require('./modules/utils/sanitize_key').sanitizeKey(key) : null)
+                    .filter((key: string | null): key is string => !!key);
+                await fundRegistry.pruneAccount(String(preferredAccount), activeKeys);
+            } catch { /* non-fatal: registration retries on startup */ }
+        }
+
         const signingSecret = await getSigningSecretForAccount(preferredAccount);
 
          // Create and start bot with log prefix for [bot.js] context

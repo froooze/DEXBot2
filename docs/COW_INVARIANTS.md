@@ -132,10 +132,11 @@ This document defines the non-negotiable behavioral invariants for the DEXBot2 s
 - `INV-ACC-002` Fund invariant consistency (INVARIANT 1)
   - Tracked totals must remain consistent with blockchain totals within `FUND_INVARIANT_PERCENT_TOLERANCE`.
   - `Total = Free + Committed` must hold per side.
+  - Shared accounts skip the account-wide equality (siblings' committed sizes are unknown) and enforce only the over-allocation bound below; the share falls back to active `bots.json` entries when the registry is empty or partial.
   - False violations due to ideal-size projection overstatement are prohibited.
 
 - `INV-ACC-003` Cross-bot fund registry invariant (INVARIANT 3)
-  - Shared-account per-bot commitment must not exceed the bot's proportional share of chain balance.
+  - Shared-account per-bot commitment must not exceed `account total × share`, where share is registry-derived per asset (`buy`→assetB, `sell`→assetA) with a `bots.json` fallback.
   - Checked with widened tolerance `max(PERCENT_TOLERANCE * 3, 0.15)`.
   - Registry failure logs an error (`order/accounting.ts`, cross-bot registry invariant block), not a silent skip.
 
@@ -370,12 +371,12 @@ not by the seven per-site structures that used to disagree
 - `INV-REG-001` Cross-bot allocation ≤ proportional share
   - Per-bot committed amounts (sum of on-chain orders) must not exceed `totalChainBalance × allocatedPercent`.
   - Violation triggers an error-level log entry (not silent), with tolerance `max(PERCENT_TOLERANCE * 3, 0.15)`.
-  - Registry registration is pre-flight + atomic; only shared-account bots register (`dexbot.ts` derives `sharedAccounts` where `accountGroups[a].length > 1`), and registration completes before any shared-account bot starts.
-  - Release happens in `DEXBot.shutdown`.
+  - Registration is idempotent: the launcher pre-registers shared-account bots and each bot re-registers at startup (covers PM2), with allocations scoped by asset.
+  - Release happens in `DEXBot.shutdown`; an entry is kept while siblings remain, and startup prunes entries for inactive bots.
 
 - `INV-REG-002` Async-locked registry writes
-  - All `fund_registry` mutations (register, update, release) must hold an async lock.
-  - Concurrent writes from multiple bots sharing the same account must be serialized.
+  - All `fund_registry` mutations (register, update, release) hold an in-process async lock and a cross-process file lock.
+  - Registry writes are atomic (tmp + rename); reads never see a partial file.
 
 ---
 

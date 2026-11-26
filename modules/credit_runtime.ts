@@ -193,11 +193,10 @@ function getAccountRef(bot: BotLike): string | null {
         || null;
 }
 
+/** Registry-key account name only — never accountId (the registry is keyed by name). */
 function getAccountName(bot: BotLike): string | null {
-    return (bot?.account as unknown as { id?: string; name?: string } | null)?.name
-        || bot?.config?.preferredAccount
-        || (bot?.account as unknown as { id?: string; name?: string } | null)?.id
-        || bot?.accountId
+    return bot?.config?.preferredAccount
+        || (bot?.account as unknown as { id?: string; name?: string } | null)?.name
         || null;
 }
 

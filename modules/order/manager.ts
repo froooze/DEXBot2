@@ -43,12 +43,12 @@ import {
     GRID_LIMITS
 } from '../constants.js';
 import { seedBotRuntimeConfig, createDefaultBotMetrics } from '../bot_defaults.js';
+import * as fundRegistry from '../fund_registry.js';
 import {
     getMinOrderSize,
     computeChainFundTotals,
     hasValidAccountTotals,
     resolveConfigValueWithRegistry,
-    isExplicitZeroAllocation,
     floatToBlockchainInt,
     validateBoundaryCommit,
     resolveGapSlots,
@@ -1768,8 +1768,12 @@ class OrderManager implements OrderManagerLike {
 
         const account = this.config.preferredAccount;
         const botName = this.config.botKey;
-        const allocatedBuy = resolveConfigValueWithRegistry(this.config.botFunds.buy, chainTotalBuy, account, botName, 'buy');
-        const allocatedSell = resolveConfigValueWithRegistry(this.config.botFunds.sell, chainTotalSell, account, botName, 'sell');
+        // BUY is denominated in assetB, SELL in assetA. Pass the asset so two
+        // bots on one account but different sell assets do not split funds.
+        const buyAsset = this.config.assetB ? String(this.config.assetB) : undefined;
+        const sellAsset = this.config.assetA ? String(this.config.assetA) : undefined;
+        const allocatedBuy = resolveConfigValueWithRegistry(this.config.botFunds.buy, chainTotalBuy, account, botName, 'buy', buyAsset);
+        const allocatedSell = resolveConfigValueWithRegistry(this.config.botFunds.sell, chainTotalSell, account, botName, 'sell', sellAsset);
 
         if (allocatedBuy === 0 && typeof this.config.botFunds.buy === 'string' && this.config.botFunds.buy.trim().endsWith('%')) {
             if (chainTotalBuy === 0) this._triggerAccountTotalsFetchIfNeeded();
@@ -1780,11 +1784,10 @@ class OrderManager implements OrderManagerLike {
 
         this.funds.allocated = { buy: allocatedBuy, sell: allocatedSell };
 
-        const shouldCapBuy = allocatedBuy > 0 || isExplicitZeroAllocation(this.config.botFunds.buy);
-        const shouldCapSell = allocatedSell > 0 || isExplicitZeroAllocation(this.config.botFunds.sell);
-
-        if (shouldCapBuy) this.funds.available.buy = Math.min(this.funds.available.buy, Math.max(0, allocatedBuy));
-        if (shouldCapSell) this.funds.available.sell = Math.min(this.funds.available.sell, Math.max(0, allocatedSell));
+        // Always cap: a registry 0% can differ from the configured percentage,
+        // otherwise spread correction could spend raw free funds with no budget.
+        this.funds.available.buy = Math.min(this.funds.available.buy, Math.max(0, allocatedBuy));
+        this.funds.available.sell = Math.min(this.funds.available.sell, Math.max(0, allocatedSell));
     }
 
     /**
@@ -3018,7 +3021,16 @@ class OrderManager implements OrderManagerLike {
         if (!this.assets || !hasValidAccountTotals(this.accountTotals)) {
             return { isValid: true, reason: 'Skipped: missing assets or totals' };
         }
-        return checkFundDrift(this.orders, this.accountTotals, this.assets, this.config?.gridLimits ?? null);
+        const account = this.config?.preferredAccount;
+        const botName = this.config?.botKey;
+        const buyAsset = this.config?.assetB ? String(this.config.assetB) : undefined;
+        const sellAsset = this.config?.assetA ? String(this.config.assetA) : undefined;
+        const shares = {
+            buy: fundRegistry.getBotShareSync(account, botName, 'buy', buyAsset),
+            sell: fundRegistry.getBotShareSync(account, botName, 'sell', sellAsset)
+        };
+        const skipEquality = !!account && fundRegistry.isSharedAccount(account);
+        return checkFundDrift(this.orders, this.accountTotals, this.assets, this.config?.gridLimits ?? null, shares, skipEquality);
     }
 
     /**

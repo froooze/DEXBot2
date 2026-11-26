@@ -546,7 +546,13 @@ async function runBotInstances(botEntries: BotEntry[], { forceDryRun = false, so
         // Note: each bot creates its own AccountOrders instance with per-bot file when it
         // starts and syncs its own meta via syncMeta(). No shared initialization needed here.
 
-        const { errors } = collectValidationIssues(prepared, sourceName);
+        const { errors, warnings } = collectValidationIssues(prepared, sourceName);
+
+        // Shared-account allocation warnings were previously computed and
+        // silently dropped, so nobody saw the proportional-split consequences.
+        for (const warning of warnings || []) {
+            console.warn(`WARNING: ${warning}`);
+        }
 
         if (errors.length) {
             console.error(startupError('ERROR: Invalid configuration for one or more **active** bots:'));
@@ -620,50 +626,80 @@ async function runBotInstances(botEntries: BotEntry[], { forceDryRun = false, so
             }
         }
         const sharedAccounts = Object.keys(accountGroups).filter((a) => accountGroups[a].length > 1);
-        if (sharedAccounts.length > 0) {
-            console.log(`Shared accounts detected: ${sharedAccounts.join(', ')} — pre-registering fund allocations atomically.`);
-            // Phase 5a: Collect all unique collateral asset refs and resolve them in bulk
-            const allCollateralRefs = new Set<string>();
-            for (const entry of activeBots) {
-                if (entry.debtPolicy?.lending && (entry.preferredAccount && accountGroups[entry.preferredAccount]?.length > 1)) {
-                    for (const item of entry.debtPolicy.lending) {
-                        if (item.collateralAsset) allCollateralRefs.add(String(item.collateralAsset));
-                    }
-                }
-            }
-            if (allCollateralRefs.size > 0) {
-                await Promise.all([...allCollateralRefs].map(ref => _resolveCollateralAssetId(ref)));
-            }
-
-            for (const account of sharedAccounts) {
-                for (const entry of accountGroups[account]) {
-                    const botName = entry.botKey;
-                    if (botName && entry.botFunds) {
-                        const sides = ['buy', 'sell'] as const;
-                        for (const side of sides) {
-                            const pct = entry.botFunds[side];
-                            if (pct !== undefined && pct !== null) {
-                                await fundRegistry.registerAllocation(account, botName, side, Number(pct));
+        // Prune every account we know about, including ones that are no longer
+        // shared: a stale sibling entry would otherwise keep halving the
+        // survivor's allocation indefinitely. This must not be gated on
+        // sharedAccounts, which is exactly empty in that scenario.
+        const accountsToPrune = new Set<string>([
+            ...Object.keys(accountGroups),
+            ...fundRegistry.getRegisteredAccounts(),
+        ]);
+        if (accountsToPrune.size > 0) {
+            // Registry writes are best-effort: a lock timeout or a stale lock
+            // must not prevent the bots from starting. Each bot re-registers
+            // idempotently during its own startup.
+            try {
+                if (sharedAccounts.length > 0) {
+                    console.log(`Shared accounts detected: ${sharedAccounts.join(', ')} — pre-registering fund allocations atomically.`);
+                    // Phase 5a: Collect all unique collateral asset refs and resolve them in bulk
+                    const allCollateralRefs = new Set<string>();
+                    for (const entry of activeBots) {
+                        if (entry.debtPolicy?.lending && (entry.preferredAccount && accountGroups[entry.preferredAccount]?.length > 1)) {
+                            for (const item of entry.debtPolicy.lending) {
+                                if (item.collateralAsset) allCollateralRefs.add(String(item.collateralAsset));
                             }
                         }
                     }
+                    if (allCollateralRefs.size > 0) {
+                        await Promise.all([...allCollateralRefs].map(ref => _resolveCollateralAssetId(ref)));
+                    }
+                }
 
-                    // Register credit/MPA collateral allocations
-                    if (botName && entry.debtPolicy?.lending) {
-                        const dp = entry.debtPolicy;
-                        const globalPct = dp.maxCollateralAmount ?? '100%';
-                        for (const item of dp.lending || []) {
-                            const collateralRef = item.collateralAsset;
-                            if (!collateralRef) continue;
-                            const collateralAssetId = _collateralAssetIdCache.get(normalizeAssetRef(collateralRef)) ?? null;
-                            if (!collateralAssetId) {
-                                console.error(`  ERROR: unable to resolve collateral asset '${collateralRef}' for credit bot ${botName}. Credit bot will run WITHOUT proportional allocation. Check chain connectivity and asset configuration.`);
-                                continue;
+                for (const account of accountsToPrune) {
+                    const entries = accountGroups[account] || [];
+                    // Drop entries for bots no longer active before re-registering.
+                    await fundRegistry.pruneAccount(account, entries.map((e: { botKey?: string }) => e.botKey).filter(Boolean) as string[]);
+                    for (const entry of entries) {
+                        const botName = entry.botKey;
+                        // Old launchers registered seeded botFunds for credit-only
+                        // bots; strip those entries while keeping collateral.
+                        if (botName && entry.creditOnly) {
+                            await fundRegistry.clearSideAllocations(account, botName);
+                        }
+                        // Credit-only bots have no trade sides; they register
+                        // collateral only (also at their own startup).
+                        if (botName && entry.botFunds && !entry.creditOnly) {
+                            const sides = ['buy', 'sell'] as const;
+                            for (const side of sides) {
+                                const pct = entry.botFunds[side];
+                                if (pct !== undefined && pct !== null) {
+                                    // Pass the raw percentage string: Number('80%')
+                                    // is NaN and used to be persisted as null.
+                                    const assetKey = side === 'buy' ? entry.assetB : entry.assetA;
+                                    await fundRegistry.registerAllocation(account, botName, side, pct as number | string, assetKey ? String(assetKey) : undefined);
+                                }
                             }
-                            await fundRegistry.registerCollateralAllocation(account, botName, collateralAssetId, globalPct);
+                        }
+
+                        // Register credit/MPA collateral allocations
+                        if (botName && entry.debtPolicy?.lending) {
+                            const dp = entry.debtPolicy;
+                            const globalPct = dp.maxCollateralAmount ?? '100%';
+                            for (const item of dp.lending || []) {
+                                const collateralRef = item.collateralAsset;
+                                if (!collateralRef) continue;
+                                const collateralAssetId = _collateralAssetIdCache.get(normalizeAssetRef(collateralRef)) ?? null;
+                                if (!collateralAssetId) {
+                                    console.error(`  ERROR: unable to resolve collateral asset '${collateralRef}' for credit bot ${botName}. Credit bot will run WITHOUT proportional allocation. Check chain connectivity and asset configuration.`);
+                                    continue;
+                                }
+                                await fundRegistry.registerCollateralAllocation(account, botName, collateralAssetId, globalPct);
+                            }
                         }
                     }
                 }
+            } catch (err) {
+                console.warn(`WARNING: shared-account registry pre-registration failed: ${getErrorMessage(err)}`);
             }
         }
 

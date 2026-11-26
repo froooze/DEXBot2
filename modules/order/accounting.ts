@@ -118,6 +118,23 @@ import { getErrorMessage } from '../utils/errors.js';
 import type { OrderManagerLike, ManagedOrder, ChainOrder, FundDriftCheck } from '../types.js';
 const { toFiniteNumber } = Format;
 
+/** Registry key must be the configured account name, not accountId (1.2.x). */
+function registryAccountKey(mgr: OrderManagerLike): string | null {
+    const preferred = mgr.config?.preferredAccount;
+    if (typeof preferred === 'string' && preferred) return preferred;
+    return typeof mgr.account === 'string' && mgr.account ? mgr.account : null;
+}
+
+function allocationAsset(mgr: OrderManagerLike, side: 'buy' | 'sell'): string | undefined {
+    const raw = side === 'buy' ? mgr.config?.assetB : mgr.config?.assetA;
+    return raw ? String(raw) : undefined;
+}
+
+/** Bot's proportional share of a side on a shared account (1 for a single bot). */
+function botFundShare(mgr: OrderManagerLike, side: 'buy' | 'sell'): number {
+    return fundRegistry.getBotShareSync(registryAccountKey(mgr) ?? undefined, mgr.config?.botKey ?? undefined, side, allocationAsset(mgr, side));
+}
+
 interface FillPaysReceives {
     asset_id?: string;
     amount: number | string;
@@ -672,36 +689,48 @@ class Accountant {
 
          let hasViolation = false;
 
-         // INVARIANT 1: Drift detection
-         // FORMULA: expectedBuy = chainFreeBuy + chainBuy (what we think we have)
-         //          actualBuy = mgr.accountTotals.buy (what blockchain says)
-         //          If |actualBuy - expectedBuy| > tolerance → fund tracking corruption detected
-        const expectedBuy = chainFreeBuy + chainBuy;
-        const diffBuy = Math.abs((actualBuy ?? expectedBuy) - expectedBuy);
-         const allowedBuyTolerance = Math.max(precisionSlackBuy, (actualBuy || expectedBuy) * effectivePercentTolerance);
+         // INVARIANT 1: Drift detection for single-bot accounts.
+         // accountTotals.* are account-wide; chainBuy/Sell are this bot's
+         // orders. Shared accounts skip the equality (see sharedAccountMode)
+         // and rely on INVARIANT 3's over-allocation bound.
+        const registryKeyForInvariant = registryAccountKey(mgr);
+        // On a shared account this equality cannot be proved from account
+        // totals alone: siblings may hold arbitrary committed sizes. The
+        // cross-bot over-allocation bound (INVARIANT 3) is the enforceable
+        // check instead, so a sibling fill cannot trigger the recovery spiral.
+        const sharedAccountMode = !!registryKeyForInvariant && fundRegistry.isSharedAccount(registryKeyForInvariant);
+        const buyShare = botFundShare(mgr, 'buy');
+        const sellShare = botFundShare(mgr, 'sell');
+        const sharedActualBuy = actualBuy != null ? actualBuy * buyShare : actualBuy;
+        const sharedActualSell = actualSell != null ? actualSell * sellShare : actualSell;
+        const sharedFreeBuy = chainFreeBuy * buyShare;
+        const sharedFreeSell = chainFreeSell * sellShare;
+        const expectedBuy = sharedFreeBuy + chainBuy;
+        const diffBuy = Math.abs((sharedActualBuy ?? expectedBuy) - expectedBuy);
+         const allowedBuyTolerance = Math.max(precisionSlackBuy, (sharedActualBuy || expectedBuy) * effectivePercentTolerance);
 
-        if (actualBuy !== null && actualBuy !== undefined && diffBuy > allowedBuyTolerance) {
+        if (!sharedAccountMode && sharedActualBuy !== null && sharedActualBuy !== undefined && diffBuy > allowedBuyTolerance) {
             hasViolation = true;
             // CRITICAL FIX: Log as ERROR instead of WARN
             // Invariant violations indicate serious fund tracking corruption and must not be silent
             // This triggers immediate recovery attempt
             this._logThrottled(
                 'fund-invariant-buy',
-                `CRITICAL: Fund invariant violation (BUY): blockchainTotal (${Format.formatAmountByPrecision(actualBuy, buyPrecision)}) != trackedTotal (${Format.formatAmountByPrecision(expectedBuy, buyPrecision)}) (diff: ${Format.formatAmountByPrecision(diffBuy, buyPrecision)}, allowed: ${Format.formatAmountByPrecision(allowedBuyTolerance, buyPrecision)}${orphanFillsAt != null ? ', orphan-fill buffer active' : ''})`,
+                `CRITICAL: Fund invariant violation (BUY): blockchainTotal (${Format.formatAmountByPrecision(sharedActualBuy, buyPrecision)}) != trackedTotal (${Format.formatAmountByPrecision(expectedBuy, buyPrecision)}) (diff: ${Format.formatAmountByPrecision(diffBuy, buyPrecision)}, allowed: ${Format.formatAmountByPrecision(allowedBuyTolerance, buyPrecision)}${orphanFillsAt != null ? ', orphan-fill buffer active' : ''})`,
                 orphanFillsAt != null ? 'warn' : 'error'
             );
         }
 
-        const expectedSell = chainFreeSell + chainSell;
-        const diffSell = Math.abs((actualSell ?? expectedSell) - expectedSell);
-        const allowedSellTolerance = Math.max(precisionSlackSell, (actualSell || expectedSell) * effectivePercentTolerance);
+        const expectedSell = sharedFreeSell + chainSell;
+        const diffSell = Math.abs((sharedActualSell ?? expectedSell) - expectedSell);
+        const allowedSellTolerance = Math.max(precisionSlackSell, (sharedActualSell || expectedSell) * effectivePercentTolerance);
 
-        if (actualSell !== null && actualSell !== undefined && diffSell > allowedSellTolerance) {
+        if (!sharedAccountMode && sharedActualSell !== null && sharedActualSell !== undefined && diffSell > allowedSellTolerance) {
             hasViolation = true;
             // CRITICAL FIX: Log as ERROR instead of WARN
             this._logThrottled(
                 'fund-invariant-sell',
-                `CRITICAL: Fund invariant violation (SELL): blockchainTotal (${Format.formatAmountByPrecision(actualSell, sellPrecision)}) != trackedTotal (${Format.formatAmountByPrecision(expectedSell, sellPrecision)}) (diff: ${Format.formatAmountByPrecision(diffSell, sellPrecision)}, allowed: ${Format.formatAmountByPrecision(allowedSellTolerance, sellPrecision)}${orphanFillsAt != null ? ', orphan-fill buffer active' : ''})`,
+                `CRITICAL: Fund invariant violation (SELL): blockchainTotal (${Format.formatAmountByPrecision(sharedActualSell, sellPrecision)}) != trackedTotal (${Format.formatAmountByPrecision(expectedSell, sellPrecision)}) (diff: ${Format.formatAmountByPrecision(diffSell, sellPrecision)}, allowed: ${Format.formatAmountByPrecision(allowedSellTolerance, sellPrecision)}${orphanFillsAt != null ? ', orphan-fill buffer active' : ''})`,
                 orphanFillsAt != null ? 'warn' : 'error'
             );
         }
@@ -714,16 +743,21 @@ class Accountant {
             try {
                 const account = mgr.config.preferredAccount;
                 const botName = mgr.config.botKey;
-                const registeredBots = fundRegistry.getRegisteredBots(account);
-                if (registeredBots.length > 1) {
+                // isSharedAccount also falls back to active bots.json entries,
+                // so the guard is not lost when the registry is empty/stale.
+                if (fundRegistry.isSharedAccount(account)) {
                     const crossBotTolerance = Math.max(PERCENT_TOLERANCE * 3, 0.15);
-                    const totalBuyPct = fundRegistry.getTotalAllocatedPct(account, 'buy');
-                    const totalSellPct = fundRegistry.getTotalAllocatedPct(account, 'sell');
-                    const myBuyPct = fundRegistry.getBotAllocationPct(account, botName, 'buy');
-                    const mySellPct = fundRegistry.getBotAllocationPct(account, botName, 'sell');
+                    const buyAsset = allocationAsset(mgr, 'buy');
+                    const sellAsset = allocationAsset(mgr, 'sell');
+                    const totalBuyPct = fundRegistry.getTotalAllocatedPct(account, 'buy', buyAsset);
+                    const totalSellPct = fundRegistry.getTotalAllocatedPct(account, 'sell', sellAsset);
+                    const myBuyPct = fundRegistry.getBotAllocationPct(account, botName, 'buy', buyAsset);
+                    const mySellPct = fundRegistry.getBotAllocationPct(account, botName, 'sell', sellAsset);
 
                     if (myBuyPct !== null && totalBuyPct > 0) {
-                        const proportionalBuy = (chainFreeBuy + chainBuy) * (myBuyPct / totalBuyPct);
+                        // Baseline must be the account-wide total (not the
+                        // mixed free+own-committed sum) before applying share.
+                        const proportionalBuy = (actualBuy ?? chainFreeBuy + chainBuy) * (myBuyPct / totalBuyPct);
                         const committedBuy = mgr.funds?.committed?.chain?.buy || 0;
                         const maxAllowedBuy = proportionalBuy * (1 + crossBotTolerance);
                         if (committedBuy > maxAllowedBuy && proportionalBuy > precisionSlackBuy) {
@@ -739,7 +773,7 @@ class Accountant {
                     }
 
                     if (mySellPct !== null && totalSellPct > 0) {
-                        const proportionalSell = (chainFreeSell + chainSell) * (mySellPct / totalSellPct);
+                        const proportionalSell = (actualSell ?? chainFreeSell + chainSell) * (mySellPct / totalSellPct);
                         const committedSell = mgr.funds?.committed?.chain?.sell || 0;
                         const maxAllowedSell = proportionalSell * (1 + crossBotTolerance);
                         if (committedSell > maxAllowedSell && proportionalSell > precisionSlackSell) {
@@ -769,8 +803,10 @@ class Accountant {
             const sellBad = actualSell !== null && actualSell !== undefined && diffSell > allowedSellTolerance;
             const buyBad = actualBuy !== null && actualBuy !== undefined && diffBuy > allowedBuyTolerance;
             const side = (buyBad && !sellBad) ? 'buy' : (!buyBad && sellBad) ? 'sell' : 'both';
-            const direction = (side === 'buy') ? ((actualBuy ?? 0) > expectedBuy ? 'tracked-low' : 'tracked-high')
-                : (side === 'sell') ? ((actualSell ?? 0) > expectedSell ? 'tracked-low' : 'tracked-high')
+            // Use the share-scaled actuals: mixing a whole-account total with
+            // a scaled expected always records 'tracked-low' on shared accounts.
+            const direction = (side === 'buy') ? ((sharedActualBuy ?? 0) > expectedBuy ? 'tracked-low' : 'tracked-high')
+                : (side === 'sell') ? ((sharedActualSell ?? 0) > expectedSell ? 'tracked-low' : 'tracked-high')
                 : null;
             const prev = mgr._fundDriftLedger;
             if (prev && side !== 'both' && direction && prev.side === side && prev.direction === direction) {
@@ -1144,14 +1180,16 @@ class Accountant {
           }
 
           // Shared-account guard: free = chainTotal − committed would absorb
-          // other bots' committed funds as this bot's free.
+          // other bots' committed funds as this bot's free. The registry is
+          // keyed by preferredAccount (a name), so resolveAccountRef() (which
+          // prefers accountId) must NOT be used here.
+          const registryKey = registryAccountKey(mgr);
           try {
-              const accountRef = resolveAccountRef(mgr, '');
+              const accountRef = registryKey;
               if (accountRef) {
-                  const registeredBots = fundRegistry.getRegisteredBots(accountRef);
-                  if ((registeredBots?.length ?? 0) > 1 && limits.FUND_INVARIANT_HEAL_ALLOW_SHARED !== true) {
+                  if (fundRegistry.isSharedAccount(accountRef) && limits.FUND_INVARIANT_HEAL_ALLOW_SHARED !== true) {
                       mgr.logger?.log?.(
-                          `[RECOVERY] Trust-chain heal refused: ${registeredBots.length} bots registered on shared account ${accountRef}; ` +
+                          `[RECOVERY] Trust-chain heal refused: shared account ${accountRef}; ` +
                           `enable FUND_INVARIANT_HEAL_ALLOW_SHARED to override`,
                           'warn'
                       );
@@ -1162,14 +1200,16 @@ class Accountant {
               mgr.logger?.log?.(`[RECOVERY] Trust-chain heal shared-account check skipped: ${getErrorMessage(err)}`, 'warn');
           }
 
-          const chainTotal = toFiniteNumber(side === 'sell' ? mgr.accountTotals.sell : mgr.accountTotals.buy);
+          const share = botFundShare(mgr, side);
+          const accountChainTotal = toFiniteNumber(side === 'sell' ? mgr.accountTotals.sell : mgr.accountTotals.buy);
+          const chainTotal = accountChainTotal * share;
           const committed = toFiniteNumber(side === 'sell' ? mgr.funds.committed.chain.sell : mgr.funds.committed.chain.buy);
           if (!Number.isFinite(chainTotal) || chainTotal < 0 || !Number.isFinite(committed) || committed < 0) return null;
 
           // Direction re-validation: the ledger snapshot may predate the
           // recovery-time drift read (checkFundDriftAfterFills); only heal
           // when the CURRENT mismatch still points the same way.
-          const expected = toFiniteNumber(side === 'sell' ? mgr.accountTotals.sellFree : mgr.accountTotals.buyFree) + committed;
+          const expected = toFiniteNumber(side === 'sell' ? mgr.accountTotals.sellFree : mgr.accountTotals.buyFree) * share + committed;
           const currentDirection = chainTotal > expected ? 'tracked-low' : 'tracked-high';
           if (ledger.direction && currentDirection !== ledger.direction) {
               mgr.logger?.log?.(
@@ -1178,19 +1218,21 @@ class Accountant {
               );
               return null;
           }
-          // committed > chainTotal means the books hold more on-chain orders
-          // than the chain total can cover — genuinely broken. Seeding free=0
-          // would re-trip the drift immediately and re-enter the recovery
-          // loop, so fail loudly instead and leave the state for inspection.
-          if (committed > chainTotal) {
+          // The invariant scales the ACCOUNT-WIDE free balance by `share`
+          // before comparing with this bot's committed orders. A shared heal
+          // must therefore seed free = accountTotal - committed / share,
+          // otherwise the next invariant check scales it a second time and
+          // re-reports drift (tracked-low by exactly committed × (1 - share)).
+          const committedAtAccountScale = share > 0 ? committed / share : committed;
+          if (committedAtAccountScale > accountChainTotal) {
               mgr.logger?.log?.(
-                  `[RECOVERY] Trust-chain heal refused: committed (${committed}) exceeds chain total (${chainTotal}) — awaiting manual intervention`,
+                  `[RECOVERY] Trust-chain heal refused: committed (${committed}) exceeds chain total (${accountChainTotal}) — awaiting manual intervention`,
                   'error'
               );
               return null;
           }
 
-          const seededFree = Math.max(0, chainTotal - committed);
+          const seededFree = Math.max(0, accountChainTotal - committedAtAccountScale);
           if (side === 'sell') mgr.accountTotals.sellFree = seededFree;
           else mgr.accountTotals.buyFree = seededFree;
 

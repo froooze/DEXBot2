@@ -142,7 +142,7 @@ DEXBot brings a full Python desktop GUI and a strategy plugin model. DEXBot2 is 
 - **Copy-on-Write** grid: planning happens on isolated `WorkingGrid`; committed atomically or discarded on failure
 - **Targeted fill subscription** via `set_subscribe_callback` → `get_account_history_operations` filtered for `OP_FILL_ORDER` fill operations; push-triggered gap-slot batching (a unified batch contains at most `gapSlots + 1` fills)
 - **Market Adapter**: AMA-based price tracking, dynamic buy/sell weighting, Kalman confirmation, ATR/regime dampening, asymmetric grid bounds, and configurable delta triggers
-- **`fund_registry.ts`**: shared-account fund registry — tracks per-account, per-bot fund and collateral allocations; pre-registered atomically at startup so all bots sharing an account see a consistent proportional split before any bot starts; cross-bot invariant enforcement
+- **`fund_registry.ts`**: shared-account fund registry — per-account, per-bot allocations scoped by asset (`buy`→assetB, `sell`→assetA); pre-registered by the launcher and re-registered idempotently at each bot startup (covers PM2); cross-bot invariant on `account total × share`
 - **Bot keys**: deterministic name-derived key (`sanitizeKey(name)`) with uniqueness enforced at all write paths — eliminates name-collision risk across restarts and config reorders
 - State in **JSON flat files** (no database dependency)
 - The default `dexbot start` launcher (the `unlock` runtime) runs the active bot set as **one monolithic bot process** (credential daemon + market adapter in separate helper processes); isolated per-bot mode and PM2 are available alternatives; multiple bots can share an account via fund_registry
@@ -417,7 +417,7 @@ Where:
 - **Atomic snapshots**: consistent reads across all fund components
 - **Recovery triggers**: invariant violation automatically initiates recovery cycle
 - **Market-fee and BTS-fee regression coverage**: tests cover fee cache fallback, BTS fee deduction, batching, and precision quantization
-- **`fund_registry.ts`**: shared-account fund registry with async-locked per-account, per-bot fund and collateral allocation tracking; pre-registered atomically at startup so all bots see consistent proportional splits before any bot starts; cross-bot invariant enforcement with widened tolerance for shared accounts
+- **`fund_registry.ts`**: shared-account fund registry with per-account, per-bot fund and collateral allocations; in-process and cross-process locked writes; idempotent registration at every bot startup; asset-scoped shares with `bots.json` fallback; cross-bot invariant with widened tolerance
 - **Bot keys**: deterministic name-derived key (`sanitizeKey(name)`) used in registry keys; duplicate names rejected at all write paths, eliminating name-collision risk across config reorders and restarts
 - **Credit/MPA collateral allocation**: fund registry extended with `registerCollateralAllocation` / `getEffectiveCollateralAllocationSync` to proportionally split credit bot collateral across bots sharing one account
 - **Credit/MPA runtime support**: separate runtime modules track collateral/debt position data and planning state for advanced BitShares workflows
@@ -435,7 +435,7 @@ Where:
 | **Optimistic Proceeds** | No | Yes |
 | **Accounting Audit Trail** | No | Partial (logging) |
 | **Credit/MPA Collateral Allocation** | No | Yes (fund_registry.ts proportional split for shared-account credit bots) |
-| **Shared-Account Fund Registry** | Manual per-strategy percentages | Automated via `fund_registry.ts` with pre-registration, cross-bot invariants, and atomic release |
+| **Shared-Account Fund Registry** | Manual per-strategy percentages | Automated via `fund_registry.ts` with asset-scoped shares, cross-bot invariants, and sibling-safe release |
 
 ---
 

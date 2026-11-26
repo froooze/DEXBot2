@@ -76,6 +76,8 @@ const { BitShares } = client;
 import * as chainKeys from './chain_keys.js';
 import * as chainOrders from './chain_orders.js';
 import * as fundRegistry from './fund_registry.js';
+import { sanitizeKey } from './utils/sanitize_key.js';
+import { normalizeAssetRef } from './utils/asset_symbols.js';
 import * as DexbotFillRuntime from './dexbot_fill_runtime.js';
 import DexbotMaintenanceRuntime from './dexbot_maintenance_runtime.js';
 import * as DexbotStateRecovery from './dexbot_state_recovery.js';
@@ -1803,6 +1805,61 @@ class DEXBot implements BotLike {
     }
 
     /**
+     * Register this bot's fund allocations in the shared-account registry.
+     * PM2 launches each bot in its own process, so the monolithic launcher's
+     * pre-registration does not run for them — registration must also happen
+     * here. Re-registration is idempotent.
+     * @private
+     */
+    async _registerSharedAccountAllocation() {
+        const account = this.config?.preferredAccount as string | undefined;
+        const rawName = (this.config?.botKey || this.config?.name) as string | undefined;
+        if (!account || !rawName) return;
+        // A raw/un-normalized entry may have no botKey; derive the same key the
+        // launcher uses so one bot cannot occupy two registry entries.
+        const botName = sanitizeKey(rawName);
+
+        // Credit-only bots have no trade sides; register their collateral
+        // here so PM2/isolated cores get the same split as the launcher.
+        if (this.config?.creditOnly) {
+            // Drop side entries left by the old launcher before registering collateral.
+            await fundRegistry.clearSideAllocations(account, botName);
+            const debtPolicy = this.config?.debtPolicy as {
+                lending?: Array<{ collateralAsset?: string }>;
+                maxCollateralAmount?: number | string;
+            } | undefined;
+            const lending = debtPolicy?.lending;
+            const globalPct = debtPolicy?.maxCollateralAmount ?? '100%';
+            for (const item of lending || []) {
+                if (!item?.collateralAsset) continue;
+                const ref = normalizeAssetRef(item.collateralAsset);
+                let assetId = ref.startsWith('1.3.') ? ref : null;
+                if (!assetId && ref) {
+                    try {
+                        const res = await BitShares.db.lookup_asset_symbols([ref]) as Array<{ id?: string }> | null;
+                        if (res && res[0] && res[0].id) assetId = String(res[0].id);
+                    } catch { /* asset lookup is best-effort at startup */ }
+                }
+                if (assetId) {
+                    await fundRegistry.registerCollateralAllocation(account, botName, assetId, globalPct as unknown as number | string);
+                }
+            }
+            return;
+        }
+        const buyPct = this.config?.botFunds?.buy;
+        const sellPct = this.config?.botFunds?.sell;
+        const assetA = this.config?.assetA ? String(this.config.assetA) : undefined;
+        const assetB = this.config?.assetB ? String(this.config.assetB) : undefined;
+        // Register each configured side independently, matching the launcher.
+        if (buyPct != null && assetB) {
+            await fundRegistry.registerAllocation(account, botName, 'buy', buyPct as unknown as number | string, assetB);
+        }
+        if (sellPct != null && assetA) {
+            await fundRegistry.registerAllocation(account, botName, 'sell', sellPct as unknown as number | string, assetA);
+        }
+    }
+
+    /**
      * Common startup sequence logic shared between start() and startWithPrivateKey().
      * @private
      */
@@ -1821,6 +1878,14 @@ class DEXBot implements BotLike {
                 { log: (msg, level) => this._log(msg, level === 'warn' ? 'warn' : 'info') }
             );
         }
+
+        // Shared-account registry registration (idempotent, before fund calc).
+        try {
+            await this._registerSharedAccountAllocation();
+        } catch (err) {
+            this._warn(`Failed to register shared-account allocations: ${getErrorMessage(err)}`);
+        }
+
         try {
             if (this.config.creditOnly) {
                 await this._runCreditOnlyStartup();
@@ -2382,7 +2447,7 @@ class DEXBot implements BotLike {
             const botName = this.config.botKey;
             if (botName) {
                 try {
-                    await fundRegistry.releaseAllocation(this.config.preferredAccount, botName);
+                    await fundRegistry.releaseAllocationOnShutdown(this.config.preferredAccount, botName);
                 } catch (err) {
                     this._warn(`Failed to release fund allocation for ${botName}: ${getErrorMessage(err)}`);
                 }

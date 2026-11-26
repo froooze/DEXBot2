@@ -114,7 +114,7 @@ function assertApproxEqual(actual, expected, message = '') {
         assert.strictEqual(total, 0.5, 'after re-registration total = 0.5');
 
         const alloc = fundRegistry.getEffectiveAllocationSync('acct-4', 'bot-x', 'buy', 1000);
-        assert.strictEqual(alloc, 1000, 'single bot gets full amount regardless of pct');
+        assert.strictEqual(alloc, 500, 'a solo bot keeps its configured percentage');
     }
     console.log('  PASS test 5: re-registration updates percentage');
 
@@ -250,7 +250,7 @@ function assertApproxEqual(actual, expected, message = '') {
         const gridBuy = fundRegistry.getEffectiveAllocationSync('acct-10', 'grid-bot', 'buy', 1000);
         assert.strictEqual(gridBuy, 1000, 'grid buy unaffected by credit registration');
         const gridSell = fundRegistry.getEffectiveAllocationSync('acct-10', 'grid-bot', 'sell', 1000);
-        assert.strictEqual(gridSell, 1000, 'grid sell unaffected by credit registration');
+        assert.strictEqual(gridSell, 500, 'grid sell keeps its configured 50% despite credit registration');
 
         // Collateral totals unaffected by grid
         const collEff = fundRegistry.getEffectiveCollateralAllocationSync('acct-10', 'credit-bot', btsAssetId, 2000);

@@ -344,9 +344,11 @@ function validateWorkingGridFunds(workingGrid: Map<string, ManagedOrder> | Worki
  * @param {Map} orders - Current orders
  * @param {Object} accountTotals - Blockchain account totals
  * @param {Object} assets - Asset metadata
+ * @param {Object} [shares] - Bot's proportional share of each side on a shared account (1 by default)
+ * @param {boolean} [skipEquality] - Skip the unprovable account-wide equality on shared accounts
  * @returns {Object} Drift check result
  */
-function checkFundDrift(orders: Map<string, ManagedOrder>, accountTotals: AccountTotals | null, assets: AssetPair | null = null, gridLimits: GridLimitsLike | null = null) {
+function checkFundDrift(orders: Map<string, ManagedOrder>, accountTotals: AccountTotals | null, assets: AssetPair | null = null, gridLimits: GridLimitsLike | null = null, shares: { buy?: number; sell?: number } | null = null, skipEquality: boolean = false) {
     let gridBuy = 0, gridSell = 0;
     for (const order of Array.from(orders.values())) {
         const size = toFiniteNumber(order.size);
@@ -356,10 +358,17 @@ function checkFundDrift(orders: Map<string, ManagedOrder>, accountTotals: Accoun
         else if (order.type === ORDER_TYPES.SELL) gridSell += size;
     }
 
-    const chainFreeBuy = accountTotals?.buyFree || 0;
-    const chainFreeSell = accountTotals?.sellFree || 0;
-    const actualBuy = accountTotals?.buy || 0;
-    const actualSell = accountTotals?.sell || 0;
+    // On a shared account the chain totals cover the whole account while the
+    // grid covers only this bot. Scale both account-wide numbers by this bot's
+    // share so the expected identity (total = free + own committed) holds.
+    const rawBuyShare = shares?.buy;
+    const rawSellShare = shares?.sell;
+    const buyShare = typeof rawBuyShare === 'number' && Number.isFinite(rawBuyShare) && rawBuyShare >= 0 ? rawBuyShare : 1;
+    const sellShare = typeof rawSellShare === 'number' && Number.isFinite(rawSellShare) && rawSellShare >= 0 ? rawSellShare : 1;
+    const chainFreeBuy = (accountTotals?.buyFree || 0) * buyShare;
+    const chainFreeSell = (accountTotals?.sellFree || 0) * sellShare;
+    const actualBuy = (accountTotals?.buy || 0) * buyShare;
+    const actualSell = (accountTotals?.sell || 0) * sellShare;
 
     const expectedBuy = chainFreeBuy + gridBuy;
     const expectedSell = chainFreeSell + gridSell;
@@ -381,6 +390,12 @@ function checkFundDrift(orders: Map<string, ManagedOrder>, accountTotals: Accoun
 
     const allowedDriftBuy = Math.max(precisionSlackBuy, actualBuy * percentTolerance);
     const allowedDriftSell = Math.max(precisionSlackSell, actualSell * percentTolerance);
+
+    // Shared accounts cannot prove the account-wide identity from one bot's
+    // orders; over-allocation is enforced by the registry invariant instead.
+    if (skipEquality) {
+        return { isValid: true, driftBuy, driftSell, allowedDriftBuy, allowedDriftSell, reason: null };
+    }
 
     const buyOk = driftBuy <= allowedDriftBuy;
     const sellOk = driftSell <= allowedDriftSell;

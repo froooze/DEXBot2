@@ -376,35 +376,28 @@ function collectValidationIssues(entries: BotEntry[], sourceName: string): { err
         errors.push(issue);
     }
 
-    // Cross-bot validation: check if botFunds percentages sum > 100% per account
-    const accountFunds: Record<string, { buy: number; sell: number; botNames: string[] }> = {};
+    // Cross-bot validation: funds are scoped per asset, not per account.
+    const assetFunds: Record<string, { account: string; side: 'buy' | 'sell'; asset: string; pct: number; botNames: string[] }> = {};
     for (const entry of entries) {
         const account = entry.preferredAccount;
-        if (!entry.active || !account || !entry.botFunds) continue;
-        if (!accountFunds[account]) {
-            accountFunds[account] = { buy: 0, sell: 0, botNames: [] };
+        if (entry.active === false || !account || !entry.botFunds) continue;
+        for (const side of ['buy', 'sell'] as const) {
+            const pctRaw = entry.botFunds[side];
+            if (pctRaw === undefined || pctRaw === null) continue;
+            const asset = String(side === 'buy' ? entry.assetB : entry.assetA || 'unknown');
+            const key = `${account}|${side}|${asset}`;
+            const group = assetFunds[key] || (assetFunds[key] = { account, side, asset, pct: 0, botNames: [] });
+            group.pct += toDecimal(pctRaw);
+            group.botNames.push(entry.name || entry.botKey || `bot-${entries.indexOf(entry)}`);
         }
-        const acc = accountFunds[account];
-        acc.buy += toDecimal(entry.botFunds.buy);
-        acc.sell += toDecimal(entry.botFunds.sell);
-        acc.botNames.push(entry.name || entry.botKey || `bot-${entries.indexOf(entry)}`);
     }
-    for (const [account, funds] of Object.entries(accountFunds)) {
-        if (funds.botNames.length > 1) {
-            if (funds.buy > 1) {
-                warnings.push(
-                    `[SHARED ACCOUNT] '${account}': bots [${funds.botNames.join(', ')}] allocate ` +
-                    `${(funds.buy * 100).toFixed(0)}% of BUY funds (>100%). ` +
-                    `Each bot will receive a proportional share (myPct / totalPct × chainBalance).`
-                );
-            }
-            if (funds.sell > 1) {
-                warnings.push(
-                    `[SHARED ACCOUNT] '${account}': bots [${funds.botNames.join(', ')}] allocate ` +
-                    `${(funds.sell * 100).toFixed(0)}% of SELL funds (>100%). ` +
-                    `Each bot will receive a proportional share (myPct / totalPct × chainBalance).`
-                );
-            }
+    for (const group of Object.values(assetFunds)) {
+        if (group.botNames.length > 1 && group.pct > 1) {
+            warnings.push(
+                `[SHARED ACCOUNT] '${group.account}': bots [${group.botNames.join(', ')}] allocate ` +
+                `${(group.pct * 100).toFixed(0)}% of ${group.side.toUpperCase()} funds for ${group.asset} (>100%). ` +
+                `Only bots trading this same asset share it proportionally.`
+            );
         }
     }
 

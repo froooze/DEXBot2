@@ -240,8 +240,12 @@ async function testHEAL060_SharedAccountGuard() {
             config: {
                 gridLimits: { FUND_INVARIANT_HEAL_ON_RECOVERY_FAIL: true, FUND_INVARIANT_HEAL_ALLOW_SHARED: allowShared, FUND_INVARIANT_HEAL_MIN_PERSISTENT_CHECKS: 2 },
                 botKey: 'botA',
+                // Registry is keyed by the name, never by accountId. Setting a
+                // different accountId catches the old resolveAccountRef lookup.
+                preferredAccount: acct,
             },
             account: acct,
+            accountId: '1.2.999999',
             assets: { assetA: { precision: 4 }, assetB: { precision: 4 } },
             accountTotals: { sell: 563.3516, sellFree: 414.84, buy: 300000, buyFree: 290000 },
             funds: { committed: { chain: { buy: 10000, sell: 74.1 } } },
@@ -262,7 +266,9 @@ async function testHEAL060_SharedAccountGuard() {
         const accountantB = new Accountant(allowedMgr);
         const res = await accountantB._tryTrustChainFreeHeal(allowedMgr, makeDriftValidation({ driftSell: 74.41, allowedSell: 0.56 }));
         assert.ok(res, 'allow-shared override must heal');
-        assert.strictEqual(allowedMgr.accountTotals.sellFree, 563.3516 - 74.1);
+        // Shared heal seeds an account-scale free balance that is consistent
+        // with the share-scaled invariant: total - committed / share.
+        assert.strictEqual(allowedMgr.accountTotals.sellFree, 563.3516 - 74.1 / 0.5);
         console.log('✓ HEAL-060 passed');
     } finally {
         fundRegistry.resetRegistry();
