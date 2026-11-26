@@ -132,7 +132,7 @@ const {
 const { buildRuntimeScriptPath, runRuntimeScript } = require('./modules/launcher/runtime_entry');
 const { parseWorkerArgs, LAUNCHER_WORKER_COMMAND } = require('./modules/launcher/launch_modes');
 const { detectRuntimeMode, runtimeControlHelp, runtimeModeLabel, checkStatusTarget, resolveStatusRoute } = require('./modules/launcher/runtime_mode');
-const { PATHS, getHomeProfilesDir, getRecalculateTriggerFile, printRelocationNotices } = require('./modules/paths');
+const { PATHS, MANUAL_GRID_FULL_RESET_SOURCE, getHomeProfilesDir, getRecalculateTriggerFile, printRelocationNotices } = require('./modules/paths');
 const credentialPolicy = require('./modules/credential_policy');
 const { Config } = require('./modules/config');
 const { isSameBotName } = require('./modules/utils/sanitize_key');
@@ -883,12 +883,14 @@ async function resetBotByName(botName: string | null | undefined) {
             // Manual CLI reset is a clean slate: the new source makes the runtime
             // drop both last-fill guard references (live + persisted) and rebuild
             // without anchoring geometry to the old last fill. Empty triggers
-            // remain the legacy/normal reset for other trigger writers (claw,
-            // market adapter, hand-made files).
+            // (hand-made files, explicit null payloads) remain the legacy/normal
+            // reset; the claw launcher and default claw settings patches use
+            // this same clean-slate source, while market-adapter triggers use
+            // their own source and keep the guard.
             // writeJSON is atomic (tmp + rename): a running bot's trigger
             // watcher must never parse a half-written trigger as a legacy
             // empty/manual reset.
-            storage.writeJSON(triggerFile, { source: 'manual_grid_full_reset' });
+            storage.writeJSON(triggerFile, { source: MANUAL_GRID_FULL_RESET_SOURCE });
             console.log(startupSuccess(`✓ Full-reset trigger set for '${bot.name}' (${path.basename(triggerFile)})`));
         } catch (err) {
             console.warn(`Failed to set trigger for '${bot.name}': ${getErrorMessage(err)}`);

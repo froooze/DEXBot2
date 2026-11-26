@@ -20,7 +20,7 @@ import { BOT_LIVE_CONFIG_KEYS } from './runtime_settings.js';
 import { migrateLegacyOrderKeys } from './bot_defaults.js';
 import { acquireIfNotHeld } from './order/async_lock.js';
 const { readOpenOrdersGuarded } = chainOrders;
-import { PATHS } from './paths.js';
+import { PATHS, MANUAL_GRID_FULL_RESET_SOURCE } from './paths.js';
 import * as Format from './order/format.js';
 import { getStorage } from './storage/index.js';
 const storage = getStorage();
@@ -170,12 +170,12 @@ const GRID_RESYNC_REASONS = Object.freeze({
     // Explicit operator clean slate: unlike every automatic resync source,
     // this one drops the last-fill guard references (live and persisted) and
     // rebuilds geometry without anchoring it to the old last fill.
-    manual_grid_full_reset: {
+    [MANUAL_GRID_FULL_RESET_SOURCE]: {
         shouldRefreshCenterPrice: true,
         centerRefreshContext: 'manual full grid reset',
         centerRefreshLabel: 'manual full grid reset',
         clearLastFillGuards: true,
-        resetSource: 'manual_grid_full_reset',
+        resetSource: MANUAL_GRID_FULL_RESET_SOURCE,
     },
     rms_structural_grid_resync: {
         shouldRefreshCenterPrice: false,
@@ -1363,7 +1363,7 @@ function readTriggerMetadata(triggerFile: string) {
         // or foreign sources keep the legacy/manual interpretation, so a stray
         // `rms_structural_grid_resync` payload cannot silently skip the AMA
         // center refresh or clear the guards.
-        if (source === 'manual_grid_full_reset') {
+        if (source === MANUAL_GRID_FULL_RESET_SOURCE) {
             return { ...buildGridResyncMetadata(source), payload };
         }
         return manualTriggerMetadata(payload);

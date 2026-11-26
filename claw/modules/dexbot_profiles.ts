@@ -4,7 +4,7 @@ import { getStorage } from '../../modules/storage/index.js';
 import { DEFAULT_CONFIG, GRID_LIMITS, INCREMENT_BOUNDS } from '../../modules/constants.js';
 import { resolveRelativePrice } from '../../modules/order/utils/math.js';
 import { Config } from '../../modules/config.js';
-import { PATHS } from '../../modules/paths.js';
+import { PATHS, MANUAL_GRID_FULL_RESET_SOURCE } from '../../modules/paths.js';
 import { writeJsonFileAtomic as baseWriteJsonFileAtomic } from '../../modules/bots_file_lock.js';
 import { acquireFileLock } from '../../market_adapter/utils/file_lock.js';
 import { assertNoDuplicateBotKeys, normalizeBotEntry } from '../../modules/bot_settings.js';
@@ -821,10 +821,6 @@ function readJsonFile(filePath: any) {
   }
 }
 
-function writeTextPayload(filePath: any, content: any) {
-  storage.writeFile(filePath, `${content}\n`, 'utf8');
-}
-
 /**
  * Write JSON data atomically via file lock.
  * Acquires a lock on the target path, delegates to the shared atomic-write helper, then releases.
@@ -1222,17 +1218,40 @@ function createDexbotProfileAdapter(profileRoot: string | null, options: Partial
         ));
       if (shouldWriteTrigger) {
         triggerPath = path.join(getProfilesDir(), `recalculate.${bot.botKey}.trigger`);
-        triggerPayload = options.triggerPayload !== undefined
-          ? options.triggerPayload
-          : {
-              botKey: bot.botKey,
-              changedKeys: validation.patchKeys,
-              reason: options.triggerReason || 'settings_update',
-              updatedAt: new Date().toISOString()
-            };
-        const content = triggerPayload ? JSON.stringify(triggerPayload, null, 2) : '';
+        // A settings patch that needs a recalc is an operator-initiated grid
+        // rebuild: default to the same clean-slate source as `dexbot reset` so
+        // the runtime drops the last-fill guards instead of anchoring the new
+        // grid to the previous fill. Explicit caller intent wins: a custom
+        // payload that already carries a `source` keeps it (any source other
+        // than the clean-slate one is the normal-reset opt out), and
+        // `triggerPayload: null` writes the legacy empty trigger.
+        const customPayload = options.triggerPayload;
+        if (customPayload === null) {
+          triggerPayload = null;
+        } else if (customPayload === undefined) {
+          triggerPayload = {
+            source: MANUAL_GRID_FULL_RESET_SOURCE,
+            botKey: bot.botKey,
+            changedKeys: validation.patchKeys,
+            reason: options.triggerReason || 'settings_update',
+            updatedAt: new Date().toISOString()
+          };
+        } else if (isPlainObject(customPayload)) {
+          triggerPayload = {
+            ...customPayload,
+            source: customPayload.source ?? MANUAL_GRID_FULL_RESET_SOURCE,
+          };
+        } else {
+          triggerPayload = customPayload;
+        }
         storage.ensureDir(path.dirname(triggerPath));
-        writeTextPayload(triggerPath, content);
+        if (triggerPayload) {
+          // Atomic tmp+rename: a running bot's trigger watcher must never parse
+          // a half-written clean-slate payload as a legacy empty reset.
+          storage.writeJSON(triggerPath, triggerPayload);
+        } else {
+          storage.writeFile(triggerPath, '', 'utf8');
+        }
       }
 
       cachedBundle = null;

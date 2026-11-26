@@ -253,7 +253,9 @@ async function testApplyBotSettingsPatchWritesTriggerAtomically() {
   assert.strictEqual(written.bots[0].weightDistribution.buy, 0.7);
   assert.strictEqual(written.bots[0].weightDistribution.sell, 0.5);
   assert.strictEqual(result.triggerPath, triggerFile);
-  assert.strictEqual(trigger.reason, 'manual_test');
+  assert.strictEqual(trigger.reason, 'manual_test', 'caller-supplied diagnostic reason must be preserved');
+  assert.strictEqual(trigger.source, 'manual_grid_full_reset', 'a settings-patch trigger is a clean-slate operator reset');
+  assert.strictEqual(result.triggerPayload.source, 'manual_grid_full_reset');
 }
 
 async function testSparseBotPatchRespectsDefaultBackedValidation() {
@@ -606,6 +608,87 @@ async function testGeometryPatchKeepsTriggerByDefault() {
   const canonicalKey = result.updatedBot.botKey;
   assert.strictEqual(result.triggerPath, path.join(profilesDir, `recalculate.${canonicalKey}.trigger`));
   await fs.access(result.triggerPath);
+  const trigger = JSON.parse(await fs.readFile(result.triggerPath, 'utf8'));
+  assert.strictEqual(trigger.source, 'manual_grid_full_reset', 'default settings-patch trigger must be a clean-slate reset');
+  assert.strictEqual(trigger.reason, 'settings_update');
+}
+
+async function testSettingsPatchTriggerPayloadEdgeCases() {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'dexbot-profiles-trigger-edges-'));
+  const profilesDir = path.join(dir, 'profiles');
+  const botsFile = path.join(profilesDir, 'bots.json');
+
+  await fs.mkdir(profilesDir, { recursive: true });
+  await fs.writeFile(botsFile, JSON.stringify({
+    bots: [{ name: 'edges', assetA: 'USD', assetB: 'BTS', incrementPercent: 0.4 }]
+  }, null, 2));
+
+  const adapter = createDexbotProfileAdapter(profilesDir);
+  const readTrigger = async (filePath: string) => fs.readFile(filePath, 'utf8');
+
+  try {
+    // null is the documented opt-out: an empty trigger is a normal reset.
+    const nullResult = await adapter.applyBotSettingsPatch('edges', { incrementPercent: 0.5 }, {
+      trigger: true,
+      triggerPayload: null
+    });
+    assert.strictEqual(nullResult.triggerPayload, null);
+    assert.strictEqual(await readTrigger(nullResult.triggerPath), '', 'null payload must write a legacy empty trigger');
+
+    // An explicitly supplied source is caller intent and must not be escalated.
+    const foreignResult = await adapter.applyBotSettingsPatch('edges', { incrementPercent: 0.6 }, {
+      trigger: true,
+      triggerPayload: { source: 'manual_grid_resync', reason: 'reprice' }
+    });
+    const foreign = JSON.parse(await readTrigger(foreignResult.triggerPath));
+    assert.strictEqual(foreign.source, 'manual_grid_resync', 'an explicit source must keep the guard');
+    assert.strictEqual(foreign.reason, 'reprice');
+
+    // A non-object payload is written verbatim and parses as a normal reset.
+    const stringResult = await adapter.applyBotSettingsPatch('edges', { incrementPercent: 0.7 }, {
+      trigger: true,
+      triggerPayload: 'manual'
+    });
+    assert.strictEqual(JSON.parse(await readTrigger(stringResult.triggerPath)), 'manual');
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function testLauncherResetWritesCleanSlateTrigger() {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'dexbot-launcher-reset-'));
+  const profilesDir = path.join(dir, 'profiles');
+  const botsFile = path.join(profilesDir, 'bots.json');
+
+  await fs.mkdir(profilesDir, { recursive: true });
+  await fs.writeFile(botsFile, JSON.stringify({
+    bots: [
+      { name: 'reset-target', assetA: 'USD', assetB: 'BTS', active: false },
+      { name: 'reset-active', assetA: 'USD', assetB: 'BTS', active: true },
+    ]
+  }, null, 2));
+
+  try {
+    const { launcherReset } = require('../modules/claw_launcher');
+    const result = await launcherReset('reset-target', { profileRoot: profilesDir });
+    assert.strictEqual(result.reset, true);
+    assert.strictEqual(result.targets.length, 1);
+
+    const triggerFile = path.join(profilesDir, result.targets[0].triggerFile);
+    const trigger = JSON.parse(await fs.readFile(triggerFile, 'utf8'));
+    assert.strictEqual(trigger.source, 'manual_grid_full_reset', 'claw launcher reset must use the CLI clean-slate source');
+    assert.deepStrictEqual(Object.keys(trigger), ['source'], 'no stale timestamp payload may remain');
+
+    const allResult = await launcherReset('all', { profileRoot: profilesDir });
+    assert.strictEqual(allResult.targets.length, 1, '"all" must normalize to null and skip explicitly inactive bots');
+    assert.strictEqual(allResult.targets[0].botName, 'reset-active');
+    for (const target of allResult.targets) {
+      const payload = JSON.parse(await fs.readFile(path.join(profilesDir, target.triggerFile), 'utf8'));
+      assert.strictEqual(payload.source, 'manual_grid_full_reset');
+    }
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 }
 
 async function testNormalizeBotEntriesDelegatesToSharedSeeder() {
@@ -645,6 +728,8 @@ async function main() {
   await testUpdateBotSettingsWithoutIdentifierReturnsResolvedBot();
   await testLiveOnlyPatchSkipsTriggerByDefault();
   await testGeometryPatchKeepsTriggerByDefault();
+  await testSettingsPatchTriggerPayloadEdgeCases();
+  await testLauncherResetWritesCleanSlateTrigger();
   console.log('dexbot profile tests passed');
 }
 

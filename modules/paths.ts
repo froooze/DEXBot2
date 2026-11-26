@@ -363,9 +363,20 @@ function getNodeHealthCacheFile(stateDir?: string): string {
     : PATHS.PROFILES.NODE_HEALTH_CACHE_JSON;
 }
 
+/**
+ * Trigger source for an operator-initiated clean-slate grid reset.
+ *
+ * Only this exact source makes the maintenance runtime drop both last-fill
+ * guard references and rebuild without anchoring to the old last fill. Any
+ * other payload (empty, malformed, market-adapter, or hand-written) stays a
+ * normal reset. Shared here so every trigger writer — CLI, claw launcher and
+ * claw profiles — uses one wire value instead of drifting apart.
+ */
+const MANUAL_GRID_FULL_RESET_SOURCE = 'manual_grid_full_reset';
+
 function getRecalculateTriggerFile(botKey: string): string {
   return path.join(PATHS.PROFILES_DIR, `recalculate.${botKey}.trigger`);
 }
 
-export { PATHS, getHomeProfilesDir, resolveProfilesDir, resolveMarketAdapterDirs, resolveClawDirs, resolveAnalysisDirs, isGlobalNpmPackageDir, getNodeBlacklistFile, getNodeHealthCacheFile, getRecalculateTriggerFile, computeRelocationNotices, printRelocationNotices }
+export { PATHS, MANUAL_GRID_FULL_RESET_SOURCE, getHomeProfilesDir, resolveProfilesDir, resolveMarketAdapterDirs, resolveClawDirs, resolveAnalysisDirs, isGlobalNpmPackageDir, getNodeBlacklistFile, getNodeHealthCacheFile, getRecalculateTriggerFile, computeRelocationNotices, printRelocationNotices }
 

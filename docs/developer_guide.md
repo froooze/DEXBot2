@@ -1094,7 +1094,7 @@ The bot performs a **Periodic Configuration Refresh** (every 4 hours by default)
 *   **Valuation locked**: All calculations use the configured numeric value
 *   **Manual Override Required**: To change numeric anchor, edit `bots.json` and use the bot's reset trigger file.
 
-*   **Applying Changes**: To force the bot to move orders to a new `startPrice` immediately, run `dexbot reset <bot>` (or create `profiles/recalculate.<botKey>.trigger`). Empty or malformed trigger files are treated as manual/legacy resets; for AMA bots the runtime refreshes `gridCenterPrice` from the latest `amaCenterPrice` before rebuilding. The CLI writes `{"source":"manual_grid_full_reset"}`: that clean-slate resync also clears both last-fill guard references (live and persisted) and skips the fill-based boundary anchor. An empty trigger (or a trigger written by another tool) remains a normal reset and keeps the guard.
+*   **Applying Changes**: To force the bot to move orders to a new `startPrice` immediately, run `dexbot reset <bot>` (or create `profiles/recalculate.<botKey>.trigger`). Empty or malformed trigger files are treated as manual/legacy resets; for AMA bots the runtime refreshes `gridCenterPrice` from the latest `amaCenterPrice` before rebuilding. The CLI, the claw launcher reset, and default claw settings patches that request a recalc write a trigger whose `source` is `manual_grid_full_reset`: that clean-slate resync also clears both last-fill guard references (live and persisted) and skips the fill-based boundary anchor. An empty or malformed trigger, a market-adapter trigger, or any other foreign-sourced trigger remains a normal reset and keeps the guard.
 
 ---
 

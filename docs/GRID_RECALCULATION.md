@@ -56,16 +56,22 @@ The bot executes the reset through `_performGridResync()`:
 3. Reload this bot's entry from `profiles/bots.json`.
 4. For full-recenter reset reasons, refresh `gridCenterPrice` in
    `<botKey>.dynamicgrid.json` from the latest `amaCenterPrice` before rebuilding.
-5. Call `Grid.recalculateGrid()` using fresh open orders from chain (this is runtime resync, not startup reconcile — see [GRID_RECONCILE.md](GRID_RECONCILE.md)). A truncated read (including an ambiguous empty-read confirm) returns `null` here and aborts BEFORE any sync/rebuild. A `dexbot reset` trigger passes `clearLastFillGuards`, so the rebuild leaves the guard cold and keeps the boundary structural instead of re-arming/anchoring to the old last fill.
+5. Call `Grid.recalculateGrid()` using fresh open orders from chain (this is runtime resync, not startup reconcile — see [GRID_RECONCILE.md](GRID_RECONCILE.md)). A truncated read (including an ambiguous empty-read confirm) returns `null` here and aborts BEFORE any sync/rebuild. A clean-slate operator trigger passes `clearLastFillGuards`, so the rebuild leaves the guard cold and keeps the boundary structural instead of re-arming/anchoring to the old last fill. Clean-slate triggers come from `dexbot reset`, the claw launcher reset, and default claw settings-patch triggers; a settings patch whose caller supplies an explicit `triggerPayload` `source` other than `manual_grid_full_reset`, or `triggerPayload: null`, stays a normal reset.
 6. The live pivot is cold from step 5, so `recalculateGrid`'s own pre-rebuild flush already drops the genesis-bound pivot row; the market-fill row survives until commit, and rollback relies on the in-memory snapshot rather than the disk row. After the rebuild succeeds, erase both persisted guard rows in one locked write and clear the spread watchdog memory; reset fee-debt bookkeeping, persist the rebuilt grid, record actual reset metadata in `dynamicgrid.json`, and remove the trigger file. On a failed/ambiguous rebuild the guard state and watchdog are rolled back and the trigger is retained for retry (an old pivot row is not restored if the failed rebuild already published a new genesis).
 
-Market-adapter triggers carry `source: "market_adapter/market_adapter.ts"` and
-an explicit `reason`, so the runtime can record reset provenance such as
+Market-adapter triggers carry an explicit `reason` and a `source` derived from
+the adapter filename: `"market_adapter/market_adapter.js"` in dist mode, or
+`"market_adapter/market_adapter.ts"` in source mode. Only the dist-mode `.js`
+source is recognized by the runtime, which then records reset provenance such as
 `market_adapter_bootstrap`, `market_adapter_delta_threshold`, or
-`market_adapter_ama_slope_delta_threshold`. `dexbot reset` writes
-`source: "manual_grid_full_reset"`, the only payload source that requests the
-guard clear; empty, malformed, and other sourced trigger files remain manual/
-legacy resets.
+`market_adapter_ama_slope_delta_threshold` and keeps the last-fill guard. A
+source-mode `.ts` trigger currently falls through to manual/legacy handling.
+`dexbot reset`, the claw launcher reset, and default claw settings-patch
+triggers write `source: "manual_grid_full_reset"` (the shared
+`MANUAL_GRID_FULL_RESET_SOURCE` wire value); that is the only payload source
+that requests the guard clear. Empty, malformed, and other foreign-sourced
+trigger files remain manual/legacy resets, as do settings-patch triggers whose
+caller supplies an explicit non-clean-slate `source` or `triggerPayload: null`.
 
 ---
 
@@ -591,7 +597,7 @@ Trigger payload reasons:
 market_adapter_bootstrap
 market_adapter_delta_threshold
 market_adapter_ama_slope_delta_threshold
-manual_grid_full_reset   # dexbot reset: clean slate, guards cleared
+manual_grid_full_reset   # dexbot reset / claw launcher reset / default settings-patch recalc: clean slate, guards cleared
 ```
 
 **RMS Divergence Trigger:**

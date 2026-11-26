@@ -167,13 +167,13 @@ Do not tune on a fixed schedule. Tune when the bot's behavior stops matching the
 
 ## Resetting a grid
 
-Use a normal reset when you want the bot to rebuild around the current market:
+Use a clean-slate reset when you want the bot to rebuild around the current market without anchoring to the previous fill:
 
 ```bash
 dexbot reset <bot>
 ```
 
-That writes the recalculation trigger file. If the bot is running, it resets immediately; if it is stopped, it resets on the next start.
+That writes a recalculation trigger with `source: "manual_grid_full_reset"`, which also clears both last-fill guard references. The claw launcher reset and default settings patches that request a recalc write the same source (an explicit `source` or a null payload opts out). If the bot is running, it resets immediately; if it is stopped, it resets on the next start. A market-adapter trigger still performs a normal reset that keeps the guard.
 
 Use a hard cleanup only when you want a full wipe of persisted order state.
 

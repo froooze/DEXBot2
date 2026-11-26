@@ -5,6 +5,7 @@ const require = createRequire(import.meta.url);
 
 import { getStorage } from '../../modules/storage/index.js';
 import { path } from '../../modules/path_api.js';
+import { MANUAL_GRID_FULL_RESET_SOURCE } from '../../modules/paths.js';
 import { loadSettingsFile, resolveRawBotEntries, saveSettingsFile, normalizeBotEntries } from '../../modules/bot_settings.js';
 import { normalizeMode, detectMode, setPreferredMode, describeModeChoice } from './launcher_mode_detector.js';
 import { normalizeRoot, resolveRuntimeScript, normalizeProfileDir } from './launcher_paths.js';
@@ -163,7 +164,12 @@ async function launcherDrystart(botName: string | null, options: Record<string, 
 }
 
 /**
- * Reset a bot grid (writes trigger file).
+ * Reset a bot grid (writes a clean-slate trigger file).
+ *
+ * The payload uses the same source as `dexbot reset`, so the runtime drops
+ * both last-fill guard references and rebuilds without anchoring to the old
+ * last fill. writeJSON is atomic (tmp + rename): a running bot's trigger
+ * watcher must never parse a half-written trigger as a legacy empty reset.
  * @param {string|null} botName - Bot name or null for all active
  * @param {Object} [options={}] - Options
  * @returns {Promise<Object>} { reset: true, targets: [...] }
@@ -186,7 +192,7 @@ async function launcherReset(botName: string | null, options: Record<string, any
   for (const bot of targets) {
     try {
       const triggerFile = getTriggerFile(options, bot.botKey || '');
-      storage.writeFile(triggerFile, new Date().toISOString());
+      storage.writeJSON(triggerFile, { source: MANUAL_GRID_FULL_RESET_SOURCE });
       triggered.push({
         botName: bot.name,
         triggerFile: path.basename(triggerFile),
