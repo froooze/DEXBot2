@@ -68,7 +68,7 @@ import {
     buildSuccessResult,
     evaluateCommit
 } from './utils/validate.js';
-import { resolveSpreadOrderSide, resolveLiveOrderLadderPosition, parseChainOrder, geometryTypeForSlotIndex, isOrderOnChain, resolveEdgeCount, resolveLiveEdgeAnchorPrice, compareEdge, collectRefillSlotIds, isFreshlyPlacedOrder, collectEdgePinnedFillIds, isStructuralRebuildStaleReason } from './utils/order.js';
+import { resolveSpreadOrderSide, resolveLiveOrderLadderPosition, parseChainOrder, geometryTypeForSlotIndex, isOrderOnChain, resolveEdgeCount, resolveLiveEdgeAnchorPrice, compareEdge, collectRefillSlotIds, isFreshlyPlacedOrder, collectEdgePinnedFillIds, isStructuralRebuildStaleReason, resolveSizeTolerancePercent } from './utils/order.js';
 import { parseSlotIndex } from './utils/slot.js';
 import PlacementLock, { withPlacement as runWithPlacement, attachPlanLease } from './placement_lock.js';
 import type { PlacementLease } from './placement_lock.js';
@@ -3022,13 +3022,14 @@ class OrderManager implements OrderManagerLike {
             return { isValid: true, reason: 'Skipped: missing assets or totals' };
         }
         const account = this.config?.preferredAccount;
-        const botName = this.config?.botKey;
-        const buyAsset = this.config?.assetB ? String(this.config.assetB) : undefined;
-        const sellAsset = this.config?.assetA ? String(this.config.assetA) : undefined;
-        const shares = {
-            buy: fundRegistry.getBotShareSync(account, botName, 'buy', buyAsset),
-            sell: fundRegistry.getBotShareSync(account, botName, 'sell', sellAsset)
-        };
+        // Same resolver as the sizing/trigger paths; pass only the fields this
+        // call used before so account resolution stays unchanged.
+        const shares = fundRegistry.getBotSideSharesSync({
+            preferredAccount: account,
+            botKey: this.config?.botKey,
+            assetA: this.config?.assetA,
+            assetB: this.config?.assetB,
+        });
         const skipEquality = !!account && fundRegistry.isSharedAccount(account);
         return checkFundDrift(this.orders, this.accountTotals, this.assets, this.config?.gridLimits ?? null, shares, skipEquality);
     }
@@ -3520,17 +3521,24 @@ class OrderManager implements OrderManagerLike {
         // Example: incrementPercent=0.5 -> relative tolerance ratio=0.0005 (0.05%).
         const priceRelativeTolerance = incrementPercent / 1000;
 
+        // Size equality tolerance must come from the same config knob the
+        // emission gate clamps against, otherwise an operator override could
+        // make the commit gate stricter than SIZE_UPDATE_MIN_CHANGE_PERCENT and
+        // reintroduce no-op batches refused after broadcast.
+        const sizeRelativeTolerance = resolveSizeTolerancePercent(this.config) / 100;
+
         return {
             buyPrecision,
             sellPrecision,
-            priceRelativeTolerance
+            priceRelativeTolerance,
+            sizeRelativeTolerance
         };
     }
 
     async _commitWorkingGrid(workingGrid: WorkingGrid, _workingIndexes: unknown, workingBoundary: number | null, options: { skipRecalc?: boolean; boundaryHeld?: boolean; result?: WorkingGridResult; [key: string]: unknown } = {}) {
         const startTime = Date.now();
         let committed = false;
-        let comparePrecisions: { buyPrecision: number; sellPrecision: number; priceRelativeTolerance: number } | undefined;
+        let comparePrecisions: { buyPrecision: number; sellPrecision: number; priceRelativeTolerance: number; sizeRelativeTolerance: number } | undefined;
         let skipRecalc = false;
         // Exactly-once stack-release contract: every settle path (return or
         // throw) releases the working-grid stack entry exactly one time via

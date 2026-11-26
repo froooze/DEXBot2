@@ -972,8 +972,19 @@ let GRID_LIMITS = {
     // RELATIVE_ORDER_UPDATE_THRESHOLD_PERCENT: Relative threshold for in-memory
     // order equality checks in COW delta planning.
     // Example: 0.1 means two values are considered equal when diff < 0.1% of magnitude.
-    // Note: Final blockchain update filtering still happens with integer precision checks.
+    // This value is config-aware: it is passed to buildDelta via
+    // manager._getCowComparePrecisions(). Integer asset precision is an
+    // additional (finer) floor, not the only filter.
     RELATIVE_ORDER_UPDATE_THRESHOLD_PERCENT: 0.1,
+
+    // SIZE_UPDATE_MIN_CHANGE_PERCENT: Minimum relative size change before the
+    // funds/divergence resize emits a limit_order_update for a slot. The resize
+    // used to emit an UPDATE for any one-satoshi difference, so on shared
+    // accounts (where the funds-ratio trigger fires every tick) a 0.04% drift
+    // produced a full 20-order update batch that was then refused at commit.
+    // The resolved value is clamped to at least RELATIVE_ORDER_UPDATE_THRESHOLD_PERCENT:
+    // a value of 0 means "smallest safe threshold", not one-satoshi emission.
+    SIZE_UPDATE_MIN_CHANGE_PERCENT: 3,
 
 };
 

@@ -138,7 +138,7 @@ import { parseSlotIndex } from './slot.js';
 import { fillKeyOf, resolveTradedSide } from '../fill_ledger.js';
 import { pendingBroadcastTtlMs } from '../lifecycle.js';
 import type { PlacementLease } from '../placement_lock.js';
-import type { OrderManagerLike, PendingPriceCorrection, ChainOrder, ParsedChainOrder, AssetPair, AssetInfo, OrderType, ManagedOrder, UnmatchedChainOrder, CowAction, ProjectedFunds } from '../../types.js';
+import type { OrderManagerLike, PendingPriceCorrection, ChainOrder, ParsedChainOrder, AssetPair, AssetInfo, OrderType, ManagedOrder, UnmatchedChainOrder, CowAction, ProjectedFunds, GridConfig } from '../../types.js';
 import type { GridGenesis } from './math.js';
 const { isValidNumber, toFiniteNumber } = Format;
 const { blockchainToFloat, floatToBlockchainInt, quantizeFloat, slotIndexForPrice, priceSlotEqual } = MathUtils;
@@ -3273,10 +3273,84 @@ function validateIndexes(grid: Map<string, ManagedOrder>, indexes: Record<string
 // SECTION 9: ORDER COMPARISON & DELTA
 // ================================================================================
 
-function _getRelativeTolerance(configOverride?: { gridLimits?: { RELATIVE_ORDER_UPDATE_THRESHOLD_PERCENT?: number; [key: string]: unknown } }): number {
-    const raw = configOverride?.gridLimits?.RELATIVE_ORDER_UPDATE_THRESHOLD_PERCENT
+export interface ComparePrecisionHints {
+    buyPrecision?: number;
+    sellPrecision?: number;
+    defaultPrecision?: number;
+    priceRelativeTolerance?: number;
+    /** Commit-time size equality tolerance as a ratio (e.g. 0.001 = 0.1%). */
+    sizeRelativeTolerance?: number;
+}
+
+export interface ComparePrecisionHintsWrapper {
+    precisions?: ComparePrecisionHints;
+    comparePrecisions?: ComparePrecisionHints;
+}
+
+/**
+ * Resolve the minimum relative size change worth an on-chain UPDATE from the
+ * geometric (funds/divergence) resize.
+ *
+ * The emission gate can never be weaker than the commit-time size equality
+ * tolerance: a change below that tolerance is indistinguishable from no
+ * change in buildDelta, so the batch would be refused at commit AFTER the ops
+ * had already landed on chain (the original fee-bleed incident). A configured
+ * 0 therefore means "use the smallest safe threshold", not one-satoshi.
+ */
+function resolveSizeUpdateMinChangePercent(config: GridConfig | null | undefined): number {
+    const raw = config?.gridLimits?.SIZE_UPDATE_MIN_CHANGE_PERCENT;
+    const parsed = Number(raw);
+    const requested = Number.isFinite(parsed) && parsed >= 0
+        ? parsed
+        : (Number.isFinite(Number(GRID_LIMITS.SIZE_UPDATE_MIN_CHANGE_PERCENT))
+            && Number(GRID_LIMITS.SIZE_UPDATE_MIN_CHANGE_PERCENT) >= 0
+            ? Number(GRID_LIMITS.SIZE_UPDATE_MIN_CHANGE_PERCENT)
+            : 0);
+    const commitTolerancePct = resolveSizeTolerancePercent(config);
+    return Math.max(requested, commitTolerancePct);
+}
+
+/** Commit-time size equality tolerance, in percent, from config or defaults. */
+export function resolveSizeTolerancePercent(config: GridConfig | null | undefined): number {
+    const raw = config?.gridLimits?.RELATIVE_ORDER_UPDATE_THRESHOLD_PERCENT
         ?? GRID_LIMITS.RELATIVE_ORDER_UPDATE_THRESHOLD_PERCENT;
-    return Number(raw) / 100;
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : GRID_LIMITS.RELATIVE_ORDER_UPDATE_THRESHOLD_PERCENT;
+}
+
+/**
+ * True when the proposed size differs from the current size by more than the
+ * configured percentage. The denominator is max(current, proposed), matching
+ * nearlyEqualRelative's commit-time scale: using `current` alone let a growth
+ * of exactly X% pass emission while commit treated it as equal (e.g.
+ * 1000 -> 1001 with both knobs at 0.1%), i.e. a no-op batch paid for after
+ * broadcast. nearlyEqualRelative also applies a precision-quantum floor, so
+ * a sub-quantum change on a tiny order must be skipped here as well. Zero-size
+ * slots are significant when the proposed size clears that floor; a threshold
+ * of 0 keeps every change above one quantum.
+ */
+function isSignificantSizeChange(
+    currentSize: number | string | null | undefined,
+    proposedSize: number | string | null | undefined,
+    thresholdPercent: number,
+    precision?: number | string | null
+): boolean {
+    const current = toFiniteNumber(currentSize);
+    const proposed = toFiniteNumber(proposedSize);
+    const diff = Math.abs(proposed - current);
+    const quantum = precisionToQuantum(precision);
+    // Mirror nearlyEqualRelative's max(scale * relative, precisionQuantum):
+    // a diff of one quantum or less is commit-equal regardless of percentage.
+    if (quantum !== null && !(diff > quantum)) return false;
+    if (!(current > 0)) return proposed > 0;
+    if (!(diff > 0)) return false;
+    if (!(thresholdPercent > 0)) return true;
+    const scale = Math.max(current, proposed);
+    return scale > 0 && (diff / scale) * 100 > thresholdPercent;
+}
+
+function _getRelativeTolerance(configOverride?: { gridLimits?: { RELATIVE_ORDER_UPDATE_THRESHOLD_PERCENT?: number; [key: string]: unknown } }): number {
+    return resolveSizeTolerancePercent(configOverride as GridConfig | null | undefined) / 100;
 }
 const ORDER_RELATIVE_TOLERANCE = _getRelativeTolerance();
 
@@ -3354,7 +3428,7 @@ function nearlyEqualAbsolute(a: number | string | null, b: number | string | nul
     return Math.abs(left - right) <= tol;
 }
 
-function nearlyEqualRelative(a: number | string | null, b: number | string | null, options: { precision?: number } = {}) {
+function nearlyEqualRelative(a: number | string | null, b: number | string | null, options: { precision?: number; relativeTolerance?: number } = {}) {
     const left = Number(a);
     const right = Number(b);
 
@@ -3368,7 +3442,10 @@ function nearlyEqualRelative(a: number | string | null, b: number | string | nul
     const scale = Math.max(Math.abs(left), Math.abs(right));
     const configuredPrecisionQuantum = precisionToQuantum(options.precision);
     const minimumTolerance = configuredPrecisionQuantum || observedQuantum(left, right);
-    const tolerance = Math.max(scale * ORDER_RELATIVE_TOLERANCE, minimumTolerance);
+    const relative = Number.isFinite(options.relativeTolerance) && Number(options.relativeTolerance) > 0
+        ? Number(options.relativeTolerance)
+        : ORDER_RELATIVE_TOLERANCE;
+    const tolerance = Math.max(scale * relative, minimumTolerance);
     return diff <= tolerance;
 }
 
@@ -3393,11 +3470,11 @@ function getOrderSize(order: ManagedOrder | null | undefined): number | null {
  * @param {Object} [options.precisions] - Optional precision hints {buyPrecision, sellPrecision, defaultPrecision, priceRelativeTolerance}
  * @returns {boolean} - True if orders are equivalent
  */
-function ordersEqual(a: ManagedOrder | null | undefined, b: ManagedOrder | null | undefined, options: { precisions?: { buyPrecision?: number; sellPrecision?: number; defaultPrecision?: number; priceRelativeTolerance?: number }; comparePrecisions?: { buyPrecision?: number; sellPrecision?: number; defaultPrecision?: number; priceRelativeTolerance?: number } } = {}) {
+function ordersEqual(a: ManagedOrder | null | undefined, b: ManagedOrder | null | undefined, options: ComparePrecisionHintsWrapper = {}) {
     if (!a || !b) return false;
     if (a === b) return true;
 
-    const precisionHints: { buyPrecision?: number; sellPrecision?: number; defaultPrecision?: number; priceRelativeTolerance?: number } = options.precisions || options.comparePrecisions || {};
+    const precisionHints = options.precisions || options.comparePrecisions || {};
     const sizePrecision = resolveOrderSizePrecision(a.type, precisionHints);
     const priceTolerance = resolvePriceTolerance(precisionHints, a, b);
 
@@ -3405,7 +3482,10 @@ function ordersEqual(a: ManagedOrder | null | undefined, b: ManagedOrder | null 
            a.type === b.type &&
            a.state === b.state &&
            nearlyEqualAbsolute(a.price, b.price, priceTolerance) &&
-           nearlyEqualRelative(getOrderSize(a), getOrderSize(b), { precision: sizePrecision ?? undefined }) &&
+           nearlyEqualRelative(getOrderSize(a), getOrderSize(b), {
+               precision: sizePrecision ?? undefined,
+               relativeTolerance: precisionHints.sizeRelativeTolerance
+           }) &&
            a.orderId === b.orderId;
 }
 
@@ -3416,7 +3496,7 @@ function ordersEqual(a: ManagedOrder | null | undefined, b: ManagedOrder | null 
  * @param {Object} [options={}] - Delta options forwarded to ordersEqual
  * @returns {Array} - Array of action objects
  */
-function buildDelta(masterGrid: Map<string, ManagedOrder>, workingGrid: Map<string, ManagedOrder>, options: { precisions?: { buyPrecision?: number; sellPrecision?: number; defaultPrecision?: number; priceRelativeTolerance?: number }; comparePrecisions?: { buyPrecision?: number; sellPrecision?: number; defaultPrecision?: number; priceRelativeTolerance?: number } } = {}): DeltaAction[] {
+function buildDelta(masterGrid: Map<string, ManagedOrder>, workingGrid: Map<string, ManagedOrder>, options: ComparePrecisionHintsWrapper = {}): DeltaAction[] {
     const actions: DeltaAction[] = [];
 
     for (const [id, workingOrder] of workingGrid.entries()) {
@@ -4595,7 +4675,7 @@ function collectKnownOnChainOrderIds(mgr: OrderManagerLike, placedResults: unkno
     return { masterIds: [...masterIds], createIds: [...createIds], all: [...all] };
 }
 
-export { parseChainOrder, resolveLiveOrderLadderPosition, applyChainSizeToGridOrder, resolveExecutionPrice, reviveVirtualSlotFromChain, attributeUnmatchedFillToGrid, getLivePendingBroadcasts,  buildFillKey, correctOrderPriceOnChain, correctAllPriceMismatches, _validatePriceCorrectionEntry, _stampCorrectionProvenance, findLiveOrderOwnerByChainId, buildCreateOrderArgs, getOrderTypeFromUpdatedFlags, resolveConfiguredPriceBound, virtualizeOrder, convertToSpreadPlaceholder, toRailHolePlaceholder, geometryTypeForSlotIndex, detectGapEvacuationCandidates, updateGapEvacuationStreaks, resolveSpreadOrderSide, chainOrderMatchesSlot, chainOrderMatchesSlotWithTolerance, crossingCandidateChainId, isCrossingCheckCandidate, buildCrossingCheckCandidates, filterOrdersByType, buildOutsideInPairGroups, extractBatchOperationResults, formatUnmatchedChainOrder, isNonBlockingUnmatchedOrder, isStrandedHoldOrder, isOrderOnChain, isOrderVirtual, hasOnChainId, isOrderPlaced, isPhantomOrder, isSlotAvailable, isEmptyGridSlot, isOrderHealthy, checkSizeThreshold, checkSizesBeforeMinimum, calculateIdealBoundary, assignGridRoles, resolveOnChainRetypeType, shouldFlagOutOfSpread, buildIndexes, validateIndexes, ordersEqual, buildDelta, deriveTargetBoundary, isShiftEligibleFill, resolveEdgeCount, resolveEdgeOrders, selectEdgeSlots, getCoreOrdersTotal, getSideBudget, calculateBudgetedSizes, buildCreateOpFingerprint, isOrderGoneErrorMessage, isStructuralRebuildStaleReason, recordDuplicateOrphanDetection, clearDuplicateOrphanDetection, duplicateOrphanLogInfo, chainOrderUnchangedFromCache, detectCrossedBookPlan, describeMarketCrossingActions, collectKnownOnChainOrderIds, collectEdgePinnedFillIds, edgeOrderIdSet, liveWindowIdSet, checkGridPriceInvariant, reportGridPriceInvariant };
+export { parseChainOrder, resolveLiveOrderLadderPosition, applyChainSizeToGridOrder, resolveExecutionPrice, reviveVirtualSlotFromChain, attributeUnmatchedFillToGrid, getLivePendingBroadcasts,  buildFillKey, correctOrderPriceOnChain, correctAllPriceMismatches, _validatePriceCorrectionEntry, _stampCorrectionProvenance, findLiveOrderOwnerByChainId, buildCreateOrderArgs, getOrderTypeFromUpdatedFlags, resolveConfiguredPriceBound, virtualizeOrder, convertToSpreadPlaceholder, toRailHolePlaceholder, geometryTypeForSlotIndex, detectGapEvacuationCandidates, updateGapEvacuationStreaks, resolveSpreadOrderSide, chainOrderMatchesSlot, chainOrderMatchesSlotWithTolerance, crossingCandidateChainId, isCrossingCheckCandidate, buildCrossingCheckCandidates, filterOrdersByType, buildOutsideInPairGroups, extractBatchOperationResults, formatUnmatchedChainOrder, isNonBlockingUnmatchedOrder, isStrandedHoldOrder, isOrderOnChain, isOrderVirtual, hasOnChainId, isOrderPlaced, isPhantomOrder, isSlotAvailable, isEmptyGridSlot, isOrderHealthy, checkSizeThreshold, checkSizesBeforeMinimum, calculateIdealBoundary, assignGridRoles, resolveOnChainRetypeType, shouldFlagOutOfSpread, buildIndexes, validateIndexes, ordersEqual, buildDelta, resolveSizeUpdateMinChangePercent, isSignificantSizeChange, deriveTargetBoundary, isShiftEligibleFill, resolveEdgeCount, resolveEdgeOrders, selectEdgeSlots, getCoreOrdersTotal, getSideBudget, calculateBudgetedSizes, buildCreateOpFingerprint, isOrderGoneErrorMessage, isStructuralRebuildStaleReason, recordDuplicateOrphanDetection, clearDuplicateOrphanDetection, duplicateOrphanLogInfo, chainOrderUnchangedFromCache, detectCrossedBookPlan, describeMarketCrossingActions, collectKnownOnChainOrderIds, collectEdgePinnedFillIds, edgeOrderIdSet, liveWindowIdSet, checkGridPriceInvariant, reportGridPriceInvariant };
 export type { CrawlEntry }
 export { resolveEdgeAnchorPrice, resolveLiveEdgeAnchorPrice, compareEdge, collectRefillSlotIds, isFreshlyPlacedOrder, _filterUnmatchedChainOrders };
 

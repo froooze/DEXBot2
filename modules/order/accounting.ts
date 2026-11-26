@@ -130,9 +130,17 @@ function allocationAsset(mgr: OrderManagerLike, side: 'buy' | 'sell'): string | 
     return raw ? String(raw) : undefined;
 }
 
-/** Bot's proportional share of a side on a shared account (1 for a single bot). */
+/**
+ * Bot's proportional share of a side on a shared account (1 for a single bot).
+ * Delegates to the single registry resolver; pass the account explicitly as
+ * the fallback so the manager's account-name resolution is preserved exactly.
+ */
 function botFundShare(mgr: OrderManagerLike, side: 'buy' | 'sell'): number {
-    return fundRegistry.getBotShareSync(registryAccountKey(mgr) ?? undefined, mgr.config?.botKey ?? undefined, side, allocationAsset(mgr, side));
+    return fundRegistry.getBotSideSharesSync({
+        botKey: mgr.config?.botKey ?? undefined,
+        assetA: mgr.config?.assetA ?? undefined,
+        assetB: mgr.config?.assetB ?? undefined,
+    }, registryAccountKey(mgr) ?? undefined)[side];
 }
 
 interface FillPaysReceives {
@@ -529,7 +537,10 @@ class Accountant {
          const chainTotalBuy = chainFreeBuy + chainBuy;
          const chainTotalSell = chainFreeSell + chainSell;
 
-         mgr.funds.total.chain = { buy: chainTotalBuy, sell: chainTotalSell };
+         // account-wide free + THIS bot's committed orders is a mixed scope on
+          // shared accounts; deliberately not share-scaled and only used by
+          // logging. Sizing/triggers use share-scaled `funds.available` instead.
+          mgr.funds.total.chain = { buy: chainTotalBuy, sell: chainTotalSell };
          mgr.funds.total.grid = { buy: gridBuy + virtualBuy, sell: gridSell + virtualSell };
 
          // STEP 6: Calculate available funds (what we can spend right now)
@@ -545,8 +556,12 @@ class Accountant {
                   sell: Math.max(0, Number(mgr.config.coreOrders.sell) || 0) + edgeSell,
               }
               : mgr.config.coreOrders;
-          mgr.funds.available.buy = calculateAvailableFundsValue('buy', mgr.accountTotals, mgr.funds, mgr.config.assetA, mgr.config.assetB, feeCoreOrders, mgr.config.min_BTS_value, mgr.config?.feeParams ?? null);
-          mgr.funds.available.sell = calculateAvailableFundsValue('sell', mgr.accountTotals, mgr.funds, mgr.config.assetA, mgr.config.assetB, feeCoreOrders, mgr.config.min_BTS_value, mgr.config?.feeParams ?? null);
+          // Share-scale account-wide free balances on shared accounts so
+          // `available` is comparable with this bot's own virtual reservations
+          // and allocated budget (see calculateAvailableFundsValue).
+          const availableFundsAccount = registryAccountKey(mgr);
+          mgr.funds.available.buy = calculateAvailableFundsValue('buy', mgr.accountTotals, mgr.funds, mgr.config.assetA, mgr.config.assetB, feeCoreOrders, mgr.config.min_BTS_value, mgr.config?.feeParams ?? null, availableFundsAccount, mgr.config?.botKey ?? undefined);
+          mgr.funds.available.sell = calculateAvailableFundsValue('sell', mgr.accountTotals, mgr.funds, mgr.config.assetA, mgr.config.assetB, feeCoreOrders, mgr.config.min_BTS_value, mgr.config?.feeParams ?? null, availableFundsAccount, mgr.config?.botKey ?? undefined);
 
          // Ensure percentage-based allocations are applied to the newly calculated totals
          if (typeof mgr.applyBotFundsAllocation === 'function') {

@@ -3741,6 +3741,14 @@ async function runGridMaintenance(
 const _lastBtsAcquisitionTimestamps = new Map();
 
 /**
+ * Thin adapter over the single registry share resolver. accountTotals.*Free is
+ * account-wide, so a BTS-acquisition swap must not spend a sibling's asset.
+ */
+function btsAcquireAssetShare(bot: BotLike, side: 'buy' | 'sell'): number {
+    return fundRegistry.getBotSideSharesSync(bot.config, bot.account)[side];
+}
+
+/**
  * Check if the bot's BTS balance is below the minimum threshold and trigger acquisition.
  * Only applies to non-BTS pairs. Uses hysteresis: triggers at 1× min_BTS_value,
  * fills to BTS_ACQUIRE_TARGET_MULTIPLIER × min_BTS_value.
@@ -3812,9 +3820,12 @@ async function acquireBts(bot: BotLike, deficit: number) {
     if (!BitShares || !BitShares.db) return;
 
     const coreAssetId = NATIVE_CLIENT.CHAIN.CORE_ASSET_ID;
+    // accountTotals.*Free is account-wide on a shared account. Cap the swap
+    // funding to this bot's registered share so a BTS top-up cannot consume a
+    // sibling bot's asset balance.
     const assets = [
-        { id: bot.assets?.assetA?.id, free: bot.manager.accountTotals?.sellFree || 0, precision: bot.assets?.assetA?.precision, symbol: bot.config.assetA },
-        { id: bot.assets?.assetB?.id, free: bot.manager.accountTotals?.buyFree || 0, precision: bot.assets?.assetB?.precision, symbol: bot.config.assetB }
+        { id: bot.assets?.assetA?.id, free: (bot.manager.accountTotals?.sellFree || 0) * btsAcquireAssetShare(bot, 'sell'), precision: bot.assets?.assetA?.precision, symbol: bot.config.assetA },
+        { id: bot.assets?.assetB?.id, free: (bot.manager.accountTotals?.buyFree || 0) * btsAcquireAssetShare(bot, 'buy'), precision: bot.assets?.assetB?.precision, symbol: bot.config.assetB }
     ];
 
     const candidates: PoolCandidate[] = [];

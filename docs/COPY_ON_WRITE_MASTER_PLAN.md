@@ -291,6 +291,7 @@ This architecture makes the "Metadata Reinterpretation" bug impossible by ensuri
 
 ### Grid & Timing
 - `GRID_LIMITS.RELATIVE_ORDER_UPDATE_THRESHOLD_PERCENT` — relative threshold (%) for in-memory COW order equality checks.
+- `GRID_LIMITS.SIZE_UPDATE_MIN_CHANGE_PERCENT` — minimum relative size change before the funds/divergence resize emits a `limit_order_update` for a slot (default: `3%`). Clamped to at least `RELATIVE_ORDER_UPDATE_THRESHOLD_PERCENT`; `0` means the smallest safe threshold, never one-satoshi emission.
 - `TIMING.LOCK_REFRESH_MIN_MS` — minimum lock refresh interval (250ms).
 
 ## Appendix: Validation Gates

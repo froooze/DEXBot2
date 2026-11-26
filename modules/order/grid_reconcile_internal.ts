@@ -15,6 +15,7 @@ import { parseSlotIndex } from './utils/slot.js';
 import { resolveAccountRef, isLastFillPlacementBlocked, hasUnsettledFills } from './utils/system.js';
 import * as Format from './format.js';
 import { getErrorMessage, getErrorCode, getErrorName } from '../utils/errors.js';
+import * as fundRegistry from '../fund_registry.js';
 import type { OrderManagerLike, ManagedOrder, ChainOrder, ParsedChainEntry, ParsedChainOrder, ChainOrdersLike, AssetPair, LoggerLike, UnknownRecord, StartupCreatePlan, StartupUpdatePlan, StartupCancelPlan, OrderType, PipelineSourceLike } from '../types.js';
 
 interface CrossedOrderLike {
@@ -40,6 +41,18 @@ interface StartupSideComparators {
     sortUpdateComparator: (a: ChainOrder, b: ChainOrder) => number;
     sortExcessCancelComparator: (a: ParsedChainEntry, b: ParsedChainEntry) => number;
     sortMatchedCancelComparator: (a: ManagedOrder, b: ManagedOrder) => number;
+}
+
+/**
+ * Thin adapter over the single registry share resolver. accountTotals.*Free is
+ * account-wide; authorizing this bot's order-size increases against it would
+ * let two bots lock the same sibling-owned cash.
+ */
+function startupFreeFundShare(manager: OrderManagerLike, side: 'buy' | 'sell'): number {
+    return fundRegistry.getBotSideSharesSync(
+        manager.config,
+        (manager as { account?: string }).account ?? undefined
+    )[side];
 }
 
 function computePlacementPriceCollision(manager: OrderManagerLike, gridOrder: ManagedOrder): ManagedOrder | null {
@@ -2033,7 +2046,8 @@ async function _reconcileStartupSide({
     const nonDustCount = classifiedReuse.nonDustCount;
     const updateCount = Math.min(updatePool.length, desiredSlots.length);
     let cancelledIndex: number | null = null;
-    let projectedSideBalance = Number(manager.accountTotals?.[balanceKey] || 0);
+    let projectedSideBalance = Number(manager.accountTotals?.[balanceKey] || 0)
+        * startupFreeFundShare(manager, orderType === ORDER_TYPES.SELL ? 'sell' : 'buy');
 
     // Vacated-rail-slot tracking (Phase 4, vacate+create atomic): a re-map
     // UPDATE moves an unmatched chain order from its current price onto a

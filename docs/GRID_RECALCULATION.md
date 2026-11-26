@@ -479,6 +479,10 @@ GRID_LIMITS: {
   - Grow (committed drift): the on-chain (ACTIVE/PARTIAL) orders lag their geometric ideal by ≥3% of the committed size — catches an external deposit that the fill/rotation pipeline already folded into `virtual`, which blinds the `availableFunds = chainFree − virtual` ratio
   - Shrink: grid-tracked size (ACTIVE + PARTIAL + VIRTUAL) exceeds allocation by ≥3% (external fund removal resizes affected orders down; per-side chain totals are not used — fills move value across sides)
   - Shrink (committed drift): the on-chain orders exceed their geometric ideal by ≥3% of the committed size (external withdrawal)
+- `SIZE_UPDATE_MIN_CHANGE_PERCENT`: per-slot emission gate on the resize path (default: `3%`). A trigger above resizes the side as a whole, but an individual order is only updated on chain when its own ideal-vs-current size difference reaches this threshold. Sub-threshold slots stay untouched in both the working grid and the chain. The resolved value is clamped to `RELATIVE_ORDER_UPDATE_THRESHOLD_PERCENT` so an emission below the commit-time equality tolerance can never be broadcast (such a batch was refused at commit after the ops had already landed on chain). A configured `0` means "smallest safe threshold", not the old one-satoshi behavior; to go below the default 0.1% commit floor, lower both knobs.
+  - Trade-off: convergence is per-slot. Many slots each drifting <3% do not trigger a resize even if their cumulative misallocation is large, because no individual UPDATE would be emitted. This is deliberate: sub-threshold churn costs fees without changing the book.
+  - The gate is applied to the size **emitted after the funding cap**, not only to the geometric ideal: a cap can clip a significant ideal to a sub-threshold change, which commit would treat as a no-op.
+  - Operator-visible change: configuring `RELATIVE_ORDER_UPDATE_THRESHOLD_PERCENT: 0` no longer disables the commit ratio check; it falls back to the `0.1%` default. The emission denominator is `max(current, proposed)`, matching commit, so a change exactly at the threshold is not emitted.
 
 ### How It Works
 

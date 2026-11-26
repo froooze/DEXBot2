@@ -3337,6 +3337,7 @@ export async function applyGridDivergenceCorrections(manager: OrderManagerLike, 
 
     // Phase 2: Create working grid for divergence corrections
     // Use the resize working grid as starting point if available
+    const minSizeChangePct = OrderUtils.resolveSizeUpdateMinChangePercent(manager.config);
     let cowResult: CowResult | null = null;
     await manager._gridLock.acquire(async () => {
         if (!manager._gridSidesUpdated || manager._gridSidesUpdated.size === 0) return;
@@ -3506,7 +3507,11 @@ export async function applyGridDivergenceCorrections(manager: OrderManagerLike, 
                     ? MathUtils.floatToBlockchainInt(newSize, sidePrecision) !== MathUtils.floatToBlockchainInt(currentSize, sidePrecision)
                     : newSize !== currentSize;
 
-                if (sizeChanged) {
+                // Phase 1 resize emits only >= SIZE_UPDATE_MIN_CHANGE_PERCENT
+                // changes. Apply the same gate here: a sub-threshold delta that
+                // slipped in from another source would be refused at commit
+                // after the UPDATE had already landed on chain.
+                if (sizeChanged && OrderUtils.isSignificantSizeChange(currentSize, newSize, minSizeChangePct, sidePrecision)) {
                     manager.logger.log(`[DIVERGENCE-COW] Queueing size update for ${onChainOrder.id}: ${currentSize} -> ${newSize}`, 'info');
                     actions.push({
                         type: COW_ACTIONS.UPDATE,

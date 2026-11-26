@@ -79,6 +79,7 @@ const NAMES = {
         'isOrderPlaced', 'isOrderVirtual', 'isPhantomOrder', 'isShiftEligibleFill',
         'isNonBlockingUnmatchedOrder',
         'isSlotAvailable', 'parseChainOrder', 'edgeOrderIdSet', 'liveWindowIdSet', 'collectEdgePinnedFillIds',
+        'isSignificantSizeChange', 'resolveSizeUpdateMinChangePercent',
         'resolveConfiguredPriceBound', 'resolveLiveEdgeAnchorPrice',
         'resolveOnChainRetypeType', 'resolveEdgeCount',
         'resolveSpreadOrderSide', 'selectEdgeSlots', 'shouldFlagOutOfSpread', 'virtualizeOrder',
@@ -272,6 +273,9 @@ async function testPerformGridResyncAppliesVolatilityOnlyDynamicWeights() {
     defineEsmMockAbs(require.resolve('../modules/order/utils/order'), NAMES.orderUtils, {
         virtualizeOrder: (order) => order,
         convertToSpreadPlaceholder: (order) => ({ ...order, type: 'spread', size: 0, state: 'virtual', orderId: null }),
+        isSignificantSizeChange: () => true,
+        resolveSizeUpdateMinChangePercent: () => 3,
+        resolveSizeTolerancePercent: () => 0.1,
     });
     defineEsmMockAbs(require.resolve('../modules/launcher/market_adapter_runtime'), NAMES.marketAdapterRuntime, {
         getSharedMarketAdapterRuntime: () => ({
@@ -1062,6 +1066,9 @@ function installDivergenceMocks(opts) {
     defineEsmMockAbs(require.resolve('../modules/order/utils/order'), NAMES.orderUtils, {
         virtualizeOrder: (order) => order,
         convertToSpreadPlaceholder: (order) => ({ ...order, type: 'spread', size: 0, state: 'virtual', orderId: null }),
+        isSignificantSizeChange: () => true,
+        resolveSizeUpdateMinChangePercent: () => 3,
+        resolveSizeTolerancePercent: () => 0.1,
     });
     defineEsmMockAbs(require.resolve('../modules/launcher/market_adapter_runtime'), NAMES.marketAdapterRuntime, {
         getSharedMarketAdapterRuntime: () => ({
@@ -1315,6 +1322,9 @@ async function testDexbotClassPerformGridResyncForwardsOptions() {
         buildOutsideInPairGroups: () => [],
         extractBatchOperationResults: () => [],
         buildFillKey: () => 'fill-key',
+        isSignificantSizeChange: () => true,
+        resolveSizeUpdateMinChangePercent: () => 3,
+        resolveSizeTolerancePercent: () => 0.1,
     });
     defineEsmMockAbs(require.resolve('../modules/order/utils/math'), NAMES.math, {
         validateOrderSize: () => true,

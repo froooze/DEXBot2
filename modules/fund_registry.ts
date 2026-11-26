@@ -488,6 +488,40 @@ function getBotShareSync(account: string | undefined, botName: string | undefine
 }
 
 /**
+ * Bot's share of BOTH sides with the side-to-asset resolution already applied
+ * (buy is funded by assetB, sell by assetA). Single call site for every place
+ * that must scale account-wide free balances down to one bot's funds; keeps
+ * the many callers from drifting on account/bot/asset key resolution.
+ * Returns {buy: 1, sell: 1} for unregistered/single-bot accounts.
+ */
+export interface BotShareConfigLike {
+    preferredAccount?: string | null;
+    account?: string | null;
+    botKey?: string | null;
+    assetA?: string | null;
+    assetB?: string | null;
+}
+
+function getBotSideSharesSync(config: BotShareConfigLike | null | undefined, accountFallback?: string | null): { buy: number; sell: number } {
+    const account = config?.preferredAccount ?? config?.account ?? accountFallback ?? undefined;
+    const botName = config?.botKey ?? undefined;
+    if (!account || !botName) return { buy: 1, sell: 1 };
+    try {
+        if (!isSharedAccount(account)) return { buy: 1, sell: 1 };
+        const buyAsset = config?.assetB != null ? String(config.assetB) : undefined;
+        const sellAsset = config?.assetA != null ? String(config.assetA) : undefined;
+        const sanitize = (value: number): number =>
+            Number.isFinite(value) && value >= 0 && value <= 1 ? value : 1;
+        return {
+            buy: sanitize(getBotShareSync(account, botName, 'buy', buyAsset)),
+            sell: sanitize(getBotShareSync(account, botName, 'sell', sellAsset)),
+        };
+    } catch {
+        return { buy: 1, sell: 1 };
+    }
+}
+
+/**
  * Release all allocations for a bot on an account.
  * Called during bot shutdown.
  */
@@ -620,6 +654,7 @@ export {
     getTotalAllocatedPct,
     getBotAllocationPct,
     getBotShareSync,
+    getBotSideSharesSync,
     getRegisteredBots,
     getRegisteredAccounts,
     isSharedAccount,

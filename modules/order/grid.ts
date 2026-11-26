@@ -564,7 +564,9 @@ import {
     edgeOrderIdSet,
     resolveLiveEdgeAnchorPrice,
     liveWindowIdSet,
-    getOrderTypeFromUpdatedFlags
+    getOrderTypeFromUpdatedFlags,
+    resolveSizeUpdateMinChangePercent,
+    isSignificantSizeChange
 } from './utils/order.js';
 import { parseSlotIndex } from './utils/slot.js';
 import { loadAmaCenterPrice, loadAmaCenterSnapshot, withBlockchainRetry, restoreLastFillPivot, resetLastFillPivot, rearmLastFillPivotFromMarketFill, reanchorBoundaryFromLastFill, evaluateSpreadCorrectionReadiness, maybeRefreshLiveMarketPrice, resolveLastFillGuardReference, isLastFillPlacementBlocked, hasLiveRefusedFillLevels } from './utils/system.js';
@@ -576,6 +578,7 @@ import {
     recordMissingGenesisFault,
     resolvePersistedGenesis
 } from './genesis_policy.js';
+import * as fundRegistry from '../fund_registry.js';
 
 import { WorkingGrid } from './working_grid.js';
 import type { OrderManagerLike, ChainFundsSnapshot, ManagedOrder, GridConfig, OrderType, OrderState, AccountTotals, CowAction, SpreadCorrectionStall } from '../types.js';
@@ -2266,6 +2269,18 @@ export async function recalculateGrid(manager: OrderManagerLike, opts: { readOpe
     }
 
     /**
+     * Thin adapter over the single registry share resolver. accountTotals.*Free
+     * is account-wide, so every comparison against a bot-scoped virtual
+     * reservation, ideal size or growth delta must scale it first.
+     */
+    function sharedAccountFreeShare(manager: OrderManagerLike, side: 'buy' | 'sell'): number {
+        return fundRegistry.getBotSideSharesSync(
+            manager.config,
+            (manager as { account?: string }).account ?? undefined
+        )[side];
+    }
+
+    /**
      * Check for grid divergence and trigger update if threshold is met.
      *
      * @param {import('../types.js').OrderManagerLike} manager - Manager instance with order state
@@ -2299,6 +2314,11 @@ export function checkAndUpdateGridIfNeeded(manager: OrderManagerLike): { buyUpda
                     sell: Math.max(0, Number(manager.config.coreOrders.sell) || 0) + resolveEdgeCount(manager.config, 'sell'),
                 }
                 : manager.config.coreOrders;
+            // Account-wide free balances must be share-scaled on shared
+            // accounts before comparing with this bot's allocated budget.
+            // Otherwise a 20% bot reads the whole account as available and
+            // ratio=availableFunds/allocated fires TRIGGER-GROW every tick.
+            const divergenceAccount = manager.config?.preferredAccount ?? (manager as { account?: string }).account ?? undefined;
             const availableFunds = calculateAvailableFundsValue(
                 s.name,
                 manager.accountTotals,
@@ -2307,7 +2327,9 @@ export function checkAndUpdateGridIfNeeded(manager: OrderManagerLike): { buyUpda
                 manager.config.assetB,
                 feeCoreOrders,
                 manager.config.min_BTS_value,
-                manager.config.feeParams ?? null
+                manager.config.feeParams ?? null,
+                divergenceAccount,
+                manager.config?.botKey ?? undefined
             );
 
             // Denominator: side's allocated capital (or chain total fallback).
@@ -2410,6 +2432,7 @@ function _computeCommittedSizeDriftSync(manager: OrderManagerLike): { buyUpdated
         const threshold = (Number.isFinite(Number(rawThreshold)) && Number(rawThreshold) > 0)
             ? Number(rawThreshold)
             : GRID_LIMITS.GRID_REGENERATION_PERCENTAGE;
+        const minChangePct = resolveSizeUpdateMinChangePercent(manager.config);
 
         const sides = [
             { name: 'buy', orderType: ORDER_TYPES.BUY },
@@ -2450,7 +2473,8 @@ function _computeCommittedSizeDriftSync(manager: OrderManagerLike): { buyUpdated
             // on the same blockchain-integer change test the resize uses to decide
             // whether an on-chain UPDATE is emitted.
             const freeKey = s.name === 'buy' ? 'buyFree' : 'sellFree';
-            let sideFreeAvailable = Number(manager.accountTotals?.[freeKey] || 0);
+            let sideFreeAvailable = Number(manager.accountTotals?.[freeKey] || 0)
+                * sharedAccountFreeShare(manager, s.name as 'buy' | 'sell');
             let growth = 0;
             let shrink = 0;
             let committedTotal = 0;
@@ -2463,15 +2487,29 @@ function _computeCommittedSizeDriftSync(manager: OrderManagerLike): { buyUpdated
                 const current = Number(slot.size || 0);
                 committedTotal += current;
 
+                // Mirror the resize's SIZE_UPDATE_MIN_CHANGE_PERCENT gate: a
+                // sub-threshold change emits no UPDATE and must not count toward
+                // the drift metric (otherwise this leg would re-trigger against
+                // a no-op resize every tick).
+                if (!isSignificantSizeChange(current, ideal, minChangePct, ctx.precision)) continue;
+
                 let newSize = ideal;
                 const delta = ideal - current;
+                let growthCap = 0;
+                let shrinkRelease = 0;
                 if (delta > 0) {
                     const affordableDelta = Math.min(delta, Math.max(0, sideFreeAvailable));
                     if (affordableDelta < delta) newSize = current + affordableDelta;
-                    sideFreeAvailable = Math.max(0, sideFreeAvailable - affordableDelta);
+                    growthCap = affordableDelta;
                 } else if (delta < 0) {
-                    sideFreeAvailable += Math.abs(delta);
+                    shrinkRelease = Math.abs(delta);
                 }
+
+                // The cap can clip a significant ideal down to a sub-threshold
+                // emitted size. That is the value the commit gate compares, so
+                // re-check it here and let no budget bookkeeping leak through.
+                if (!isSignificantSizeChange(current, newSize, minChangePct, ctx.precision)) continue;
+                sideFreeAvailable = Math.max(0, sideFreeAvailable - growthCap + shrinkRelease);
 
                 // Match the resize's integer-space change gate: a slot whose size
                 // rounds to the same blockchain integer emits no UPDATE and must not
@@ -2593,6 +2631,7 @@ export async function _recalculateGridOrderSizesFromBlockchain(manager: OrderMan
 
         const workingGrid = options?.workingGrid || null;
         const collectActions = !!workingGrid;
+        const minChangePct = resolveSizeUpdateMinChangePercent(manager.config);
 
         const isBuy = orderType === ORDER_TYPES.BUY;
         const sideName = isBuy ? 'buy' : 'sell';
@@ -2651,7 +2690,8 @@ export async function _recalculateGridOrderSizesFromBlockchain(manager: OrderMan
         let changed = false;
 
         const freeKey = isBuy ? 'buyFree' : 'sellFree';
-        let sideFreeAvailable = Number(manager.accountTotals?.[freeKey] || 0);
+        let sideFreeAvailable = Number(manager.accountTotals?.[freeKey] || 0)
+            * sharedAccountFreeShare(manager, isBuy ? 'buy' : 'sell');
 
         if (!collectActions) manager.pauseRecalcLogging();
         try {
@@ -2666,6 +2706,17 @@ export async function _recalculateGridOrderSizesFromBlockchain(manager: OrderMan
                 // NB: they stay in the denominator above (budget math
                 // unchanged); only the per-slot mutation below is skipped.
                 if (parseSlotIndex(slot?.id) === null) continue;
+
+                // Only resize slots whose ideal size differs by at least
+                // SIZE_UPDATE_MIN_CHANGE_PERCENT. The resize used to emit a
+                // limit_order_update for any one-satoshi difference; on a shared
+                // account the funds-ratio trigger fires every tick, so a ~0.04%
+                // drift produced a full batch of updates that the 0.1% commit
+                // equality gate refused after the ops had already landed.
+                // Skipping here leaves both the working grid and the chain
+                // untouched, so no batch is built for sub-threshold drift.
+                if (!isSignificantSizeChange(slot.size, newSizes[i], minChangePct, ctx.precision)) continue;
+
                 let newSize = newSizes[i] || 0;
 
                 // FUND CAPPING FOR COMMITTED (ON-CHAIN) ORDERS:
@@ -2676,6 +2727,8 @@ export async function _recalculateGridOrderSizesFromBlockchain(manager: OrderMan
                 // so they don't affect this asset-side size cap. Fee budgets are tracked in
                 // funds.btsFeesOwed and reserved separately via btsFeesReservation.
                 const isCommitted = isOrderOnChain(slot);
+                let growthCap = 0;
+                let shrinkRelease = 0;
                 if (isCommitted) {
                     const currentSize = Number(slot.size || 0);
                     const delta = newSize - currentSize;
@@ -2687,12 +2740,20 @@ export async function _recalculateGridOrderSizesFromBlockchain(manager: OrderMan
                             // Cannot afford full growth; cap to what's available
                             newSize = currentSize + affordableDelta;
                         }
-                        sideFreeAvailable = Math.max(0, sideFreeAvailable - affordableDelta);
+                        growthCap = affordableDelta;
                     } else if (delta < 0) {
                         // SHRINKAGE: Release freed capital back for other slots
-                        sideFreeAvailable += Math.abs(delta);
+                        shrinkRelease = Math.abs(delta);
                     }
                 }
+
+                // The funding cap above can clip a significant ideal to a
+                // sub-threshold emitted size. Re-check the value that actually
+                // goes on chain: the commit equality gate compares this one, so
+                // a capped no-op would be refused after broadcast (fee bleed).
+                // Skipping here also leaves the side's free budget untouched.
+                if (!isSignificantSizeChange(slot.size, newSize, minChangePct, ctx.precision)) continue;
+                sideFreeAvailable = Math.max(0, sideFreeAvailable - growthCap + shrinkRelease);
 
                 // Use integer comparison to avoid redundant updates from float noise
                 const currentSizeInt = floatToBlockchainInt(slot.size || 0, ctx.precision);
@@ -3772,13 +3833,20 @@ export async function getDustOrders(manager: OrderManagerLike, partials: Managed
      * @returns {{ side: import('../types.js').OrderType|null, reason: string, code?: 'market-price-unavailable'|'no-free-funds' }} The side to correct on, or null with a structured cause.
      */
 export function determineOrderSideByFunds(manager: OrderManagerLike, currentMarketPrice: number): { side: OrderType | null; reason: string; code?: 'market-price-unavailable' | 'no-free-funds' } {
+        // accountTotals.*Free is account-wide. funds.available is already
+        // share-scaled and usually binds, but keep this cap in the same scope
+        // so it cannot become an unscaled sizing read if accounting changes.
+        const freeShares = fundRegistry.getBotSideSharesSync(
+            manager.config,
+            (manager as { account?: string }).account ?? undefined
+        );
         const buyAvailable = Math.min(
             Number(manager.funds?.available?.buy || 0),
-            Number(manager.accountTotals?.buyFree || 0)
+            Number(manager.accountTotals?.buyFree || 0) * freeShares.buy
         );
         const sellAvailable = Math.min(
             Number(manager.funds?.available?.sell || 0),
-            Number(manager.accountTotals?.sellFree || 0)
+            Number(manager.accountTotals?.sellFree || 0) * freeShares.sell
         );
 
         // Need at least some funds on a side to justify correction
@@ -4503,9 +4571,13 @@ export function determineOrderSideByFunds(manager: OrderManagerLike, currentMark
         // is the very symptom) and flag it so the persistence watchdog escalates
         // on its short fund window instead of the 30-minute structural one.
         {
+            // sideVirtual is this bot's projection; the raw account-totals free
+            // balance is account-wide. Without the share, a genuinely
+            // oversubscribed rail never trips this guard on a shared account.
             const sideChainFree = Math.max(0, Number(sideName === 'buy'
                 ? manager.accountTotals?.buyFree
-                : manager.accountTotals?.sellFree) || 0);
+                : manager.accountTotals?.sellFree) || 0)
+                * sharedAccountFreeShare(manager, sideName as 'buy' | 'sell');
             const sideVirtual = Math.max(0, Number(sideName === 'buy'
                 ? manager.funds?.virtual?.buy
                 : manager.funds?.virtual?.sell) || 0);
@@ -4614,9 +4686,13 @@ export function determineOrderSideByFunds(manager: OrderManagerLike, currentMark
         // placing 0` for 84 minutes). Re-derive from chain truth, capped by
         // what the candidates need and by the real free balance.
         const candidateIdeals = prioritizedTargets.reduce((sum, t) => sum + Math.max(0, Number(t.ideal) || 0), 0);
+        // candidateIdeals and virtualIntent are this bot's; scale the chain-free
+        // side to the same share or the chain-truth fallback stays dead on a
+        // shared account ("planned N, placing 0" forever).
         const chainFreeForSide = Math.max(0, Number(sideName === 'buy'
             ? manager.accountTotals?.buyFree
-            : manager.accountTotals?.sellFree) || 0);
+            : manager.accountTotals?.sellFree) || 0)
+            * sharedAccountFreeShare(manager, sideName as 'buy' | 'sell');
         const virtualIntentForSide = Math.max(0, Number(sideName === 'buy'
             ? manager.funds?.virtual?.buy
             : manager.funds?.virtual?.sell) || 0);

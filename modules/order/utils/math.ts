@@ -576,12 +576,34 @@ function deriveChainTruthFundBudget(args: { availableFund?: number; virtualInten
  * @param {string} assetA - First asset symbol
  * @param {string} assetB - Second asset symbol
  * @param {Object} [coreOrders=null] - Active order counts {buy, sell} for BTS reservation calculation
+ * @param {string} [account] - Account name for shared-account share lookup (optional)
+ * @param {string} [botName] - Bot key for shared-account share lookup (optional)
  * @returns {number} Available funds for the side (0 if side invalid or insufficient funds)
  */
-function calculateAvailableFundsValue(side: string, accountTotals: AccountTotals | null | undefined, funds: ManagerFunds, assetA: string | undefined, assetB: string | undefined, coreOrders: CoreOrdersConfig | null = null, configMinBtsValue: number | null = null, feeParams: GridFeeParams | null = null) {
+function calculateAvailableFundsValue(side: string, accountTotals: AccountTotals | null | undefined, funds: ManagerFunds, assetA: string | undefined, assetB: string | undefined, coreOrders: CoreOrdersConfig | null = null, configMinBtsValue: number | null = null, feeParams: GridFeeParams | null = null, account?: string | null, botName?: string | null) {
     if (side !== 'buy' && side !== 'sell') return 0;
 
-    const chainFree = toFiniteNumber(side === 'buy' ? accountTotals?.buyFree : accountTotals?.sellFree);
+    // Shared accounts expose account-wide free balances. Comparing that raw
+    // figure with this bot's share-scaled budget made the funds-ratio trigger
+    // fire permanently (a 20% bot saw the whole account's free cash as its own,
+    // e.g. 968289 / 288086 = 336% against a 3% threshold). Scale EACH side by
+    // its own share: the non-BTS fee-impact fallback below reads both sides,
+    // and buy/sell shares need not be equal.
+    const shares = fundRegistry.getBotSideSharesSync({
+        preferredAccount: account,
+        botKey: botName,
+        assetA,
+        assetB,
+    });
+    const totals: AccountTotals | null | undefined = !accountTotals || (shares.buy === 1 && shares.sell === 1)
+        ? accountTotals
+        : {
+            ...accountTotals,
+            buyFree: toFiniteNumber(accountTotals.buyFree) * shares.buy,
+            sellFree: toFiniteNumber(accountTotals.sellFree) * shares.sell,
+        };
+
+    const chainFree = toFiniteNumber(side === 'buy' ? totals?.buyFree : totals?.sellFree);
     const virtualReservation = toFiniteNumber(side === 'buy' ? funds.virtual?.buy : funds.virtual?.sell);
     const btsFeesOwed = toFiniteNumber(funds.btsFeesOwed);
     const btsSide = getBtsSide(assetA, assetB);
@@ -598,7 +620,13 @@ function calculateAvailableFundsValue(side: string, accountTotals: AccountTotals
 
     const currentFeesOwed = (btsSide === side) ? btsFeesOwed : 0;
 
-    // Non-BTS pair: reserve proportional share for BTS fee budget
+    // Non-BTS pair: reserve proportional share for BTS fee budget.
+    // NOTE: btsBalance is the account-wide BTS pool and is intentionally NOT
+    // share-scaled here: fees are paid from the shared account, and the sizing
+    // path (getSideBudget) reads the same value. Scaling only this read would
+    // make `available` disagree with the budget used to size the grid. A
+    // per-bot BTS fee pool would need a registry entry for BTS itself plus a
+    // matching change in both consumers — tracked as a separate decision.
     if (!btsSide && coreOrders && funds?.btsBalance != null) {
         const targetBuy = Math.max(0, toFiniteNumber(coreOrders?.buy, 1));
         const targetSell = Math.max(0, toFiniteNumber(coreOrders?.sell, 1));
@@ -609,10 +637,10 @@ function calculateAvailableFundsValue(side: string, accountTotals: AccountTotals
         const allocatedSell = toFiniteNumber(funds?.allocated?.sell, 0);
         const totalFree = allocatedBuy + allocatedSell > 0
             ? allocatedBuy + allocatedSell
-            : toFiniteNumber(accountTotals?.buyFree, 0) + toFiniteNumber(accountTotals?.sellFree, 0);
+            : toFiniteNumber(totals?.buyFree, 0) + toFiniteNumber(totals?.sellFree, 0);
         const sideFree = allocatedBuy + allocatedSell > 0
             ? (side === 'buy' ? allocatedBuy : allocatedSell)
-            : toFiniteNumber(side === 'buy' ? accountTotals?.buyFree : accountTotals?.sellFree, 0);
+            : toFiniteNumber(side === 'buy' ? totals?.buyFree : totals?.sellFree, 0);
         const impact = computeBtsFeeImpact(false, formulaBudget, configMinBtsValue ?? 0, btsFree, sideFree, totalFree);
         return Math.max(0, chainFree - virtualReservation - impact);
     }

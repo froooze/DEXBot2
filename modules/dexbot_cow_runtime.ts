@@ -2654,6 +2654,10 @@ function buildActionsFromPlan(_bot: BotLike, plan: JsonObj | JsonObj[]): CowActi
         }, oldOrder as unknown as ManagedOrder));
     }
 
+    const planMinChangePct = orderUtils.resolveSizeUpdateMinChangePercent(
+        mgrView?.config as Parameters<typeof orderUtils.resolveSizeUpdateMinChangePercent>[0]
+    );
+
     for (const o of ordersToUpdate) {
         const ov = o as JsonObj;
         const partialOrder = (ov.partialOrder ?? ov) as JsonObj;
@@ -2665,6 +2669,17 @@ function buildActionsFromPlan(_bot: BotLike, plan: JsonObj | JsonObj[]): CowActi
             : Number(partialOrder.size || 0);
 
         if (!id || !orderId) continue;
+        // Generic plans can carry arbitrary size deltas. Suppress the ones the
+        // commit equality gate would treat as no-ops — otherwise the UPDATE is
+        // broadcast and paid for before the commit is refused. Include the
+        // asset precision so the quantum floor matches commit as well.
+        const planAssets = mgrView?.assets as { assetA?: { precision?: number }; assetB?: { precision?: number } } | undefined;
+        const planPrecision = orderType === ORDER_TYPES.SELL
+            ? planAssets?.assetA?.precision
+            : planAssets?.assetB?.precision;
+        if (!orderUtils.isSignificantSizeChange(
+            partialOrder.size as string | number | null | undefined, newSize, planMinChangePct, planPrecision as number | undefined
+        )) continue;
 
         actions.push(withOrigin({
             type: COW_ACTIONS.UPDATE,
