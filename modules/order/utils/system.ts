@@ -4,7 +4,7 @@
  * Price derivation, persistence, grid correction, and UI/interactive utilities.
  *
  * ===============================================================================
- * TABLE OF CONTENTS (52 exported functions + 12 structural view types)
+ * TABLE OF CONTENTS (60 exported functions + 12 structural view types)
  * ===============================================================================
  *
  * SECTION 1: PRICE DERIVATION (9 functions + 1 internal)
@@ -33,11 +33,13 @@
  *   - applyGridDivergenceCorrections(manager, ...) - Apply grid divergence corrections
  *   - applyPersistedPendingCrawls(...) - Apply persisted-but-uncommitted fill crawls
  *
- * SECTION 5: SPREAD-CORRECTION READINESS (8 functions)
+ * SECTION 5: SPREAD-CORRECTION READINESS (10 functions)
  *   - resolveSpreadFreshnessMs(manager) - The single freshness window for spread trust
+ *   - resolveFillMidVerifyMs(manager) - Pacing for forced fill-path market re-reads
  *   - resolveSpreadCrossingFloor(manager) - Crossing floor spread correction must not trade through
  *   - refreshLiveMarketPrice(manager) - Refresh the cached live market price
- *   - maybeRefreshLiveMarketPrice(manager) - Refresh if stale, paced to one attempt per window
+ *   - maybeRefreshLiveMarketPrice(manager, client, options) - Refresh if stale / forced; paced
+ *   - verifyFillMarketReference(manager, client, fills) - Re-read the book before an off-market veto
  *   - evaluateSpreadCorrectionReadiness(manager) - Evaluate whether spread correction may act
  *   - resolveSpreadMarketReference(manager) - Resolve the last real FILL price
  *   - resolveLastFillGuardReference(manager) - Resolve the reference the LAST-FILL-GUARD judges
@@ -51,14 +53,17 @@
  *   - resetLastFillPivot(manager) - Clear the pivot to cold state
  *   - restoreLastFillPivot(manager) - Restore the persisted pivot into the manager
  *
- * SECTION 7: FILL PIPELINE & LAST-FILL GUARD (9 functions)
+ * SECTION 7: FILL PIPELINE & LAST-FILL GUARD (15 functions)
  *   - reanchorBoundaryFromLastFill(manager, ...) - Re-anchor a rebuilt boundary to the last fill
  *   - rearmLastFillPivotFromMarketFill(manager) - Re-arm the pivot from the last market fill
  *   - isLastFillGuardBlocked(price, type, lastPrice, lastType) - LAST-FILL-GUARD direction predicate
  *   - isLastFillBandSellExempt(manager, price) - Geometry territory for a SELL counter-order
  *   - evaluateLastFillGuard(manager, price, type, pivot, pivotType) - Shared placement verdict
  *   - isLastFillPlacementBlocked(manager, price, type) - Placement-side LAST-FILL-GUARD wrapper
- *   - offMarketFill(manager, type, price) - Is a fill current-window evidence (shared eligibility)
+ *   - offMarketFill(manager, type, price) - Cached/fresh-read market bound wrapper
+ *   - fillOutsideMarket(manager, type, price, mid) - Same bound against an explicit mid
+ *   - fillEvidenceFromEconomics(manager, params, fallbackType) - Shared fill side+price derivation
+ *   - releaseRefutedRefusedLevels(manager, previousMid, freshMid) - Drop markers the fresh mid refutes
  *   - readFillPipelineState(source) - Projection of the fill-pipeline state
  *   - resolveGridUpdateBlockers(source, options) - Blockers that forbid a grid update right now
  *   - noteGridUpdateBlockers(...) - Log/record the blockers for one decision
@@ -102,6 +107,7 @@ import { PATHS } from '../../paths.js';
 import { toFiniteNumber, isValidNumber, toKnownNumber } from '../format.js';
 import * as MathUtils from './math.js';
 import * as OrderUtils from './order.js';
+import { resolveTradedSide } from '../fill_ledger.js';
 import { parseSlotIndex } from './slot.js';
 import Logger from '../../order/logger.js';
 import { runtime } from '../../runtime.js';
@@ -1281,6 +1287,50 @@ export function resolveSpreadFreshnessMs(manager: OrderManagerLike): number {
 }
 
 /**
+ * Pacing for the FORCED market re-read on the fill path. Kept separate from
+ * resolveSpreadFreshnessMs so a sweep can re-read the book within seconds
+ * without weakening the 10-minute spread-correction pacing. Falls back to the
+ * shared freshness window when unset, so the bound is never infinite.
+ *
+ * @param {Object} manager - OrderManager instance
+ * @returns {number} Pacing window in ms (> 0)
+ */
+export function resolveFillMidVerifyMs(manager: OrderManagerLike): number {
+    const configured = Number((manager?.config as { timing?: Record<string, unknown> } | undefined)?.timing?.LAST_FILL_MID_VERIFY_MS);
+    if (configured > 0) return configured;
+    const fallback = Number(TIMING?.LAST_FILL_MID_VERIFY_MS);
+    if (fallback > 0) return fallback;
+    const shared = resolveSpreadFreshnessMs(manager);
+    return shared > 0 ? shared : 5_000; // never unbounded, even if both knobs are zeroed
+}
+
+/**
+ * Hard cap for ONE book read. Pacing (resolveFillMidVerifyMs) bounds how often
+ * a read is attempted; this bounds how long one attempt may stall the fill
+ * path. Falls back to the client's RPC timeout so the cap is never unbounded.
+ */
+function resolveFillMidVerifyTimeoutMs(manager: OrderManagerLike): number {
+    const configured = Number((manager?.config as { timing?: Record<string, unknown> } | undefined)?.timing?.LAST_FILL_MID_VERIFY_TIMEOUT_MS);
+    if (configured > 0) return configured;
+    const fallback = Number(TIMING?.LAST_FILL_MID_VERIFY_TIMEOUT_MS);
+    if (fallback > 0) return fallback;
+    const rpc = Number((NATIVE_CLIENT as { TRANSPORT?: { RPC_TIMEOUT_MS?: unknown } } | undefined)?.TRANSPORT?.RPC_TIMEOUT_MS);
+    return rpc > 0 ? rpc : 15_000;
+}
+
+/**
+ * Grid increments between two prices. Internal to the single price owner so
+ * the marker-release guard and the log line cannot disagree on the threshold.
+ */
+function midStepDistance(manager: OrderManagerLike, before: number, after: number): number {
+    const incRaw = Number((manager?.config as { incrementPercent?: unknown } | undefined)?.incrementPercent);
+    const stepPct = Number.isFinite(incRaw) && incRaw > 0 ? incRaw : 0.5;
+    const step = Math.log(1 + stepPct / 100);
+    if (!(step > 0) || !Number.isFinite(before) || before <= 0 || !Number.isFinite(after) || after <= 0) return 0;
+    return Math.abs(Math.log(after / before) / step);
+}
+
+/**
  * Resolve the crossing floor spread correction must not trade through.
  *
  * Two pieces of real market evidence can supply the floor: an externally
@@ -1315,9 +1365,12 @@ export function resolveSpreadCrossingFloor(manager: OrderManagerLike): number | 
  *
  * @param {Object} manager - OrderManager instance
  * @param {unknown} BitShares - BitShares client
+ * @param {Function} [shouldWrite] - Optional gate checked immediately before
+ *   the cache write. A timed-out caller flips it false so a late RPC result
+ *   cannot mutate the cache outside the release/verification decision.
  * @returns {Promise<number|null>} New price or null
  */
-export async function refreshLiveMarketPrice(manager: OrderManagerLike, BitShares: unknown): Promise<number | null> {
+export async function refreshLiveMarketPrice(manager: OrderManagerLike, BitShares: unknown, shouldWrite?: () => boolean): Promise<number | null> {
     try {
         const symA = (manager?.assets as { assetA?: { symbol?: string } } | undefined)?.assetA?.symbol;
         const symB = (manager?.assets as { assetB?: { symbol?: string } } | undefined)?.assetB?.symbol;
@@ -1328,6 +1381,9 @@ export async function refreshLiveMarketPrice(manager: OrderManagerLike, BitShare
         const raw = await deriveMarketPrice(client as BitSharesClient, symA, symB);
         const price = Number(raw);
         if (Number.isFinite(price) && price > 0) {
+            // A timed-out caller has already returned with the cached-mid
+            // policy intact; let its late result complete but never write.
+            if (shouldWrite && !shouldWrite()) return price;
             manager._liveMarketPrice = price;
             manager._liveMarketPriceAt = Date.now();
             manager.logger?.log?.(
@@ -1345,44 +1401,90 @@ export async function refreshLiveMarketPrice(manager: OrderManagerLike, BitShare
  * freshness window so a chain that keeps failing cannot turn the spread check
  * into an RPC loop. The spread path stays RPC-free while the cache is fresh.
  *
+ * Forced mode is used by the fill path only, when a fill is about to be vetoed
+ * as off-market: a book read that is young in wall-clock time can still be
+ * wrong in value after a fast move. It bypasses the fresh-cache shortcut but
+ * keeps an independent (short) pacing bound, and returns the CACHED price when
+ * paced out — unlike normal mode, where null means "no fresh read".
+ *
+ * This is the single owner of the market cache, so marker release lives here
+ * too: a fresh read from EITHER path (forced fill verification or the
+ * time-based spread check) can refute refused-level markers written against an
+ * older mid. Releasing only on the fill path left the user-visible symptom in
+ * place after a sweep ended and the book recovered on the spread path.
+ *
  * @param {Object} manager - OrderManager instance
  * @param {unknown} BitShares - BitShares client
  * @param {Object} [options]
  * @param {number} [options.now] - Injectable clock (tests)
+ * @param {boolean} [options.force=false] - Re-read even when the cache is fresh (fill-path verification)
  * @returns {Promise<number|null>} Cached/new price or null
  */
-export async function maybeRefreshLiveMarketPrice(manager: OrderManagerLike, BitShares: unknown, options: { now?: number } = {}): Promise<number | null> {
+export async function maybeRefreshLiveMarketPrice(manager: OrderManagerLike, BitShares: unknown, options: { now?: number; force?: boolean } = {}): Promise<number | null> {
     const now = Number.isFinite(options?.now) ? Number(options.now) : Date.now();
+    const force = options?.force === true;
     const freshMs = resolveSpreadFreshnessMs(manager);
-    if (freshMs <= 0) return Number(manager?._liveMarketPrice) || null; // no bound => never force a read
+    // Capture the OLD mid before refreshLiveMarketPrice mutates the cache —
+    // marker release and the step log both need the pre-read reference.
+    const previousMid = Number(manager?._liveMarketPrice);
+    const cached = previousMid > 0 ? previousMid : null;
+    if (!force && freshMs <= 0) return cached; // no bound => never force a read
     const liveAt = Number(manager?._liveMarketPriceAt);
-    if (Number.isFinite(liveAt) && liveAt > 0 && (now - liveAt) <= freshMs) {
-        return Number(manager?._liveMarketPrice) || null;
+    if (!force && Number.isFinite(liveAt) && liveAt > 0 && (now - liveAt) <= freshMs) {
+        return cached;
     }
-    const attemptedAt = Number(manager?._liveMarketPriceAttemptedAt);
-    if (Number.isFinite(attemptedAt) && attemptedAt > 0 && (now - attemptedAt) <= freshMs) {
-        return null; // attempted recently; do not storm the chain
+    const attemptedAt = Number(force ? manager?._fillMidVerifyAttemptedAt : manager?._liveMarketPriceAttemptedAt);
+    const paceMs = force ? resolveFillMidVerifyMs(manager) : freshMs;
+    if (paceMs > 0 && Number.isFinite(attemptedAt) && attemptedAt > 0 && (now - attemptedAt) <= paceMs) {
+        return force ? cached : null; // attempted recently; do not storm the chain
     }
-    // No usable client surface: leave the floor on the fill anchor. Debug only
-    // (expected for tests/dry paths) and paced like a real attempt so it cannot
-    // fire on every tick.
+    // No usable client surface: leave the floor on the fill anchor. Do NOT
+    // stamp the forced clock here: a transient client failure (a lazy import
+    // that has not resolved yet) must not pace out the next, real read. The
+    // normal path keeps its attempt stamp so a missing client cannot spam.
     const client = BitShares as { db?: unknown } | null | undefined;
     if (!client || !client.db) {
-        manager._liveMarketPriceAttemptedAt = now;
+        if (!force) manager._liveMarketPriceAttemptedAt = now;
         manager.logger?.log?.(
             '[SPREAD-CORRECTION] Live market price refresh skipped: no order-book client; crossing floor stays on the fill anchor',
             'debug'
         );
         return null;
     }
-    manager._liveMarketPriceAttemptedAt = now;
-    const refreshed = await refreshLiveMarketPrice(manager, BitShares);
+    if (force) manager._fillMidVerifyAttemptedAt = now;
+    else manager._liveMarketPriceAttemptedAt = now;
+    let readActive = true;
+    const refreshed = await withTimeout<number | null>(
+        refreshLiveMarketPrice(manager, BitShares, () => readActive),
+        resolveFillMidVerifyTimeoutMs(manager),
+        {
+            onTimeout: 'resolve', defaultValue: null, label: 'live market price refresh',
+            onTimeoutCallback: () => { readActive = false; }
+        }
+    );
     if (refreshed == null) {
-        // One warn per pacing window: a persistently failing order-book/ticker
-        // read silently degrades the floor to the fill anchor otherwise.
+        // One warn per pacing window: a persistently failing or timed-out
+        // order-book/ticker read otherwise degrades the floor silently.
         manager.logger?.log?.(
             '[SPREAD-CORRECTION] Live market price refresh failed; crossing floor stays on the fill anchor until the next attempt',
             'warn'
+        );
+        return null;
+    }
+    if (Number.isFinite(previousMid) && previousMid > 0 && Math.abs(refreshed - previousMid) > 1e-9) {
+        const steps = midStepDistance(manager, previousMid, refreshed);
+        // The step guard is INSIDE the release helper, so both read paths get
+        // the same sub-step-noise protection without duplicating the policy.
+        const released = releaseRefutedRefusedLevels(manager, previousMid, refreshed);
+        manager.logger?.log?.(
+            `[LAST-FILL-GUARD] Live mid re-verified: ${previousMid} -> ${refreshed} `
+            + `(${steps.toFixed(1)} step(s)); released ${released} refused level(s) refuted by the fresh read`,
+            'info'
+        );
+    } else {
+        manager.logger?.log?.(
+            `[LAST-FILL-GUARD] Live mid re-verified: ${refreshed}; veto policy unchanged`,
+            'debug'
         );
     }
     return refreshed;
@@ -2143,6 +2245,73 @@ export function hasLiveRefusedFillLevels(manager: OrderManagerLike | null | unde
 }
 
 /**
+ * Release refused-level markers that a FRESH market read refutes.
+ *
+ * The marker policy (§9.12/P2 amended) is deliberately narrow: only levels
+ * that actually traded stay blocked, for a short TTL. But the classification
+ * that WROTE them used the cached mid; when a fast move makes that mid wrong in
+ * value, ordinary window fills get marked and their re-places are suppressed
+ * for the full marker TTL. Once a new book read proves those levels are inside
+ * the market bound again, they are no longer evidence of a premium sweep and
+ * must stop blocking. Levels still off-market against the fresh mid stay.
+ *
+ * The authoritative set AND its legacy scalar mirror are cleared together, so
+ * an emptied set cannot resurrect a marker through the scalar fallback.
+ *
+ * The one-grid-step guard is INSIDE this helper, not at a caller's discretion:
+ * sub-step noise in a fresh read must never invalidate a premium-sweep marker.
+ * Both the forced fill read and the time-based spread read route through the
+ * single price owner, which supplies both mids here.
+ *
+ * @param {Object} manager - OrderManager instance (or legacy stub)
+ * @param {number} previousMid - Mid the refusing classification was made against
+ * @param {number} freshMid - Fresh live market price (B/A)
+ * @returns {number} Number of released levels
+ */
+export function releaseRefutedRefusedLevels(
+    manager: OrderManagerLike | null | undefined,
+    previousMid: number,
+    freshMid: number
+): number {
+    const before = Number(previousMid);
+    const after = Number(freshMid);
+    if (!manager || !Number.isFinite(before) || before <= 0
+        || !Number.isFinite(after) || after <= 0) return 0;
+    if (midStepDistance(manager, before, after) < 1) return 0;
+    const fresh = refusedFillLevels(manager);
+    if (fresh.length === 0) return 0;
+    const refuted = fresh.filter((e) => !fillOutsideMarket(manager, e.type, e.price, freshMid));
+    if (refuted.length === 0) return 0;
+    const keyOf = (e: RefusedFillLevel) => `${e.type}|${e.price}|${e.at}`;
+    const refutedKeys = new Set(refuted.map(keyOf));
+    const list = manager._lastRefusedFillLevels;
+    if (Array.isArray(list)) {
+        const kept = list.filter((e: RefusedFillLevel) => !refutedKeys.has(keyOf(e)));
+        if (kept.length !== list.length) {
+            list.length = 0;
+            list.push(...kept);
+        }
+    }
+    // The scalar mirror is legacy observability, but refusedFillLevels falls
+    // back to it when the set is empty — clear it in both shapes.
+    const scalar: RefusedFillLevel = {
+        price: Number(manager._lastRefusedFillPrice),
+        type: String(manager._lastRefusedFillType ?? ''),
+        at: Number(manager._lastRefusedFillAt)
+    };
+    if (refutedKeys.has(keyOf(scalar))) {
+        manager._lastRefusedFillPrice = null;
+        manager._lastRefusedFillType = null;
+        manager._lastRefusedFillAt = 0;
+    }
+    manager.logger?.log?.(
+        `[LAST-FILL-GUARD] Released ${refuted.length} refused level(s) refuted by fresh market mid ${freshMid}`,
+        'info'
+    );
+    return refuted.length;
+}
+
+/**
  * REFUSED-LEVEL SAME-LEVEL RE-FILL BLOCK (§9.12/P2 amended, 2026-11-16).
  *
  * A fill the pivot-arming policy refused (wrong-side / too-far premium sweep)
@@ -2892,6 +3061,23 @@ export function offMarketFill(manager: OrderManagerLike, type: string, price: nu
     if (!Number.isFinite(midAt) || midAt <= 0) return null;
     const freshMs = Number(GRID_LIMITS.LAST_FILL_PIVOT_MARKET_FRESH_MS);
     if (!(freshMs > 0) || (Date.now() - midAt) > freshMs) return null;
+    return fillOutsideMarket(manager, type, price, mid);
+}
+
+/**
+ * The two market-bound legs against an EXPLICIT mid — no cache, no freshness
+ * gate. offMarketFill supplies the cached/fresh book read; marker release can
+ * classify against a newly verified mid without mutating the manager cache
+ * just to make the shared predicate see it.
+ */
+export function fillOutsideMarket(
+    manager: OrderManagerLike,
+    type: string,
+    price: number,
+    mid: number
+): { steps: number; mid: number; kind?: 'wrong-side' | 'too-far' } | null {
+    const reference = Number(mid);
+    if (!Number.isFinite(reference) || reference <= 0) return null;
     const incRaw = Number((manager?.config as { incrementPercent?: unknown } | undefined)?.incrementPercent);
     const stepPct = Number.isFinite(incRaw) && incRaw > 0 ? incRaw : 0.5;
     const step = 1 + (stepPct / 100);
@@ -2899,16 +3085,16 @@ export function offMarketFill(manager: OrderManagerLike, type: string, price: nu
     const tol = Number.isFinite(tolerance) && tolerance >= 0 ? tolerance : 1;
     // Relative epsilon so "exactly N steps above mid" is not refused by
     // floating-point drift in Math.pow (1000 * 1.005 === 1004.9999999999999).
-    const eps = mid * 1e-9;
+    const eps = reference * 1e-9;
     if (type === ORDER_TYPES.BUY) {
-        const limit = mid * Math.pow(step, tol);
+        const limit = reference * Math.pow(step, tol);
         if (price > limit + eps) {
-            return { steps: Math.max(1, Math.round(Math.log(price / mid) / Math.log(step))), mid, kind: 'wrong-side' };
+            return { steps: Math.max(1, Math.round(Math.log(price / reference) / Math.log(step))), mid: reference, kind: 'wrong-side' };
         }
     } else {
-        const limit = mid / Math.pow(step, tol);
+        const limit = reference / Math.pow(step, tol);
         if (price < limit - eps) {
-            return { steps: Math.max(1, Math.round(Math.log(mid / price) / Math.log(step))), mid, kind: 'wrong-side' };
+            return { steps: Math.max(1, Math.round(Math.log(reference / price) / Math.log(step))), mid: reference, kind: 'wrong-side' };
         }
     }
     // Second leg: a fill inside the direction tolerance can still be a premium
@@ -2917,12 +3103,155 @@ export function offMarketFill(manager: OrderManagerLike, type: string, price: nu
     const maxStepsRaw = Number(GRID_LIMITS.LAST_FILL_PIVOT_MAX_MID_DISTANCE_STEPS);
     const maxSteps = Number.isFinite(maxStepsRaw) && maxStepsRaw > 0 ? maxStepsRaw : 0;
     if (maxSteps > 0) {
-        const dist = Math.abs(Math.log(price / mid) / Math.log(step));
+        const dist = Math.abs(Math.log(price / reference) / Math.log(step));
         if (dist > maxSteps + 1e-9) {
-            return { steps: Math.max(1, Math.round(dist)), mid, kind: 'too-far' };
+            return { steps: Math.max(1, Math.round(dist)), mid: reference, kind: 'too-far' };
         }
     }
     return null;
+}
+
+/**
+ * Fill side + execution price from pays/receives, through the SAME single
+ * owners used by unmatched-fill attribution (fill_ledger.resolveTradedSide and
+ * order.resolveExecutionPrice). Every fill-pivot verification path judges this
+ * evidence, so a caller can never verify one price and record another. A
+ * missing receives id is inferred as the opposite pair asset; a PRESENT but
+ * unrecognized id fails soft instead of fabricating a price.
+ *
+ * @param {Object} manager - OrderManager instance
+ * @param {Object} params - Raw fill economics (integer amounts, asset ids)
+ * @param {string} [fallbackType] - Slot type when the pays asset is missing
+ * @returns {{type: string, price: number}|null} Fill evidence, or null when unresolvable
+ */
+export function fillEvidenceFromEconomics(
+    manager: OrderManagerLike | null | undefined,
+    params: {
+        paysAssetId?: unknown; paysAmountRaw?: unknown;
+        receivesAssetId?: unknown; receivesAmountRaw?: unknown;
+    },
+    fallbackType?: string
+): { type: string; price: number } | null {
+    try {
+        const assets = manager?.assets;
+        if (!assets?.assetA || !assets?.assetB) return null;
+        const paysId = params?.paysAssetId as string | null | undefined;
+        const type = resolveTradedSide(paysId, assets, fallbackType as string | null | undefined);
+        if (type !== ORDER_TYPES.BUY && type !== ORDER_TYPES.SELL) return null;
+        // A chain fill always carries both asset ids, but a degraded/deferred
+        // event may miss the receives id. Infer the opposite pair asset only
+        // when the id is missing. A PRESENT id that is not one of the pair is
+        // untrustworthy (a malformed or foreign-asset event): fail soft here
+        // rather than reinterpret its amount in the opposite asset's units.
+        const expectedReceives = paysId === assets.assetA.id ? assets.assetB.id
+            : (paysId === assets.assetB.id ? assets.assetA.id : null);
+        const suppliedReceivesId = params?.receivesAssetId as string | null | undefined;
+        const pairIds: Array<string | null | undefined> = [assets.assetA.id, assets.assetB.id];
+        if (suppliedReceivesId != null && !pairIds.includes(suppliedReceivesId)) return null;
+        const receivesId = suppliedReceivesId ?? expectedReceives;
+        const price = OrderUtils.resolveExecutionPrice(
+            assets, paysId, Number(params?.paysAmountRaw), receivesId, Number(params?.receivesAmountRaw)
+        );
+        if (price == null || !Number.isFinite(price) || !(price > 0)) return null;
+        return { type, price: Number(price) };
+    } catch { return null; /* malformed economics: caller falls back to slot identity */ }
+}
+
+/**
+ * VERIFY BEFORE VETO — re-read the book when a fill is about to be refused.
+ *
+ * offMarketFill judges every fill against the cached book mid. Time-based
+ * freshness alone cannot catch a mid that is seconds old yet wrong in value
+ * after a fast move (live 2026-11-26: one bot cached 1739.24 at 16:14:27 and
+ * refused ten fills at 1683–1703 as premium sweeps; the sibling bot's older
+ * cache had failed open, refreshed to 1702.76 and re-placed its rails normally).
+ *
+ * This helper keeps ONE classifier (offMarketFill) and ONE price writer
+ * (refreshLiveMarketPrice). It only changes WHEN the book is read: before the
+ * veto instead of only on the spread path, which is skipped while fills are
+ * queued. In-window batches cost no RPC. After a fresh read the existing
+ * setLastFillPivot policy re-evaluates every fill unchanged, and markers a
+ * stale mid wrote are released where the new mid refutes them.
+ *
+ * @param {Object} manager - OrderManager instance
+ * @param {unknown} BitShares - BitShares client (needs a `db` surface)
+ * @param {Array} fills - Fill batch with `type`+`price`, or raw pays/receives economics
+ * @param {Object} [options]
+ * @param {number} [options.now] - Injectable clock (tests)
+ * @returns {Promise<number|null>} Price used for the decision, or null when no read happened
+ */
+export async function verifyFillMarketReference(
+    manager: OrderManagerLike,
+    BitShares: unknown,
+    fills: unknown,
+    options: { now?: number } = {}
+): Promise<number | null> {
+    if (!manager || !Array.isArray(fills) || fills.length === 0) return null;
+    const candidates: Array<{ type: string; price: number }> = [];
+    for (const raw of fills) {
+        const item = raw as {
+            type?: unknown; price?: unknown; order?: { price?: unknown }; id?: unknown;
+            paysAssetId?: unknown; paysAmountRaw?: unknown;
+            receivesAssetId?: unknown; receivesAmountRaw?: unknown;
+        } | null;
+        let type = String(item?.type ?? '');
+        let price = Number(item?.price ?? item?.order?.price);
+        if ((type !== ORDER_TYPES.BUY && type !== ORDER_TYPES.SELL) || !Number.isFinite(price) || price <= 0) {
+            // Raw fill economics: derive through the SAME single owners the
+            // unmatched-fill attribution path uses, so the evidence judged by
+            // this gate is the evidence the pivot writer will record.
+            try {
+                const derived = fillEvidenceFromEconomics(manager, {
+                    paysAssetId: item?.paysAssetId,
+                    paysAmountRaw: item?.paysAmountRaw,
+                    receivesAssetId: item?.receivesAssetId,
+                    receivesAmountRaw: item?.receivesAmountRaw,
+                }, type === ORDER_TYPES.BUY || type === ORDER_TYPES.SELL ? type : undefined);
+                if (derived) { type = derived.type; price = derived.price; }
+            } catch { /* malformed fill: fall through to the slot fallback */ }
+        }
+        if (!Number.isFinite(price) || price <= 0) {
+            try {
+                const slot = item?.id != null ? manager.orders?.get(String(item.id)) : null;
+                price = Number((slot as { price?: unknown } | null)?.price);
+            } catch { price = NaN; }
+        }
+        if ((type === ORDER_TYPES.BUY || type === ORDER_TYPES.SELL) && Number.isFinite(price) && price > 0) {
+            candidates.push({ type, price });
+        }
+    }
+    if (candidates.length === 0) return null;
+    // Fast path: no veto candidate against the cached mid — no extra RPC.
+    if (!candidates.some((c) => offMarketFill(manager, c.type, c.price))) return null;
+
+    const before = Number(manager?._liveMarketPrice);
+    const beforeAt = Number(manager?._liveMarketPriceAt);
+    const refreshed = await maybeRefreshLiveMarketPrice(manager, BitShares, { force: true, now: options?.now });
+    if (refreshed == null) {
+        manager.logger?.log?.(
+            '[LAST-FILL-GUARD] Off-market fill candidate could not re-verify the live mid; '
+            + `cached ${Number.isFinite(before) && before > 0 ? before : 'none'} retained — veto policy unchanged`,
+            'warn'
+        );
+        return null;
+    }
+    if (Number(manager?._liveMarketPriceAt) === beforeAt) {
+        manager.logger?.log?.('[LAST-FILL-GUARD] Live mid verification paced out; cached veto policy unchanged', 'debug');
+        return refreshed;
+    }
+    // Marker release is owned by the single price writer, which runs this
+    // refresh for BOTH forced fill reads and time-based spread reads. Keeping
+    // it there means a sweep whose markers were written from a stale mid is
+    // also cleared when the book recovers on the spread path after the sweep
+    // ends (no further veto candidate to re-enter this gate). The gate only
+    // reports the veto consequence; it does not re-implement release policy.
+    manager.logger?.log?.(
+        Number.isFinite(before) && before > 0 && Math.abs(refreshed - before) > 1e-9
+            ? `[LAST-FILL-GUARD] Fill veto candidates judged against re-verified mid ${before} -> ${refreshed}`
+            : `[LAST-FILL-GUARD] Fill veto candidates judged against unchanged mid ${refreshed}; veto stands`,
+        'debug'
+    );
+    return refreshed;
 }
 
 /**

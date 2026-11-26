@@ -110,6 +110,7 @@ const getRecalculateTriggerFile = lazyShim('./paths', 'getRecalculateTriggerFile
 const cloneWeightDistribution = lazyShim('./order/utils/math', 'cloneWeightDistribution');
 const resolveBotRuntimeSettings = lazyShim('./runtime_settings', 'resolveBotRuntimeSettings');
 const readBotInFlightFlags = lazyShim('./order/utils/system', 'readBotInFlightFlags');
+const verifyFillMarketReference = lazyShim('./order/utils/system', 'verifyFillMarketReference');
 
 /**
  * Resolve the COALESCE_BACKLOG_REPLAY opt-in.
@@ -1289,6 +1290,14 @@ class DEXBot implements BotLike {
                 const batchEnd = Math.min(i + currentBatchSize, totalFills);
                 const fillBatch = fillList.slice(i, batchEnd) as Array<{ id?: unknown; orderId?: unknown }>;
                 i = batchEnd;
+
+                // Verify the book mid BEFORE the LAST-FILL guard can veto any
+                // fill in this chunk. A cached mid that is young in wall-clock
+                // time can still be wrong in value after a fast move; without
+                // this re-read, ordinary window fills are classified as premium
+                // sweeps and their re-places stay blocked for the marker TTL.
+                // No RPC in the normal (in-window) case.
+                try { await verifyFillMarketReference(this.manager, BitShares, fillBatch); } catch { /* best-effort */ }
 
                 // Refresh the LAST-FILL guard pivot for this chunk's broadcast:
                 // recordLastFilledPrices walks the batch in order, so the pivot

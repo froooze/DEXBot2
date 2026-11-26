@@ -88,6 +88,8 @@ export const TIMING_CLASSIFICATIONS: Readonly<Record<string, TimingClassificatio
     CREDIT_REBORROW_MAX_ATTEMPTS: { kind: 'policy', rationale: 'Retry budget for reborrowing.' },
     DUST_HEALTH_CHECK_INTERVAL_MS: { kind: 'external', rationale: 'Dust-sweep cadence.' },
     DUST_CANCEL_TIMEOUT_MS: { kind: 'external', rationale: 'How long a dust cancel waits for the fill-processing lock.' },
+    LAST_FILL_MID_VERIFY_MS: { kind: 'policy', rationale: 'Pacing for the forced book re-read before a cached mid can veto a fill.' },
+    LAST_FILL_MID_VERIFY_TIMEOUT_MS: { kind: 'external', rationale: 'Hard cap on a single fill-path book read so a slow RPC cannot stall the veto gate.' },
     LIGHTWEIGHT_SYNC_CHECK_INTERVAL_MS: { kind: 'external', rationale: 'Cadence for the cheap open-orders check.' },
     RUN_LOOP_DEFAULT_MS: { kind: 'external', rationale: 'Default open-orders sync cycle length.' },
     SHARED_ACCOUNT_FETCH_INTERVAL_MIN: { kind: 'external', rationale: 'Shared-account balance fetch cadence.' },

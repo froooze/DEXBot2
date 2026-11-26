@@ -1075,6 +1075,37 @@ slot is in the gap band: those are stranded residuals, not window trades. Edge-p
 fills remain excluded by the existing shared classifier. A rail/window fill is still
 recorded once, by the existing pivot writer.
 
+> **Addendum (2026-11-26, fast move with a time-fresh mid).** In a live market-pair
+> sweep, one bot cached the book mid at 1739.24 one minute before a taker walked
+> it down to ~1702; the mid was *time-fresh* (well inside the 15-minute trust
+> window) but wrong in value. Ten fills at 1683–1703 were refused as "premium
+> sweeps", their levels were marked for 30 minutes, all four re-places were
+> skipped, and the book sat 2.13–2.74% wide against a 1.65% target. The sibling
+> bot in the same market had a mid older than the trust window: `offMarketFill`
+> failed open and its next spread check refreshed to 1702.76, so the same sweep
+> armed the pivot normally and it stayed in spread. **Resolution:** the fill path
+> now re-reads the book before it lets a cached mid veto (`verifyFillMarketReference`,
+> called once per fill chunk ahead of `recordLastFilledPrices`). The classifier,
+> the refusal policy and the refused-level TTL are unchanged — only the *time*
+> of the independent book read moves, from the spread path (which is skipped
+> while fills are queued) to just before the veto. A fresh read that refutes old
+> markers releases only those levels; levels still off-market stay blocked.
+> The forced read is paced by `TIMING.LAST_FILL_MID_VERIFY_MS`, leaves the
+> cached-mid veto policy unchanged when the book is unreadable (so a genuine
+> premium sweep still cannot arm the pivot), and costs no RPC for in-window
+> batches. Centralization follows the existing one-owner rule: the low-level
+> `setLastFillPivot` writer stays synchronous; verification is one async helper
+> called at every live boundary (fill batch, COW freeze and final gate, both
+> unmatched-fill sites), fill evidence is derived by one helper, and a contract
+> test fails when a new write path skips verification. Marker release lives in
+> the single price owner, so the time-based spread read also frees markers a
+> recovered book refutes — a sweep whose re-places were blocked does not have
+> to wait for another off-market fill (or the full TTL) to heal. The one-step
+> guard is inside the release helper, and a per-read timeout
+> (`TIMING.LAST_FILL_MID_VERIFY_TIMEOUT_MS`) keeps a slow RPC off the fill
+> critical path. Only rebuild re-arm and startup restore remain unverified by
+> design (no client, no live mid).
+
 **P2 — the pivot may not veto its own counter-order territory.** The shared
 `evaluateLastFillGuard` verdict is used by both COW placement checks and the final
 pre-broadcast gate. A SELL strictly below a SELL pivot, inside the band that the fill

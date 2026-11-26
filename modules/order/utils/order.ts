@@ -130,7 +130,7 @@ import { ORDER_TYPES, ORDER_STATES, TIMING, FEE_PARAMETERS, GRID_LIMITS, NATIVE_
 import * as Format from '../format.js';
 import * as MathUtils from './math.js';
 import Logger from '../../order/logger.js';
-import { sleep, resolveSpreadCrossingFloor, offMarketFill } from './system.js';
+import { sleep, resolveSpreadCrossingFloor, offMarketFill, fillEvidenceFromEconomics } from './system.js';
 import { withTimeout } from './timeout.js';
 import { getErrorMessage, getErrorCode, getErrorName } from '../../utils/errors.js';
 import { hasGenesisLadder } from '../genesis_policy.js';
@@ -622,10 +622,20 @@ function attributeUnmatchedFillToGrid(
     // quote buys the base, paying the base sells it. Independent of the slot
     // type; a malformed fill with no pays asset falls back to the slot's type
     // and the side is never guessed from the price.
-    const type = resolveTradedSide(input.paysAssetId, assets, slot?.type);
+    const evidence = fillEvidenceFromEconomics(
+        mgr,
+        {
+            paysAssetId: input.paysAssetId,
+            paysAmountRaw: input.paysAmountRaw,
+            receivesAssetId: input.receivesAssetId,
+            receivesAmountRaw: input.receivesAmountRaw,
+        },
+        slot?.type
+    );
+    const type = evidence?.type ?? resolveTradedSide(input.paysAssetId, assets, slot?.type);
     if (type !== ORDER_TYPES.BUY && type !== ORDER_TYPES.SELL) return false;
 
-    const execPrice = resolveExecutionPrice(
+    const execPrice = evidence?.price ?? resolveExecutionPrice(
         assets, input.paysAssetId, input.paysAmountRaw, input.receivesAssetId, input.receivesAmountRaw
     );
     let identity: 'chain-id' | 'ladder' | null = slot && slot.id ? 'chain-id' : null;

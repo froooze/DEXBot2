@@ -15,7 +15,7 @@ import { BroadcastUncertainError as BroadcastUncertainErrorBinding } from './dex
 const BroadcastUncertainError = BroadcastUncertainErrorBinding;
 import * as orderUtils from './order/utils/order.js';
 import { lazyShim } from './lazy_shim.js';
-import { sleep, setLastFillPivot, fireStructuralResync, evaluateSpreadCorrectionReadiness, resolveLastFillGuardReference, resolveSpreadCrossingFloor, isLastFillGuardBlocked, evaluateLastFillGuard, extractGoneOrderIds, extractUpdateTargetOrderIds, hasLiveRefusedFillLevels } from './order/utils/system.js';
+import { sleep, setLastFillPivot, fireStructuralResync, evaluateSpreadCorrectionReadiness, resolveLastFillGuardReference, resolveSpreadCrossingFloor, isLastFillGuardBlocked, evaluateLastFillGuard, extractGoneOrderIds, extractUpdateTargetOrderIds, hasLiveRefusedFillLevels, verifyFillMarketReference, fillEvidenceFromEconomics } from './order/utils/system.js';
 const {
     buildCreateOrderArgs,
     buildCreateOpFingerprint,
@@ -35,7 +35,6 @@ const { validateCreateTargetSlots, evaluateCommit, hasExecutableActions, stampGa
 import * as math from './order/utils/math.js';
 const { validateOrderSize, findCrossedOrder, sameGridLevel, isEvacuationRotationAllowed, isEvacuationSizeStillValid, getSellStartIdx, getPrecisionByOrderType, isSlotIndexInGapBand, getAssetFeesSafe, blockchainToFloat, floatToBlockchainInt, quantizeFloat } = math;
 import { parseSlotIndex } from './order/utils/slot.js';
-import { resolveTradedSide } from './order/fill_ledger.js';
 import type { PlacementLease } from './order/placement_lock.js';
 import { takePlanLease } from './order/placement_lock.js';
 
@@ -2420,6 +2419,106 @@ function isSpreadCorrectionBypassAllowed(bot: BotLike): boolean {
 }
 
 /**
+ * The newest usable side+price in the queue, derived by the SAME shared helper
+ * for both the market verification and the pivot write. Peek-only, never
+ * drains. A fill can arrive between the verify await and the write; the book
+ * read is already fresh at that point, so the later write is judged against
+ * that same mid rather than a stale cache.
+ */
+function latestQueuedFillEvidence(bot: BotLike): { price: number; type: string } | null {
+    const mgr = bot?.manager;
+    const queue = bot?._incomingFillQueue;
+    if (!Array.isArray(queue) || queue.length === 0 || !mgr || !mgr.orders) return null;
+    const assets = mgr.assets;
+    const findSlotByOrderId = (orderId: unknown) => {
+        if (!orderId) return null;
+        try {
+            for (const o of mgr.orders.values()) {
+                if (o?.orderId === orderId) return o as unknown as ManagedOrder;
+            }
+        } catch { /* ignore iteration errors */ }
+        return null;
+    };
+    let latest: { price: number; type: string } | null = null;
+    for (const fill of queue) {
+        const fillOp = fill?.op?.[1] || fill;
+        const orderId = fillOp?.order_id || fill?.orderId;
+        let type: unknown = null;
+        let price: number | null = null;
+        if (fillOp?.pays && fillOp?.receives && assets?.assetA && assets?.assetB) {
+            try {
+                const pays = fillOp.pays as { asset_id?: unknown; amount?: unknown };
+                const receives = fillOp.receives as { asset_id?: unknown; amount?: unknown };
+                const evidence = fillEvidenceFromEconomics(mgr, {
+                    paysAssetId: pays.asset_id,
+                    paysAmountRaw: pays.amount,
+                    receivesAssetId: receives.asset_id,
+                    receivesAmountRaw: receives.amount,
+                });
+                if (evidence) { type = evidence.type; price = evidence.price; }
+            } catch { /* best-effort: the slot-price fallback still applies */ }
+        }
+        if (type == null || price == null) {
+            const slot = findSlotByOrderId(orderId);
+            if (slot && (slot.type === ORDER_TYPES.BUY || slot.type === ORDER_TYPES.SELL)) {
+                type = slot.type;
+                const slotPrice = Number(slot.price);
+                if (Number.isFinite(slotPrice) && slotPrice > 0) price = slotPrice;
+            }
+        }
+        if ((type === ORDER_TYPES.BUY || type === ORDER_TYPES.SELL)
+            && Number.isFinite(price as number) && (price as number) > 0) {
+            latest = { price: price as number, type };
+        }
+    }
+    return latest;
+}
+
+/** Cached lazy client: this runtime deliberately avoids a static client import. */
+let guardMarketClientPromise: Promise<unknown> | null = null;
+function guardMarketClient(): Promise<unknown> {
+    if (!guardMarketClientPromise) {
+        guardMarketClientPromise = import('./bitshares_client.js')
+            .then((m) => {
+                if (!m.BitShares) throw new Error('BitShares client export missing');
+                return m.BitShares;
+            })
+            .catch(() => {
+                // A transient module-load failure must not disable market
+                // verification for the rest of the process.
+                guardMarketClientPromise = null;
+                return null;
+            });
+    }
+    return guardMarketClientPromise;
+}
+
+/**
+ * Verify the book mid BEFORE the broadcast-time queued pivot write. Called at
+ * the async freeze and final-gate boundaries; the sync helpers themselves stay
+ * sync and consume the already-verified cache.
+ *
+ * Resolve the client BEFORE peeking the queue. An early return on an empty
+ * queue followed by `await` at the caller yields a microtask in which a newly
+ * queued fill could reach refreshLastFillPivotFromQueue without verification.
+ * With the client awaited first, every fill that arrives during that await is
+ * included in the peek; fills arriving during the book read are judged against
+ * the already-refreshed mid, so the subsequent write is still verified.
+ */
+async function verifyQueuedFillMarket(bot: BotLike): Promise<void> {
+    let client: unknown = null;
+    try { client = await guardMarketClient(); } catch { client = null; }
+    // No client (e.g. a transient lazy-import failure): skip cleanly so the
+    // forced-read pacing clock is not stamped by an attempt that never ran.
+    if (!client) return;
+    const evidence = latestQueuedFillEvidence(bot);
+    if (!evidence) return;
+    try {
+        await verifyFillMarketReference(bot.manager, client, [evidence]);
+    } catch { /* best-effort: verification must never block a broadcast */ }
+}
+
+/**
  * Refresh the LAST-FILL guard pivot from fills that arrived while the current
  * batch was being planned or broadcast but have not been ingested yet.
  *
@@ -2440,65 +2539,11 @@ function refreshLastFillPivotFromQueue(bot: BotLike): boolean {
         if (!Array.isArray(queue) || queue.length === 0) return false;
         const mgr = bot?.manager;
         if (!mgr || !mgr.orders) return false;
-        const assets = mgr.assets;
-        const findSlotByOrderId = (orderId: unknown) => {
-            if (!orderId) return null;
-            try {
-                for (const o of mgr.orders.values()) {
-                    if (o?.orderId === orderId) return o as unknown as ManagedOrder;
-                }
-            } catch { /* ignore iteration errors */ }
-            return null;
-        };
-        let latest: { price: number; type: string } | null = null;
-        for (const fill of queue) {
-            const fillOp = fill?.op?.[1] || fill;
-            const orderId = fillOp?.order_id || fill?.orderId;
-            let type: unknown = null;
-            let price: number | null = null;
-            // FILL ECONOMICS FIRST: the pays/receives amounts are the trade
-            // fact. The grid slot is only an identity hint — after a
-            // refused-commit adoption it can still be keyed at an old
-            // generation price (live incident: slot-118 @1267 for an order
-            // that traded at 1345.73), and preferring the slot price made the
-            // last-fill pivot / re-anchor judge a market that never traded.
-            if (fillOp?.pays && fillOp?.receives && assets?.assetA && assets?.assetB) {
-                try {
-                    const pays = fillOp.pays as { asset_id?: unknown; amount?: unknown };
-                    const receives = fillOp.receives as { amount?: unknown };
-                    const paysId = pays.asset_id;
-                    const paysAmt = Number(pays.amount);
-                    const recvAmt = Number(receives.amount);
-                    if (Number.isFinite(paysAmt) && paysAmt > 0 && Number.isFinite(recvAmt) && recvAmt > 0) {
-                        const paysFloat = (base: number, precision: number) => base / Math.pow(10, precision);
-                        // Side from the paid asset through the shared resolver
-                        // (order/fill_ledger.ts); the price math stays here.
-                        const paysSide = resolveTradedSide(paysId, assets);
-                        if (paysSide === ORDER_TYPES.SELL) {
-                            type = ORDER_TYPES.SELL;
-                            price = paysFloat(recvAmt, assets.assetB.precision) / paysFloat(paysAmt, assets.assetA.precision);
-                        } else if (paysSide === ORDER_TYPES.BUY) {
-                            type = ORDER_TYPES.BUY;
-                            price = paysFloat(paysAmt, assets.assetB.precision) / paysFloat(recvAmt, assets.assetA.precision);
-                        }
-                    }
-                } catch { /* best-effort */ }
-            }
-            // Fall back to the grid slot only when the fill amounts are absent
-            // (a limit fill normally executes at its slot price).
-            if ((type == null || price == null)) {
-                const slot = findSlotByOrderId(orderId);
-                if (slot && (slot.type === ORDER_TYPES.BUY || slot.type === ORDER_TYPES.SELL)) {
-                    type = slot.type;
-                    const slotPrice = Number(slot.price);
-                    if (Number.isFinite(slotPrice) && slotPrice > 0) price = slotPrice;
-                }
-            }
-            if ((type === ORDER_TYPES.BUY || type === ORDER_TYPES.SELL)
-                && Number.isFinite(price as number) && (price as number) > 0) {
-                latest = { price: price as number, type };
-            }
-        }
+        // FILL ECONOMICS FIRST: the pays/receives amounts are the trade fact;
+        // the grid slot is only an identity hint (live incident: slot-118
+        // @1267 for an order that traded at 1345.73). Derived by the shared
+        // helper so verification and the pivot write judge the SAME evidence.
+        const latest = latestQueuedFillEvidence(bot);
         if (!latest) return false;
         // Shared free writer (utils/system) — the same implementation the
         // manager's _setLastFillPivot method delegates to and restoreLast-
@@ -4826,6 +4871,10 @@ async function updateOrdersOnChainBatchCOWBody(
                 ? bot._incomingFillQueue.length
                 : null;
         } catch { freezeQueueDepth = null; }
+        // Verify before the queued-fill pivot write: the freeze is an async
+        // boundary and a cached mid that is young but wrong in value must not
+        // veto (or arm) from a fill the fresh book says is in-window.
+        await verifyQueuedFillMarket(bot);
         try { if (refreshLastFillPivotFromQueue(bot)) lastFillGuardPivotRefreshed = true; } catch { /* best-effort */ }
         // Captured AFTER the freeze refresh, not before: the refresh is part
         // of the freeze, so the baseline must be the pivot the ops are about
@@ -5637,6 +5686,9 @@ async function updateOrdersOnChainBatchCOWBody(
         const skippedUpdateCountRef = { count: 0 };
         const finalGateStats = { checked: 0, passed: 0, skipped: 0, bypassed: 0, pivotOffGrid: 0 };
         let finalGate: { dropped: unknown[]; pivotChanged: boolean; refreshed: boolean } | null = null;
+        // Same verify-before-write contract as the freeze: the gate's internal
+        // peek-only refresh now consumes an already-verified market cache.
+        await verifyQueuedFillMarket(bot);
         try {
             finalGate = runFinalPivotGate(bot, operations, opContexts, {
                 actions,
@@ -6918,7 +6970,11 @@ function warnCrossingCreate(bot: BotLike, price: unknown, type: unknown, slotId:
  * @param {number} price - Target order price
  * @param {string} type - ORDER_TYPES.BUY/SELL
  * @param {Object} stats - lastFillGuardStats tracker (checked++ here)
- * @param {boolean} [skipRefresh=false] - Skip the queued-fill pivot refresh
+ * @param {boolean} [skipRefresh=false] - Skip the queued-fill pivot refresh.
+ *   Production batch callers MUST pass true: only the async batch boundaries
+ *   (freeze / final gate) can verify the cached mid before a queued-fill
+ *   pivot write (see verifyQueuedFillMarket). A non-batch caller with a client
+ *   must await verification before leaving this refresh enabled.
  * @returns {{check: Object, refreshed: boolean}}
  */
 function runLastFillGuardCheck(bot: BotLike, price: number, type: string, stats: LastFillGuardStats, skipRefresh: boolean = false): { check: LastFillGuardResult; refreshed: boolean } {

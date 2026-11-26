@@ -1264,6 +1264,9 @@ export interface OrderManagerLike {
   _liveMarketPrice?: number | null;
   _liveMarketPriceAt?: number | null;
   _liveMarketPriceAttemptedAt?: number | null;
+  // Separate pacing clock for forced fill-path verification: a failed spread
+  // read must not block the veto gate for the next 10 minutes.
+  _fillMidVerifyAttemptedAt?: number | null;
   _lastSyncAt?: number;
 
   // --- internals the runtime wires in or the engine reads defensively ---

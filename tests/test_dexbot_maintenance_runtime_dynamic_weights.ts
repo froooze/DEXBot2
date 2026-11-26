@@ -61,6 +61,9 @@ const NAMES = {
         // under this manifest (order.ts, maintenance/cow runtime, accounting).
         'offMarketFill', 'readBotInFlightFlags', 'readFillPipelineState',
         'extractGoneOrderIds', 'extractUpdateTargetOrderIds',
+        // Fill-pivot verification family (fill batch / queued refresh / orphans).
+        'fillEvidenceFromEconomics', 'verifyFillMarketReference',
+        'releaseRefutedRefusedLevels', 'resolveFillMidVerifyMs', 'fillOutsideMarket',
     ],
     format: ['formatCurrency', 'formatMetric2', 'isValidNumber', 'toFiniteNumber', 'toKnownNumber', 'formatPrice6', 'formatPercent'],
     orderUtils: [

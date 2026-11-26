@@ -475,6 +475,20 @@ let TIMING = {
     // guard applies instead of trusting the stale anchor. Fail-open when no
     // sync timestamp exists yet.
     SPREAD_CORRECTION_SYNC_FRESH_MS: 10 * 60 * 1000,  // 10 minutes
+    // LAST_FILL_MID_VERIFY_MS: pacing for the FORCED live-market read triggered
+    // when a fill would be refused by LAST_FILL_PIVOT_MAX_MID_DISTANCE_STEPS.
+    // A cached mid can be seconds old yet wrong in value after a fast move;
+    // the fill path re-reads the book before it lets that mid veto a fill.
+    // Short (separate from the 10min spread pacing) so a long sweep can refresh
+    // again, but bounded so a failing order-book read cannot become an RPC
+    // loop. 0 falls back to SPREAD_CORRECTION_SYNC_FRESH_MS.
+    LAST_FILL_MID_VERIFY_MS: 5 * 1000,  // 5 seconds
+    // LAST_FILL_MID_VERIFY_TIMEOUT_MS: hard cap on ONE book read made by the
+    // fill-path verification (and by the shared price owner it delegates to).
+    // Pacing bounds how OFTEN a read is attempted; without a per-read cap a
+    // slow — but not failing — RPC would stall fill processing at the veto
+    // gate. A timed-out read falls back to the cached-mid policy. 0 disables.
+    LAST_FILL_MID_VERIFY_TIMEOUT_MS: 8 * 1000,  // 8 seconds
     // Dedicated escalation cooldown for the spread-stale watchdog. Deliberately
     // separate from BOUNDARY_HOLD_RESYNC_COOLDOWN_MS so tuning boundary-hold
     // behavior never silently changes the spread watchdog cadence.

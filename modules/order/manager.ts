@@ -734,6 +734,7 @@ class OrderManager implements OrderManagerLike {
     _liveMarketPrice: number | null;
     _liveMarketPriceAt: number;
     _liveMarketPriceAttemptedAt: number;
+    _fillMidVerifyAttemptedAt: number;
     _lastSyncAt: number;
     _deferredRebalanceAt: number;
     _lastHeldPlanSignature: { boundaryIdx: number | null; pivot: number | null; fillsAt: number | null } | null;
@@ -915,6 +916,7 @@ class OrderManager implements OrderManagerLike {
         this._liveMarketPrice = null;
         this._liveMarketPriceAt = 0;
         this._liveMarketPriceAttemptedAt = 0;
+        this._fillMidVerifyAttemptedAt = 0;
         this._lastSyncAt = 0;
         this._deferredRebalanceAt = 0;
         this._lastHeldPlanSignature = null;
