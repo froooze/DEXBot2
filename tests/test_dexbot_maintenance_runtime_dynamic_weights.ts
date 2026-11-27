@@ -1186,6 +1186,55 @@ async function testRmsDivergenceRunsFullGridResync() {
     );
 }
 
+async function testLadderRebuildRunsFullGridResync() {
+    let resyncOptions = null;
+    let correctionCalled = false;
+    const logs = [];
+
+    installDivergenceMocks({
+        applyCorrections: async () => {
+            correctionCalled = true;
+        },
+        divergence: {
+            needsUpdate: true,
+            buy: { ratio: false, rms: false, rebuild: false, metric: 0 },
+            sell: { ratio: true, rms: false, rebuild: true, metric: 0, shrink: true },
+        },
+    });
+
+    const { executeMaintenanceLogic } = require('../modules/dexbot_maintenance_runtime');
+    const self = makeDivergenceSelf({
+        botKey: 'ladder-reset-bot-0',
+        logs,
+    });
+    self.updateOrdersOnChainBatch = async () => {
+        throw new Error('correction batch should not run for a stepped ladder rebuild');
+    };
+    self._performGridResync = async (options) => {
+        resyncOptions = options;
+        return true;
+    };
+
+    await executeMaintenanceLogic(self, 'unit-test-ladder');
+
+    assert.deepStrictEqual(resyncOptions, {
+        refreshCenterPrice: false,
+        centerRefreshContext: 'funds ladder grid resync',
+        centerRefreshLabel: 'funds ladder grid resync',
+        resetSource: 'funds_ladder_grid_resync',
+        clearLastFillGuards: false,
+    }, 'a stepped whole-side ladder must take the unconditional resync, not a gate-driven resize');
+    assert.strictEqual(correctionCalled, false, 'stepped ladder must not use the correction-only path');
+    assert.ok(
+        logs.some((msg) => msg.includes('[LADDER] Whole-side size ladder rebuild during unit-test-ladder')),
+        'ladder rebuild should be logged with [LADDER] tag'
+    );
+    assert.ok(
+        logs.some((msg) => msg.includes('TRIGGER-RESYNC (funds_ladder_grid_resync)')),
+        'ladder rebuild log should name the resync reason'
+    );
+}
+
 async function testSpreadCheckRunsWithoutDivergence() {
     let spreadChecked = false;
     let correctionCalled = false;
@@ -1392,6 +1441,7 @@ const STAGES = {
     market_adapter_bootstrap_trigger_reset: testMarketAdapterBootstrapTriggerResetRecordsBootstrapSource,
     market_adapter_slope_trigger_reset: testMarketAdapterSlopeTriggerResetRecordsSlopeSource,
     rms_divergence_runs_full_grid_resync: testRmsDivergenceRunsFullGridResync,
+    ladder_rebuild_runs_full_grid_resync: testLadderRebuildRunsFullGridResync,
     spread_check_runs_without_divergence: testSpreadCheckRunsWithoutDivergence,
     divergence_defers_when_fill_queued_mid_tick: testDivergenceDefersWhenFillQueuedMidTick,
     dexbot_class_perform_grid_resync_forwards_options: testDexbotClassPerformGridResyncForwardsOptions,
@@ -1431,6 +1481,8 @@ const STAGE_UNITS = [
         'market_adapter_slope_trigger_reset',
     ],
     'rms_divergence_runs_full_grid_resync',
+    // Own unit: installs its own stepped-ladder divergence mock.
+    'ladder_rebuild_runs_full_grid_resync',
     'spread_check_runs_without_divergence',
     // Installs its own divergence mock (queued-fill fixture) — keep as its own unit.
     'divergence_defers_when_fill_queued_mid_tick',

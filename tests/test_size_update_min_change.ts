@@ -257,11 +257,87 @@ async function testSkippedSlotKeepsBudgetForLaterSlots() {
     console.log('✓ SIZE-UPDATE-004 passed');
 }
 
+async function testVirtualSlotsReladderWithoutGate() {
+    console.log('\n[SIZE-UPDATE-005] virtual slots re-ladder to exact ideals without chain updates...');
+
+    const manager = new OrderManager({
+        assetA: 'TESTA',
+        assetB: 'TESTB',
+        startPrice: 100,
+        incrementPercent: 1,
+        targetSpreadPercent: 2,
+        coreOrders: { buy: 4, sell: 4 },
+        botFunds: { buy: 1000, sell: 1000 },
+        gridLimits: { SIZE_UPDATE_MIN_CHANGE_PERCENT: 3 }
+    });
+    manager.assets = {
+        assetA: { id: '1.3.1', symbol: 'TESTA', precision: 5 },
+        assetB: { id: '1.3.2', symbol: 'TESTB', precision: 5 }
+    };
+    manager.boundaryIdx = 4; // all four slots are BUY
+    manager.outOfSpread = 0;
+    manager._gridVersion = 1;
+
+    for (let i = 0; i < 4; i++) {
+        await manager._updateOrder({
+            id: `slot-${i}`,
+            price: 100 + i,
+            type: ORDER_TYPES.BUY,
+            state: i < 2 ? ORDER_STATES.ACTIVE : ORDER_STATES.VIRTUAL,
+            size: 100,
+            orderId: i < 2 ? `chain-${i}` : '',
+        });
+    }
+    await manager.setAccountTotals({ buy: 1000, sell: 1000, buyFree: 1000, sellFree: 1000 });
+    await manager.recalculateFunds();
+
+    // Capture the exact ideals with the gate disabled (reference ladder).
+    manager.config.gridLimits = { ...manager.config.gridLimits, SIZE_UPDATE_MIN_CHANGE_PERCENT: 0 };
+    const baselineGrid = new WorkingGrid(manager.orders, { baseVersion: manager._gridVersion });
+    const baseline = await _recalculateGridOrderSizesFromBlockchain(manager, ORDER_TYPES.BUY, { workingGrid: baselineGrid });
+    assert(baseline, 'baseline resize result exists');
+    const ideal = new Map<string, number>();
+    for (const slot of baselineGrid.values()) ideal.set(String(slot.id), Number(slot.size));
+    assert.strictEqual(ideal.size, 4, 'baseline covers all four slots');
+
+    // Every rung is 1% off its ideal — below the 3% emission gate. Committed
+    // slots must keep that stale size; VIRTUAL rungs must snap to the ideal
+    // because they never go on chain and a frozen sub-gate rung is what makes a
+    // ladder stepped across successive fill batches.
+    for (const slot of manager.orders.values()) {
+        await manager._updateOrder({ ...slot, size: ideal.get(String(slot.id))! * 1.01 });
+    }
+    // _updateOrder books the size delta against optimistic free balance; reset
+    // the chain view so the resize derives the same budget on every pass.
+    await manager.setAccountTotals({ buy: 1000, sell: 1000, buyFree: 1000, sellFree: 1000 });
+    await manager.recalculateFunds();
+
+    manager.config.gridLimits = { ...manager.config.gridLimits, SIZE_UPDATE_MIN_CHANGE_PERCENT: 3 };
+    const workingGrid = new WorkingGrid(manager.orders, { baseVersion: manager._gridVersion });
+    const result = await _recalculateGridOrderSizesFromBlockchain(manager, ORDER_TYPES.BUY, { workingGrid });
+    assert(result, 'resize result exists');
+    assert.strictEqual(result!.actions.length, 0, 'committed sub-threshold rungs still emit no UPDATE');
+    assert.strictEqual(result!.changed, true, 'virtual rungs must be re-laddered in the working grid');
+
+    for (let i = 0; i < 4; i++) {
+        const id = `slot-${i}`;
+        const after = Number(workingGrid.get(id)?.size);
+        if (i < 2) {
+            assert(Math.abs(after - ideal.get(id)! * 1.01) < 1e-5, `committed ${id} keeps its sub-threshold size`);
+        } else {
+            assert(Math.abs(after - ideal.get(id)!) < 1e-5, `virtual ${id} snaps to the exact ideal`);
+        }
+    }
+
+    console.log('✓ SIZE-UPDATE-005 passed');
+}
+
 async function main() {
     await testHelperSemantics();
     await testResizeEmissionGate();
     await testPostCapEmissionGate();
     await testSkippedSlotKeepsBudgetForLaterSlots();
+    await testVirtualSlotsReladderWithoutGate();
     console.log('\nAll size-update min-change tests passed.');
 }
 

@@ -182,6 +182,14 @@ const GRID_RESYNC_REASONS = Object.freeze({
         centerRefreshContext: 'RMS structural grid resync',
         centerRefreshLabel: 'RMS structural grid resync',
     },
+    // Whole-side ladder drift built up over several fill batches (boundary
+    // crawl + budget changes). A gate-driven resize only fixes the rungs past
+    // SIZE_UPDATE_MIN_CHANGE_PERCENT, so re-ladder from one budget unconditionally.
+    funds_ladder_grid_resync: {
+        shouldRefreshCenterPrice: false,
+        centerRefreshContext: 'funds ladder grid resync',
+        centerRefreshLabel: 'funds ladder grid resync',
+    },
 });
 
 /**
@@ -3069,6 +3077,32 @@ async function executeMaintenanceLogic(bot: BotLike, context: string) {
                 const divergence = await grid.monitorDivergence(bot.manager, calculatedGrid, persistedGridData);
 
                 if (divergence.needsUpdate) {
+                    // A stepped ladder (many rungs past the per-slot gate plus
+                    // residual sub-gate rungs) cannot be made monotone by the
+                    // gate-driven resize — it would only move the tall rungs
+                    // and leave the plateaus. Rebuild the whole side from one
+                    // budget instead, with no on-chain size churn per rung.
+                    const hasLadderRebuild = !!(divergence.buy.rebuild || divergence.sell.rebuild);
+                    if (hasLadderRebuild) {
+                        const rebuildSides = [
+                            divergence.buy.rebuild ? 'buy' : null,
+                            divergence.sell.rebuild ? 'sell' : null,
+                        ].filter(Boolean).join('+') || 'none';
+                        bot._log(
+                            `[LADDER] Whole-side size ladder rebuild during ${context} sides=${rebuildSides} ` +
+                            `→ TRIGGER-RESYNC (funds_ladder_grid_resync)`
+                        );
+                        let ok;
+                        if (typeof bot._performGridResync === 'function') {
+                            ok = await bot._performGridResync(buildGridResyncOptions('funds_ladder_grid_resync'));
+                        } else {
+                            ok = await performGridResync(bot, buildGridResyncOptions('funds_ladder_grid_resync'));
+                        }
+                        if (!ok) {
+                            bot._warn(`[LADDER] Funds ladder grid resync failed during ${context}; retaining existing grid state.`);
+                        }
+                        return;
+                    }
                     const hasRmsDivergence = !!(divergence.buy.rms || divergence.sell.rms);
                     if (divergence.buy.ratio || divergence.sell.ratio) {
                         const buyDir = divergence.buy.shrink ? '/shrink' : '';

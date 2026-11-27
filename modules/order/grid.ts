@@ -36,7 +36,8 @@
  *
  * GRID STATE CHECKING (2 functions)
  *   8. checkAndUpdateGridIfNeeded(manager) - Complete fund trigger: available-
- *       funds ratio + over-allocation + on-chain committed-drift legs
+ *       funds ratio + over-allocation + on-chain committed-drift + whole-side
+ *       ladder (VIRTUAL included) legs
  *   9. checkCommittedSizeDrift(manager) - Async committed-drift-only accessor
  *       (the drift core is folded into checkAndUpdateGridIfNeeded)
  *
@@ -587,6 +588,27 @@ import { getErrorMessage } from '../utils/errors.js';
 
 const calculateGapSlots = _mathGapSlots;
 export { calculateGapSlots };
+
+/**
+ * Whole-side ladder rebuild policy. These are deliberate fixed policy, not
+ * operator knobs: they decide when a stepped rail is expensive enough to
+ * justify an unconditional resync instead of the cheap in-memory resize.
+ * They are named here so the trade-off is visible and reviewable in one place.
+ */
+// A rail is "stepped" only when at least this many rungs (floor and share of
+// the rail) are past the per-slot emission gate — a single stale rung is a
+// job for the cheap resize.
+const LADDER_REBUILD_MIN_SIGNIFICANT_RUNGS = 3;
+const LADDER_REBUILD_SIGNIFICANT_SHARE = 0.1;
+// ...at least one COMMITTED rung is this far off the ideal. The floor keeps a
+// configured tiny emission gate from flagging ordinary small drift; the
+// margin keeps it above that gate (a uniform deposit takes the resize).
+const LADDER_REBUILD_MIN_DEVIATION_PCT = 5;
+const LADDER_REBUILD_DEVIATION_GATE_MARGIN_PCT = 2;
+// ...and at least this many COMMITTED sub-gate rungs would be left behind by a
+// gated resize. Virtual rungs are always re-laddered exactly in memory, so
+// they cannot justify cancel/recreate churn on their own.
+const LADDER_REBUILD_MIN_RESIDUAL_RUNGS = 3;
 
 export function isGridBloated(manager: OrderManagerLike, orders: ManagedOrder[] | Map<string, ManagedOrder>): { bloated: boolean; details?: { gridSize: number; placedCount: number; numBuyActive: number; numSellActive: number; gapSlots: number; maxAllowed: number; railEstimate: number } } {
         const gridSize = Array.isArray(orders) ? orders.length : orders.size;
@@ -2286,7 +2308,7 @@ export async function recalculateGrid(manager: OrderManagerLike, opts: { readOpe
      * @param {import('../types.js').OrderManagerLike} manager - Manager instance with order state
      * @returns {unknown}
      */
-export function checkAndUpdateGridIfNeeded(manager: OrderManagerLike): { buyUpdated: boolean; sellUpdated: boolean; buyShrink: boolean; sellShrink: boolean } {
+export function checkAndUpdateGridIfNeeded(manager: OrderManagerLike): { buyUpdated: boolean; sellUpdated: boolean; buyShrink: boolean; sellShrink: boolean; buyRebuild: boolean; sellRebuild: boolean } {
         const rawThreshold = manager.config?.gridLimits?.GRID_REGENERATION_PERCENTAGE;
         // NOTE: a configured 0 (or non-numeric) falls back to the global default
         // instead of disabling. 0 never worked as "disable" (ratio >= 0 is always
@@ -2297,7 +2319,11 @@ export function checkAndUpdateGridIfNeeded(manager: OrderManagerLike): { buyUpda
         const chainSnap = manager.getChainFundsSnapshot();
         const gridBuy = Number(manager.funds?.total?.grid?.buy || 0);
         const gridSell = Number(manager.funds?.total?.grid?.sell || 0);
-        const result = { buyUpdated: false, sellUpdated: false, buyShrink: false, sellShrink: false };
+        const result = {
+            buyUpdated: false, sellUpdated: false,
+            buyShrink: false, sellShrink: false,
+            buyRebuild: false, sellRebuild: false,
+        };
 
         const sides = [
             { name: 'buy', grid: gridBuy, orderType: ORDER_TYPES.BUY },
@@ -2389,6 +2415,17 @@ export function checkAndUpdateGridIfNeeded(manager: OrderManagerLike): { buyUpda
         result.sellUpdated = result.sellUpdated || driftResult.sellUpdated;
         result.buyShrink = result.buyShrink || driftResult.buyShrink;
         result.sellShrink = result.sellShrink || driftResult.sellShrink;
+
+        // Whole-side leg: every rung (VIRTUAL included) vs the same geometric
+        // ideal the resize writes. This closes the "active window only" blind
+        // spot and routes badly stepped rails to an unconditional rebuild.
+        const ladderResult = _computeSideLadderDriftSync(manager);
+        result.buyUpdated = result.buyUpdated || ladderResult.buyUpdated;
+        result.sellUpdated = result.sellUpdated || ladderResult.sellUpdated;
+        result.buyShrink = result.buyShrink || ladderResult.buyShrink;
+        result.sellShrink = result.sellShrink || ladderResult.sellShrink;
+        result.buyRebuild = ladderResult.buyRebuild;
+        result.sellRebuild = ladderResult.sellRebuild;
         return result;
     }
 
@@ -2558,6 +2595,221 @@ function _computeCommittedSizeDriftSync(manager: OrderManagerLike): { buyUpdated
     }
 
     /**
+     * Whole-side ladder drift check (virtual slots included).
+     *
+     * The resize path (_recalculateGridOrderSizesFromBlockchain) derives ONE
+     * geometric ideal for every slot on a side — ACTIVE/PARTIAL and VIRTUAL
+     * alike. A ladder assembled by several fill batches at different
+     * budgets/boundaries can therefore be visibly stepped while each active
+     * window stays under the old committed-only drift threshold
+     * (committedTotal denominator). This leg compares the WHOLE side against
+     * the resize's own ideal, replaying its denominator set (when no COW
+     * boundary shift is pending), both emission gates, the integer write gate
+     * and its free-balance growth cap for committed orders. VIRTUAL slots count
+     * in the metric and in "many rungs past the gate" even though they need no
+     * blockchain UPDATE — their sizes are rungs of the same ladder.
+     *
+     * A rail is flagged for rebuild (unconditional re-ladder) when many slots
+     * are past the per-slot update gate, a badly-off COMMITTED rung exists,
+     * and at least three COMMITTED sub-gate rungs would survive a gate-driven
+     * resize. Virtual rungs are deliberately excluded from both the badly-off
+     * and left-behind signals: the resize re-ladders them exactly in memory,
+     * so they must never drive cancel/recreate churn on their own. Cap-clipped
+     * no-ops are excluded too — with no free balance to grow into they would
+     * re-trigger every tick (see SIZE-UPDATE-003). Without that route a
+     * stepped on-chain ladder only smooths one rung per pass.
+     *
+     * @param {import('../types.js').OrderManagerLike} manager - Manager instance with order state
+     * @returns {{buyUpdated: boolean, sellUpdated: boolean, buyShrink: boolean, sellShrink: boolean, buyRebuild: boolean, sellRebuild: boolean}}
+     */
+    function _computeSideLadderDriftSync(manager: OrderManagerLike): { buyUpdated: boolean; sellUpdated: boolean; buyShrink: boolean; sellShrink: boolean; buyRebuild: boolean; sellRebuild: boolean } {
+        const result = {
+            buyUpdated: false, sellUpdated: false,
+            buyShrink: false, sellShrink: false,
+            buyRebuild: false, sellRebuild: false,
+        };
+        if (!manager || !manager.assets || !manager.orders) return result;
+
+        const rawThreshold = manager.config?.gridLimits?.GRID_REGENERATION_PERCENTAGE;
+        const threshold = (Number.isFinite(Number(rawThreshold)) && Number(rawThreshold) > 0)
+            ? Number(rawThreshold)
+            : GRID_LIMITS.GRID_REGENERATION_PERCENTAGE;
+        const minChangePct = resolveSizeUpdateMinChangePercent(manager.config);
+        // A ladder with this many gated slots, a badly off rung AND sub-gate
+        // committed residuals cannot be repaired by one gated pass. Keep the
+        // deviation floor well above SIZE_UPDATE_MIN_CHANGE_PERCENT so a
+        // healthy rail that absorbed a uniform deposit takes the cheaper resize.
+        const rebuildDeviationPct = Math.max(
+            LADDER_REBUILD_MIN_DEVIATION_PCT,
+            minChangePct + LADDER_REBUILD_DEVIATION_GATE_MARGIN_PCT
+        );
+
+        const sides = [
+            { name: 'buy' as const, orderType: ORDER_TYPES.BUY },
+            { name: 'sell' as const, orderType: ORDER_TYPES.SELL },
+        ];
+
+        for (const s of sides) {
+            const ctx = _computeSizingContextSync(manager, s.name);
+            if (!ctx || !(ctx.budget > 0)) continue;
+
+            // Mirror the resize's ideal: it sizes ONE geometric progression
+            // over every side slot. Non-slot-N shelf/manual orders stay in the
+            // denominator even though the resize never mutates them; SPREAD
+            // placeholders have a different type and are already excluded.
+            // VIRTUAL rungs are included — they are part of the same ladder
+            // even though they need no blockchain UPDATE. This sync check
+            // reads manager.orders, which is the resize's source whenever no
+            // COW boundary shift is pending; inside a shift the resize reads
+            // the working grid (to pick up SPREAD→side crossers) and the two
+            // denominators can differ for that tick.
+            const sideSlots = Array.from(manager.orders.values())
+                .filter((o) => o.type === s.orderType)
+                .sort((a, b) => a.price - b.price);
+            if (sideSlots.length === 0) continue;
+
+            let newSizes: number[];
+            try {
+                newSizes = calculateRotationOrderSizes(
+                    ctx.budget, 0, sideSlots.length, s.orderType, manager.config, ctx.precision
+                );
+            } catch (err) {
+                // A sizing error must not masquerade as "no ladder drift".
+                manager.logger?.log?.(
+                    `[DIVERGENCE] ${s.name.toUpperCase()} whole-side ladder check skipped: ` +
+                    `calculateRotationOrderSizes failed: ${getErrorMessage(err)}`,
+                    'warn'
+                );
+                continue;
+            }
+
+            const freeKey = s.name === 'buy' ? 'buyFree' : 'sellFree';
+            let sideFreeAvailable = Number(manager.accountTotals?.[freeKey] || 0)
+                * sharedAccountFreeShare(manager, s.name);
+
+            let currentTotal = 0;
+            let railSlotCount = 0;
+            let grow = 0;
+            let shrink = 0;
+            let significantCount = 0;
+            let residualCount = 0;
+            let maxDeviationPct = 0;
+            let committedMaxDeviationPct = 0;
+
+            for (let i = 0; i < sideSlots.length; i++) {
+                const slot = sideSlots[i];
+                // Shelf/manual orders are not rail rungs: skip them in the
+                // metric and the replay, exactly like the resize's per-slot
+                // mutation gate.
+                if (parseSlotIndex(slot?.id) === null) continue;
+                railSlotCount += 1;
+
+                const current = Number(slot.size || 0);
+                const ideal = Number(newSizes[i] || 0);
+                const delta = ideal - current;
+                currentTotal += current;
+
+                const scale = Math.max(Math.abs(current), Math.abs(ideal));
+                const deviationPct = scale > 0 ? (Math.abs(delta) / scale) * 100 : 0;
+                if (deviationPct > maxDeviationPct) maxDeviationPct = deviationPct;
+
+                const committed = isOrderOnChain(slot);
+                // Only a badly-off COMMITTED rung justifies a rebuild. Virtual
+                // rungs are re-laddered exactly in memory by the cheap resize,
+                // so a tall virtual rung must not drive cancel/recreate churn.
+                if (committed && deviationPct > committedMaxDeviationPct) {
+                    committedMaxDeviationPct = deviationPct;
+                }
+                const idealSignificant = isSignificantSizeChange(current, ideal, minChangePct, ctx.precision);
+                // The "many rungs past the gate" signal counts every rung,
+                // VIRTUAL included — they are all part of the ladder.
+                if (idealSignificant) significantCount += 1;
+                // A sub-gate residual only justifies a full rebuild when it is
+                // committed: the resize now writes the exact ideal into every
+                // VIRTUAL rung for free, so a virtual residual is repaired in
+                // memory and must not trigger cancel/recreate churn. Mirror the
+                // resize's integer write gate so sub-quantum noise is not a
+                // "left-behind rung" either.
+                else if (committed
+                    && floatToBlockchainInt(current, ctx.precision) !== floatToBlockchainInt(ideal, ctx.precision)) {
+                    residualCount += 1;
+                }
+
+                // Replay BOTH resize emission gates so grow/shrink equal the
+                // delta the resize can actually apply. A gated slot consumes
+                // no free balance in the resize either.
+                let applied = delta;
+                let nextFree = sideFreeAvailable;
+                if (committed) {
+                    if (!idealSignificant) continue;
+                    if (delta > 0) {
+                        applied = Math.min(delta, Math.max(0, sideFreeAvailable));
+                        nextFree = Math.max(0, sideFreeAvailable - applied);
+                    } else if (delta < 0) {
+                        nextFree = sideFreeAvailable + Math.abs(delta);
+                    }
+                    // The post-cap gate controls the emitted size; when it
+                    // skips, the free budget stays untouched. Do NOT count a
+                    // cap-clipped no-op as a residual: with no free balance to
+                    // grow into, flagging it would churn every tick (pinned by
+                    // SIZE-UPDATE-003). Only sub-gate residuals signal a
+                    // structurally stepped ladder.
+                    if (!isSignificantSizeChange(current, current + applied, minChangePct, ctx.precision)) continue;
+                }
+                sideFreeAvailable = nextFree;
+                // Mirror the resize's integer-space write gate: a VIRTUAL rung
+                // whose delta rounds to the same blockchain integer is never
+                // written, so it must not count toward grow/shrink.
+                if (floatToBlockchainInt(current, ctx.precision)
+                    === floatToBlockchainInt(current + applied, ctx.precision)) continue;
+                if (applied > 0) grow += applied;
+                else if (applied < 0) shrink += Math.abs(applied);
+            }
+
+            if (!(currentTotal > 0) || !(railSlotCount > 0)) continue;
+            const growPct = (grow / currentTotal) * 100;
+            const shrinkPct = (shrink / currentTotal) * 100;
+            const drifted = growPct >= threshold || shrinkPct >= threshold;
+            const stepped = significantCount >= Math.max(
+                    LADDER_REBUILD_MIN_SIGNIFICANT_RUNGS,
+                    Math.ceil(railSlotCount * LADDER_REBUILD_SIGNIFICANT_SHARE)
+                )
+                && committedMaxDeviationPct >= rebuildDeviationPct
+                && residualCount >= LADDER_REBUILD_MIN_RESIDUAL_RUNGS;
+
+            if (!drifted && !stepped) continue;
+
+            manager.logger?.log?.(
+                `[DIVERGENCE] ${s.name.toUpperCase()} whole-side ladder check: slots=${railSlotCount}, ` +
+                `current=${currentTotal.toFixed(5)}, grow=${grow.toFixed(5)}, shrink=${shrink.toFixed(5)}, ` +
+                `growth=${growPct.toFixed(4)}% (threshold=${threshold}%), shrinkPct=${shrinkPct.toFixed(4)}%, ` +
+                `significant=${significantCount}, residual=${residualCount}, maxDeviation=${maxDeviationPct.toFixed(4)}%, ` +
+                `committedMax=${committedMaxDeviationPct.toFixed(4)}% ` +
+                `→ ${drifted ? (shrinkPct >= threshold ? 'TRIGGER-SHRINK' : 'TRIGGER-GROW') : 'no drift trigger'} | ` +
+                `${stepped ? 'TRIGGER-REBUILD' : 'no rebuild trigger'}`,
+                'debug'
+            );
+
+            if (stepped) {
+                if (s.name === 'buy') result.buyRebuild = true;
+                else result.sellRebuild = true;
+            }
+            if (drifted || stepped) {
+                if (!(manager._gridSidesUpdated instanceof Set)) manager._gridSidesUpdated = new Set();
+                manager._gridSidesUpdated.add(s.orderType);
+                if (s.name === 'buy') {
+                    result.buyUpdated = true;
+                    if (shrinkPct >= threshold) result.buyShrink = true;
+                } else {
+                    result.sellUpdated = true;
+                    if (shrinkPct >= threshold) result.sellShrink = true;
+                }
+            }
+        }
+        return result;
+    }
+
+    /**
      * Async committed-drift accessor: refresh funds, then run the sync core.
      * Public for callers/tests that want the drift-only result; the complete
      * trigger is checkAndUpdateGridIfNeeded, which folds this core in.
@@ -2707,15 +2959,18 @@ export async function _recalculateGridOrderSizesFromBlockchain(manager: OrderMan
                 // unchanged); only the per-slot mutation below is skipped.
                 if (parseSlotIndex(slot?.id) === null) continue;
 
-                // Only resize slots whose ideal size differs by at least
-                // SIZE_UPDATE_MIN_CHANGE_PERCENT. The resize used to emit a
-                // limit_order_update for any one-satoshi difference; on a shared
-                // account the funds-ratio trigger fires every tick, so a ~0.04%
-                // drift produced a full batch of updates that the 0.1% commit
-                // equality gate refused after the ops had already landed.
-                // Skipping here leaves both the working grid and the chain
-                // untouched, so no batch is built for sub-threshold drift.
-                if (!isSignificantSizeChange(slot.size, newSizes[i], minChangePct, ctx.precision)) continue;
+                // Committed (on-chain) slots keep the SIZE_UPDATE_MIN_CHANGE_PERCENT
+                // gate: the resize used to emit a limit_order_update for any
+                // one-satoshi difference, and on a shared account a ~0.04% drift
+                // produced a full batch that the commit equality gate refused
+                // after the ops had landed (fee bleed). VIRTUAL slots never go
+                // on chain, so the gate does not apply to them — holding a
+                // sub-threshold virtual delta only freezes a stepped ladder:
+                // later batches re-derive ideals from that stale rung and the
+                // rail never converges to one geometric curve. Re-ladder the
+                // plan exactly; only the on-chain UPDATE emission stays gated.
+                const isCommitted = isOrderOnChain(slot);
+                if (isCommitted && !isSignificantSizeChange(slot.size, newSizes[i], minChangePct, ctx.precision)) continue;
 
                 let newSize = newSizes[i] || 0;
 
@@ -2726,7 +2981,6 @@ export async function _recalculateGridOrderSizesFromBlockchain(manager: OrderMan
                 // NOTE: BTS update fees are paid from BTS balance (separate from asset balance),
                 // so they don't affect this asset-side size cap. Fee budgets are tracked in
                 // funds.btsFeesOwed and reserved separately via btsFeesReservation.
-                const isCommitted = isOrderOnChain(slot);
                 let growthCap = 0;
                 let shrinkRelease = 0;
                 if (isCommitted) {
@@ -2752,7 +3006,9 @@ export async function _recalculateGridOrderSizesFromBlockchain(manager: OrderMan
                 // goes on chain: the commit equality gate compares this one, so
                 // a capped no-op would be refused after broadcast (fee bleed).
                 // Skipping here also leaves the side's free budget untouched.
-                if (!isSignificantSizeChange(slot.size, newSize, minChangePct, ctx.precision)) continue;
+                // VIRTUAL slots are exempt for the same reason as the first
+                // gate — they are not broadcast and must be re-laddered exactly.
+                if (isCommitted && !isSignificantSizeChange(slot.size, newSize, minChangePct, ctx.precision)) continue;
                 sideFreeAvailable = Math.max(0, sideFreeAvailable - growthCap + shrinkRelease);
 
                 // Use integer comparison to avoid redundant updates from float noise
@@ -3065,14 +3321,17 @@ export async function compareGrids(calculatedGrid: unknown[], persistedGrid: unk
 
     /**
      * Unified divergence monitoring.
-     * Performs both Ratio-based and RMS-based divergence checks.
-     * 
+     * Performs Ratio-based (funds, committed drift, whole-side ladder) and
+     * RMS-based divergence checks. `buy.rebuild` / `sell.rebuild` is set only
+     * for a stepped ladder that an unconditional resync must repair; it is
+     * independent of the RMS flags.
+     *
      * @param {import('../types.js').OrderManagerLike} manager - Manager instance
      * @param {Array<any>} calculatedGrid - Ideal/calculated grid
      * @param {Array<any>} persistedGrid - Current/persisted grid
      * @returns {Promise<any>}
      */
-export async function monitorDivergence(manager: OrderManagerLike, calculatedGrid: unknown[], persistedGrid: unknown[]): Promise<{ needsUpdate: boolean; buy: { updated: boolean; ratio: boolean; rms: boolean; metric: number; shrink: boolean }; sell: { updated: boolean; ratio: boolean; rms: boolean; metric: number; shrink: boolean }; orderType?: string | null; thresholdPct?: number }> {
+export async function monitorDivergence(manager: OrderManagerLike, calculatedGrid: unknown[], persistedGrid: unknown[]): Promise<{ needsUpdate: boolean; buy: { updated: boolean; ratio: boolean; rms: boolean; rebuild: boolean; metric: number; shrink: boolean }; sell: { updated: boolean; ratio: boolean; rms: boolean; rebuild: boolean; metric: number; shrink: boolean }; orderType?: string | null; thresholdPct?: number }> {
         // Refresh once so every leg sizes from one snapshot. The trigger itself
         // is sync and already folds the committed-drift legs in (see
         // checkAndUpdateGridIfNeeded), so there is no separate drift call here.
@@ -3087,12 +3346,14 @@ export async function monitorDivergence(manager: OrderManagerLike, calculatedGri
         const ratioSell = ratioResult.sellUpdated;
         const buyShrink = ratioResult.buyShrink === true;
         const sellShrink = ratioResult.sellShrink === true;
+        const buyRebuild = ratioResult.buyRebuild === true;
+        const sellRebuild = ratioResult.sellRebuild === true;
 
         if (ratioBuy || ratioSell) {
             return {
                 needsUpdate: true,
-                buy: { updated: ratioBuy, ratio: ratioBuy, rms: false, metric: 0, shrink: buyShrink },
-                sell: { updated: ratioSell, ratio: ratioSell, rms: false, metric: 0, shrink: sellShrink },
+                buy: { updated: ratioBuy, ratio: ratioBuy, rms: false, rebuild: buyRebuild, metric: 0, shrink: buyShrink },
+                sell: { updated: ratioSell, ratio: ratioSell, rms: false, rebuild: sellRebuild, metric: 0, shrink: sellShrink },
                 orderType: getOrderTypeFromUpdatedFlags(ratioBuy, ratioSell)
             };
         }
@@ -3100,13 +3361,16 @@ export async function monitorDivergence(manager: OrderManagerLike, calculatedGri
         // 2. Check RMS-based divergence (structural deviation)
         const rmsResult = await compareGrids(calculatedGrid, persistedGrid, manager);
         
-        const buyUpdated = rmsResult.buy.updated;
-        const sellUpdated = rmsResult.sell.updated;
-        
+        // Carry the ladder rebuild flag through BOTH branches. Today the
+        // ladder leg also sets `updated`, so the ratio branch above catches
+        // it, but the signal must not depend on that coupling.
+        const buyUpdated = rmsResult.buy.updated || buyRebuild;
+        const sellUpdated = rmsResult.sell.updated || sellRebuild;
+
         return {
             needsUpdate: buyUpdated || sellUpdated,
-            buy: { updated: buyUpdated, ratio: false, rms: rmsResult.buy.updated, metric: rmsResult.buy.metric, shrink: false },
-            sell: { updated: sellUpdated, ratio: false, rms: rmsResult.sell.updated, metric: rmsResult.sell.metric, shrink: false },
+            buy: { updated: buyUpdated, ratio: false, rms: rmsResult.buy.updated, rebuild: buyRebuild, metric: rmsResult.buy.metric, shrink: false },
+            sell: { updated: sellUpdated, ratio: false, rms: rmsResult.sell.updated, rebuild: sellRebuild, metric: rmsResult.sell.metric, shrink: false },
             orderType: getOrderTypeFromUpdatedFlags(buyUpdated, sellUpdated),
             thresholdPct: rmsResult.thresholdPct
         };

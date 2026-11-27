@@ -382,6 +382,17 @@ code paths and log differently:
 The structural-recovery path is debounced through `_structuralGridResyncTimer`
 and dedupes while one resync is already pending or running.
 
+A third full-resync reason, `funds_ladder_grid_resync`, comes from the
+whole-side ladder check (not RMS). It fires when many rungs are past the
+per-slot `SIZE_UPDATE_MIN_CHANGE_PERCENT` gate, a badly-off **committed** rung
+exists, and at least three committed sub-gate rungs would be left behind by a
+gated resize — a stepped on-chain rail that a gate-driven resize would only
+partially fix. Virtual rungs never drive this decision: the cheap resize writes
+their exact ideals in memory. Cap-clipped no-ops are excluded as well, since
+with no free balance to grow into they would re-trigger every tick. It uses
+`refreshCenterPrice: false` (geometry-preserving, like the RMS path) and logs
+`[LADDER] Whole-side size ladder rebuild ... → TRIGGER-RESYNC (funds_ladder_grid_resync)`.
+
 ### Configuration
 
 **File:** `profiles/general.settings.json`
@@ -479,8 +490,9 @@ GRID_LIMITS: {
   - Grow (committed drift): the on-chain (ACTIVE/PARTIAL) orders lag their geometric ideal by ≥3% of the committed size — catches an external deposit that the fill/rotation pipeline already folded into `virtual`, which blinds the `availableFunds = chainFree − virtual` ratio
   - Shrink: grid-tracked size (ACTIVE + PARTIAL + VIRTUAL) exceeds allocation by ≥3% (external fund removal resizes affected orders down; per-side chain totals are not used — fills move value across sides)
   - Shrink (committed drift): the on-chain orders exceed their geometric ideal by ≥3% of the committed size (external withdrawal)
-- `SIZE_UPDATE_MIN_CHANGE_PERCENT`: per-slot emission gate on the resize path (default: `3%`). A trigger above resizes the side as a whole, but an individual order is only updated on chain when its own ideal-vs-current size difference reaches this threshold. Sub-threshold slots stay untouched in both the working grid and the chain. The resolved value is clamped to `RELATIVE_ORDER_UPDATE_THRESHOLD_PERCENT` so an emission below the commit-time equality tolerance can never be broadcast (such a batch was refused at commit after the ops had already landed on chain). A configured `0` means "smallest safe threshold", not the old one-satoshi behavior; to go below the default 0.1% commit floor, lower both knobs.
-  - Trade-off: convergence is per-slot. Many slots each drifting <3% do not trigger a resize even if their cumulative misallocation is large, because no individual UPDATE would be emitted. This is deliberate: sub-threshold churn costs fees without changing the book.
+  - Whole-side ladder: every rail rung on a side (VIRTUAL included) is compared against the same geometric ideal the resize writes. The ideal progression includes shelf/manual side orders in its denominator, while the drift numerator sums only rail rungs — the same split the resize uses. A stepped rail assembled by several fill batches at different budgets/boundaries is caught even when its active window stays below the committed-only threshold. When many rungs are past the per-slot gate, a badly-off **committed** rung exists, and at least three committed sub-gate rungs would be left behind, the side is routed to an unconditional grid resync (`funds_ladder_grid_resync`) instead of a gate-driven resize. Virtual rungs never drive that decision — the cheap in-memory resize re-ladders them exactly; cap-clipped no-ops are excluded to avoid a per-tick re-trigger. The rebuild thresholds (3 significant-rung floor, 10% of the rail, 3 left-behind committed rungs, 5% committed max deviation with a 2% margin over the emission gate) are fixed policy, not config knobs.
+- `SIZE_UPDATE_MIN_CHANGE_PERCENT`: per-slot emission gate on the resize path (default: `3%`). A trigger above resizes the side as a whole, but a committed order is only updated on chain when its own ideal-vs-current size difference reaches this threshold. Sub-threshold on-chain slots stay untouched. VIRTUAL slots are exempt: they never broadcast, and holding a sub-threshold virtual rung freezes its step into the next fill batch's ideal, so the resize writes the exact ideal into the working grid for them. The resolved value is clamped to `RELATIVE_ORDER_UPDATE_THRESHOLD_PERCENT` so an emission below the commit-time equality tolerance can never be broadcast (such a batch was refused at commit after the ops had already landed on chain). A configured `0` means "smallest safe threshold", not the old one-satoshi behavior; to go below the default 0.1% commit floor, lower both knobs.
+  - Trade-off: on-chain convergence is per-slot. Many committed slots each drifting <3% do not emit an UPDATE even if their cumulative misallocation is large, because sub-threshold churn costs fees without changing the book. The VIRTUAL plan is not subject to that trade-off — it is re-laddered in memory at no cost.
   - The gate is applied to the size **emitted after the funding cap**, not only to the geometric ideal: a cap can clip a significant ideal to a sub-threshold change, which commit would treat as a no-op.
   - Operator-visible change: configuring `RELATIVE_ORDER_UPDATE_THRESHOLD_PERCENT: 0` no longer disables the commit ratio check; it falls back to the `0.1%` default. The emission denominator is `max(current, proposed)`, matching commit, so a change exactly at the threshold is not emitted.
 
@@ -488,9 +500,9 @@ GRID_LIMITS: {
 
 1. **OrderManager** tracks available funds per side (BUY and SELL separately)
 2. Allocated capital = number of active orders × size per order
-3. When `availableFunds / allocatedCapital × 100 >= GRID_REGENERATION_PERCENTAGE`, OR the committed-drift leg flags the side (on-chain orders ≥threshold off their geometric ideal):
-   - Triggers `Grid.recalculateGrid()` on that side only
-   - Recalculates order sizes to incorporate freed capital
+3. When `availableFunds / allocatedCapital × 100 >= GRID_REGENERATION_PERCENTAGE`, OR a drift leg flags the side (on-chain orders ≥threshold off their geometric ideal, or the whole-side ladder ≥threshold off the geometric ideal):
+   - Triggers `Grid.recalculateGrid()` on that side only; a stepped whole-side ladder instead triggers `funds_ladder_grid_resync`, which rebuilds the whole grid from one budget
+   - Recalculates order sizes to incorporate freed capital (VIRTUAL rungs re-ladder in memory; only on-chain rungs past the emission gate are broadcast)
    - Maintains asymmetric fills (BUY fills don't trigger SELL resize)
    - The committed-drift leg is what keeps a deposit that was absorbed into the VIRTUAL reservation from silently leaving the on-chain side un-resized
 4. After the resize, available funds are re-allocated into active orders

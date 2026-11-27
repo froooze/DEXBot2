@@ -536,6 +536,301 @@ async function runTests() {
         assert.strictEqual(smallPartialDrift.sellUpdated, false, 'a sub-threshold partial-fill remainder must not churn a full-side resize');
     }
 
+    console.log(' - Testing whole-side ladder drift flags a stepped rail for rebuild...');
+    {
+        // Regression: a rail assembled by several fill batches at different
+        // budgets/boundaries is visibly stepped while the active window stays
+        // below the old committed-only drift threshold. The whole-side leg
+        // must flag a rebuild (gate-driven resize leaves residual rungs).
+        const BUDGET = 1000;
+        const PRECISION = 8;
+        const SLOT_COUNT = 40;
+        const config = {
+            assetA: 'USD',
+            assetB: 'EUR',
+            incrementPercent: 0.3,
+            targetSpreadPercent: 1.5,
+            weightDistribution: { buy: 1, sell: 0.5 },
+            coreOrders: { buy: 5, sell: 5 },
+            min_BTS_value: null,
+            gridLimits: { GRID_REGENERATION_PERCENTAGE: 3, SIZE_UPDATE_MIN_CHANGE_PERCENT: 3 },
+        };
+        const ideal = calculateRotationOrderSizes(
+            BUDGET, 0, SLOT_COUNT, ORDER_TYPES.SELL, config, PRECISION
+        );
+        const buildManager = (stepped: boolean) => {
+            const slots = ideal.map((size, i) => {
+                // Active slots sit in the sub-gate plateau so the committed-only
+                // leg stays blind; the stepped rungs are mostly VIRTUAL.
+                const active = stepped && i >= 10 && i < 15;
+                let actual = size;
+                if (stepped) {
+                    if (i < 10 || i >= 30) actual = size * 1.07;      // 7% tall rungs
+                    else actual = size * 0.975;                       // 2.5% residual plateau
+                    // One committed rung is badly off: the rebuild policy
+                    // requires an on-chain rung past the deviation floor so a
+                    // tall VIRTUAL rung cannot drive a resync on its own.
+                    if (i === 10) actual = size * 1.07;
+                }
+                return {
+                    id: `slot-${100 + i}`,
+                    type: ORDER_TYPES.SELL,
+                    state: active ? ORDER_STATES.ACTIVE : ORDER_STATES.VIRTUAL,
+                    orderId: active ? `1.7.${i}` : '',
+                    price: 100 + i * 0.01,
+                    size: actual,
+                };
+            });
+            return {
+                assets: {
+                    assetA: { id: '1.3.0', symbol: 'USD', precision: PRECISION },
+                    assetB: { id: '1.3.1', symbol: 'EUR', precision: PRECISION },
+                },
+                config,
+                orders: new Map(slots.map((s) => [s.id, s])),
+                funds: {
+                    total: { grid: { buy: 0, sell: BUDGET } },
+                    virtual: { buy: 0, sell: 0 },
+                    btsFeesOwed: 0,
+                    btsBalance: null,
+                },
+                accountTotals: { buyFree: 0, sellFree: 0 },
+                _gridSidesUpdated: new Set<string>(),
+                logger: { log: () => {} },
+                recalculateFunds: async () => {},
+                getChainFundsSnapshot() {
+                    return {
+                        allocatedBuy: 0, allocatedSell: BUDGET,
+                        chainTotalBuy: 0, chainTotalSell: BUDGET,
+                        btsBalance: null,
+                    };
+                },
+            };
+        };
+
+        const smoothManager = buildManager(false);
+        const smooth = checkAndUpdateGridIfNeeded(smoothManager);
+        assert.strictEqual(smooth.sellRebuild, false, 'a clean ladder must not request a rebuild');
+        assert.strictEqual(smooth.sellUpdated, false, 'a clean ladder must not trigger a resize');
+
+        const steppedManager = buildManager(true);
+        const committedOnly = await checkCommittedSizeDrift(steppedManager);
+        assert.strictEqual(committedOnly.sellUpdated, false, 'precondition: active-window metrics stay under threshold');
+        const stepped = checkAndUpdateGridIfNeeded(steppedManager);
+        assert.strictEqual(stepped.sellUpdated, true, 'stepped whole-side ladder must trigger an update');
+        assert.strictEqual(stepped.sellRebuild, true, 'stepped whole-side ladder must request an unconditional rebuild');
+        assert.ok(steppedManager._gridSidesUpdated.has(ORDER_TYPES.SELL), 'sell side must be flagged for the full-side resize');
+
+        // monitorDivergence must expose the rebuild signal separately from RMS
+        // so the maintenance runtime routes it to the unconditional resync.
+        steppedManager._gridSidesUpdated = new Set();
+        const diverged = await monitorDivergence(steppedManager, [], []);
+        assert.strictEqual(diverged.needsUpdate, true, 'stepped ladder must request a divergence update');
+        assert.strictEqual(diverged.sell.rebuild, true, 'rebuild must reach the divergence result');
+        assert.strictEqual(diverged.sell.rms, false, 'ladder rebuild must not be reported as RMS divergence');
+        assert.strictEqual(diverged.buy.rebuild, false, 'the healthy buy side must not rebuild');
+    }
+
+    console.log(' - Testing whole-side ladder shares the resize denominator with shelf orders...');
+    {
+        // The resize sizes ONE geometric progression over every side slot.
+        // Non-slot-N shelf orders stay in the denominator even though they are
+        // never mutated. The trigger must use that same denominator or it
+        // misses a rail the resize would re-size (review finding).
+        const BUDGET = 1000;
+        const PRECISION = 8;
+        const SLOT_COUNT = 40;
+        const config = {
+            assetA: 'USD',
+            assetB: 'EUR',
+            incrementPercent: 0.3,
+            targetSpreadPercent: 1.5,
+            weightDistribution: { buy: 1, sell: 0.5 },
+            coreOrders: { buy: 5, sell: 5 },
+            min_BTS_value: null,
+            gridLimits: { GRID_REGENERATION_PERCENTAGE: 3, SIZE_UPDATE_MIN_CHANGE_PERCENT: 3 },
+        };
+        const ideal = calculateRotationOrderSizes(
+            BUDGET, 0, SLOT_COUNT, ORDER_TYPES.SELL, config, PRECISION
+        );
+        const slots = ideal.map((size, i) => ({
+            id: `slot-${100 + i}`,
+            type: ORDER_TYPES.SELL,
+            state: ORDER_STATES.VIRTUAL,
+            price: 100 + i * 0.01,
+            size,
+            orderId: '',
+        }));
+        // Ten deep shelf orders dilute the geometric denominator: the same
+        // budget now spreads over 50 slots, so each rail rung is ~20% too tall.
+        for (let i = 0; i < 10; i++) {
+            slots.push({
+                id: `deep-${i}`,
+                type: ORDER_TYPES.SELL,
+                state: ORDER_STATES.VIRTUAL,
+                price: 1 + i * 0.01,
+                size: 1,
+                orderId: '',
+            });
+        }
+        const manager = {
+            assets: {
+                assetA: { id: '1.3.0', symbol: 'USD', precision: PRECISION },
+                assetB: { id: '1.3.1', symbol: 'EUR', precision: PRECISION },
+            },
+            config,
+            orders: new Map(slots.map((s) => [s.id, s])),
+            funds: {
+                total: { grid: { buy: 0, sell: BUDGET } },
+                virtual: { buy: 0, sell: 0 },
+                btsFeesOwed: 0,
+                btsBalance: null,
+            },
+            accountTotals: { buyFree: 0, sellFree: 0 },
+            _gridSidesUpdated: new Set<string>(),
+            logger: { log: () => {} },
+            recalculateFunds: async () => {},
+            getChainFundsSnapshot() {
+                return {
+                    allocatedBuy: 0, allocatedSell: BUDGET,
+                    chainTotalBuy: 0, chainTotalSell: BUDGET,
+                    btsBalance: null,
+                };
+            },
+        };
+
+        const result = checkAndUpdateGridIfNeeded(manager);
+        assert.strictEqual(result.sellUpdated, true, 'the trigger must see the same diluted denominator the resize writes');
+        assert.strictEqual(result.sellRebuild, false, 'a uniform whole-rail shrink takes the cheaper gate-driven resize');
+        assert.strictEqual(result.buyUpdated, false, 'the empty buy side stays quiet');
+    }
+
+    console.log(' - Testing virtual-only sub-gate residuals use the cheap resize...');
+    {
+        // Review finding: a sub-gate VIRTUAL rung is repaired for free by the
+        // resize (it writes the exact ideal in memory). Counting it as a
+        // "left-behind rung" would route an all-virtual stepped rail to an
+        // unnecessary full resync with cancel/recreate churn.
+        const BUDGET = 1000;
+        const PRECISION = 8;
+        const SLOT_COUNT = 40;
+        const config = {
+            assetA: 'USD',
+            assetB: 'EUR',
+            incrementPercent: 0.3,
+            targetSpreadPercent: 1.5,
+            weightDistribution: { buy: 1, sell: 0.5 },
+            coreOrders: { buy: 5, sell: 5 },
+            min_BTS_value: null,
+            gridLimits: { GRID_REGENERATION_PERCENTAGE: 3, SIZE_UPDATE_MIN_CHANGE_PERCENT: 3 },
+        };
+        const ideal = calculateRotationOrderSizes(
+            BUDGET, 0, SLOT_COUNT, ORDER_TYPES.SELL, config, PRECISION
+        );
+        const slots = ideal.map((size, i) => ({
+            id: `slot-${100 + i}`,
+            type: ORDER_TYPES.SELL,
+            state: ORDER_STATES.VIRTUAL,
+            orderId: '',
+            price: 100 + i * 0.01,
+            // Ten badly tall rungs drive the whole-side drift trigger; the
+            // other thirty are sub-gate residuals. All are VIRTUAL, so no
+            // committed rung can be left behind by a gated resize.
+            size: i < 10 ? size * 2 : size * 0.975,
+        }));
+        const manager = {
+            assets: {
+                assetA: { id: '1.3.0', symbol: 'USD', precision: PRECISION },
+                assetB: { id: '1.3.1', symbol: 'EUR', precision: PRECISION },
+            },
+            config,
+            orders: new Map(slots.map((s) => [s.id, s])),
+            funds: {
+                total: { grid: { buy: 0, sell: BUDGET } },
+                virtual: { buy: 0, sell: 0 },
+                btsFeesOwed: 0,
+                btsBalance: null,
+            },
+            accountTotals: { buyFree: 0, sellFree: 0 },
+            _gridSidesUpdated: new Set<string>(),
+            logger: { log: () => {} },
+            recalculateFunds: async () => {},
+            getChainFundsSnapshot() {
+                return {
+                    allocatedBuy: 0, allocatedSell: BUDGET,
+                    chainTotalBuy: 0, chainTotalSell: BUDGET,
+                    btsBalance: null,
+                };
+            },
+        };
+
+        const result = checkAndUpdateGridIfNeeded(manager);
+        assert.strictEqual(result.sellUpdated, true, 'the whole-side drift must still trigger a cheap resize');
+        assert.strictEqual(result.sellRebuild, false, 'virtual-only residuals must not request a full resync');
+        assert.strictEqual(result.buyUpdated, false, 'the empty buy side stays quiet');
+    }
+
+    console.log(' - Testing a single small committed residual cannot force a resync...');
+    {
+        // Repro from review: virtual rungs are badly stepped and drift the
+        // whole side, but the only committed rung left behind is 2.5% off.
+        // The cheap resize fixes all 39 virtual rungs in memory; a full
+        // cancel/recreate resync would buy no extra convergence.
+        const BUDGET = 1000;
+        const PRECISION = 8;
+        const SLOT_COUNT = 40;
+        const config = {
+            assetA: 'USD',
+            assetB: 'EUR',
+            incrementPercent: 0.3,
+            targetSpreadPercent: 1.5,
+            weightDistribution: { buy: 1, sell: 0.5 },
+            coreOrders: { buy: 5, sell: 5 },
+            min_BTS_value: null,
+            gridLimits: { GRID_REGENERATION_PERCENTAGE: 3, SIZE_UPDATE_MIN_CHANGE_PERCENT: 3 },
+        };
+        const ideal = calculateRotationOrderSizes(
+            BUDGET, 0, SLOT_COUNT, ORDER_TYPES.SELL, config, PRECISION
+        );
+        const slots = ideal.map((size, i) => ({
+            id: `slot-${100 + i}`,
+            type: ORDER_TYPES.SELL,
+            state: i === 10 ? ORDER_STATES.ACTIVE : ORDER_STATES.VIRTUAL,
+            orderId: i === 10 ? '1.7.10' : '',
+            price: 100 + i * 0.01,
+            size: i < 10 ? size * 2 : size * 0.975,
+        }));
+        const manager = {
+            assets: {
+                assetA: { id: '1.3.0', symbol: 'USD', precision: PRECISION },
+                assetB: { id: '1.3.1', symbol: 'EUR', precision: PRECISION },
+            },
+            config,
+            orders: new Map(slots.map((s) => [s.id, s])),
+            funds: {
+                total: { grid: { buy: 0, sell: BUDGET } },
+                virtual: { buy: 0, sell: 0 },
+                btsFeesOwed: 0,
+                btsBalance: null,
+            },
+            accountTotals: { buyFree: 0, sellFree: 0 },
+            _gridSidesUpdated: new Set<string>(),
+            logger: { log: () => {} },
+            recalculateFunds: async () => {},
+            getChainFundsSnapshot() {
+                return {
+                    allocatedBuy: 0, allocatedSell: BUDGET,
+                    chainTotalBuy: 0, chainTotalSell: BUDGET,
+                    btsBalance: null,
+                };
+            },
+        };
+
+        const result = checkAndUpdateGridIfNeeded(manager);
+        assert.strictEqual(result.sellUpdated, true, 'the whole-side drift must still trigger the cheap resize');
+        assert.strictEqual(result.sellRebuild, false, 'one sub-gate committed rung must not justify cancel/recreate churn');
+    }
+
     console.log(' - Testing initializeGrid with case-insensitive AMA mode and out-of-bounds startPrice...');
     {
         const botKey = `test-grid-ama-${process.pid}-case`;
