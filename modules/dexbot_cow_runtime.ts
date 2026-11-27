@@ -15,6 +15,7 @@ import { BroadcastUncertainError as BroadcastUncertainErrorBinding } from './dex
 const BroadcastUncertainError = BroadcastUncertainErrorBinding;
 import * as orderUtils from './order/utils/order.js';
 import { lazyShim } from './lazy_shim.js';
+import { getLazyBitSharesClient as guardMarketClient } from './lazy_client_access.js';
 import { sleep, setLastFillPivot, fireStructuralResync, evaluateSpreadCorrectionReadiness, resolveLastFillGuardReference, resolveSpreadCrossingFloor, isLastFillGuardBlocked, evaluateLastFillGuard, extractGoneOrderIds, extractUpdateTargetOrderIds, hasLiveRefusedFillLevels, verifyFillMarketReference, fillEvidenceFromEconomics } from './order/utils/system.js';
 const {
     buildCreateOrderArgs,
@@ -2472,25 +2473,6 @@ function latestQueuedFillEvidence(bot: BotLike): { price: number; type: string }
         }
     }
     return latest;
-}
-
-/** Cached lazy client: this runtime deliberately avoids a static client import. */
-let guardMarketClientPromise: Promise<unknown> | null = null;
-function guardMarketClient(): Promise<unknown> {
-    if (!guardMarketClientPromise) {
-        guardMarketClientPromise = import('./bitshares_client.js')
-            .then((m) => {
-                if (!m.BitShares) throw new Error('BitShares client export missing');
-                return m.BitShares;
-            })
-            .catch(() => {
-                // A transient module-load failure must not disable market
-                // verification for the rest of the process.
-                guardMarketClientPromise = null;
-                return null;
-            });
-    }
-    return guardMarketClientPromise;
 }
 
 /**

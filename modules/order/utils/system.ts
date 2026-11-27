@@ -1292,6 +1292,11 @@ export function resolveSpreadFreshnessMs(manager: OrderManagerLike): number {
  * without weakening the 10-minute spread-correction pacing. Falls back to the
  * shared freshness window when unset, so the bound is never infinite.
  *
+ * Returns the RAW knob. The forced read in maybeRefreshLiveMarketPrice widens
+ * it to at least resolveFillMidVerifyTimeoutMs so a full-length read cannot
+ * hand the next veto candidate a fresh window; any other caller reusing this
+ * resolver for pacing must apply the same widening itself.
+ *
  * @param {Object} manager - OrderManager instance
  * @returns {number} Pacing window in ms (> 0)
  */
@@ -1418,9 +1423,10 @@ export async function refreshLiveMarketPrice(manager: OrderManagerLike, BitShare
  * @param {Object} [options]
  * @param {number} [options.now] - Injectable clock (tests)
  * @param {boolean} [options.force=false] - Re-read even when the cache is fresh (fill-path verification)
+ * @param {{value: boolean}} [options.didRead] - Out-param set true only when a book read was actually attempted (never on the paced-out / no-client shortcuts)
  * @returns {Promise<number|null>} Cached/new price or null
  */
-export async function maybeRefreshLiveMarketPrice(manager: OrderManagerLike, BitShares: unknown, options: { now?: number; force?: boolean } = {}): Promise<number | null> {
+export async function maybeRefreshLiveMarketPrice(manager: OrderManagerLike, BitShares: unknown, options: { now?: number; force?: boolean; didRead?: { value: boolean } } = {}): Promise<number | null> {
     const now = Number.isFinite(options?.now) ? Number(options.now) : Date.now();
     const force = options?.force === true;
     const freshMs = resolveSpreadFreshnessMs(manager);
@@ -1434,7 +1440,13 @@ export async function maybeRefreshLiveMarketPrice(manager: OrderManagerLike, Bit
         return cached;
     }
     const attemptedAt = Number(force ? manager?._fillMidVerifyAttemptedAt : manager?._liveMarketPriceAttemptedAt);
-    const paceMs = force ? resolveFillMidVerifyMs(manager) : freshMs;
+    // A forced read may take as long as its per-read cap. Widen the pacing
+    // window to at least that cap so consecutive veto candidates cannot each
+    // block the fill path for a full timeout. The stamp stays BEFORE the read:
+    // it also prevents overlapping forced reads from concurrent callers.
+    const paceMs = force
+        ? Math.max(resolveFillMidVerifyMs(manager), resolveFillMidVerifyTimeoutMs(manager))
+        : freshMs;
     if (paceMs > 0 && Number.isFinite(attemptedAt) && attemptedAt > 0 && (now - attemptedAt) <= paceMs) {
         return force ? cached : null; // attempted recently; do not storm the chain
     }
@@ -1453,6 +1465,7 @@ export async function maybeRefreshLiveMarketPrice(manager: OrderManagerLike, Bit
     }
     if (force) manager._fillMidVerifyAttemptedAt = now;
     else manager._liveMarketPriceAttemptedAt = now;
+    if (options.didRead) options.didRead.value = true;
     let readActive = true;
     const refreshed = await withTimeout<number | null>(
         refreshLiveMarketPrice(manager, BitShares, () => readActive),
@@ -3162,9 +3175,9 @@ export function fillEvidenceFromEconomics(
  *
  * offMarketFill judges every fill against the cached book mid. Time-based
  * freshness alone cannot catch a mid that is seconds old yet wrong in value
- * after a fast move (live 2026-11-26: one bot cached 1739.24 at 16:14:27 and
- * refused ten fills at 1683–1703 as premium sweeps; the sibling bot's older
- * cache had failed open, refreshed to 1702.76 and re-placed its rails normally).
+ * after a fast move (live 2026-11-26: one bot cached `<cached-mid>` and refused
+ * ten fills across a sweep as premium sweeps; the sibling bot's older cache had
+ * failed open, refreshed to the current market level and re-placed normally).
  *
  * This helper keeps ONE classifier (offMarketFill) and ONE price writer
  * (refreshLiveMarketPrice). It only changes WHEN the book is read: before the
@@ -3187,6 +3200,23 @@ export async function verifyFillMarketReference(
     options: { now?: number } = {}
 ): Promise<number | null> {
     if (!manager || !Array.isArray(fills) || fills.length === 0) return null;
+    // Only fills the writer can actually veto are worth a forced read.
+    // recordLastFilledPrices skips edge-pinned fills and gap-band residuals
+    // BEFORE the pivot writer runs, so a read for those batches would burn an
+    // RPC for a veto that can never be applied. Reuse both shared classifiers
+    // so the gate and the writer cannot disagree on eligibility. Economics-
+    // derived unmatched fills carry no slot id and stay eligible — they DO
+    // write the pivot at the attribution sites.
+    let edgeFillIds: Set<string> | null = null;
+    let gapSlots: number | null = null;
+    const boundaryIdx = (manager as unknown as { boundaryIdx?: number | string | null })?.boundaryIdx;
+    try {
+        edgeFillIds = OrderUtils.collectEdgePinnedFillIds(
+            manager as unknown as Parameters<typeof OrderUtils.collectEdgePinnedFillIds>[0],
+            fills as Array<{ id?: string; type?: string }>
+        );
+        gapSlots = MathUtils.resolveGapSlots(manager);
+    } catch { /* unreadable geometry: keep every candidate eligible (fail open) */ }
     const candidates: Array<{ type: string; price: number }> = [];
     for (const raw of fills) {
         const item = raw as {
@@ -3216,6 +3246,14 @@ export async function verifyFillMarketReference(
                 price = Number((slot as { price?: unknown } | null)?.price);
             } catch { price = NaN; }
         }
+        const fillId = item?.id != null ? String(item.id) : null;
+        if (fillId && edgeFillIds?.has(fillId)) continue;
+        if (fillId) {
+            try {
+                const idx = parseSlotIndex(fillId);
+                if (OrderUtils.geometryTypeForSlotIndex(idx, boundaryIdx, gapSlots) === ORDER_TYPES.SPREAD) continue;
+            } catch { /* unreadable geometry — treat as eligible */ }
+        }
         if ((type === ORDER_TYPES.BUY || type === ORDER_TYPES.SELL) && Number.isFinite(price) && price > 0) {
             candidates.push({ type, price });
         }
@@ -3225,17 +3263,24 @@ export async function verifyFillMarketReference(
     if (!candidates.some((c) => offMarketFill(manager, c.type, c.price))) return null;
 
     const before = Number(manager?._liveMarketPrice);
-    const beforeAt = Number(manager?._liveMarketPriceAt);
-    const refreshed = await maybeRefreshLiveMarketPrice(manager, BitShares, { force: true, now: options?.now });
+    const hasClientSurface = Boolean((BitShares as { db?: unknown } | null | undefined)?.db);
+    const readState = { value: false };
+    const refreshed = await maybeRefreshLiveMarketPrice(manager, BitShares, { force: true, now: options?.now, didRead: readState });
     if (refreshed == null) {
+        // A missing client is not a failed read: the price owner skips it
+        // without stamping the forced clock. Warn only when a real book read
+        // was attempted and came back unusable, so a dry/no-client path with a
+        // cached mid does not warn once per fill chunk.
         manager.logger?.log?.(
-            '[LAST-FILL-GUARD] Off-market fill candidate could not re-verify the live mid; '
-            + `cached ${Number.isFinite(before) && before > 0 ? before : 'none'} retained — veto policy unchanged`,
-            'warn'
+            hasClientSurface
+                ? '[LAST-FILL-GUARD] Off-market fill candidate could not re-verify the live mid; '
+                    + `cached ${Number.isFinite(before) && before > 0 ? before : 'none'} retained — veto policy unchanged`
+                : '[LAST-FILL-GUARD] Off-market fill candidate not re-verified: no order-book client; cached veto policy unchanged',
+            hasClientSurface ? 'warn' : 'debug'
         );
         return null;
     }
-    if (Number(manager?._liveMarketPriceAt) === beforeAt) {
+    if (!readState.value) {
         manager.logger?.log?.('[LAST-FILL-GUARD] Live mid verification paced out; cached veto policy unchanged', 'debug');
         return refreshed;
     }

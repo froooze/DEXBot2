@@ -453,6 +453,101 @@ async function main() {
             'a full-grid-step move must free it');
     });
 
+    await run('MID-20 fills the writer skips cannot force a verification read', async () => {
+        const calls = { n: 0 };
+        // boundary=100, gap=3 => slots 101..102 are the gap band. collectEdgePinnedFillIds
+        // sees no orders, so only the geometry filter can skip the fill.
+        const mgr: any = makeManager({
+            _liveMarketPrice: OLD_MID,
+            _liveMarketPriceAt: FRESH_MID_AT,
+            boundaryIdx: 100,
+            _gapSlots: 3
+        });
+        const inBand = [{ id: 'slot-101', type: ORDER_TYPES.BUY, price: 1650 }];
+        assert.ok(offMarketFill(mgr, ORDER_TYPES.BUY, 1650), 'fixture must be a veto candidate');
+        const skipped = await verifyFillMarketReference(mgr, makeClient(NEW_MID, calls), inBand, { now: NOW });
+        assert.strictEqual(skipped, null, 'a gap-band fill can never arm the pivot');
+        assert.strictEqual(calls.n, 0, 'no RPC for a batch the writer would skip entirely');
+        const windowFill = [{ id: 'slot-99', type: ORDER_TYPES.BUY, price: 1650 }];
+        await verifyFillMarketReference(mgr, makeClient(NEW_MID, calls), windowFill, { now: NOW });
+        assert.strictEqual(calls.n, 1, 'a window fill still forces the read');
+    });
+
+    await run('MID-21 a client-less verification is debug, never a per-chunk warn', async () => {
+        const mgr: any = makeManager({
+            _liveMarketPrice: OLD_MID,
+            _liveMarketPriceAt: FRESH_MID_AT
+        });
+        const fill = [{ type: ORDER_TYPES.BUY, price: 1692 }];
+        assert.ok(offMarketFill(mgr, ORDER_TYPES.BUY, 1692));
+        await verifyFillMarketReference(mgr, { db: null }, fill, { now: NOW });
+        assert.ok(mgr.logs.some((l: any) => l.level === 'debug' && /no order-book client/.test(l.msg)),
+            'the missing-client case must be logged at debug');
+        assert.ok(!mgr.logs.some((l: any) => l.level === 'warn'),
+            'no failed read happened, so there must be no warn');
+    });
+
+    await run('MID-22 forced pacing covers a full-length read', async () => {
+        const calls = { n: 0 };
+        const mgr: any = makeManager({
+            _liveMarketPrice: OLD_MID,
+            _liveMarketPriceAt: FRESH_MID_AT,
+            config: {
+                incrementPercent: 0.3,
+                timing: { LAST_FILL_MID_VERIFY_MS: 1, LAST_FILL_MID_VERIFY_TIMEOUT_MS: 100 }
+            }
+        });
+        const stillOffMarket = [{ id: 'slot-130', type: ORDER_TYPES.BUY, price: 1650 }];
+        await verifyFillMarketReference(mgr, makeClient(NEW_MID, calls), stillOffMarket, { now: NOW });
+        assert.strictEqual(calls.n, 1);
+        await verifyFillMarketReference(mgr, makeClient(NEW_MID, calls), stillOffMarket, { now: NOW + 10 });
+        assert.strictEqual(calls.n, 1,
+            'a 1ms pacing knob must not open a fresh window after a read capped at 100ms');
+        // Walk the widened window's boundary, not just its max() value.
+        await verifyFillMarketReference(mgr, makeClient(NEW_MID, calls), stillOffMarket, { now: NOW + 99 });
+        assert.strictEqual(calls.n, 1, 'one millisecond inside the 100ms window stays paced out');
+        await verifyFillMarketReference(mgr, makeClient(NEW_MID, calls), stillOffMarket, { now: NOW + 101 });
+        assert.strictEqual(calls.n, 2, 'one millisecond past the window allows a fresh read');
+    });
+
+    await run('MID-23 the read actually happened is reported without a timestamp compare', async () => {
+        const calls = { n: 0 };
+        const mgr: any = makeManager({
+            _liveMarketPrice: OLD_MID,
+            _liveMarketPriceAt: FRESH_MID_AT
+        });
+        const client = makeClient(NEW_MID, calls);
+        const read = { value: false };
+        await maybeRefreshLiveMarketPrice(mgr, client, { force: true, now: NOW, didRead: read });
+        assert.strictEqual(read.value, true, 'a real book read must be reported');
+        const paced = { value: false };
+        await maybeRefreshLiveMarketPrice(mgr, client, { force: true, now: NOW + 1, didRead: paced });
+        assert.strictEqual(paced.value, false, 'a paced-out attempt must not be reported as a read');
+    });
+
+    await run('MID-24 an edge-pinned fill cannot force a verification read', async () => {
+        const calls = { n: 0 };
+        // One buy edge (lowest price) and one window slot. No coreOrders count,
+        // so the window exclusion set is empty and only the edge predicate fires.
+        const mgr: any = makeManager({
+            _liveMarketPrice: OLD_MID,
+            _liveMarketPriceAt: FRESH_MID_AT,
+            config: { incrementPercent: 0.3, edgeOrders: { buy: 1, sell: 0 } },
+            orders: new Map([
+                ['slot-1', { id: 'slot-1', price: 100, type: ORDER_TYPES.BUY }],
+                ['slot-2', { id: 'slot-2', price: 200, type: ORDER_TYPES.BUY }]
+            ])
+        });
+        const edgeFill = [{ id: 'slot-1', type: ORDER_TYPES.BUY, price: 1650 }];
+        assert.ok(offMarketFill(mgr, ORDER_TYPES.BUY, 1650), 'fixture must be a veto candidate');
+        const skipped = await verifyFillMarketReference(mgr, makeClient(NEW_MID, calls), edgeFill, { now: NOW });
+        assert.strictEqual(skipped, null, 'an edge insurance fill can never arm the pivot');
+        assert.strictEqual(calls.n, 0, 'no RPC for an edge-only batch');
+        const windowFill = [{ id: 'slot-2', type: ORDER_TYPES.BUY, price: 1650 }];
+        await verifyFillMarketReference(mgr, makeClient(NEW_MID, calls), windowFill, { now: NOW });
+        assert.strictEqual(calls.n, 1, 'the non-edge slot still forces the read');
+    });
+
     console.log(`\n${passed} passed, ${failed} failed\n`);
     if (failed > 0) process.exit(1);
 }

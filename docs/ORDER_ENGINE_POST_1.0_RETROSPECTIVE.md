@@ -1076,14 +1076,15 @@ fills remain excluded by the existing shared classifier. A rail/window fill is s
 recorded once, by the existing pivot writer.
 
 > **Addendum (2026-11-26, fast move with a time-fresh mid).** In a live market-pair
-> sweep, one bot cached the book mid at 1739.24 one minute before a taker walked
-> it down to ~1702; the mid was *time-fresh* (well inside the 15-minute trust
-> window) but wrong in value. Ten fills at 1683–1703 were refused as "premium
-> sweeps", their levels were marked for 30 minutes, all four re-places were
-> skipped, and the book sat 2.13–2.74% wide against a 1.65% target. The sibling
-> bot in the same market had a mid older than the trust window: `offMarketFill`
-> failed open and its next spread check refreshed to 1702.76, so the same sweep
-> armed the pivot normally and it stayed in spread. **Resolution:** the fill path
+> sweep, one bot cached the book mid at `<cached-mid>` one minute before a taker
+> walked it down to `<post-move-mid>`; the mid was *time-fresh* (well inside the
+> 15-minute trust window) but wrong in value. Ten fills across the sweep were
+> refused as "premium sweeps", their levels were marked for 30 minutes, all four
+> re-places were skipped, and the book sat 2.13–2.74% wide against a 1.65% target.
+> The sibling bot in the same market had a mid older than the trust window:
+> `offMarketFill` failed open and its next spread check refreshed to the current
+> market level, so the same sweep armed the pivot normally and it stayed in spread.
+> **Resolution:** the fill path
 > now re-reads the book before it lets a cached mid veto (`verifyFillMarketReference`,
 > called once per fill chunk ahead of `recordLastFilledPrices`). The classifier,
 > the refusal policy and the refused-level TTL are unchanged — only the *time*
@@ -1095,7 +1096,7 @@ recorded once, by the existing pivot writer.
 > premium sweep still cannot arm the pivot), and costs no RPC for in-window
 > batches. Centralization follows the existing one-owner rule: the low-level
 > `setLastFillPivot` writer stays synchronous; verification is one async helper
-> called at every live boundary (fill batch, COW freeze and final gate, both
+> called at every live boundary (fill batch, COW freeze and final gate, all three
 > unmatched-fill sites), fill evidence is derived by one helper, and a contract
 > test fails when a new write path skips verification. Marker release lives in
 > the single price owner, so the time-based spread read also frees markers a

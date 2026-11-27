@@ -109,6 +109,18 @@ function main() {
             'the one-step guard must live inside the release helper');
     });
 
+    run('CONTRACT-9 both market verifiers share one lazy client accessor', () => {
+        const cow = read('modules/dexbot_cow_runtime.ts');
+        const fill = read('modules/dexbot_fill_runtime.ts');
+        const shared = read('modules/lazy_client_access.ts');
+        assert.ok(/export function getLazyBitSharesClient\(/.test(shared), 'the shared accessor must exist');
+        assert.ok(cow.includes('getLazyBitSharesClient as guardMarketClient'), 'COW must use the shared accessor');
+        assert.ok(fill.includes("import { getLazyBitSharesClient } from './lazy_client_access.js';"),
+            'the fill runtime must use the same accessor');
+        assert.ok(!/from '\.\/bitshares_client\.js'/.test(fill),
+            'the fill runtime must not reintroduce a static client import');
+    });
+
     console.log(`\n${passed} passed, ${failed} failed\n`);
     if (failed > 0) process.exit(1);
 }

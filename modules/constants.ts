@@ -481,13 +481,18 @@ let TIMING = {
     // the fill path re-reads the book before it lets that mid veto a fill.
     // Short (separate from the 10min spread pacing) so a long sweep can refresh
     // again, but bounded so a failing order-book read cannot become an RPC
-    // loop. 0 falls back to SPREAD_CORRECTION_SYNC_FRESH_MS.
+    // loop. 0 falls back to SPREAD_CORRECTION_SYNC_FRESH_MS. The forced pacing
+    // window is widened to at least LAST_FILL_MID_VERIFY_TIMEOUT_MS so a read
+    // that consumes its whole cap cannot leave the next veto candidate outside
+    // the window.
     LAST_FILL_MID_VERIFY_MS: 5 * 1000,  // 5 seconds
     // LAST_FILL_MID_VERIFY_TIMEOUT_MS: hard cap on ONE book read made by the
-    // fill-path verification (and by the shared price owner it delegates to).
+    // fill-path verification (and by the shared price owner it delegates to,
+    // including the time-based spread read).
     // Pacing bounds how OFTEN a read is attempted; without a per-read cap a
     // slow — but not failing — RPC would stall fill processing at the veto
-    // gate. A timed-out read falls back to the cached-mid policy. 0 disables.
+    // gate. A timed-out read falls back to the cached-mid policy. 0 falls back
+    // to the client RPC timeout (15s if unset); it never removes the cap.
     LAST_FILL_MID_VERIFY_TIMEOUT_MS: 8 * 1000,  // 8 seconds
     // Dedicated escalation cooldown for the spread-stale watchdog. Deliberately
     // separate from BOUNDARY_HOLD_RESYNC_COOLDOWN_MS so tuning boundary-hold
