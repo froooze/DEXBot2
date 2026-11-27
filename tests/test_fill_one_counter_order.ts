@@ -12,10 +12,11 @@
  */
 
 const assert = require('assert');
-const { ORDER_TYPES, ORDER_STATES } = require('../modules/constants');
+const { ORDER_TYPES, ORDER_STATES, FILL_PROCESSING } = require('../modules/constants');
 const StrategyEngine = require('../modules/order/strategy').default;
 const { fillKeyOf } = require('../modules/order/fill_ledger');
 const { adoptPlacedBatchFromChain } = require('../modules/dexbot_cow_runtime');
+const { processFillsWithBootstrapMode } = require('../modules/dexbot_fill_runtime');
 const { recordCounterDebt } = require('../modules/order/utils/counter_debt');
 const { attributeUnmatchedFillToGrid } = require('../modules/order/utils/order');
 
@@ -372,6 +373,52 @@ async function main() {
         assert.strictEqual(attributed, true, 'the unmatched fill was attributed');
         assert.strictEqual(mgr._counterDebt.size, 1, 'the two writers mint one debt, not two');
         assert.strictEqual(mgr._metrics.counterOrdersOwedCount, 1);
+    });
+
+    await run('Q-12 bootstrap handoff keeps chain identity for the counter writer', async () => {
+        const mgr = makeManager();
+        const slot: any = mgr.orders.get('slot-30');
+        slot.orderId = '1.7.777';
+        const fill = {
+            op: [FILL_PROCESSING.OPERATION_TYPE, { order_id: '1.7.777', is_maker: true }],
+            id: 'h-shared',
+            block_num: 2000,
+        };
+        let handedOff: any[] = [];
+        const bot: any = {
+            _shuttingDown: false,
+            _incomingFillQueue: [fill],
+            accountId: '1.2.345',
+            manager: {
+                orders: mgr.orders,
+                _counterDebt: mgr._counterDebt,
+                _metrics: mgr._metrics,
+                logger: mgr.logger,
+                lockOrders: () => {},
+                unlockOrders: () => {},
+            },
+            _isNewFillKey: () => true,
+            _applyReplaySafeTrackedFillAccounting: async () => ({ status: 'applied' }),
+            _flushProcessedFillPersistence: async () => {},
+            _log: () => {},
+            _warn: () => {},
+            _metrics: { fillsProcessed: 0, fillProcessingTimeMs: 0 },
+            _processFillsWithBatching: async (orders: any[]) => {
+                handedOff = orders;
+                return { aborted: false };
+            },
+        };
+        await processFillsWithBootstrapMode(bot, {} as any);
+
+        assert.strictEqual(handedOff.length, 1, 'the matched bootstrap fill reaches the standard pipeline');
+        recordCounterDebt(mgr, handedOff[0]);
+        const attributed = attributeUnmatchedFillToGrid(mgr, {
+            orderId: '1.7.777', blockNum: 2000, historyId: 'h-shared',
+        });
+        assert.strictEqual(attributed, true, 'the same fill is attributed by the orphan writer');
+        assert.strictEqual(mgr._counterDebt.size, 1, 'both writers mint one debt from the same chain fill');
+        assert.ok([...mgr._counterDebt.keys()][0].startsWith('1.7.777:2000:'),
+            'the ledger key is the chain fill key, not a slot key');
     });
 
     await run('Q-11 a missing poll id keeps its context slot so later ids do not shift', async () => {

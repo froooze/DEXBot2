@@ -198,7 +198,8 @@ async function processSweepOrphanFill(bot: BotLike, fill: unknown, fillOp: FillO
             paysAmountRaw: pays?.amount ?? null,
             receivesAssetId: receives?.asset_id ?? null,
             receivesAmountRaw: receives?.amount ?? null,
-            // Same chain identity processFillsOnly uses: a fill seen by both
+            // Same chain identity processFillsOnly receives from the queued
+            // fill (bootstrap) and the sync resolver: a fill seen by both
             // writers must mint ONE counter debt, not a slot-keyed second one.
             blockNum: chainFill?.block_num ?? chainFill?.blockNum,
             historyId: chainFill?.id,
@@ -931,7 +932,15 @@ async function processFillsWithBootstrapMode(bot: BotLike, chainOrders: ChainOrd
     try {
         bot._log(`[BOOTSTRAP] Processing ${validFills.length} fill(s) through standard pipeline`, 'info');
 
-        const filledOrders = validFills.map((f) => f.gridOrder);
+        // The bootstrap path resolves the slot from the queued fill, but
+        // handing off only that slot drops the chain identity. Thread the
+        // block/history ids alongside it so processFillsOnly mints the SAME
+        // debt key as the orphan writer when a fill is seen by both paths.
+        const filledOrders = validFills.map((f) => ({
+            ...f.gridOrder,
+            blockNum: f.block_num ?? f.blockNum,
+            historyId: f.id,
+        }));
         const result = await bot._processFillsWithBatching(
             filledOrders,
             new Set(),
