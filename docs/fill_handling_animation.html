@@ -1,0 +1,964 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DEXBot2 — how a fill is handled in the grid</title>
+<style>
+    :root {
+        --bg: #0b1220;
+        --panel: #121b2d;
+        --panel-2: #172236;
+        --line: #26334a;
+        --text: #e6edf7;
+        --muted: #94a3b8;
+        --buy: #38bdf8;
+        --sell: #fb7185;
+        --band: #a78bfa;
+        --spread: #94a3b8;
+        --ok: #34d399;
+        --warn: #fbbf24;
+    }
+    * { box-sizing: border-box; }
+    body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    header {
+        padding: 20px 24px 12px;
+        border-bottom: 1px solid var(--line);
+    }
+    h1 { margin: 0 0 6px; font-size: 20px; letter-spacing: .2px; }
+    header p { margin: 0; color: var(--muted); max-width: 1000px; }
+    .controls {
+        display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+        padding: 12px 24px; border-bottom: 1px solid var(--line);
+    }
+    button, select, input[type=range] { accent-color: var(--buy); }
+    button, select {
+        background: var(--panel-2); color: var(--text);
+        border: 1px solid var(--line); border-radius: 8px;
+        padding: 7px 12px; font: inherit; cursor: pointer;
+    }
+    button:hover, select:hover { border-color: var(--buy); }
+    button.primary { background: #0e7490; border-color: #0891b2; }
+    .controls label { color: var(--muted); display: flex; gap: 6px; align-items: center; }
+    .timeline {
+        display: flex; flex-wrap: wrap; gap: 6px;
+        padding: 12px 24px; border-bottom: 1px solid var(--line);
+    }
+    .timeline button {
+        padding: 5px 9px; font-size: 12px; color: var(--muted);
+    }
+    .timeline button.active {
+        color: #04121c; background: var(--buy); border-color: var(--buy); font-weight: 700;
+    }
+    main {
+        display: grid; grid-template-columns: minmax(420px, 1.4fr) minmax(320px, 1fr);
+        gap: 16px; padding: 16px 24px 24px;
+    }
+    .card {
+        background: var(--panel); border: 1px solid var(--line);
+        border-radius: 12px; padding: 14px 16px;
+    }
+    .card h2 { margin: 0 0 10px; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }
+    .ladder { display: flex; flex-direction: column; gap: 2px; }
+    .row {
+        display: grid; grid-template-columns: 92px 52px 1fr 116px;
+        align-items: center; gap: 8px; min-height: 26px;
+        padding: 2px 8px; border-radius: 6px;
+        border: 1px solid transparent;
+        transition: background .35s ease, border-color .35s ease, transform .35s ease;
+    }
+    .row.band { background: rgba(167,139,250,.09); }
+    .row.filled { background: rgba(251,113,133,.16); animation: flash 1s ease; }
+    .row.boundary { border-left: 3px solid var(--band); }
+    .row.pivot { border-right: 3px solid var(--warn); }
+    .row.target { border-color: var(--ok); animation: pulse 1.4s ease-in-out infinite; }
+    @keyframes flash { from { transform: scale(1.02); background: rgba(251,113,133,.35); } to { transform: none; } }
+    @keyframes pulse { 50% { border-color: rgba(52,211,153,.35); } }
+    .slot, .price { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); font-size: 12px; }
+    .track { display: flex; align-items: center; min-height: 20px; }
+    .order {
+        display: inline-flex; align-items: center; gap: 6px;
+        height: 20px; padding: 0 9px; border-radius: 5px;
+        font-size: 11px; font-weight: 700; letter-spacing: .04em;
+        animation: slide .4s ease both;
+    }
+    @keyframes slide { from { opacity: 0; transform: translateX(-14px); } to { opacity: 1; transform: none; } }
+    .order.buy { background: rgba(56,189,248,.18); color: var(--buy); border: 1px solid rgba(56,189,248,.5); }
+    .order.sell { background: rgba(251,113,133,.18); color: var(--sell); border: 1px solid rgba(251,113,133,.5); }
+    .order.spread { background: rgba(148,163,184,.16); color: var(--spread); border: 1px dashed rgba(148,163,184,.5); }
+    .order.stamp::after { content: "★"; color: var(--ok); }
+    .hole { font-size: 11px; color: var(--sell); border: 1px dashed rgba(251,113,133,.6); border-radius: 5px; padding: 1px 8px; }
+    .flags { display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }
+    .flag {
+        font-size: 10px; padding: 1px 6px; border-radius: 999px;
+        background: var(--panel-2); border: 1px solid var(--line); color: var(--muted);
+    }
+    .flag.pivot { color: var(--warn); border-color: rgba(251,191,36,.5); }
+    .flag.boundary { color: var(--band); border-color: rgba(167,139,250,.5); }
+    .flag.target { color: var(--ok); border-color: rgba(52,211,153,.5); }
+    .side { display: flex; flex-direction: column; gap: 16px; }
+    #stepTitle { margin: 0 0 6px; font-size: 16px; }
+    #narration { margin: 0; color: #cbd5e1; }
+    .kv { display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; font-size: 13px; }
+    .kv span:nth-child(even) { font-family: ui-monospace, monospace; color: var(--buy); }
+    .guard { margin-top: 10px; padding: 8px 10px; border-radius: 8px; background: rgba(52,211,153,.1); border: 1px solid rgba(52,211,153,.35); color: var(--ok); font-size: 12px; }
+    .debt {
+        display: flex; justify-content: space-between; gap: 8px;
+        padding: 6px 8px; margin-bottom: 5px; border-radius: 6px;
+        background: var(--panel-2); border: 1px solid var(--line); font-size: 12px;
+    }
+    .debt .key { font-family: ui-monospace, monospace; color: var(--muted); }
+    .debt .status.owed { color: var(--warn); }
+    .debt .status.stamped { color: var(--ok); }
+    .debt .status.deferred { color: var(--sell); }
+    .empty { color: var(--muted); font-size: 12px; }
+    .legend { display: flex; flex-wrap: wrap; gap: 8px 14px; font-size: 12px; color: var(--muted); }
+    .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; }
+    .intro { padding: 14px 24px; border-bottom: 1px solid var(--line); background: var(--panel); }
+    .intro h2 { margin: 0 0 6px; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }
+    .intro p { margin: 0 0 10px; max-width: 1000px; color: #cbd5e1; }
+    .glossary { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 4px 18px; font-size: 12px; color: var(--muted); }
+    .glossary b { color: var(--text); font-weight: 600; }
+    .gauge-bar { position: relative; }
+    .gauge-bar::after {
+        content: ''; position: absolute; left: 50%; top: 0; bottom: 0;
+        width: 1px; background: rgba(230,237,247,.45);
+    }
+    #phantomNote { margin-top: 8px; font-size: 11px; color: var(--warn); display: none; }
+    footer { padding: 0 24px 24px; color: var(--muted); font-size: 12px; }
+    code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; }
+    .order.blocked {
+        background: rgba(251,113,133,.1); color: var(--sell);
+        border: 1px dashed var(--sell); text-decoration: line-through;
+    }
+    .order.residual {
+        background: rgba(167,139,250,.12); color: var(--band);
+        border: 1px dashed rgba(167,139,250,.6);
+    }
+    .order.phantom {
+        background: rgba(251,191,36,.1); color: var(--warn);
+        border: 1px dashed rgba(251,191,36,.6);
+    }
+    .order.partial {
+        background: rgba(251,191,36,.12); color: var(--warn);
+        border: 1px dashed rgba(251,191,36,.6);
+    }
+    .order.edge {
+        background: rgba(148,163,184,.12); color: var(--muted);
+        border: 1px dashed rgba(148,163,184,.6);
+    }
+    .flag.blocked { color: var(--sell); border-color: rgba(251,113,133,.5); }
+    .flag.phantom { color: var(--warn); border-color: rgba(251,191,36,.5); }
+    .flag.stranded { color: var(--band); border-color: rgba(167,139,250,.5); }
+    .flag.partial { color: var(--warn); border-color: rgba(251,191,36,.5); }
+    .flag.edge { color: var(--muted); border-color: rgba(148,163,184,.5); }
+    .nomid {
+        display: inline-block; margin-top: 10px; font-size: 11px;
+        color: var(--muted); text-decoration: line-through;
+        border: 1px dashed var(--line); border-radius: 999px; padding: 2px 8px;
+    }
+    .nomid b { color: var(--sell); text-decoration: none; margin-left: 6px; }
+    .gauge-bar {
+        height: 10px; border-radius: 6px; background: var(--panel-2);
+        border: 1px solid var(--line); overflow: hidden; margin: 8px 0 4px;
+    }
+    .gauge-fill { height: 100%; width: 0; background: var(--ok); transition: width .5s ease, background .5s ease; }
+    .gauge-fill.wide { background: var(--warn); }
+    .gauge-fill.stalled { background: var(--sell); }
+    .gauge-text { font-size: 12px; color: var(--muted); }
+    .debt .meta { display: block; font-size: 10px; color: var(--muted); }
+    @media (max-width: 900px) {
+        main { grid-template-columns: 1fr; }
+        .row { grid-template-columns: 78px 42px 1fr 88px; }
+    }
+</style>
+</head>
+<body>
+<header>
+    <h1>DEXBot2 — from fill to counter order</h1>
+    <p>Fill-authoritative policy (§9.16): every full fill arms the pivot and attempts a crawl/re-anchor from the batch extremum — which the validator may refuse. Each mints exactly one counter obligation on the opposite rail, keyed by chain fill identity. Edge-pinned fills skip pivot/crawl/anchor but still owe a counter.</p>
+</header>
+
+<section class="intro">
+    <h2>How to use this page / what to watch</h2>
+    <p>Press <b>Play</b> or use <b>Step →</b> to walk a scenario; the ladder shows the book, the right-hand panels show the runtime state and the counter-debt ledger. Watch three things: where the <em>boundary</em> ends up, whether the fill's <em>counter</em> gets a free rail slot, and whether the debt is cleared by a confirmed op. The <b>Phantom CREATE</b> and <b>Show blocked op</b> toggles let you replay the confirmation and guard branches. The spread gauge turns amber when the book is wide and red when it is stalled.</p>
+    <div class="glossary">
+        <div><b>boundary</b> — highest BUY slot; the window anchor. BUY rail ≤ boundary, SELL rail ≥ boundary+gap+1.</div>
+        <div><b>gap band</b> — the <code>gap</code> SPREAD slots between the rails; not a place for counters.</div>
+        <div><b>pivot</b> — the last filled level and side; drives the direction guard.</div>
+        <div><b>batch extremum</b> — furthest fill of the side in this batch; the re-anchor uses it, not just the last fill.</div>
+        <div><b>stamped op</b> — the planned counter tagged with <code>counterForFillKey</code>; only its confirmation settles a debt.</div>
+        <div><b>no-slot / batch-cap</b> — the counter is deferred: no free rail slot, or the per-cycle <code>gap+1</code> budget is used.</div>
+        <div><b>CREATE</b> — the on-chain order-placement op; a phantom CREATE returned no chain id and cannot settle a debt.</div>
+        <div><b>mid</b> — a cached market price. Deliberately NOT consulted by any fill path here.</div>
+        <div><b>COW</b> — copy-on-write grid: a plan is built on a working grid and swapped into master only if it commits.</div>
+        <div><b>recordLastFilledPrices</b> — the pivot writer; it skips edge-pinned fills.</div>
+        <div><b>recordCounterDebt</b> — the single writer of the in-memory obligation ledger.</div>
+        <div><b>resolveCounterQuota</b> — selects and projects at most <code>gap+1</code> counters per cycle.</div>
+        <div><b>counterOrdersPlacedCount</b> — metric incremented only on a confirmed stamped op.</div>
+        <div><b>placed_order_in_band</b> — validator reason a re-anchor would strand a live order in the band.</div>
+        <div><b>isDelayedRotationTrigger</b> — synthetic dust-cancel flag; owes no counter.</div>
+        <div><b>src=partial</b> — pivot log tag: the pivot came from a partial fill.</div>
+        <div><b>§9.16</b> — the policy section that made every fill authoritative.</div>
+    </div>
+</section>
+
+<div class="controls">
+    <button id="play" class="primary">▶ Play</button>
+    <button id="next">Step →</button>
+    <button id="reset">↺ Reset</button>
+    <label>Scenario
+        <select id="scenario">
+            <option value="sell">One SELL fill — re-anchor + one counter</option>
+            <option value="burst">5 SELL fills — per-cycle cap defers one</option>
+            <option value="buy">One BUY fill — mirrored side</option>
+            <option value="refuse">Re-anchor refused — counters alone cannot fix spread</option>
+            <option value="partial">Partial + dust — no counter owed</option>
+            <option value="mirror">Filled counter — mints the mirror debt</option>
+            <option value="edge">Edge fill — no pivot/crawl, counter still owed</option>
+        </select>
+    </label>
+    <label><input id="phantom" type="checkbox"> Phantom CREATE</label>
+    <label><input id="blockedDemo" type="checkbox"> Show blocked op</label>
+    <label>Step delay (ms, lower = faster) <input id="speed" type="range" min="350" max="2200" step="50" value="1100"></label>
+    <label>Space = play/pause · ← → = step</label>
+</div>
+
+<div class="timeline" id="timeline"></div>
+
+<main>
+    <section class="card">
+        <h2>Grid ladder — slot index increases upward in price</h2>
+        <div class="ladder" id="ladder"></div>
+    </section>
+    <aside class="side">
+        <div class="card">
+            <h2>What is happening</h2>
+            <h3 id="stepTitle"></h3>
+            <p id="narration"></p>
+            <div class="guard" id="guard"></div>
+            <div id="phantomNote">Phantom branch applies at the confirmation step only; later steps resume the normal path.</div>
+            <span class="nomid">cached mid <b>NOT CONSULTED</b></span>
+        </div>
+        <div class="card">
+            <h2>Spread gauge</h2>
+            <div class="gauge-bar" title="The vertical tick marks the nominal width (50%)"><div class="gauge-fill" id="gaugeFill"></div></div>
+            <div class="gauge-text" id="gaugeText"></div>
+        </div>
+        <div class="card">
+            <h2>Runtime state</h2>
+            <div class="kv" id="state"></div>
+        </div>
+        <div class="card">
+            <h2>Counter debt ledger (in memory)</h2>
+            <div id="debts"></div>
+        </div>
+        <div class="card">
+            <h2>Legend</h2>
+            <div class="legend">
+                <span><i style="background:var(--buy)"></i>BUY rail (idx ≤ boundary)</span>
+                <span><i style="background:var(--sell)"></i>SELL rail (idx ≥ boundary+gap+1)</span>
+                <span><i style="background:var(--band)"></i>gap band (SPREAD slots)</span>
+                <span><i style="background:var(--warn)"></i>pivot / last fill</span>
+                <span><i style="background:var(--ok)"></i>★ stamped counter op</span>
+                <span><i style="background:var(--sell)"></i>dashed "filled / virtual" = consumed slot</span>
+                <span><i style="background:var(--ok)"></i>gap → slot-N / ← gap counter = fill↔counter link</span>
+                <span><i style="background:var(--sell)"></i>crossed-out = op dropped by the final gate</span>
+                <span><i style="background:var(--band)"></i>dashed = stranded residual</span>
+                <span><i style="background:var(--warn)"></i>partial residual</span>
+                <span><i style="background:var(--muted)"></i>grey dashed = edge insurance</span>
+                <span><i style="background:var(--warn)"></i>dashed amber = phantom / unconfirmed</span>
+                <span>debt status: amber owed · green stamped · pink deferred/unconfirmed</span>
+                <span>gauge: <i style="background:var(--ok)"></i>inside tolerance · <i style="background:var(--warn)"></i>wide · <i style="background:var(--sell)"></i>stalled</span>
+            </div>
+        </div>
+    </aside>
+</main>
+
+<footer>
+    Simplified for illustration: 26 slots, gap = 3, starting boundary = 12. Counter placement uses the free rail slot <em>closest</em> to <code>fill ± gap</code> (not the lowest slot), at most <code>gap + 1</code> counters per cycle. A debt clears only when its stamped op is confirmed on chain; a phantom/lost CREATE leaves it owed. Nothing here reads a market mid.
+</footer>
+
+<script>
+(function () {
+    'use strict';
+
+    const N = 26, GAP = 3, START_BOUNDARY = 12;
+    const clone = (o) => JSON.parse(JSON.stringify(o));
+    const price = (i) => (100 * Math.pow(1.01, i)).toFixed(4);
+    const slot = (i) => 'slot-' + i;
+
+    function initialState() {
+        const orders = {};
+        for (let i = 7; i <= START_BOUNDARY; i++) orders[i] = { type: 'BUY' };
+        for (let i = 16; i <= 23; i++) orders[i] = { type: 'SELL' };
+        return {
+            boundary: START_BOUNDARY,
+            pivot: null,
+            holes: [],
+            filled: [],
+            orders,
+            debts: [],
+            targets: [],
+            spreadSlot: null,
+            guard: '',
+            cycle: 1,
+            blocked: [],
+            stalled: false,
+            metrics: { owed: 0, placed: 0, deferred: 0, cap: GAP + 1 }
+        };
+    }
+
+    function sellFill(i, n) {
+        return { idx: i, type: 'SELL', key: '1.7.' + (1040 + i) + ':' + (880 + i) + ':h-' + i, n };
+    }
+
+    const STEP_DEFS = {
+        sell: [
+            {
+                title: '1 · SELL fill is a market fact',
+                narration: 'A taker bought from the best ask — the LOWEST sell, slot 16 (sells at 17..23 are behind it and cannot fill first). The slot becomes a virtual hole. There is no mid comparison: the fill arms the pivot and is eligible for the crawl and re-anchor.',
+                apply(s) {
+                    s.filled = [16]; s.holes = [16];
+                    delete s.orders[16];
+                    s.pivot = { idx: 16, type: 'SELL' };
+                }
+            },
+            {
+                title: '2 · Batch-extremum re-anchor',
+                narration: 'The window jumps so the fill sits outside it: boundary 12 → 16 − gap = 13. The filled level now falls in the gap band (14..16); the SELL rail starts at 17.',
+                apply(s) { s.boundary = 13; }
+            },
+            {
+                title: '3 · One counter debt is minted',
+                narration: 'The single owner (counter_debt.ts) records one obligation keyed by the chain fill identity. Its ideal counter is slot 16 − gap = 13, on the opposite (BUY) rail. Partial residuals and dust cancels would owe nothing.',
+                apply(s) {
+                    s.debts = [{ key: sellFill(16).key, side: 'BUY', ideal: 13, from: 16, status: 'owed', attempts: 0, reason: null, link: 16 }];
+                    s.metrics.owed = 1;
+                }
+            },
+            {
+                title: '4 · Guard check + closest free slot',
+                narration: 'The direction rule asks whether a BUY at the ideal level may be placed against a SELL pivot: 13 < 16, so it is allowed. The planner picks the free BUY rail slot closest to 13 — not the lowest slot in the grid.',
+                apply(s) { s.cycle = 2; s.targets = [13]; s.guard = 'BUY slot-13 < SELL pivot slot-16 → allowed'; }
+            },
+            {
+                title: '5 · Counter order is planned',
+                narration: 'The chosen slot is projected into the active window (dropping the farthest ordinary BUY window slot) and stamped with counterForFillKey. The debt is still owed: being in a plan is not proof of placement.',
+                apply(s) {
+                    s.orders[13] = { type: 'BUY', stamped: true };
+                    s.debts[0].status = 'stamped';
+                    s.targets = [];
+                }
+            },
+            {
+                title: '6 · On-chain confirmation settles the debt',
+                confirm: true,
+                narration: 'Only a confirmed placement of that stamped op clears the debt. A phantom or lost CREATE would leave it owed and re-planned next cycle. counterOrdersPlacedCount becomes 1.',
+                apply(s) {
+                    s.debts = []; s.metrics.owed = 0; s.metrics.placed = 1;
+                    s.guard = 'stamped op confirmed → debt cleared';
+                }
+            },
+            {
+                title: '7 · Spread correction resumes',
+                narration: 'With the window now centred past the fill, the ordinary spread path activates a SPREAD slot in the gap band. The opposite rail was restored by the counter, not by waiting for the mean to revert.',
+                apply(s) { s.spreadSlot = 14; s.guard = ''; }
+            }
+        ],
+
+        buy: [
+            {
+                title: '1 · BUY fill is a market fact',
+                narration: 'A taker sold to the best bid — the HIGHEST buy, slot 12 (buys at 7..11 are behind it and cannot fill first). It arms the pivot and is eligible for the crawl and re-anchor — same policy, mirrored side.',
+                apply(s) {
+                    s.filled = [12]; s.holes = [12];
+                    delete s.orders[12];
+                    s.pivot = { idx: 12, type: 'BUY' };
+                }
+            },
+            {
+                title: '2 · Batch-extremum re-anchor',
+                narration: 'For a BUY fill the required boundary is fill − 1 = 11. The gap band becomes 12..14 and the SELL rail starts at 15, just above the fill.',
+                apply(s) { s.boundary = 11; }
+            },
+            {
+                title: '3 · One counter debt is minted',
+                narration: 'The BUY fill owes one SELL counter at fill + gap = 15, keyed by its chain fill identity.',
+                apply(s) {
+                    s.debts = [{ key: '1.7.1052:892:h-12', side: 'SELL', ideal: 15, from: 12, status: 'owed', attempts: 0, reason: null, link: 12 }];
+                    s.metrics.owed = 1;
+                }
+            },
+            {
+                title: '4 · Guard check + closest free slot',
+                narration: 'SELL slot-15 is above the BUY pivot slot-12, so the direction rule allows it. (A BUY at or above its own pivot would be blocked — the bot does not chase.)',
+                apply(s) { s.cycle = 2; s.targets = [15]; s.guard = 'SELL slot-15 > BUY pivot slot-12 → allowed'; }
+            },
+            {
+                title: '5 · Counter order is planned',
+                narration: 'The SELL counter is stamped with its fill key and projected into the SELL window. It is still owed until the op is observed on chain.',
+                apply(s) {
+                    s.orders[15] = { type: 'SELL', stamped: true };
+                    s.debts[0].status = 'stamped'; s.targets = [];
+                }
+            },
+            {
+                title: '6 · Confirmation settles the debt',
+                confirm: true,
+                narration: 'The stamped op is confirmed, so the obligation is removed and the placed counter is counted.',
+                apply(s) {
+                    s.debts = []; s.metrics.owed = 0; s.metrics.placed = 1;
+                    s.guard = 'stamped op confirmed → debt cleared';
+                }
+            },
+            {
+                title: '7 · Spread correction resumes',
+                narration: 'The normal spread path now works on the new window; a SPREAD slot in the band tightens the quote.',
+                apply(s) { s.spreadSlot = 13; s.guard = ''; }
+            }
+        ],
+
+        burst: [
+            {
+                title: '1 · Five SELL fills arrive',
+                narration: 'A sweep walks the asks from best to worst: slots 16, 17, 18, 19, 20 — the lowest sell fills first, then the next one, and so on. Every fill is market truth. The pivot is the last processed fill (20), but the re-anchor uses the batch extremum (the furthest SELL).',
+                apply(s) {
+                    s.filled = [16, 17, 18, 19, 20]; s.holes = [16, 17, 18, 19, 20];
+                    for (const i of s.filled) delete s.orders[i];
+                    s.pivot = { idx: 20, type: 'SELL' };
+                }
+            },
+            {
+                title: '2 · One re-anchor from the extremum',
+                narration: 'Boundary 12 → 20 − gap = 17. Here the last fill is also the furthest (the sweep walked the asks in order), so anchoring on either gives the same window: the band becomes 18..20 and the SELL rail starts at 21.',
+                apply(s) { s.boundary = 17; }
+            },
+            {
+                title: '3 · Five debts, one per fill',
+                narration: 'The shared debt writer mints five obligations. Each ideal level is its own fill minus the gap: 13, 14, 15, 16 and 17.',
+                apply(s) {
+                    s.debts = s.filled.map((i) => ({
+                        key: sellFill(i).key, side: 'BUY', ideal: i - GAP, from: i,
+                        status: 'owed', attempts: 0, reason: null, link: i
+                    }));
+                    s.metrics.owed = 5;
+                }
+            },
+            {
+                title: '4 · Per-cycle cap: gap + 1 = 4',
+                narration: 'Only four counters are selected this cycle (oldest fill first: 16, 17, 18, 19). The fifth (fill 20 → ideal 17) is deferred with reason batch-cap: a counter beyond the side window would land VIRTUAL and emit no op, so it stays owed instead of being wasted.',
+                apply(s) {
+                    s.targets = [13, 14, 15, 16];
+                    s.debts[4].status = 'deferred';
+                    s.debts[4].reason = 'batch-cap';
+                    s.debts[4].attempts = 1;
+                    s.metrics.deferred = 1;
+                    s.guard = 'cap = gap + 1 = 4 → 1 debt deferred (batch-cap)';
+                }
+            },
+            {
+                title: '5 · Four counters placed',
+                narration: 'The four selected BUY counters take the free rail slots closest to their ideals and carry their own fill stamps. The deferred debt keeps its original identity.',
+                apply(s) {
+                    for (const i of s.targets) s.orders[i] = { type: 'BUY', stamped: true };
+                    for (const d of s.debts.slice(0, 4)) d.status = 'stamped';
+                    s.targets = [];
+                }
+            },
+            {
+                title: '6 · Confirmation clears only those four',
+                confirm: true,
+                narration: 'The stamped ops are confirmed, so four debts settle and the counterOrdersPlacedCount rises to 4. The batch-capped debt remains owed and keeps its original ideal level.',
+                apply(s) {
+                    s.debts = [s.debts[4]];
+                    s.metrics.owed = 1; s.metrics.placed = 4;
+                    s.guard = '4 confirmed → 4 cleared, 1 still owed';
+                }
+            },
+            {
+                title: '7 · Next cycle promotes the remainder',
+                confirm: true,
+                narration: 'The owed debt is re-derived from its ORIGINAL fill (slot 20) — it does not chase the market. Its ideal slot 17 is now free, so the counter is placed there and confirmed.',
+                apply(s) {
+                    s.cycle = 3;
+                    s.orders[17] = { type: 'BUY', stamped: true };
+                    s.debts = []; s.metrics.owed = 0; s.metrics.deferred = 0; s.metrics.placed = 5;
+                    s.guard = 'deferred debt promoted → confirmed on next cycle';
+                }
+            },
+            {
+                title: '8 · Spread correction resumes',
+                narration: 'All five fills now have their one counter. The spread path activates a SPREAD slot in the gap band around the new window.',
+                apply(s) { s.spreadSlot = 18; s.guard = ''; }
+            }
+        ],
+
+        refuse: [
+            {
+                title: '1 · SELL fill with a stranded BUY in the band',
+                narration: 'The best ask is slot 16 and it fills. Note the residual BUY at slot 15: it is already out of place in the band (boundary 12, gap 3). It does not change the best ask, but it will block the re-anchor.',
+                apply(s) {
+                    s.filled = [16]; s.holes = [16];
+                    delete s.orders[16];
+                    s.pivot = { idx: 16, type: 'SELL' };
+                }
+            },
+            {
+                title: '2 · Re-anchor is REFUSED',
+                narration: 'The target boundary would be 13, making the band 14..16 — the stranded BUY at slot 15 would be caught inside it. The validator refuses the move, so the boundary stays at 12 and the grid remains behind the fill.',
+                apply(s) {
+                    s.stalled = true;
+                    s.guard = 're-anchor refused: would strand BUY slot-15 (placed_order_in_band)';
+                }
+            },
+            {
+                title: '3 · The counter debt is still minted',
+                narration: 'A refused re-anchor does not excuse the fill: it still owes one BUY counter at fill − gap = 13. The debt is keyed by chain fill identity and is in no way relaxed by the geometry stall.',
+                apply(s) {
+                    s.debts = [{ key: sellFill(16).key, side: 'BUY', ideal: 13, from: 16, status: 'owed', attempts: 0, reason: null, link: 16 }];
+                    s.metrics.owed = 1;
+                }
+            },
+            {
+                title: '4 · Counter has no free rail slot',
+                narration: 'The direction rule would allow a BUY at 13 — but with the boundary stuck at 12, the BUY rail ends at 12 and all of its slots (7..12) are occupied. Slot 13 would land VIRTUAL and emit no op, so resolveCounterQuota defers the debt with reason no-slot. The same-side SELL at 16 is dropped by the final gate.',
+                apply(s) {
+                    s.cycle = 2;
+                    s.debts[0].reason = 'no-slot';
+                    s.debts[0].attempts = 1;
+                    s.metrics.deferred = 1;
+                    s.blocked = [{ idx: 16, type: 'SELL', reason: 'same-level / direction' }];
+                    s.guard = 'BUY slot-13 outside rail → no-slot · SELL slot-16 → DROPPED by final gate';
+                }
+            },
+            {
+                title: '5 · No counter op is broadcast',
+                narration: 'The debt stays owed with its original fill key and ideal level. Nothing is stamped, so there is no op to confirm — the obligation is re-derived from the same fill next cycle rather than silently dropped.',
+                apply(s) { s.guard = 'no-slot → debt stays owed, no op to confirm'; }
+            },
+            {
+                title: '6 · Nothing can settle the debt',
+                narration: 'No stamped op exists, so no confirmation can clear it. The conservative direction holds: an unplaceable counter remains owed until the geometry gives it a rail slot.',
+                apply(s) { s.guard = 'no stamped op → debt still owed (ledger unchanged)'; }
+            },
+            {
+                title: '7 · Spread stays WIDE despite the debt',
+                narration: 'This is the key point: one counter per fill does not guarantee a normal spread. The boundary is still at 12, so the SELL rail still starts at the fill level (slot 16 = 12 + gap + 1); slot 16 is a hole and the direction guard refuses a SELL there, so the first placeable SELL is slot 17. Spread correction cannot move the window from inside the gap band.',
+                apply(s) {
+                    s.stalled = true;
+                    s.guard = 'STALLED — re-anchor refused; the sell side cannot be refilled at the fill level';
+                }
+            },
+            {
+                title: '8 · Residual clears, re-anchor succeeds',
+                confirm: true,
+                narration: 'Once the stranded BUY is cancelled by ordinary maintenance, the validator allows the move: boundary 12 → 13. Slot 13 is now inside the BUY rail, so the owed counter is finally placed, confirmed, and the spread path tightens the quote. Recovery came from the geometry, not from the counter alone.',
+                apply(s) {
+                    delete s.orders[15];
+                    s.boundary = 13;
+                    s.stalled = false;
+                    s.blocked = [];
+                    s.debts = [];
+                    s.metrics.owed = 0;
+                    s.metrics.deferred = 0;
+                    s.metrics.placed = 1;
+                    s.orders[13] = { type: 'BUY', stamped: true };
+                    s.spreadSlot = 14;
+                    s.cycle = 3;
+                    s.guard = 'residual gone → boundary 13 → BUY slot-13 placed → spread correction resumed';
+                }
+            }
+        ],
+
+        partial: [
+            {
+                title: '1 · Partial fill at the best ask',
+                narration: 'A taker buys only part of the resting SELL at slot 16. The slot stays live as a PARTIAL residual. A partial fill is still a real fill: it arms the pivot (src=partial), but it is not a full fill.',
+                apply(s) {
+                    s.orders[16] = { type: 'SELL', partial: true };
+                    s.filled = [16];
+                    s.pivot = { idx: 16, type: 'SELL' };
+                    s.guard = 'pivot armed by a PARTIAL fill (src=partial)';
+                }
+            },
+            {
+                title: '2 · No counter debt is minted',
+                narration: 'recordCounterDebt rejects isPartial === true: the residual still owns its slot, so there is no opposite-rail obligation. The ledger stays empty — only FULL fills owe a counter.',
+                apply(s) { s.guard = 'isPartial → no debt owed'; }
+            },
+            {
+                title: '3 · Re-anchor allows its own residual',
+                narration: 'The boundary may still move to 16 − gap = 13. The partial remainder at slot 16 lands in the new band, but the re-anchor allow-list explicitly permits the fill\'s OWN residual — a foreign in-band order would refuse it.',
+                apply(s) { s.boundary = 13; }
+            },
+            {
+                title: '4 · Dust remainder is cancelled',
+                narration: 'Maintenance cancels the tiny remainder. That synthetic dust-cancel fill also owes no counter (isDelayedRotationTrigger is rejected by the same debt writer). The slot becomes a clean virtual hole.',
+                apply(s) {
+                    delete s.orders[16];
+                    s.holes = [16];
+                    s.guard = 'dust cancel → still no debt';
+                }
+            },
+            {
+                title: '5 · No counter op, no settlement',
+                narration: 'There was never a stamped counter op, so nothing can clear and nothing is owed. The normal refill/spread path owns this hole; the one-counter guarantee applies only to full fills.',
+                apply(s) { s.spreadSlot = 14; s.guard = ''; }
+            }
+        ],
+
+        edge: [
+            {
+                title: '1 · Normal asks fill first',
+                narration: 'Price-time priority: the best ask is slot 23, so takers consume it before the static ceiling order at 25 (slot 24 is empty). Only once the normal ask is gone can the edge order become the best ask.',
+                apply(s) {
+                    delete s.orders[23];
+                    s.holes = [23];
+                    s.filled = [23];
+                    s.pivot = { idx: 23, type: 'SELL' };
+                    s.boundary = 23 - GAP;
+                    s.debts = [{
+                        key: sellFill(23).key, side: 'BUY', ideal: 20, from: 23,
+                        status: 'owed', attempts: 0, reason: null, link: 23
+                    }];
+                    s.metrics.owed = 1;
+                    s.guard = 'normal fill → pivot SELL slot-23, boundary 12 → 20';
+                }
+            },
+            {
+                title: '2 · Its counter is placed and confirmed',
+                confirm: true,
+                narration: 'The normal fill owes a BUY counter at 23 − gap = 20, inside the widened BUY rail. The window refill occupies slots 13..19 and the stamped counter takes slot 20; the op confirms and the debt clears.',
+                apply(s) {
+                    s.cycle = 2;
+                    for (let i = 13; i <= 19; i++) s.orders[i] = { type: 'BUY' };
+                    s.orders[20] = { type: 'BUY', stamped: true };
+                    s.debts = [];
+                    s.metrics.owed = 0;
+                    s.metrics.placed = 1;
+                    s.guard = 'normal counter confirmed → debt cleared';
+                }
+            },
+            {
+                title: '3 · Edge-pinned insurance fill',
+                narration: 'Now the ceiling SELL at slot 25 is the best ask and it finally fills. recordLastFilledPrices skips edge-pinned fills, so the pivot STAYS at slot-23 and the boundary stays at 20: no new guard arm, no crawl, no re-anchor. This is the one documented geometry exception.',
+                apply(s) {
+                    delete s.orders[25];
+                    s.holes = [23, 25];
+                    s.filled = [25];
+                    s.debts = [{
+                        key: '1.7.1065:905:h-25', side: 'BUY', ideal: 22, from: 25,
+                        status: 'owed', attempts: 1, reason: 'no-slot', link: 25
+                    }];
+                    s.metrics.owed = 1;
+                    s.metrics.deferred = 1;
+                    s.guard = 'edge-skipped → pivot stays at slot-23 · BUY rail 7..20 is full → ideal slot-22 has no free slot (no-slot)';
+                }
+            },
+            {
+                title: '4 · Geometry belongs to the normal fill',
+                narration: 'The window moved because of the normal fill at 23, not the edge wick. The edge fill still owes one counter, but every free BUY slot is already occupied (7..20), so the debt is deferred no-slot and stays in memory until a rail slot opens — a restart drops it, since nothing is persisted. Both asks are now consumed, so the book is one-sided and the spread gauge reads undefined until the SELL rail is restocked.',
+                apply(s) {
+                    s.guard = 'edge fill: no pivot change, no crawl, no anchor — but still one owed counter';
+                }
+            }
+        ]
+    };
+
+    // A filled counter is just another fill: mirror the single-SELL walkthrough
+    // and then follow the counter BUY into a new SELL obligation.
+    STEP_DEFS.mirror = STEP_DEFS.sell.concat([
+        {
+            title: '8 · The counter BUY itself fills',
+            narration: 'A taker sold into the counter BUY at slot 13. That is a real fill, so it arms a new BUY pivot and re-anchors to 13 − 1 = 12. Critically, it does NOT cancel the earlier trade — it mints a new SELL debt at 13 + gap = 16.',
+            apply(s) {
+                s.cycle = 3;
+                s.filled = s.filled.concat(13);
+                s.holes = s.holes.concat(13);
+                delete s.orders[13];
+                s.spreadSlot = null;
+                s.pivot = { idx: 13, type: 'BUY' };
+                s.boundary = 12;
+                s.debts = [{
+                    key: '1.7.1053:893:h-13', side: 'SELL', ideal: 16, from: 13,
+                    status: 'owed', attempts: 0, reason: null, link: 13
+                }];
+                s.metrics.owed = 1;
+                s.guard = 'counter fill → new SELL debt at slot-16 (the original sell level)';
+            }
+        },
+        {
+            title: '9 · The mirror counter is placed',
+            narration: 'The SELL rail now starts at 16 again, so slot 16 is free and becomes the mirrored counter. It is stamped with the NEW fill key, not the old one.',
+            apply(s) {
+                s.orders[16] = { type: 'SELL', stamped: true };
+                s.debts[0].status = 'stamped';
+            }
+        },
+        {
+            title: '10 · Second confirmation clears it',
+            confirm: true,
+            narration: 'The mirrored op confirms and the second debt clears. Both fills have now been answered — and the loop stops here because no further fill has occurred. Placement alone never mints debt.',
+            apply(s) {
+                s.debts = [];
+                s.metrics.owed = 0;
+                s.metrics.placed = 2;
+                s.guard = '2 fills → 2 confirmed counters → ledger empty';
+            }
+        },
+        {
+            title: '11 · Spread normal again',
+            narration: 'The ladder has ping-ponged between slots 13 and 16, harvesting the gap on each round trip, and the spread path tightens the quote around the new window.',
+            apply(s) { s.spreadSlot = 14; s.guard = ''; }
+        }
+    ]);
+
+    function buildTimeline(scenario) {
+        const base = initialState();
+        let idleNote = 'BUY orders below the boundary, SELL orders above the gap band. No pivot is armed; the direction guard is cold.';
+        if (scenario === 'refuse') {
+            // A residual BUY stranded in the gap band: it blocks the validator
+            // from moving the boundary past it (no order-book implication).
+            base.orders[15] = { type: 'BUY', residual: true };
+            idleNote = 'BUY orders below the boundary, SELL orders above the gap band — plus a stranded BUY at slot 15 inside the band. No pivot is armed; the guard is cold.';
+        }
+        if (scenario === 'edge') {
+            // One normal ask in front of static fat-finger insurance at the
+            // ceiling: the edge order cannot fill until slot 23 is consumed.
+            for (let i = 16; i <= 22; i++) delete base.orders[i];
+            base.orders[25] = { type: 'SELL', edge: true };
+            idleNote = 'One normal SELL at slot 23 plus a static SELL at the ceiling (slot 25). The normal ask must fill first — the edge order is only reachable after it is gone.';
+        }
+        const steps = [{ title: '0 · Idle grid', narration: idleNote, state: clone(base) }];
+        let s = clone(steps[0].state);
+        for (const def of STEP_DEFS[scenario]) {
+            const prev = clone(s);
+            s = clone(s);
+            def.apply(s);
+            const step = { title: def.title, narration: def.narration, state: clone(s) };
+            // Kept so the "phantom CREATE" toggle can replay the same step
+            // without a confirmation instead of rebuilding the timeline.
+            if (def.confirm) step.preConfirm = prev;
+            steps.push(step);
+        }
+        return steps;
+    }
+
+    const $ = (id) => document.getElementById(id);
+    const CODE_TERMS = [
+        'counterOrdersPlacedCount', 'placed_order_in_band', 'resolveCounterQuota',
+        'recordCounterDebt', 'isDelayedRotationTrigger', 'recordLastFilledPrices',
+        'counterForFillKey', 'src=partial', '§9.16', 'COW', 'CREATE',
+        'no-slot', 'batch-cap', 'gap+1'
+    ];
+    function narrate(text) {
+        const esc = String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        const re = new RegExp('(' + CODE_TERMS.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')', 'g');
+        return esc.replace(re, '<code>$1</code>');
+    }
+    const ladder = $('ladder'), timeline = $('timeline');
+    let steps = [], index = 0, timer = null;
+
+    function render() {
+        let s = steps[index].state;
+        const phantomOn = $('phantom').checked;
+        if (phantomOn && steps[index].preConfirm) {
+            // Replay the PRE-confirmation snapshot: a lost/phantom CREATE
+            // leaves the stamped debt owed instead of settling it.
+            s = clone(steps[index].preConfirm);
+            s.phantom = true;
+        }
+        if ($('blockedDemo').checked && s.pivot
+            && !s.blocked.some((b) => b.idx === s.pivot.idx)) {
+            s = clone(s);
+            s.blocked = s.blocked.concat([
+                { idx: s.pivot.idx, type: s.pivot.type, reason: 'same-level / direction' }
+            ]);
+        }
+        const bandLo = s.boundary + 1, bandHi = s.boundary + GAP;
+
+        ladder.innerHTML = '';
+        for (let i = N - 1; i >= 0; i--) {
+            const row = document.createElement('div');
+            let cls = 'row';
+            if (i > s.boundary && i <= bandHi) cls += ' band';
+            if (i === s.boundary) cls += ' boundary';
+            if (s.pivot && s.pivot.idx === i) cls += ' pivot';
+            if (s.targets.indexOf(i) >= 0) cls += ' target';
+            if (s.filled.indexOf(i) >= 0) cls += ' filled';
+            row.className = cls;
+
+            const zone = document.createElement('span');
+            zone.className = 'slot';
+            zone.textContent = slot(i);
+            const px = document.createElement('span');
+            px.className = 'price';
+            px.textContent = price(i);
+            const track = document.createElement('span');
+            track.className = 'track';
+            const o = s.orders[i];
+            if (o) {
+                const bar = document.createElement('span');
+                bar.className = 'order ' + o.type.toLowerCase()
+                    + (o.stamped ? ' stamped' : '')
+                    + (o.residual ? ' residual' : '')
+                    + (o.partial ? ' partial' : '')
+                    + (o.edge ? ' edge' : '')
+                    + (s.phantom && o.stamped ? ' phantom' : '');
+                bar.textContent = o.type
+                    + (o.partial ? ' (partial)' : '')
+                    + (s.phantom && o.stamped ? ' (unconfirmed)' : '');
+                if (o.stamped) bar.title = 'stamped with counterForFillKey';
+                track.appendChild(bar);
+            } else if (s.holes.indexOf(i) >= 0) {
+                const hole = document.createElement('span');
+                hole.className = 'hole';
+                hole.textContent = 'filled / virtual';
+                track.appendChild(hole);
+            } else if (s.spreadSlot === i) {
+                const bar = document.createElement('span');
+                bar.className = 'order spread';
+                bar.textContent = 'SPREAD';
+                track.appendChild(bar);
+            }
+            for (const b of s.blocked.filter((x) => x.idx === i)) {
+                const ghost = document.createElement('span');
+                ghost.className = 'order blocked';
+                ghost.textContent = b.type + ' (blocked)';
+                ghost.title = 'final gate dropped this op: ' + b.reason;
+                track.appendChild(ghost);
+            }
+
+            const flags = document.createElement('span');
+            flags.className = 'flags';
+            const flag = (text, kind) => {
+                const f = document.createElement('span');
+                f.className = 'flag ' + kind;
+                f.textContent = text;
+                flags.appendChild(f);
+            };
+            if (i === s.boundary) flag('boundary', 'boundary');
+            if (s.pivot && s.pivot.idx === i) flag('pivot ' + s.pivot.type, 'pivot');
+            if (s.filled.indexOf(i) >= 0) flag('filled', 'pivot');
+            if (s.targets.indexOf(i) >= 0) flag('counter target', 'target');
+            if (o && o.residual) flag('stranded residual', 'stranded');
+            if (o && o.partial) flag('partial residual', 'partial');
+            if (o && o.edge) flag('edge insurance', 'edge');
+            const outgoing = s.debts.find((d) => d.from === i);
+            if (outgoing) flag('gap → slot-' + outgoing.ideal, 'target');
+            if (s.debts.some((d) => d.link === i)) flag('← gap counter', 'target');
+            for (const b of s.blocked.filter((x) => x.idx === i)) flag('blocked: ' + b.reason, 'blocked');
+            if (s.phantom && o && o.stamped) flag('phantom / unconfirmed', 'phantom');
+            if (i > s.boundary && i <= bandHi) flag('band', '');
+
+            row.append(zone, px, track, flags);
+            ladder.appendChild(row);
+        }
+
+        $('stepTitle').textContent = steps[index].title + (s.phantom ? ' (PHANTOM BRANCH)' : '');
+        $('narration').innerHTML = narrate(s.phantom
+            ? 'PHANTOM BRANCH: the CREATE result was lost or never indexed. The order may look present, but without a confirmed stamped op the debt is NOT settled — it stays in the ledger and is re-planned next cycle.'
+            : steps[index].narration);
+        const guardText = s.phantom
+            ? 'phantom CREATE → no confirmation → debt stays owed (re-planned next cycle)'
+            : (s.guard || '');
+        $('guard').textContent = guardText || 'No guard verdict this step.';
+        $('guard').style.display = guardText ? 'block' : 'none';
+        const lastConfirmIdx = steps.reduce((acc, st, i) => (st.preConfirm ? i : acc), -1);
+        $('phantomNote').style.display = (phantomOn && lastConfirmIdx >= 0 && index > lastConfirmIdx)
+            ? 'block' : 'none';
+
+        const bids = Object.keys(s.orders).map(Number)
+            .filter((i) => s.orders[i].type === 'BUY' && i <= s.boundary);
+        const asks = Object.keys(s.orders).map(Number)
+            .filter((i) => s.orders[i].type === 'SELL');
+        const bestBid = bids.length ? Math.max.apply(null, bids) : null;
+        const bestAsk = asks.length ? Math.min.apply(null, asks) : null;
+        const width = bestBid != null && bestAsk != null ? bestAsk - bestBid : null;
+        const nominal = GAP + 1;
+        const excess = width == null ? null : width - nominal;
+        const gaugeFill = $('gaugeFill');
+        gaugeFill.style.width = (width == null ? 0 : Math.min(100, Math.round(width / (nominal * 2) * 100))) + '%';
+        gaugeFill.className = 'gauge-fill' + (s.stalled ? ' stalled' : (excess != null && excess > 0 ? ' wide' : ''));
+        $('gaugeText').textContent = (bestBid == null || bestAsk == null)
+            ? 'no two-sided book — spread undefined'
+            : 'best bid slot-' + bestBid + ' · best ask slot-' + bestAsk
+                + ' · width ' + width + ' steps (nominal ' + nominal + ')'
+                + (s.stalled ? ' — STALLED: re-anchor refused'
+                    : (excess != null && excess > 0 ? ' — wide by ' + excess : ' — inside tolerance'))
+                + (s.spreadSlot != null ? ' · SPREAD active' : '');
+
+        const kv = [
+            ['cycle', String(s.cycle)],
+            ['pivot', s.pivot ? s.pivot.type + ' @ slot-' + s.pivot.idx : 'cold'],
+            ['boundary', 'slot-' + s.boundary],
+            ['gap band', 'slot-' + bandLo + ' .. slot-' + bandHi],
+            ['counter ideal', s.debts.length ? 'slot-' + s.debts[0].ideal : '—'],
+            ['owed now', String(s.metrics.owed)],
+            ['placed (confirmed)', String(s.metrics.placed)],
+            ['deferred', String(s.metrics.deferred)],
+            ['per-cycle cap', String(s.metrics.cap)]
+        ];
+        $('state').innerHTML = kv.map((p) => '<span>' + p[0] + '</span><span>' + p[1] + '</span>').join('');
+
+        $('debts').innerHTML = s.debts.length
+            ? s.debts.map((d) => '<div class="debt"><div><span class="key">' + d.key + '</span>'
+                + '<span class="meta">attempts=' + (d.attempts || 0)
+                + (d.reason ? ' · ' + d.reason : '')
+                + (s.phantom ? ' · confirmation missing' : '')
+                + '</span></div><span>' + d.side + ' @ slot-' + d.ideal
+                + ' <b class="status ' + (s.phantom ? 'deferred' : d.status) + '">'
+                + (s.phantom ? 'unconfirmed' : d.status) + '</b></span></div>').join('')
+            : '<div class="empty">Ledger empty — no counter is currently owed.</div>';
+
+        timeline.innerHTML = '';
+        steps.forEach((st, i) => {
+            const b = document.createElement('button');
+            b.textContent = String(i);
+            b.title = st.title;
+            if (i === index) b.className = 'active';
+            b.onclick = () => { stop(); index = i; render(); };
+            timeline.appendChild(b);
+        });
+        $('play').textContent = timer ? '❚❚ Pause' : '▶ Play';
+    }
+
+    function stop() { if (timer) { clearTimeout(timer); timer = null; } }
+    function play() {
+        if (timer) { stop(); render(); return; }
+        if (index >= steps.length - 1) index = 0;
+        const tick = () => {
+            if (index >= steps.length - 1) { stop(); render(); return; }
+            index++; render();
+            timer = setTimeout(tick, Number($('speed').value));
+        };
+        timer = setTimeout(tick, Number($('speed').value));
+        render();
+    }
+    function stepBy(d) { stop(); index = Math.max(0, Math.min(steps.length - 1, index + d)); render(); }
+    function reset() { stop(); steps = buildTimeline($('scenario').value); index = 0; render(); }
+
+    $('play').onclick = play;
+    $('next').onclick = () => stepBy(1);
+    $('reset').onclick = reset;
+    $('scenario').onchange = reset;
+    $('phantom').onchange = render;
+    $('blockedDemo').onchange = render;
+    document.addEventListener('keydown', (e) => {
+        if (e.target.tagName === 'SELECT' || e.target.tagName === 'INPUT') return;
+        if (e.code === 'Space') { e.preventDefault(); play(); }
+        if (e.code === 'ArrowRight') stepBy(1);
+        if (e.code === 'ArrowLeft') stepBy(-1);
+    });
+
+    reset();
+})();
+</script>
+</body>
+</html>

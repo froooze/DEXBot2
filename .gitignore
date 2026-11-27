@@ -30,6 +30,7 @@ Thumbs.db
 .antigravitycli/
 
 *.html
+!docs/fill_handling_animation.html
 analysis/**/*.json
 market_adapter/**/*.json
 !**/package.json
