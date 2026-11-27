@@ -59,9 +59,8 @@ const NAMES = {
         'resolveGridUpdateBlockers', 'noteGridUpdateBlockers',
         // Newly consolidated single-source readers used by modules loaded
         // under this manifest (order.ts, maintenance/cow runtime, accounting).
-        // The retired fill-veto family (offMarketFill, fillOutsideMarket,
-        // verifyFillMarketReference, resolveFillMidVerifyMs and the
-        // refused-level helpers) is NOT imported by any module any more.
+        // The retired fill-veto and marker families are removed from the
+        // system module entirely, so no consumer can import them.
         'readBotInFlightFlags', 'readFillPipelineState',
         'extractGoneOrderIds', 'extractUpdateTargetOrderIds',
         // Shared evidence derivation survives the fill-authoritative change.

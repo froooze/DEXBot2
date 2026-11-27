@@ -7,10 +7,13 @@
  * blocked (a SELL at/below the last SELL, a BUY at/above the last BUY). The
  * counter side stays placeable, and a cold pivot blocks nothing.
  *
- * This suite flips the old marker assertions and pins the neutral stubs.
+ * This suite flips the old marker assertions and pins that the whole helper
+ * family is gone (the filename is kept for historical continuity).
  */
 
 const assert = require('assert');
+const fs = require('fs');
+const path = require('path');
 const {
     setLastFillPivot,
     evaluateLastFillGuard,
@@ -18,9 +21,6 @@ const {
     isLastFillGuardBlocked,
     resetLastFillPivot,
     expireLastFillGuardReferences,
-    liveRefusedFillLevels,
-    hasLiveRefusedFillLevels,
-    releaseRefutedRefusedLevels,
 } = require('../modules/order/utils/system');
 const { ORDER_TYPES } = require('../modules/constants');
 
@@ -52,11 +52,6 @@ function makeManager(over: Record<string, unknown> = {}) {
         _lastMarketFillPrice: null as number | null,
         _lastMarketFillType: null as string | null,
         _lastMarketFillAt: 0,
-        // Legacy marker fields are inert: no writer and no reader consults them.
-        _lastRefusedFillPrice: null as number | null,
-        _lastRefusedFillType: null as string | null,
-        _lastRefusedFillAt: 0,
-        _lastRefusedFillLevels: [] as Array<{ price: number; type: string; at: number }>,
         _liveMarketPrice: null as number | null,
         _liveMarketPriceAt: null as number | null,
         config: { incrementPercent: 0.5 },
@@ -86,9 +81,11 @@ run('REFUSED-1 the sweep arms the pivot and writes no marker', () => {
     assert.strictEqual(mgr._lastFilledPrice, SWEEP_SELL, 'the pivot family follows the fill');
     assert.strictEqual(mgr._lastFilledType, ORDER_TYPES.SELL);
     assert.strictEqual(mgr._lastMarketFillPrice, SWEEP_SELL, 'the market-fill row follows too');
-    assert.strictEqual(mgr._lastRefusedFillPrice, null, 'no marker writer survives');
-    assert.deepStrictEqual(mgr._lastRefusedFillLevels, [], 'no per-level set survives');
     assert.ok(!mgr.logs.some((l: any) => /same-level re-fill|Refusing to arm pivot/.test(l.msg)));
+    const src = fs.readFileSync(path.join(__dirname, '../../modules/order/utils/system.ts'), 'utf8');
+    for (const name of ['liveRefusedFillLevels', 'hasLiveRefusedFillLevels', 'releaseRefutedRefusedLevels']) {
+        assert.ok(!new RegExp(`export function ${name}\\(`).test(src), `${name} is no longer exported`);
+    }
 });
 
 run('REFUSED-2 the new fill displaces an already-armed pivot', () => {
@@ -96,7 +93,6 @@ run('REFUSED-2 the new fill displaces an already-armed pivot', () => {
     armSweepSell(mgr);
     assert.strictEqual(mgr._lastFilledPrice, SWEEP_SELL, 'the latest fill wins');
     assert.strictEqual(mgr._lastFilledType, ORDER_TYPES.SELL);
-    assert.strictEqual(mgr._lastRefusedFillPrice, null);
 });
 
 run('REFUSED-3 all fills arm, including an ordinary window fill', () => {
@@ -104,7 +100,6 @@ run('REFUSED-3 all fills arm, including an ordinary window fill', () => {
     mgr._liveMarketPrice = MID;
     mgr._liveMarketPriceAt = FRESH_MID_AT;
     assert.strictEqual(setLastFillPivot(mgr, ORDER_TYPES.SELL, MID * 1.005, 'fill'), true);
-    assert.strictEqual(mgr._lastRefusedFillPrice, null);
 });
 
 // ── 2. Direction rule: equal counts as blocked ───────────────────────────
@@ -149,19 +144,14 @@ run('REFUSED-6 same-level reason is "same-level" (never "refused-level")', () =>
 
 // ── 3. Cold pivot and neutral marker stubs ───────────────────────────────
 
-run('REFUSED-7 a cold pivot blocks nothing, even with legacy marker fields seeded', () => {
-    const mgr: any = makeManager({
-        _lastRefusedFillPrice: SWEEP_SELL,
-        _lastRefusedFillType: ORDER_TYPES.SELL,
-        _lastRefusedFillAt: Date.now(),
-        _lastRefusedFillLevels: [{ price: SWEEP_SELL, type: ORDER_TYPES.SELL, at: Date.now() }]
-    });
+run('REFUSED-7 a cold pivot blocks nothing; no marker helper can supply a guard', () => {
+    const mgr: any = makeManager();
     assert.strictEqual(isLastFillPlacementBlocked(mgr, SWEEP_SELL, ORDER_TYPES.SELL).blocked, false,
-        'the marker must not become a second guard');
-    assert.deepStrictEqual(liveRefusedFillLevels(mgr), []);
-    assert.strictEqual(hasLiveRefusedFillLevels(mgr), false);
-    assert.strictEqual(releaseRefutedRefusedLevels(mgr, MID, SWEEP_SELL), 0);
-    assert.strictEqual(mgr._lastRefusedFillLevels.length, 1, 'the stub must not mutate legacy fields');
+        'a cold reference disables the guard');
+    const runtime = require('../modules/order/utils/system');
+    for (const name of ['liveRefusedFillLevels', 'hasLiveRefusedFillLevels', 'releaseRefutedRefusedLevels']) {
+        assert.strictEqual(runtime[name], undefined, `${name} is absent at runtime`);
+    }
 });
 
 run('REFUSED-8 reset clears the pivot scalars; the market row still arms the guard', () => {
@@ -170,7 +160,6 @@ run('REFUSED-8 reset clears the pivot scalars; the market row still arms the gua
     assert.strictEqual(isLastFillPlacementBlocked(mgr, SWEEP_SELL, ORDER_TYPES.SELL).blocked, true);
     assert.strictEqual(resetLastFillPivot(mgr, 'grid rebuild'), true);
     assert.strictEqual(mgr._lastFilledPrice, null);
-    assert.strictEqual(mgr._lastRefusedFillLevels.length, 0);
     // The bot-scoped market-fill row is deliberately NOT cleared by a grid
     // rebuild: it survives regeneration and keeps the guard armed.
     assert.strictEqual(isLastFillPlacementBlocked(mgr, SWEEP_SELL, ORDER_TYPES.SELL).blocked, true);

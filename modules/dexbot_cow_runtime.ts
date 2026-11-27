@@ -331,8 +331,6 @@ interface PreBroadcastGuardResult extends JsonObj {
 interface LastFillGuardResult {
     blocked: boolean;
     pivot: number | null;
-    /** The pivot itself: the direction rule has no separate band threshold. */
-    threshold?: number | null;
 }
 
 /** Per-batch last-fill guard counters. */
@@ -2415,10 +2413,8 @@ function isSpreadCorrectionBypassAllowed(bot: BotLike): boolean {
 
 /**
  * The newest usable side+price in the queue, derived by the SAME shared helper
- * for both the market verification and the pivot write. Peek-only, never
- * drains. A fill can arrive between the verify await and the write; the book
- * read is already fresh at that point, so the later write is judged against
- * that same mid rather than a stale cache.
+ * used by the fill-batch writer. Peek-only, never drains; the queued pivot
+ * write consumes the same evidence as the batch without any book read.
  */
 function latestQueuedFillEvidence(bot: BotLike): { price: number; type: string } | null {
     const mgr = bot?.manager;
@@ -2969,7 +2965,12 @@ async function pollChainForConfirmation(bot: BotLike, opContexts: OpPhase[], opt
     // Chain ids of the poll-matched fresh creates. Retained (not just
     // logged) so the poll-confirmed adoption path can re-read them BY ID —
     // the window fallback cannot prove a lagging node has them yet.
-    const matchedChainIds: string[] = [];
+    // Keyed by context, not appended in discovery order: contexts can confirm
+    // on different polls, while `confirmed` is returned in createContexts
+    // order. The returned id array keeps one slot per confirmed context (an
+    // unmatched context contributes '') so the two stay positionally aligned;
+    // collectors/clearing helpers ignore the empty slot by id regex.
+    const matchedChainIds = new Map<CreateContext, string>();
 
     for (let attempt = 1; attempt <= maxPollRetries; attempt++) {
         try {
@@ -3011,7 +3012,7 @@ async function pollChainForConfirmation(bot: BotLike, opContexts: OpPhase[], opt
                         `[COW][POLL] Confirmed CREATE for slot ${ctx.order.id} on chain as ${match.id}`,
                         'debug'
                     );
-                    if (match.id && /^1\.7\.\d+$/.test(String(match.id))) matchedChainIds.push(String(match.id));
+                    if (match.id && /^1\.7\.\d+$/.test(String(match.id))) matchedChainIds.set(ctx, String(match.id));
                 } else {
                     stillUnconfirmed.push(ctx);
                 }
@@ -3023,7 +3024,10 @@ async function pollChainForConfirmation(bot: BotLike, opContexts: OpPhase[], opt
                     `[COW][POLL] All ${confirmed.length} CREATE(s) confirmed on chain after ${attempt} poll(s)`,
                     'info'
                 );
-                return { allConfirmed: true, confirmed, unconfirmed: [], confirmedChainIds: [...matchedChainIds] };
+                return {
+                    allConfirmed: true, confirmed, unconfirmed: [],
+                    confirmedChainIds: confirmed.map((c) => matchedChainIds.get(c) ?? ''),
+                };
             }
 
             remaining = stillUnconfirmed;
@@ -3047,7 +3051,10 @@ async function pollChainForConfirmation(bot: BotLike, opContexts: OpPhase[], opt
         `${remaining.length} unconfirmed. Falling back to reconciliation.`,
         'warn'
     );
-    return { allConfirmed: false, confirmed, unconfirmed: remaining, confirmedChainIds: [...matchedChainIds] };
+    return {
+        allConfirmed: false, confirmed, unconfirmed: remaining,
+        confirmedChainIds: confirmed.map((c) => matchedChainIds.get(c) ?? ''),
+    };
 }
 
 /**
@@ -3681,9 +3688,6 @@ async function replanStaleBatch(bot: BotLike, cowResult: CowResult, replanDepth:
     popPushedWorkingGrid(bot, cowResult);
 
     let replanned: CowResult | null = null;
-    // Pre-plan snapshot of the per-batch absolute-anchor budget (see the restore
-    // above). Kept at function scope so the fresh plan can carry it on for a
-    // second re-plan.
     try {
         // Restore the boundary-shift budget consumed by the abandoned plan:
         // it was built from the same fills and never shipped, so the re-plan
@@ -6132,7 +6136,12 @@ async function updateOrdersOnChainBatchCOWBody(
                     ) as typeof executedContexts;
                     return await recoverRefusedCommit(
                         bot, chainOrders, '[COW]',
-                        { placedResults: result, placedContexts: confirmedContexts },
+                        {
+                            placedResults: result, placedContexts: confirmedContexts,
+                            // Debt settlement derives chain ids from result
+                            // indices, so it needs the UNfiltered context list.
+                            counterContexts: executedContexts,
+                        },
                         confirmedContexts, effectiveBoundary,
                         {
                             failureResyncReason: 'commit refused after broadcast (chain adoption unavailable)',
@@ -6291,7 +6300,7 @@ async function updateOrdersOnChainBatchCOWBody(
                         // protection if adoption is unavailable.
                         return await recoverRefusedCommit(
                             bot, chainOrders, '[COW][UNCERTAIN]',
-                            { placedContexts: opContexts, polledCreateIds: confirmation.confirmedChainIds },
+                            { placedContexts: opContexts, polledCreateIds: confirmation.confirmedChainIds, polledConfirmedContexts: confirmation.confirmed },
                             opContexts, effectiveBoundary,
                             {
                                 successReturn: { executed: false, hadRotation: false, commitRefused: true, uncertainResolved: true },
@@ -6316,7 +6325,7 @@ async function updateOrdersOnChainBatchCOWBody(
                     // refused-commit paths via recoverRefusedCommit).
                     return await recoverRefusedCommit(
                         bot, chainOrders, '[COW][UNCERTAIN]',
-                        { placedContexts: opContexts, polledCreateIds: confirmation.confirmedChainIds },
+                        { placedContexts: opContexts, polledCreateIds: confirmation.confirmedChainIds, polledConfirmedContexts: confirmation.confirmed },
                         opContexts, effectiveBoundary,
                         {
                             // Poll-confirmed SUCCESS: the commit was accepted;
@@ -6506,6 +6515,11 @@ async function defaultAdoptionNodeFailover(): Promise<boolean> {
  *   the uncertain-broadcast poll (no broadcast result exists on that path);
  *   routes the poll call sites through the by-id path with its lagging-create
  *   retry instead of the unguarded window fallback
+ * @param {unknown[]} [opts.polledConfirmedContexts] - CREATE contexts parallel
+ *   to `polledCreateIds`; only these may settle a counter debt on that path
+ * @param {unknown[]} [opts.counterContexts] - unfiltered op contexts aligned
+ *   with `operation_results`; used ONLY for debt settlement so an earlier
+ *   phantom removal cannot shift the result-index mapping
  * @returns {Promise<boolean>} true if master was adopted from the chain
  */
 /**
@@ -6519,6 +6533,69 @@ export function filterPhantomCounterContexts(
     phantomContexts: ReadonlySet<unknown>
 ): unknown[] {
     return (contexts ?? []).filter((ctx) => !phantomContexts.has(ctx));
+}
+
+/**
+ * Recovery-scoped counterpart: an authoritative adoption can find only SOME
+ * of the batch's orders, so only those ops may settle their own debt. A
+ * context without a provable chain id stays owed (the conservative direction:
+ * a duplicate counter is preferable to a missing one). Poll-confirmed CREATEs
+ * carry their ids in `polledCreateIds`, parallel to `polledConfirmedContexts`;
+ * the broadcast path derives them from `operation_results` by context index.
+ * A size-update keeps the SAME live chain id, so that id is also proof; a
+ * rotation's OLD id is deliberately NOT used — it is cancelled by the op, so
+ * finding it would not prove the stamped new order landed. A rotation settles
+ * in recovery only when its own op result carries the new chain id.
+ */
+function filterConfirmedCounterContexts(
+    contexts: readonly unknown[] | null | undefined,
+    confirmedIds: ReadonlySet<string>,
+    placedResults: unknown,
+    polledConfirmedContexts?: readonly unknown[] | null,
+    polledCreateIds?: readonly string[] | null
+): unknown[] {
+    if (!Array.isArray(contexts)) return [];
+    const idByContext = new Map<unknown, string>();
+    // Production passes the exact poll-confirmed contexts. A caller supplying
+    // only the ids (older seams) gets the historical alignment: ids in create
+    // context order.
+    const polledContexts = Array.isArray(polledConfirmedContexts)
+        ? polledConfirmedContexts
+        : (Array.isArray(polledCreateIds) ? contexts.filter((c) => (c as { kind?: string } | null)?.kind === 'create') : null);
+    if (polledContexts && Array.isArray(polledCreateIds)) {
+        for (let i = 0; i < polledContexts.length; i++) {
+            const id = polledCreateIds[i];
+            if (typeof id === 'string' && /^1\.7\.\d+$/.test(id)) idByContext.set(polledContexts[i], id);
+        }
+    }
+    const chainId = (v: unknown): string | null =>
+        typeof v === 'string' && /^1\.7\.\d+$/.test(v) ? v : null;
+    // Only where the poll did not already name its confirmed contexts: a
+    // size-update keeps the SAME live chain id, so that id proves the op
+    // landed. With a poll list, that list is the authority — an unconfirmed
+    // context must not settle a debt just because its id exists on chain.
+    if (!polledContexts) {
+        for (const ctx of contexts) {
+            const c = ctx as {
+                order?: { orderId?: string | null };
+                updateInfo?: { partialOrder?: { orderId?: string | null } | null };
+            } | null;
+            const liveId = chainId(c?.order?.orderId) ?? chainId(c?.updateInfo?.partialOrder?.orderId);
+            if (liveId) idByContext.set(ctx, liveId);
+        }
+    }
+    const opResults = extractBatchOperationResults(placedResults);
+    if (opResults) {
+        for (let i = 0; i < contexts.length; i++) {
+            if (idByContext.has(contexts[i])) continue;
+            const raw = chainId(opResults[i]?.[1]);
+            if (raw) idByContext.set(contexts[i], raw);
+        }
+    }
+    return contexts.filter((ctx) => {
+        const id = idByContext.get(ctx);
+        return id != null && confirmedIds.has(id);
+    });
 }
 
 function clearCounterDebtsFromContexts(bot: BotLike, contexts: unknown[] | null | undefined): void {
@@ -6546,7 +6623,7 @@ function clearCounterDebtsFromContexts(bot: BotLike, contexts: unknown[] | null 
 
 async function adoptPlacedBatchFromChain(bot: BotLike, chainOrders: typeof chainOrdersModule, logPrefix: string, opts: JsonObj = {}): Promise<boolean> {
     const {
-        placedResults = null, placedContexts = null, polledCreateIds = null, nodeFailover = null,
+        placedResults = null, placedContexts = null, polledCreateIds = null, polledConfirmedContexts = null, counterContexts = null, nodeFailover = null,
         // Test seams: the production retry budget/backoff come from the frozen
         // COW_PERFORMANCE constants; callers in tests inject small values so the
         // lagging-read paths do not sleep for seconds.
@@ -6566,7 +6643,10 @@ async function adoptPlacedBatchFromChain(bot: BotLike, chainOrders: typeof chain
             || (Array.isArray(placedContexts) && placedContexts.length > 0)
             || (Array.isArray(polledCreateIds) && polledCreateIds.length > 0);
         const { all: knownIds, createIds } = haveIdHints
-            ? collectKnownOnChainOrderIds(mgr, placedResults, placedContexts as Parameters<typeof collectKnownOnChainOrderIds>[2], polledCreateIds as string[] | null | undefined)
+            // Same unfiltered, result-aligned list used for debt settlement:
+            // pairing a phantom-filtered list with operation_results shifts
+            // every later index and silently loses the fresh CREATE ids.
+            ? collectKnownOnChainOrderIds(mgr, placedResults, (counterContexts ?? placedContexts) as Parameters<typeof collectKnownOnChainOrderIds>[2], polledCreateIds as string[] | null | undefined)
             : { all: [], createIds: [] as string[] };
         if (knownIds.length > 0 && typeof chainOrders.batchReadOrders === 'function') {
             // Retry/backoff (fix #6): a fresh CREATE absent from the first read
@@ -6732,7 +6812,15 @@ async function adoptPlacedBatchFromChain(bot: BotLike, chainOrders: typeof chain
             }
             if (fullChain.length > 0 && typeof mgr.syncFromOpenOrders === 'function') {
                 await mgr.syncFromOpenOrders(fullChain, { skipAccounting: false });
-                clearCounterDebtsFromContexts(bot, placedContexts as unknown[] | null | undefined);
+                const foundIds = new Set(
+                    fullChain.map((o) => String(o?.id ?? '')).filter((id) => /^1\.7\.\d+$/.test(id))
+                );
+                clearCounterDebtsFromContexts(bot, filterConfirmedCounterContexts(
+                    (counterContexts ?? placedContexts) as unknown[] | null | undefined,
+                    foundIds, placedResults,
+                    polledConfirmedContexts as readonly unknown[] | null | undefined,
+                    polledCreateIds as readonly string[] | null | undefined
+                ));
                 bot.manager.logger.log(
                     `${logPrefix} Adopted ${fullChain.length} on-chain order(s) by id after refused/uncertain commit (truncation-immune)`,
                     'info'
@@ -6753,7 +6841,15 @@ async function adoptPlacedBatchFromChain(bot: BotLike, chainOrders: typeof chain
         const freshChain = freshRead.orders;
         if (freshChain.length > 0 && typeof bot.manager.syncFromOpenOrders === 'function') {
             await bot.manager.syncFromOpenOrders(freshChain, { skipAccounting: false });
-            clearCounterDebtsFromContexts(bot, placedContexts as unknown[] | null | undefined);
+            const freshIds = new Set(
+                freshChain.map((o) => String(o?.id ?? '')).filter((id) => /^1\.7\.\d+$/.test(id))
+            );
+            clearCounterDebtsFromContexts(bot, filterConfirmedCounterContexts(
+                (counterContexts ?? placedContexts) as unknown[] | null | undefined,
+                freshIds, placedResults,
+                polledConfirmedContexts as readonly unknown[] | null | undefined,
+                polledCreateIds as readonly string[] | null | undefined
+            ));
             return true;
         }
     } catch (syncErr) {
@@ -6966,10 +7062,8 @@ function warnCrossingCreate(bot: BotLike, price: unknown, type: unknown, slotId:
  * @param {string} type - ORDER_TYPES.BUY/SELL
  * @param {Object} stats - lastFillGuardStats tracker (checked++ here)
  * @param {boolean} [skipRefresh=false] - Skip the queued-fill pivot refresh.
- *   Production batch callers MUST pass true: only the async batch boundaries
- *   (freeze / final gate) can verify the cached mid before a queued-fill
- *   pivot write (see verifyQueuedFillMarket). A non-batch caller with a client
- *   must await verification before leaving this refresh enabled.
+ *   Production batch callers pass true: the freeze already refreshed the pivot
+ *   from the queue, and no fill path reads the book any more.
  * @returns {{check: Object, refreshed: boolean}}
  */
 function runLastFillGuardCheck(bot: BotLike, price: number, type: string, stats: LastFillGuardStats, skipRefresh: boolean = false): { check: LastFillGuardResult; refreshed: boolean } {

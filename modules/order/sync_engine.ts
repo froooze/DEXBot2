@@ -1706,6 +1706,8 @@ class SyncEngine {
         receivesAssetId?: string | null;
         receivesAmountRaw?: unknown;
         isPartial?: boolean;
+        blockNum?: number;
+        historyId?: string;
     }): boolean {
         return attributeUnmatchedFillToGrid(mgr, {
             orderId: params?.orderId ?? null,
@@ -1714,6 +1716,8 @@ class SyncEngine {
             receivesAssetId: params?.receivesAssetId ?? null,
             receivesAmountRaw: params?.receivesAmountRaw == null ? null : Number(params.receivesAmountRaw),
             isPartial: params?.isPartial === true,
+            blockNum: params?.blockNum,
+            historyId: params?.historyId,
         });
     }
 
@@ -2051,6 +2055,7 @@ class SyncEngine {
                         // _absorbUnmatchedFill). Only a truly unknown order is ignored.
                         const absorbed = this._absorbUnmatchedFill(mgr, {
                             orderId, paysAssetId, paysAmountRaw, receivesAssetId, receivesAmountRaw,
+                            blockNum, historyId,
                         });
                         if (!absorbed) {
                             mgr.logger.log(`[SYNC] Fill for order ${orderId} ignored: order not found in active grid.`, 'debug');
@@ -2285,6 +2290,7 @@ class SyncEngine {
                             const absorbed = this._absorbUnmatchedFill(mgr, {
                                 orderId, paysAssetId, paysAmountRaw,
                                 receivesAssetId: entry.receivesAssetId, receivesAmountRaw: entry.receivesAmountRaw,
+                                blockNum: entry.blockNum, historyId: entry.historyId,
                             });
                             if (!absorbed) {
                                 mgr.logger.log(`[SYNC] Fill for order ${orderId} ignored: order not found in active grid.`, 'debug');

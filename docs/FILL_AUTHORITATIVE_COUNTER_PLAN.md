@@ -13,6 +13,20 @@
 > 3. Three in-memory observability counters are landed with the change.
 > 4. At most `gapSlots + 1` counter orders are stacked into the grid per cycle;
 >    the remainder stays owed for later cycles.
+>
+> **Current state (follow-up cleanup):** Stages 0–1 below are kept as the
+> original plan and are **superseded** by a later cleanup. The compatibility
+> surface they retained is now removed: `offMarketFill`, `fillOutsideMarket`,
+> `verifyFillMarketReference`, `resolveFillMidVerifyMs`, the refused-level
+> helpers and `RefusedFillLevel` type, the `force`/`didRead` branch of
+> `maybeRefreshLiveMarketPrice` and the `_fillMidVerifyAttemptedAt` field no
+> longer exist. `TIMING.LAST_FILL_MID_VERIFY_MS` /
+> `LAST_FILL_MID_VERIFY_TIMEOUT_MS` and their timing-policy entries are gone;
+> `deriveTargetBoundary` no longer accepts `isFillEligibleForCrawl`. The
+> market-bound `GRID_LIMITS` knobs are removed from the defaults (generated bot
+> profiles may still carry the legacy keys as inert data); `LAST_FILL_PIVOT_TTL_MS`
+> stays, and `LAST_FILL_REFUSED_LEVEL_TTL_MS` is retained only because the
+> historical log-replay analysis still buckets old refusal events by it.
 
 ## Source incident (generic)
 
@@ -46,25 +60,26 @@ removes that comparison entirely. Consequences:
 
 ## Stages
 
-### Stage 0 — fills become authoritative
+### Stage 0 — fills become authoritative (SUPERSEDED by the cleanup above)
 
 `modules/order/utils/system.ts`: `offMarketFill` returns `null`;
 `verifyFillMarketReference` is a no-op. Gate: replay the incident window —
 pivot follows fills, no markers written, no forced book RPC. Stop if a counter
 BUY is blocked by the newly armed pivot; fix counter selection first.
 
-### Stage 1 — remove the dead machinery
+### Stage 1 — remove the dead machinery (SUPERSEDED by the cleanup above)
 
-Remove all live call sites of `verifyFillMarketReference` and neutralise the
-single `offMarketFill` predicate. Delete the refused-level marker family
-(writer, readers, release, generation-key branch, bypass denials, manager and
-type fields), `isCrawlEligible` and the injected crawl predicate, the gap-band
-and market-bound legs of anchor/pivot eligibility, and the one-per-cycle
-re-anchor budget. `fillOutsideMarket`, the neutral stubs and the
-`LAST_FILL_MID_VERIFY_*` / market-bound constants are **retained** as exported
-compatibility surface (config and tests reference them) with no live fill-path
-use. Keep `LAST_FILL_PIVOT_TTL_MS`.
-Gate: no live references remain; typechecks and `check:any` green.
+Remove all live call sites of `verifyFillMarketReference` and the single
+`offMarketFill` predicate. Delete the refused-level marker family (writer,
+readers, release, generation-key branch, bypass denials, manager and type
+fields), `isCrawlEligible` and the injected crawl predicate, the gap-band and
+market-bound legs of anchor/pivot eligibility, the one-per-cycle re-anchor
+budget, `fillOutsideMarket`, the forced-mid-verify branch and its timing knobs,
+and the market-bound `GRID_LIMITS` defaults. `LAST_FILL_REFUSED_LEVEL_TTL_MS`
+stays only because the offline analysis tool still reads it for historical log
+replay. Keep `LAST_FILL_PIVOT_TTL_MS`.
+Gate: no live references remain; tests assert absence of the removed exports
+and parameters; typechecks green.
 
 ### Stage 2 — quota ledger, batch-size stacking and counters
 
@@ -112,7 +127,10 @@ contracts; amend the retrospective sections, `COW_INVARIANTS.md`,
 ## Non-goals
 
 No reserved proceeds / pair ledger, no cooldown or backoff, no new persisted
-row or second writer of a fill fact, no crossing veto, no config or TTL change.
+row or second writer of a fill fact, no crossing veto, and no *behavioral*
+config or TTL change: the follow-up cleanup deleted the now-dead
+`LAST_FILL_MID_VERIFY_*` and market-bound `GRID_LIMITS` keys, but
+`LAST_FILL_PIVOT_TTL_MS` and the analysis-only refused-level TTL are unchanged.
 
 ## Verification
 

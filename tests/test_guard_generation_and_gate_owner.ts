@@ -3,11 +3,9 @@
  *
  * Post-v1.7.3 propagation fixes, two families:
  *
- * GG-001..004 — the generation key used to have a second leg: the oldest live
- *   refused-level marker supplied an identity while the fill pivot was cold.
- *   Under the fill-authoritative policy no fill is refused, so that branch is
- *   gone: an armed pivot keys as `price|side`, a cold reference keys as '' and
- *   the marker stubs are always empty/false. The bounded-expiry heal still
+ * GG-001..004 — the generation key used to have a second leg from a refused
+ *   level marker. The whole marker family is now removed: an armed pivot keys
+ *   as `price|side`, a cold reference keys as ''. The bounded-expiry heal still
  *   works for an ARMED generation; a cold one has no marker to clear.
  *
  * GG-005..006 — deferral/scheduling gates still peeked raw in-flight counters,
@@ -25,12 +23,8 @@
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
-const { ORDER_TYPES, TIMING, GRID_LIMITS } = require('../modules/constants');
-const {
-    resolveGuardGenerationKey,
-    liveRefusedFillLevels,
-    hasLiveRefusedFillLevels,
-} = require('../modules/order/utils/system');
+const { ORDER_TYPES, TIMING } = require('../modules/constants');
+const { resolveGuardGenerationKey } = require('../modules/order/utils/system');
 const {
     trackOutOfSpreadStaleness,
     checkPipelineInFlightWatchdogs,
@@ -83,7 +77,6 @@ function stubSpreadBot(): any {
             outOfSpread: 2,
             resyncRequests: [] as any[],
             logger: { log: () => {} },
-            _lastRefusedFillLevels: [] as any[],
             requestStructuralGridResync: async function (reason: string) {
                 (this as any).resyncRequests.push(reason);
                 return { scheduled: true };
@@ -95,54 +88,37 @@ function stubSpreadBot(): any {
 async function main() {
     console.log('=== Guard-generation key & in-flight owner tests ===\n');
 
-    await test('GG-001 armed pivot wins; legacy marker fields are ignored', () => {
+    await test('GG-001 an armed pivot keys as price|side', () => {
         const mgr: any = {
             _lastFilledPrice: 0.44764,
             _lastFilledType: ORDER_TYPES.SELL,
             _lastFilledAt: Date.now(),
-            _lastRefusedFillLevels: [{ price: 0.44, type: ORDER_TYPES.SELL, at: Date.now() - 1000 }],
         };
         assert.strictEqual(resolveGuardGenerationKey(mgr), `0.44764|${ORDER_TYPES.SELL}`);
-        assert.deepStrictEqual(liveRefusedFillLevels(mgr), [], 'marker stubs stay empty');
-        assert.strictEqual(hasLiveRefusedFillLevels(mgr), false);
     });
 
-    await test('GG-002 a cold pivot keys as empty regardless of a swept marker set', () => {
-        const now = Date.now();
-        const mgr: any = {
-            _lastRefusedFillLevels: [
-                { price: 0.44, type: ORDER_TYPES.SELL, at: now - 5000 },
-                { price: 0.4405, type: ORDER_TYPES.SELL, at: now - 4000 },
-                { price: 0.441, type: ORDER_TYPES.SELL, at: now - 3000 },
-            ],
-        };
-        const key = resolveGuardGenerationKey(mgr);
-        assert.strictEqual(key, '', 'there is no refused-level leg to the generation key');
-        mgr._lastRefusedFillLevels.push({ price: 0.4415, type: ORDER_TYPES.SELL, at: now - 1000 });
-        assert.strictEqual(resolveGuardGenerationKey(mgr), key, 'more swept rungs cannot fork the generation');
-        assert.strictEqual(hasLiveRefusedFillLevels(mgr, ORDER_TYPES.BUY), false);
-        assert.strictEqual(hasLiveRefusedFillLevels(mgr, ORDER_TYPES.SELL), false);
-        assert.strictEqual(liveRefusedFillLevels(mgr, ORDER_TYPES.SELL).length, 0);
+    await test('GG-002 a cold pivot keys as empty; no marker helper survives', () => {
+        const mgr: any = { _lastFilledPrice: null, _lastFilledType: null, _lastFilledAt: 0 };
+        assert.strictEqual(resolveGuardGenerationKey(mgr), '', 'the marker leg is gone');
+        const src = source('order/utils/system.ts');
+        assert.ok(!/export function (?:liveRefusedFillLevels|hasLiveRefusedFillLevels|releaseRefutedRefusedLevels)\(/.test(src),
+            'no marker reader/release helper may be exported');
+        const runtime = require('../modules/order/utils/system');
+        assert.strictEqual(runtime.hasLiveRefusedFillLevels, undefined);
+        assert.strictEqual(runtime.liveRefusedFillLevels, undefined);
     });
 
-    await test('GG-003 neither an expired nor a fresh legacy scalar supplies a key', () => {
-        const ttl = Number(GRID_LIMITS.LAST_FILL_REFUSED_LEVEL_TTL_MS);
-        const mgr: any = {
-            _lastRefusedFillLevels: [{ price: 0.44, type: ORDER_TYPES.SELL, at: Date.now() - ttl - 1000 }],
-            _lastRefusedFillPrice: 0.44,
-            _lastRefusedFillType: ORDER_TYPES.SELL,
-            _lastRefusedFillAt: Date.now() - ttl - 1000,
-        };
-        assert.strictEqual(resolveGuardGenerationKey(mgr), '');
-        mgr._lastRefusedFillAt = Date.now();
-        assert.strictEqual(resolveGuardGenerationKey(mgr), '', 'the scalar fallback branch is retired');
+    await test('GG-003 only the armed pivot contributes a generation identity', () => {
+        const key = functionBody('order/utils/system.ts', 'export function resolveGuardGenerationKey(');
+        assert.ok(!/refused|Refused/i.test(key), 'no refused-level branch remains in the owner');
+        assert.ok(/return ''/.test(key), 'cold reference yields the empty key');
+        const mgr: any = { _lastFilledPrice: 0, _lastFilledType: ORDER_TYPES.SELL, _lastFilledAt: Date.now() };
+        assert.strictEqual(resolveGuardGenerationKey(mgr), '', 'an unarmed (zero) pivot stays cold');
     });
 
     await test('GG-004 a cold generation has no marker to expire', () => {
         const now = Date.now();
         const bot = stubSpreadBot();
-        const marker = { price: 0.44, type: ORDER_TYPES.SELL, at: now - 1000 };
-        bot.manager._lastRefusedFillLevels = [marker];
         bot._lastGeometryResyncPivotKey = '';
         assert.strictEqual(resolveGuardGenerationKey(bot.manager), '', 'cold key');
 
@@ -150,13 +126,10 @@ async function main() {
         bot._outOfSpreadSince = now - (Number(TIMING.SPREAD_STALE_WARN_MS) / 2);
         let r = trackOutOfSpreadStaleness(bot, true, 0);
         assert.strictEqual(r.escalated, false, 'premature escalation');
-        assert.deepStrictEqual(bot.manager._lastRefusedFillLevels, [marker], 'no marker is written or cleared');
 
         bot._outOfSpreadSince = now - (Number(TIMING.SPREAD_STALE_GEOMETRY_ESCALATE_MS) + 60_000);
         r = trackOutOfSpreadStaleness(bot, true, 0);
         assert.strictEqual(r.escalated, true, 'the cold generation still reaches the escalation window');
-        assert.deepStrictEqual(bot.manager._lastRefusedFillLevels, [marker],
-            'legacy marker fields are inert: a cold generation has no marker to expire');
         assert.strictEqual(resolveGuardGenerationKey(bot.manager), '', 'generation stays cold');
     });
 

@@ -728,7 +728,6 @@ class OrderManager implements OrderManagerLike {
     _liveMarketPrice: number | null;
     _liveMarketPriceAt: number;
     _liveMarketPriceAttemptedAt: number;
-    _fillMidVerifyAttemptedAt: number;
     _lastSyncAt: number;
     _deferredRebalanceAt: number;
     _lastHeldPlanSignature: { boundaryIdx: number | null; pivot: number | null; fillsAt: number | null } | null;
@@ -907,7 +906,6 @@ class OrderManager implements OrderManagerLike {
         this._liveMarketPrice = null;
         this._liveMarketPriceAt = 0;
         this._liveMarketPriceAttemptedAt = 0;
-        this._fillMidVerifyAttemptedAt = 0;
         this._lastSyncAt = 0;
         this._deferredRebalanceAt = 0;
         this._lastHeldPlanSignature = null;
@@ -2821,16 +2819,9 @@ class OrderManager implements OrderManagerLike {
      * the crawl's classification (collectEdgePinnedFillIds is the shared
      * definition).
      *
-     * IN-BAND FILLS ARE SKIPPED TOO (same rule, completed). A slot the CURRENT
-     * geometry classifies as gap-band holds a stranded residual — an order the
-     * engine has already declared out of place ("placed_order_in_band") — not a
-     * window trade. Live: a sweep crawled the boundary over a resting sell,
-     * that stranded sell then partially filled 11s later, and the fill armed the
-     * pivot at the top of the band the geometry had just derived. Every SELL in
-     * the band was then `<= pivot`, so the counter-orders the sweep owed could
-     * never be placed. The eligibility rule (§9.6 "Only a window trade may
-     * become the pivot") is applied at this single writer: edge-pinned here,
-     * in-band here, off-market distance in setLastFillPivot.
+     * Every other fill is market truth under §9.16: a residual in the gap band
+     * still arms the pivot and contributes to the crawl and the anchor. No
+     * in-band or market-distance eligibility rule remains.
      * @param {Array} fills
      */
     recordLastFilledPrices(fills: COWFillLike[]): void {

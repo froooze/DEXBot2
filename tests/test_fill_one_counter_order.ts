@@ -16,6 +16,8 @@ const { ORDER_TYPES, ORDER_STATES } = require('../modules/constants');
 const StrategyEngine = require('../modules/order/strategy').default;
 const { fillKeyOf } = require('../modules/order/fill_ledger');
 const { adoptPlacedBatchFromChain } = require('../modules/dexbot_cow_runtime');
+const { recordCounterDebt } = require('../modules/order/utils/counter_debt');
+const { attributeUnmatchedFillToGrid } = require('../modules/order/utils/order');
 
 let passed = 0;
 let failed = 0;
@@ -307,6 +309,104 @@ async function main() {
             `the deferral must name the missing slot (got ${entry.lastDeferReason})`);
         assert.strictEqual(entry.attempts, 1);
         assert.strictEqual(mgr._metrics.counterOrdersPlacedCount, 0);
+    });
+
+    await run('Q-8 the debt ledger is capped oldest-first so it cannot grow without bound', () => {
+        const mgr = makeManager();
+        for (let i = 0; i < 502; i++) {
+            recordCounterDebt(mgr, fullFill(i, { id: `slot-${i % SLOTS}` }));
+        }
+        assert.strictEqual(mgr._counterDebt.size, 500, 'the ledger holds at most the crawl-ledger cap');
+        assert.strictEqual(mgr._counterDebt.has('1.7.1000:2000:h-0'), false, 'the oldest debt is evicted');
+        assert.strictEqual(mgr._counterDebt.has('1.7.1501:2501:h-501'), true, 'the freshest fill stays owed');
+        assert.strictEqual(mgr._metrics.counterDebtSlotsCount, 500);
+        assert.ok(mgr.logs.some((l: any) => l.level === 'warn' && /ledger cap/.test(String(l.msg))),
+            'an eviction is diagnosable');
+    });
+
+    await run('Q-9 recovery settles only debts whose stamped op was confirmed by the poll', async () => {
+        const mgr = makeManager();
+        mgr._counterDebt.set('key-a', {
+            fillKey: 'key-a', fillSide: ORDER_TYPES.SELL, fillSlotId: 'slot-30',
+            counterSide: ORDER_TYPES.BUY, counterSlotId: 'slot-6', at: 1, attempts: 0,
+        });
+        mgr._counterDebt.set('key-b', {
+            fillKey: 'key-b', fillSide: ORDER_TYPES.SELL, fillSlotId: 'slot-31',
+            counterSide: ORDER_TYPES.BUY, counterSlotId: 'slot-7', at: 2, attempts: 0,
+        });
+        const ctxA = { kind: 'create', orderId: '1.7.901', order: { id: 'slot-6', orderId: '1.7.901', metadata: { counterForFillKey: 'key-a' } } };
+        const ctxB = { kind: 'create', orderId: '1.7.902', order: { id: 'slot-7', orderId: '1.7.902', metadata: { counterForFillKey: 'key-b' } } };
+        const bot: any = {
+            accountId: '1.2.345',
+            manager: {
+                orders: mgr.orders, _counterDebt: mgr._counterDebt, _metrics: mgr._metrics,
+                logger: mgr.logger, syncFromOpenOrders: async () => {},
+            },
+        };
+        const chainOrders: any = {
+            batchReadOrders: async (ids: string[]) => new Map(ids.map((id) => [id, { id }])),
+        };
+        const adopted = await adoptPlacedBatchFromChain(bot, chainOrders, '[COUNTER-QUOTA] test', {
+            placedContexts: [ctxA, ctxB],
+            polledCreateIds: ['1.7.901', '1.7.902'],
+            // Only ctxA was poll-confirmed: ctxB's CREATE must NOT settle its debt.
+            polledConfirmedContexts: [ctxA],
+        });
+        assert.strictEqual(adopted, true);
+        assert.strictEqual(mgr._counterDebt.has('key-a'), false, 'the confirmed op clears its own debt');
+        assert.strictEqual(mgr._counterDebt.has('key-b'), true, 'the unconfirmed op stays owed');
+        assert.strictEqual(mgr._metrics.counterOrdersPlacedCount, 1);
+    });
+
+    await run('Q-10 both fill writers dedupe on full chain fill identity', () => {
+        const mgr = makeManager();
+        const slot: any = mgr.orders.get('slot-30');
+        slot.orderId = '1.7.777';
+        const fill = fullFill(30, { orderId: '1.7.777', block_num: 2000, historyId: 'h-shared' });
+        recordCounterDebt(mgr, fill);
+        // The second writer resolves a different slot but the SAME chain fill;
+        // without block/history threading it would mint a slot-keyed second debt.
+        const attributed = attributeUnmatchedFillToGrid(mgr, {
+            orderId: '1.7.777', blockNum: 2000, historyId: 'h-shared'
+        });
+        assert.strictEqual(attributed, true, 'the unmatched fill was attributed');
+        assert.strictEqual(mgr._counterDebt.size, 1, 'the two writers mint one debt, not two');
+        assert.strictEqual(mgr._metrics.counterOrdersOwedCount, 1);
+    });
+
+    await run('Q-11 a missing poll id keeps its context slot so later ids do not shift', async () => {
+        const mgr = makeManager();
+        mgr._counterDebt.set('key-a', {
+            fillKey: 'key-a', fillSide: ORDER_TYPES.SELL, fillSlotId: 'slot-30',
+            counterSide: ORDER_TYPES.BUY, counterSlotId: 'slot-6', at: 1, attempts: 0,
+        });
+        mgr._counterDebt.set('key-b', {
+            fillKey: 'key-b', fillSide: ORDER_TYPES.SELL, fillSlotId: 'slot-31',
+            counterSide: ORDER_TYPES.BUY, counterSlotId: 'slot-7', at: 2, attempts: 0,
+        });
+        const ctxA = { kind: 'create', orderId: '1.7.900', order: { id: 'slot-6', orderId: '1.7.900', metadata: { counterForFillKey: 'key-a' } } };
+        const ctxB = { kind: 'create', orderId: '1.7.902', order: { id: 'slot-7', orderId: '1.7.902', metadata: { counterForFillKey: 'key-b' } } };
+        const bot: any = {
+            accountId: '1.2.345',
+            manager: {
+                orders: mgr.orders, _counterDebt: mgr._counterDebt, _metrics: mgr._metrics,
+                logger: mgr.logger, syncFromOpenOrders: async () => {},
+            },
+        };
+        const chainOrders: any = {
+            batchReadOrders: async (ids: string[]) => new Map(ids.map((id) => [id, { id }])),
+        };
+        const adopted = await adoptPlacedBatchFromChain(bot, chainOrders, '[COUNTER-QUOTA] test', {
+            placedContexts: [ctxA, ctxB],
+            // ctxA matched no usable chain id; its empty slot must not let
+            // ctxB's id shift left and wrongly settle ctxA's debt.
+            polledCreateIds: ['', '1.7.902'],
+            polledConfirmedContexts: [ctxA, ctxB],
+        });
+        assert.strictEqual(adopted, true);
+        assert.strictEqual(mgr._counterDebt.has('key-a'), true, 'the id-less context stays owed');
+        assert.strictEqual(mgr._counterDebt.has('key-b'), false, 'the aligned id settles its own debt');
+        assert.strictEqual(mgr._metrics.counterOrdersPlacedCount, 1);
     });
 
     console.log(`\nONE-FILL-ONE-COUNTER: ${passed} passed, ${failed} failed`);

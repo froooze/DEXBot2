@@ -116,6 +116,7 @@ modules/
 │   ├── export.ts                  trade history export
 │   └── utils/                     math, order predicates, validation, system helpers
 │       ├── math.ts                precision conversion, RMS divergence, rail geometry
+│       ├── counter_debt.ts        single in-memory owner of the one-counter-per-fill obligation ledger
 │       ├── order.ts               order state predicates, grid indexing, reconciliation helpers
 │       ├── slot.ts                slot/price-level helpers
 │       ├── system.ts              system utilities, price derivation, fill deduplication

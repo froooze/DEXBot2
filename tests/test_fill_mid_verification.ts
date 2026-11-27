@@ -1,17 +1,17 @@
 /**
- * FILL-PATH MID VERIFICATION — REPLACED BY THE FILL-AUTHORITATIVE POLICY.
+ * FILL-PATH MID VERIFICATION — SURFACE REMOVED UNDER THE FILL-AUTHORITATIVE POLICY.
  *
- * The former suite pinned a forced book re-read before a cached mid could
- * veto a fill, refused-level markers and marker release. That policy is gone:
- * every fill is market truth. This suite now pins the replacement contract:
+ * The former suite pinned a forced book re-read, a cached-mid veto and refused
+ * level markers. That whole compatibility surface is now gone: a fill is
+ * market truth, so no fill-path classifier or verifier is exported at all.
+ * This suite pins the replacement contract:
  *
- *   1. offMarketFill is neutral (always null) — no cached-mid comparison;
- *   2. verifyFillMarketReference is a no-op that never touches the client;
- *   3. fills arm the pivot regardless of how far/side they sit from a cached
- *      mid, and no marker writer runs on the fill path;
- *   4. the marker helpers are neutral stubs that never mutate a manager;
- *   5. the surviving book reader (maybeRefreshLiveMarketPrice) still belongs
- *      to the spread/market-price path, not fill intake.
+ *   1. the verification helpers, refused-level stubs and fill-mid timing knobs
+ *      are absent from the code (not merely neutral);
+ *   2. the fill writer arms the pivot regardless of how far/side it sits from a
+ *      cached mid, with no market RPC and no marker branch;
+ *   3. rebuild re-arm and raw-fill evidence share the same single owners;
+ *   4. the surviving book reader belongs to the spread/market-price path only.
  */
 
 const assert = require('assert');
@@ -20,17 +20,14 @@ const path = require('path');
 
 const {
     ORDER_TYPES,
+    TIMING,
 } = require('../modules/constants');
 const {
-    verifyFillMarketReference,
-    offMarketFill,
-    fillOutsideMarket,
     setLastFillPivot,
     maybeRefreshLiveMarketPrice,
-    releaseRefutedRefusedLevels,
-    liveRefusedFillLevels,
-    hasLiveRefusedFillLevels,
+    refreshLiveMarketPrice,
     fillEvidenceFromEconomics,
+    rearmLastFillPivotFromMarketFill,
 } = require('../modules/order/utils/system');
 const { OrderManager } = require('../modules/order/manager');
 
@@ -49,6 +46,8 @@ async function run(name: string, fn: () => Promise<void> | void) {
     }
 }
 
+const root = path.join(__dirname, '..', '..');
+const read = (rel: string) => fs.readFileSync(path.join(root, rel), 'utf8');
 const NOW = Date.now();
 const FRESH_MID_AT = NOW - 5_000;
 
@@ -64,12 +63,6 @@ function makeManager(over: Record<string, unknown> = {}) {
         _lastMarketFillPrice: null as number | null,
         _lastMarketFillType: null as string | null,
         _lastMarketFillAt: 0,
-        // Seeded legacy marker fields: the neutralized stubs must ignore them
-        // and no fill-path writer may touch them.
-        _lastRefusedFillPrice: null as number | null,
-        _lastRefusedFillType: null as string | null,
-        _lastRefusedFillAt: 0,
-        _lastRefusedFillLevels: [] as Array<{ price: number; type: string; at: number }>,
         _liveMarketPrice: null as number | null,
         _liveMarketPriceAt: null as number | null,
         _liveMarketPriceAttemptedAt: null as number | null,
@@ -95,60 +88,53 @@ function makeManager(over: Record<string, unknown> = {}) {
     };
 }
 
-/** A client whose every book surface explodes: any fill-path RPC is a failure. */
-function poisonClient(calls: { n: number }) {
-    return {
-        db: {
-            lookup_asset_symbols: async () => { calls.n++; throw new Error('fill path must not read the book'); },
-            get_order_book: async () => { calls.n++; throw new Error('fill path must not read the book'); },
-            get_ticker: async () => { calls.n++; throw new Error('fill path must not read the book'); }
-        }
-    };
-}
-
 async function main() {
-    console.log('\n=== FILL-PATH MID VERIFICATION (fill-authoritative) ===\n');
+    console.log('\n=== FILL-PATH MID VERIFICATION (removed surface) ===\n');
 
-    await run('MID-1 offMarketFill is neutral for stale, wrong-side and far fills', () => {
-        const mgr: any = makeManager({
-            _liveMarketPrice: 1739.237923,
-            _liveMarketPriceAt: FRESH_MID_AT
-        });
-        assert.strictEqual(offMarketFill(mgr, ORDER_TYPES.BUY, 1650), null, 'far BUY must not be vetoed');
-        assert.strictEqual(offMarketFill(mgr, ORDER_TYPES.SELL, 1900), null, 'far SELL must not be vetoed');
-        assert.strictEqual(offMarketFill(mgr, ORDER_TYPES.BUY, 1700), null, 'in-window BUY stays null');
-        // The legacy explicit-mid classifier still exists for compatibility,
-        // but no fill-path caller may use it. The neutral wrapper is the only
-        // predicate left on the fill path.
-        assert.ok(typeof fillOutsideMarket === 'function');
-        const system = fs.readFileSync(path.join(__dirname, '../../modules/order/utils/system.ts'), 'utf8');
-        assert.ok(!/offMarketFill\([^)]*fillOutsideMarket|fillOutsideMarket\([^)]*\)/.test(
-            system.slice(system.indexOf('export function offMarketFill('), system.indexOf('export function offMarketFill(') + 400)),
-            'offMarketFill must no longer delegate to the market-bound classifier');
+    await run('MID-1 no fill classifier, verifier or marker helper is exported', () => {
+        const system = read('modules/order/utils/system.ts');
+        for (const name of [
+            'offMarketFill', 'fillOutsideMarket', 'verifyFillMarketReference',
+            'resolveFillMidVerifyMs', 'releaseRefutedRefusedLevels',
+            'liveRefusedFillLevels', 'hasLiveRefusedFillLevels',
+        ]) {
+            assert.ok(!new RegExp(`export (?:async )?function ${name}\\(`).test(system),
+                `${name} must no longer be exported`);
+        }
+        assert.ok(!/export interface RefusedFillLevel\b/.test(system), 'the marker type is gone too');
+        assert.ok(!/_fillMidVerifyAttemptedAt|LAST_FILL_MID_VERIFY_/.test(system),
+            'no fill-mid pacing clock or knob remains in the price owner');
+        const exported = require('../modules/order/utils/system');
+        for (const name of [
+            'offMarketFill', 'fillOutsideMarket', 'verifyFillMarketReference',
+            'resolveFillMidVerifyMs', 'releaseRefutedRefusedLevels',
+            'liveRefusedFillLevels', 'hasLiveRefusedFillLevels',
+        ]) {
+            assert.strictEqual(exported[name], undefined, `${name} is absent at runtime`);
+        }
     });
 
-    await run('MID-2 verifyFillMarketReference is a no-op: no RPC, no cache mutation', async () => {
-        const calls = { n: 0 };
-        const mgr: any = makeManager({
-            _liveMarketPrice: 1739.237923,
-            _liveMarketPriceAt: FRESH_MID_AT
-        });
-        const fills = [
-            { id: 'slot-1', type: ORDER_TYPES.BUY, price: 1650, isPartial: false },
-            { id: 'slot-2', type: ORDER_TYPES.SELL, price: 1900, isPartial: false },
-        ];
-        const result = await verifyFillMarketReference(mgr, poisonClient(calls), fills, { now: NOW });
-        assert.strictEqual(result, null, 'the no-op verifier reports no replacement mid');
-        assert.strictEqual(calls.n, 0, 'the fill path must never touch the order-book client');
-        assert.strictEqual(mgr._liveMarketPrice, 1739.237923, 'the cached mid is untouched');
-        assert.strictEqual(mgr._fillMidVerifyAttemptedAt, undefined, 'no pacing clock is stamped');
+    await run('MID-2 fill-mid timing knobs are gone from TIMING and its policy', () => {
+        assert.ok(!('LAST_FILL_MID_VERIFY_MS' in TIMING), 'pacing knob removed');
+        assert.ok(!('LAST_FILL_MID_VERIFY_TIMEOUT_MS' in TIMING), 'per-read cap knob removed');
+        const policy = read('modules/timing_policy.ts');
+        assert.ok(!/LAST_FILL_MID_VERIFY_/.test(policy), 'no classification for removed knobs');
+        const manager = read('modules/order/manager.ts');
+        const types = read('modules/types.ts');
+        assert.ok(!/_fillMidVerifyAttemptedAt/.test(manager + types), 'no pacing clock field survives');
     });
 
-    await run('MID-3 a missing/throwable client is equally harmless on the fill path', async () => {
-        const mgr: any = makeManager({ _liveMarketPrice: 1000, _liveMarketPriceAt: FRESH_MID_AT });
-        assert.strictEqual(await verifyFillMarketReference(mgr, null, [{ type: ORDER_TYPES.SELL, price: 1200 }]), null);
-        assert.strictEqual(await verifyFillMarketReference(mgr, { db: null }, []), null);
-        assert.strictEqual(mgr.logs.length, 0, 'no warn/debug verification line belongs to a fill path');
+    await run('MID-3 deriveTargetBoundary has no fill-eligibility parameter', () => {
+        const src = read('modules/order/utils/order.ts');
+        const start = src.indexOf('function deriveTargetBoundary(');
+        assert.ok(start > 0, 'the boundary derivation must exist');
+        const signature = src.slice(start, src.indexOf('\n', start));
+        assert.ok(!/isFillEligibleForCrawl/.test(signature), 'no optional predicate parameter');
+        assert.ok(!/isFillEligibleForCrawl/.test(src), 'no predicate check remains anywhere');
+        const strategy = read('modules/order/strategy.ts');
+        const call = strategy.slice(strategy.indexOf('deriveTargetBoundary(fills'));
+        assert.ok(!/isFillEligibleForCrawl|offMarketFill/.test(call.slice(0, call.indexOf(';'))),
+            'the live call site injects no market predicate');
     });
 
     await run('MID-4 the real fill writer arms the pivot far from a fresh cached mid', () => {
@@ -166,8 +152,6 @@ async function main() {
         assert.strictEqual(mgr._lastFilledPrice, 1500, 'the last fill wins and arms the pivot');
         assert.strictEqual(mgr._lastFilledType, ORDER_TYPES.SELL);
         assert.strictEqual(mgr._lastMarketFillPrice, 1500, 'the market-fill reference follows the fill');
-        assert.strictEqual(mgr._lastRefusedFillPrice, null, 'no refusal marker may be written');
-        assert.deepStrictEqual(mgr._lastRefusedFillLevels, [], 'no per-level marker may be written');
         assert.ok(mgr.logs.some((l: any) => /\[FILL-PIVOT\]/.test(l.msg) && l.level === 'info'));
         assert.ok(!mgr.logs.some((l: any) => /Refusing to arm pivot/.test(l.msg)),
             'a fill can no longer be refused by a cached market price');
@@ -181,41 +165,23 @@ async function main() {
             'the geometry filter must not log a skip');
     });
 
-    await run('MID-6 marker helpers are neutral stubs that never write', () => {
-        const marker = { price: 1650, type: ORDER_TYPES.BUY, at: NOW };
-        const mgr: any = makeManager({
-            _lastRefusedFillLevels: [marker],
-            _lastRefusedFillPrice: marker.price,
-            _lastRefusedFillType: marker.type,
-            _lastRefusedFillAt: marker.at
-        });
-        assert.deepStrictEqual(liveRefusedFillLevels(mgr), [], 'no live refused levels exist');
-        assert.strictEqual(hasLiveRefusedFillLevels(mgr), false, 'a marker is no longer fill evidence');
-        assert.strictEqual(hasLiveRefusedFillLevels(mgr, ORDER_TYPES.BUY), false, 'side filter is neutral too');
-        assert.strictEqual(releaseRefutedRefusedLevels(mgr, 1000, 1650), 0, 'there is nothing to release');
-        assert.deepStrictEqual(mgr._lastRefusedFillLevels, [marker], 'the stub must not mutate a manager');
-        assert.strictEqual(mgr._lastRefusedFillPrice, marker.price, 'the scalar mirror is untouched');
-        assert.strictEqual(mgr.logs.length, 0, 'the stub must not log a release line');
-    });
-
-    await run('MID-7 fill intake has no verification call in the writer or the fill-batch path', () => {
-        const system = fs.readFileSync(path.join(__dirname, '../../modules/order/utils/system.ts'), 'utf8');
+    await run('MID-6 fill intake has no verification call in the writer or the fill-batch path', () => {
+        const system = read('modules/order/utils/system.ts');
         const writerStart = system.indexOf('export function setLastFillPivot(');
         assert.ok(writerStart > 0, 'the synchronous writer must exist');
         const writer = system.slice(writerStart, system.indexOf('\n}', writerStart) + 2);
         assert.ok(!/await\s/.test(writer), 'setLastFillPivot stays synchronous: no async verification inside it');
         assert.ok(!/verifyFillMarketReference|offMarketFill|RefusedFill/.test(writer),
             'the writer must not vet a fill through a market read or a marker');
-        const cls = fs.readFileSync(path.join(__dirname, '../../modules/dexbot_class.ts'), 'utf8');
-        assert.strictEqual(cls.split('verifyFillMarketReference(').length - 1, 0,
-            'the fill-batch loop must not call the verifier');
-        const mgrSrc = fs.readFileSync(path.join(__dirname, '../../modules/order/manager.ts'), 'utf8');
-        assert.strictEqual(mgrSrc.split('verifyFillMarketReference(').length - 1, 0,
-            'recordLastFilledPrices must not call the verifier');
+        for (const rel of ['modules/dexbot_class.ts', 'modules/order/manager.ts',
+            'modules/dexbot_cow_runtime.ts', 'modules/dexbot_fill_runtime.ts',
+            'modules/order/sync_engine.ts']) {
+            assert.ok(!/verifyFillMarketReference|offMarketFill|fillOutsideMarket/.test(read(rel)),
+                `${rel} must not reference a removed fill classifier`);
+        }
     });
 
-    await run('MID-8 rebuild re-arm accepts a row far from the cached mid', () => {
-        const { rearmLastFillPivotFromMarketFill } = require('../modules/order/utils/system');
+    await run('MID-7 rebuild re-arm accepts a row far from the cached mid', () => {
         const mgr: any = makeManager({
             _lastMarketFillPrice: 1500,
             _lastMarketFillType: ORDER_TYPES.SELL,
@@ -229,7 +195,7 @@ async function main() {
         assert.ok(!mgr.logs.some((l: any) => /Refusing to arm pivot/.test(l.msg)));
     });
 
-    await run('MID-9 raw fill economics still share one evidence derivation', () => {
+    await run('MID-8 raw fill economics still share one evidence derivation', () => {
         const mgr: any = makeManager({
             assets: {
                 assetA: { id: '1.3.101', symbol: 'BASE', precision: 5 },
@@ -249,7 +215,7 @@ async function main() {
         }), null, 'a foreign asset still fails soft');
     });
 
-    await run('MID-10 the shared price owner keeps its own pacing (not a fill gate)', async () => {
+    await run('MID-9 the shared price owner keeps its own pacing (not a fill gate)', async () => {
         const calls = { n: 0 };
         const mgr: any = makeManager({
             _liveMarketPrice: 1000,
@@ -269,9 +235,41 @@ async function main() {
                 get_ticker: async () => { calls.n++; return { latest: 1 / 1010 }; }
             }
         };
-        const read = await maybeRefreshLiveMarketPrice(mgr, client, { now: NOW });
+        const readPrice = await maybeRefreshLiveMarketPrice(mgr, client, { now: NOW });
         assert.strictEqual(calls.n, 1, 'the market-price path may still read the book');
-        assert.ok(read !== null && Math.abs(Number(read) - 1010) < 1e-4);
+        assert.ok(readPrice !== null && Math.abs(Number(readPrice) - 1010) < 1e-4);
+        // No force/didRead surface is left on the shared reader.
+        const src = read('modules/order/utils/system.ts');
+        const sig = src.slice(src.indexOf('export async function maybeRefreshLiveMarketPrice('));
+        assert.ok(!/force|didRead/.test(sig.slice(0, sig.indexOf('): Promise'))),
+            'the price owner has no forced-read branch');
+    });
+
+    await run('MID-10 a late book result cannot overwrite the cache after its read was released', async () => {
+        const mgr: any = makeManager({
+            _liveMarketPrice: 1000,
+            _liveMarketPriceAt: 123,
+            assets: {
+                assetA: { id: '1.3.101', symbol: 'BASE', precision: 5 },
+                assetB: { id: '1.3.102', symbol: 'QUOTE', precision: 5 }
+            }
+        });
+        const client = {
+            db: {
+                lookup_asset_symbols: async (refs: string[]) => refs.map((r) => ({
+                    id: r === 'BASE' ? '1.3.101' : '1.3.102',
+                    precision: 5,
+                })),
+                get_order_book: async () => ({ bids: [], asks: [] }),
+                get_ticker: async () => ({ latest: 1 / 1010 })
+            }
+        };
+        // A released read still runs to completion, but it neither reports a
+        // fresh price nor mutates the cache a newer attempt may have written.
+        const price = await refreshLiveMarketPrice(mgr, client, () => false);
+        assert.strictEqual(price, null, 'a released read reports no new price');
+        assert.strictEqual(mgr._liveMarketPrice, 1000, 'the cache was not overwritten');
+        assert.strictEqual(mgr._liveMarketPriceAt, 123, 'the cache timestamp was not overwritten');
     });
 
     console.log(`\n${passed} passed, ${failed} failed\n`);

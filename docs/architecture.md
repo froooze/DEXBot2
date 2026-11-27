@@ -620,9 +620,9 @@ BUY  fill at slot f  ->  boundary <= f - 1            (buy window ends below f)
 
 Fills are authoritative: every fill arms the guard (`lastFillPivotSource` is
 `fill`; the bot-scoped last-market-fill row is the fallback) and contributes to
-the crawl and the extremum. `offMarketFill` is a neutral stub and
-`verifyFillMarketReference` is a no-op — there is no off-market classification
-and no cached-mid veto; a book-seeded max-bid/min-ask value is a startup proxy,
+the crawl and the extremum. No market classifier or verifier exists — there is
+no off-market classification and no cached-mid veto; a book-seeded
+max-bid/min-ask value is a startup proxy,
 never a reason to exclude a real fill. Remaining preconditions are fail-closed:
 an on-ladder price within one increment (`off-ladder-fill`), a target that
 actually puts the fill outside the window after the grid-ceiling clamp

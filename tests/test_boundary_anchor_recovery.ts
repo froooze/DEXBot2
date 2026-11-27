@@ -110,35 +110,34 @@ async function testP0d_GenesisAnchorRecoversHonestBoundary() {
     console.log('✓ ANCHOR-004 passed');
 }
 
-async function testP0f_NullBoundaryAnchorUsesEligibleFillsOnly() {
-    console.log('\n[ANCHOR-010] null-boundary fill anchor ignores fills the guard refused...');
-    // Tier-1 recovery used to take its extremum from RAW fills ("eligible or
-    // dust"), so a premium sweep / wrong-side fill the pivot writer refused
-    // could position the absolute boundary through this early return, which
-    // bypasses the filtered crawl loop. The injected single-source predicate
-    // must gate the anchor too; omitting it keeps legacy callers unchanged.
+async function testP0f_NullBoundaryAnchorUsesAllFills() {
+    console.log('\n[ANCHOR-010] null-boundary anchor takes the extremum of every fill...');
+    // Under the fill-authoritative policy there is no eligibility predicate:
+    // every full fill is market truth, including the far/cheap rail sweep that
+    // a cached-mid classifier used to discard. The recovery extremum and the
+    // crawl therefore read the same unfiltered batch.
     const slots = buildSlots(N_SLOTS);
-    const eligible = 0.0015;
-    const hijack = 0.0011;
+    const near = 0.0015;
+    const far = 0.0011;
     const fills = [
-        { id: 'slot-125', type: ORDER_TYPES.SELL, price: eligible },
-        { id: 'slot-25', type: ORDER_TYPES.SELL, price: hijack },
+        { id: 'slot-125', type: ORDER_TYPES.SELL, price: near },
+        { id: 'slot-25', type: ORDER_TYPES.SELL, price: far },
     ];
-    const isEligible = (f: any) => Number(f?.price) > 0.0013;
 
-    const { boundaryIdx: honest } = deriveTargetBoundary(
-        fills, null, slots, POOL_CFG, GAP, null, null, null, isEligible
-    );
-    const { boundaryIdx: legacy } = deriveTargetBoundary(
-        fills, null, slots, POOL_CFG, GAP
-    );
+    const { boundaryIdx } = deriveTargetBoundary(fills, null, slots, POOL_CFG, GAP);
+    assert.strictEqual(boundaryIdx, calculateIdealBoundary(slots, far, GAP),
+        'the furthest SELL fill must anchor the recovered boundary');
+    assert.notStrictEqual(boundaryIdx, calculateIdealBoundary(slots, near, GAP),
+        'the far fill must no longer be filtered out');
 
-    assert.strictEqual(honest, calculateIdealBoundary(slots, eligible, GAP),
-        'the anchor must use the fill the guard would have armed');
-    assert.strictEqual(legacy, calculateIdealBoundary(slots, hijack, GAP),
-        'without the predicate the legacy extremum is unchanged');
-    assert.notStrictEqual(honest, legacy, 'the rejected fill must not be able to move the anchor');
-    console.log('  ✓ fill-anchor recovery consumes only eligible fills');
+    const fs = require('fs');
+    const path = require('path');
+    const src = fs.readFileSync(path.join(__dirname, '../../modules/order/utils/order.ts'), 'utf8');
+    const start = src.indexOf('function deriveTargetBoundary(');
+    const signature = src.slice(start, src.indexOf('\n', start));
+    assert.ok(!/isFillEligibleForCrawl/.test(signature),
+        'deriveTargetBoundary has no eligibility parameter left');
+    console.log('  ✓ fill-anchor recovery consumes every fill');
 }
 
 async function testP0e_KnownBoundaryCrawlUnchanged() {
@@ -282,7 +281,7 @@ async function main() {
     await testP0b_NumericReferenceUnchanged();
     await testP0c_NullBoundaryWithoutPricedAnchorFallsToCenter();
     await testP0d_GenesisAnchorRecoversHonestBoundary();
-    await testP0f_NullBoundaryAnchorUsesEligibleFillsOnly();
+    await testP0f_NullBoundaryAnchorUsesAllFills();
     await testP0e_KnownBoundaryCrawlUnchanged();
     await testP4_NullBoundaryPlanAbortsWithResync();
     await testP1_RailEdgePlanWarnsAndProceeds();

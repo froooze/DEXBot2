@@ -4,7 +4,7 @@
  * Price derivation, persistence, grid correction, and UI/interactive utilities.
  *
  * ===============================================================================
- * TABLE OF CONTENTS (60 exported functions + 12 structural view types)
+ * TABLE OF CONTENTS (55 exported functions + 12 structural view types)
  * ===============================================================================
  *
  * SECTION 1: PRICE DERIVATION (9 functions + 1 internal)
@@ -33,13 +33,11 @@
  *   - applyGridDivergenceCorrections(manager, ...) - Apply grid divergence corrections
  *   - applyPersistedPendingCrawls(...) - Apply persisted-but-uncommitted fill crawls
  *
- * SECTION 5: SPREAD-CORRECTION READINESS (10 functions)
+ * SECTION 5: SPREAD-CORRECTION READINESS (8 functions)
  *   - resolveSpreadFreshnessMs(manager) - The single freshness window for spread trust
- *   - resolveFillMidVerifyMs(manager) - Pacing for forced fill-path market re-reads
  *   - resolveSpreadCrossingFloor(manager) - Crossing floor spread correction must not trade through
  *   - refreshLiveMarketPrice(manager) - Refresh the cached live market price
- *   - maybeRefreshLiveMarketPrice(manager, client, options) - Refresh if stale / forced; paced
- *   - verifyFillMarketReference(manager, client, fills) - Re-read the book before an off-market veto
+ *   - maybeRefreshLiveMarketPrice(manager, client, options) - Refresh if stale; paced
  *   - evaluateSpreadCorrectionReadiness(manager) - Evaluate whether spread correction may act
  *   - resolveSpreadMarketReference(manager) - Resolve the last real FILL price
  *   - resolveLastFillGuardReference(manager) - Resolve the reference the LAST-FILL-GUARD judges
@@ -53,17 +51,14 @@
  *   - resetLastFillPivot(manager) - Clear the pivot to cold state
  *   - restoreLastFillPivot(manager) - Restore the persisted pivot into the manager
  *
- * SECTION 7: FILL PIPELINE & LAST-FILL GUARD (15 functions)
+ * SECTION 7: FILL PIPELINE & LAST-FILL GUARD (12 functions)
  *   - reanchorBoundaryFromLastFill(manager, ...) - Re-anchor a rebuilt boundary to the last fill
  *   - rearmLastFillPivotFromMarketFill(manager) - Re-arm the pivot from the last market fill
  *   - isLastFillGuardBlocked(price, type, lastPrice, lastType) - LAST-FILL-GUARD direction predicate
  *   - isLastFillBandSellExempt(manager, price) - Geometry territory for a SELL counter-order
  *   - evaluateLastFillGuard(manager, price, type, pivot, pivotType) - Shared placement verdict
  *   - isLastFillPlacementBlocked(manager, price, type) - Placement-side LAST-FILL-GUARD wrapper
- *   - offMarketFill(manager, type, price) - Cached/fresh-read market bound wrapper
- *   - fillOutsideMarket(manager, type, price, mid) - Same bound against an explicit mid
  *   - fillEvidenceFromEconomics(manager, params, fallbackType) - Shared fill side+price derivation
- *   - releaseRefutedRefusedLevels(manager, previousMid, freshMid) - Compatibility no-op (no markers exist)
  *   - readFillPipelineState(source) - Projection of the fill-pipeline state
  *   - resolveGridUpdateBlockers(source, options) - Blockers that forbid a grid update right now
  *   - noteGridUpdateBlockers(...) - Log/record the blockers for one decision
@@ -1287,55 +1282,6 @@ export function resolveSpreadFreshnessMs(manager: OrderManagerLike): number {
 }
 
 /**
- * Pacing for the FORCED market re-read on the fill path. Kept separate from
- * resolveSpreadFreshnessMs so a sweep can re-read the book within seconds
- * without weakening the 10-minute spread-correction pacing. Falls back to the
- * shared freshness window when unset, so the bound is never infinite.
- *
- * Returns the RAW knob. The forced read in maybeRefreshLiveMarketPrice widens
- * it to at least resolveFillMidVerifyTimeoutMs so a full-length read cannot
- * hand the next veto candidate a fresh window; any other caller reusing this
- * resolver for pacing must apply the same widening itself.
- *
- * @param {Object} manager - OrderManager instance
- * @returns {number} Pacing window in ms (> 0)
- */
-export function resolveFillMidVerifyMs(manager: OrderManagerLike): number {
-    const configured = Number((manager?.config as { timing?: Record<string, unknown> } | undefined)?.timing?.LAST_FILL_MID_VERIFY_MS);
-    if (configured > 0) return configured;
-    const fallback = Number(TIMING?.LAST_FILL_MID_VERIFY_MS);
-    if (fallback > 0) return fallback;
-    const shared = resolveSpreadFreshnessMs(manager);
-    return shared > 0 ? shared : 5_000; // never unbounded, even if both knobs are zeroed
-}
-
-/**
- * Hard cap for ONE book read. Pacing (resolveFillMidVerifyMs) bounds how often
- * a read is attempted; this bounds how long one attempt may stall the fill
- * path. Falls back to the client's RPC timeout so the cap is never unbounded.
- */
-function resolveFillMidVerifyTimeoutMs(manager: OrderManagerLike): number {
-    const configured = Number((manager?.config as { timing?: Record<string, unknown> } | undefined)?.timing?.LAST_FILL_MID_VERIFY_TIMEOUT_MS);
-    if (configured > 0) return configured;
-    const fallback = Number(TIMING?.LAST_FILL_MID_VERIFY_TIMEOUT_MS);
-    if (fallback > 0) return fallback;
-    const rpc = Number((NATIVE_CLIENT as { TRANSPORT?: { RPC_TIMEOUT_MS?: unknown } } | undefined)?.TRANSPORT?.RPC_TIMEOUT_MS);
-    return rpc > 0 ? rpc : 15_000;
-}
-
-/**
- * Grid increments between two prices. Internal to the single price owner so
- * the marker-release guard and the log line cannot disagree on the threshold.
- */
-function midStepDistance(manager: OrderManagerLike, before: number, after: number): number {
-    const incRaw = Number((manager?.config as { incrementPercent?: unknown } | undefined)?.incrementPercent);
-    const stepPct = Number.isFinite(incRaw) && incRaw > 0 ? incRaw : 0.5;
-    const step = Math.log(1 + stepPct / 100);
-    if (!(step > 0) || !Number.isFinite(before) || before <= 0 || !Number.isFinite(after) || after <= 0) return 0;
-    return Math.abs(Math.log(after / before) / step);
-}
-
-/**
  * Resolve the crossing floor spread correction must not trade through.
  *
  * Two pieces of real market evidence can supply the floor: an externally
@@ -1370,9 +1316,9 @@ export function resolveSpreadCrossingFloor(manager: OrderManagerLike): number | 
  *
  * @param {Object} manager - OrderManager instance
  * @param {unknown} BitShares - BitShares client
- * @param {Function} [shouldWrite] - Optional gate checked immediately before
- *   the cache write. A timed-out caller flips it false so a late RPC result
- *   cannot mutate the cache outside the release/verification decision.
+ * @param {Function} [shouldWrite] - Gate checked immediately before the cache
+ *   write. A timed-out caller flips it false so a late RPC result cannot
+ *   overwrite a newer cache entry.
  * @returns {Promise<number|null>} New price or null
  */
 export async function refreshLiveMarketPrice(manager: OrderManagerLike, BitShares: unknown, shouldWrite?: () => boolean): Promise<number | null> {
@@ -1385,10 +1331,7 @@ export async function refreshLiveMarketPrice(manager: OrderManagerLike, BitShare
         if (!symA || !symB || !client || !client.db) return null;
         const raw = await deriveMarketPrice(client as BitSharesClient, symA, symB);
         const price = Number(raw);
-        if (Number.isFinite(price) && price > 0) {
-            // A timed-out caller has already returned with the cached-mid
-            // policy intact; let its late result complete but never write.
-            if (shouldWrite && !shouldWrite()) return price;
+        if (Number.isFinite(price) && price > 0 && shouldWrite?.() !== false) {
             manager._liveMarketPrice = price;
             manager._liveMarketPriceAt = Date.now();
             manager.logger?.log?.(
@@ -1406,67 +1349,49 @@ export async function refreshLiveMarketPrice(manager: OrderManagerLike, BitShare
  * freshness window so a chain that keeps failing cannot turn the spread check
  * into an RPC loop. The spread path stays RPC-free while the cache is fresh.
  *
- * The `force` option and its pacing knobs remain only as compatibility surface:
- * no live fill path forces a read under the fill-authoritative policy. Forced
- * mode bypasses the fresh-cache shortcut and returns the CACHED price when
- * paced out — unlike normal mode, where null means "no fresh read".
- *
- * This is the single owner of the market cache. The refused-level marker
- * release that used to live here is gone (no markers are written); the plain
- * time-based re-verification diagnostic remains.
+ * This is the single owner of the market cache. Under the fill-authoritative
+ * policy no fill path forces a read: a cached mid is never a fill veto, and
+ * every fill arms the guard and the boundary crawl on its own evidence.
  *
  * @param {Object} manager - OrderManager instance
  * @param {unknown} BitShares - BitShares client
  * @param {Object} [options]
  * @param {number} [options.now] - Injectable clock (tests)
- * @param {boolean} [options.force=false] - Re-read even when the cache is fresh (fill-path verification)
- * @param {{value: boolean}} [options.didRead] - Out-param set true only when a book read was actually attempted (never on the paced-out / no-client shortcuts)
  * @returns {Promise<number|null>} Cached/new price or null
  */
-export async function maybeRefreshLiveMarketPrice(manager: OrderManagerLike, BitShares: unknown, options: { now?: number; force?: boolean; didRead?: { value: boolean } } = {}): Promise<number | null> {
+export async function maybeRefreshLiveMarketPrice(manager: OrderManagerLike, BitShares: unknown, options: { now?: number } = {}): Promise<number | null> {
     const now = Number.isFinite(options?.now) ? Number(options.now) : Date.now();
-    const force = options?.force === true;
     const freshMs = resolveSpreadFreshnessMs(manager);
-    // Capture the OLD mid before refreshLiveMarketPrice mutates the cache —
-    // marker release and the step log both need the pre-read reference.
     const previousMid = Number(manager?._liveMarketPrice);
     const cached = previousMid > 0 ? previousMid : null;
-    if (!force && freshMs <= 0) return cached; // no bound => never force a read
+    if (freshMs <= 0) return cached; // no bound => never force a read
     const liveAt = Number(manager?._liveMarketPriceAt);
-    if (!force && Number.isFinite(liveAt) && liveAt > 0 && (now - liveAt) <= freshMs) {
-        return cached;
-    }
-    const attemptedAt = Number(force ? manager?._fillMidVerifyAttemptedAt : manager?._liveMarketPriceAttemptedAt);
-    // A forced read may take as long as its per-read cap. Widen the pacing
-    // window to at least that cap so consecutive veto candidates cannot each
-    // block the fill path for a full timeout. The stamp stays BEFORE the read:
-    // it also prevents overlapping forced reads from concurrent callers.
-    const paceMs = force
-        ? Math.max(resolveFillMidVerifyMs(manager), resolveFillMidVerifyTimeoutMs(manager))
-        : freshMs;
-    if (paceMs > 0 && Number.isFinite(attemptedAt) && attemptedAt > 0 && (now - attemptedAt) <= paceMs) {
-        return force ? cached : null; // attempted recently; do not storm the chain
-    }
-    // No usable client surface: leave the floor on the fill anchor. Do NOT
-    // stamp the forced clock here: a transient client failure (a lazy import
-    // that has not resolved yet) must not pace out the next, real read. The
-    // normal path keeps its attempt stamp so a missing client cannot spam.
+    if (Number.isFinite(liveAt) && liveAt > 0 && (now - liveAt) <= freshMs) return cached;
+    const attemptedAt = Number(manager?._liveMarketPriceAttemptedAt);
+    if (Number.isFinite(attemptedAt) && attemptedAt > 0 && (now - attemptedAt) <= freshMs) return null;
+    // No usable client surface: leave the floor on the fill anchor, but keep
+    // the attempt stamp so a missing client cannot spam the book read.
     const client = BitShares as { db?: unknown } | null | undefined;
     if (!client || !client.db) {
-        if (!force) manager._liveMarketPriceAttemptedAt = now;
+        manager._liveMarketPriceAttemptedAt = now;
         manager.logger?.log?.(
             '[SPREAD-CORRECTION] Live market price refresh skipped: no order-book client; crossing floor stays on the fill anchor',
             'debug'
         );
         return null;
     }
-    if (force) manager._fillMidVerifyAttemptedAt = now;
-    else manager._liveMarketPriceAttemptedAt = now;
-    if (options.didRead) options.didRead.value = true;
+    manager._liveMarketPriceAttemptedAt = now;
+    // Bound one read by the client RPC timeout so a slow node cannot stall the
+    // spread path. No per-fill pacing/timeout knobs remain.
+    const rpcTimeout = Number((NATIVE_CLIENT as { TRANSPORT?: { RPC_TIMEOUT_MS?: unknown } } | undefined)?.TRANSPORT?.RPC_TIMEOUT_MS);
+    const readCapMs = Number.isFinite(rpcTimeout) && rpcTimeout > 0 ? rpcTimeout : 15_000;
+    // The bounded race releases the caller at the cap but the underlying RPC
+    // keeps running. Gate its late write so a slow node cannot overwrite a
+    // newer cache entry after this attempt already reported failure.
     let readActive = true;
     const refreshed = await withTimeout<number | null>(
         refreshLiveMarketPrice(manager, BitShares, () => readActive),
-        resolveFillMidVerifyTimeoutMs(manager),
+        readCapMs,
         {
             onTimeout: 'resolve', defaultValue: null, label: 'live market price refresh',
             onTimeoutCallback: () => { readActive = false; }
@@ -1480,18 +1405,6 @@ export async function maybeRefreshLiveMarketPrice(manager: OrderManagerLike, Bit
             'warn'
         );
         return null;
-    }
-    if (Number.isFinite(previousMid) && previousMid > 0 && Math.abs(refreshed - previousMid) > 1e-9) {
-        const steps = midStepDistance(manager, previousMid, refreshed);
-        manager.logger?.log?.(
-            `[LAST-FILL-GUARD] Live mid re-verified: ${previousMid} -> ${refreshed} (${steps.toFixed(1)} step(s))`,
-            'debug'
-        );
-    } else {
-        manager.logger?.log?.(
-            `[LAST-FILL-GUARD] Live mid re-verified: ${refreshed}`,
-            'debug'
-        );
     }
     return refreshed;
 }
@@ -1688,7 +1601,7 @@ export function reanchorBoundaryFromLastFill(manager: OrderManagerLike, boundary
     let anchorIdx = idx;
     let anchorPrice = price;
     const eligibleFills = Array.isArray(fills)
-        ? fills.filter((f) => isEligibleAnchorFill(manager, f, side, genesis, maxDrift))
+        ? fills.filter((f) => isEligibleAnchorFill(manager, f, side))
         : [];
     const batchExtremum = resolveFillAnchorIndex(eligibleFills, side, genesis, maxDrift);
     if (batchExtremum) {
@@ -1858,54 +1771,29 @@ function resolveFillAnchorIndex(
 /**
  * Is this fill the kind of trade that may anchor the ABSOLUTE geometry?
  *
- * The pivot writer already refuses three classes of fill: off-market (a
- * premium sweep of our own rail, or a crossed-book artifact), stranded
- * gap-band residuals, and edge-pinned insurance. Those refusals used to apply
- * only to the guard; the batch extremum below then consumed the raw fills, so
- * the very fill that could not arm the guard could still move the boundary to
- * its own level (live: a 20-step BUY sweep froze the pivot at 1574 while the
- * boundary crawled to 116, leaving every counter-SELL below the pivot and the
- * book out of spread).
- *
- * Compose the SAME single-source classifiers — offMarketFill (this module),
- * geometryTypeForSlotIndex and collectEdgePinnedFillIds (order utils) — rather
- * than defining a second notion of "real fill" (R3.5, lesson 9). Each leg
- * fails OPEN when its evidence is missing or unreadable: a cold grid, a stale
- * market read or unknown gap geometry must still anchor on its first fill.
- * The pivot reference itself is already eligible by construction (it had to
- * pass these checks to arm the guard), so a filtered-out batch keeps the
- * single provenanced ref as the anchor.
+ * Every full fill is market truth: it may anchor the geometry regardless of
+ * its distance from a cached mid or of a gap-band residual's position. The
+ * only exclusion is edge-pinned insurance, judged by the same single-source
+ * classifier the pivot writer uses (collectEdgePinnedFillIds). Missing or
+ * unreadable evidence fails OPEN, so a cold grid still anchors on its first
+ * fill; a filtered-out batch keeps the single provenanced ref as the anchor.
  *
  * @param {Object} manager - OrderManager instance
  * @param {Object} f - Fill candidate (id?, type?, price?)
  * @param {string} side - Side of the anchor (fills of the other side are out)
- * @param {Object} genesis - Genesis ladder
- * @param {number} maxDrift - One-increment drift bound for an on-ladder price
  * @returns {boolean} True when the fill may contribute to the batch extremum
  */
 function isEligibleAnchorFill(
     manager: OrderManagerLike,
     f: { id?: string; type?: string; price?: unknown } | null | undefined,
-    side: string,
-    genesis: Parameters<typeof MathUtils.slotIndexForPrice>[1],
-    _maxDrift: number
+    side: string
 ): boolean {
     if (!f || f.type !== side) return false;
-    // The extremum is resolved from real execution prices by
-    // resolveFillAnchorIndex; only the on-ladder fallback and the edge
-    // exclusion are needed here.
-    let price = Number(f.price);
-    if (!Number.isFinite(price) || price <= 0) {
-        const idIdx = parseSlotIndex(String(f.id ?? ''));
-        if (idIdx != null && Number.isFinite(Number(idIdx))) {
-            try { price = Number(MathUtils.priceForSlot(Number(idIdx), genesis)); } catch { price = NaN; }
-        }
-    }
     // Every fill is market truth: no market-bound or gap-band eligibility
     // filter. A residual that traded in the band still anchors the geometry
-    // and owes its counter. Edge-pinned insurance stays excluded below.
-    // Edge-pinned insurance: the same classifier the pivot writer uses. No id
-    // means it cannot be classified -> eligible.
+    // and owes its counter. Only edge-pinned insurance is excluded below;
+    // the extremum itself is resolved from real execution prices by
+    // resolveFillAnchorIndex. No id means it cannot be classified -> eligible.
     if (f.id != null && String(f.id)) {
         try {
             if (OrderUtils.collectEdgePinnedFillIds(manager, [{ id: String(f.id), type: side }]).has(String(f.id))) return false;
@@ -2092,11 +1980,11 @@ export function resolveLastFillGuardReference(manager: OrderManagerLike | null |
  * GUARD-GENERATION IDENTITY for the spread-stale re-center dedupe.
  *
  * The maintenance watchdog keys "one re-center per guard generation" off this
- * identity so a refused band cannot re-center every cycle. Under the
+ * identity so a stale band cannot re-center every cycle. Under the
  * fill-authoritative policy every fill arms the guard, so the identity is the
- * armed fill reference (`price|type`); a cold reference returns '' (no refused
- * fallback exists any more). No new state and no timing value — this is a read
- * contract over the existing guard reference.
+ * armed fill reference (`price|type`); a cold reference returns '' (there is
+ * no second leg). No new state and no timing value — this is a read contract
+ * over the existing guard reference.
  *
  * @param {Object} manager - OrderManager instance
  * @returns {string} `price|type`, or '' when the guard reference is cold
@@ -2106,8 +1994,8 @@ export function resolveGuardGenerationKey(manager: OrderManagerLike | null | und
     if (ref?.price != null && Number.isFinite(Number(ref.price))) {
         return `${Number(ref.price)}|${String(ref.type ?? '')}`;
     }
-    // No refused-level markers exist (every fill arms the guard), so a cold
-    // reference is the only generation identity.
+    // Every fill arms the guard, so a cold reference is the only generation
+    // identity: there is no second leg to key on.
     return '';
 }
 
@@ -2138,42 +2026,16 @@ export function resolveGuardGenerationKey(manager: OrderManagerLike | null | und
  * @param {string} type - ORDER_TYPES.BUY/SELL
  * @param {number|null} lastPrice - Most recent fill price
  * @param {string|null} lastType - Most recent fill side; null keeps the guard cold
- * @returns {{blocked: boolean, pivot: number|null, threshold?: number|null}}
+ * @returns {{blocked: boolean, pivot: number|null}}
  */
-export function isLastFillGuardBlocked(price: number, type: unknown, lastPrice: number | null, lastType: string | null): { blocked: boolean; pivot: number|null; threshold?: number|null } {
+export function isLastFillGuardBlocked(price: number, type: unknown, lastPrice: number | null, lastType: string | null): { blocked: boolean; pivot: number|null } {
     const numPrice = Number(price);
     if (!Number.isFinite(numPrice)) return { blocked: false, pivot: null };
     if (lastPrice == null || !Number.isFinite(Number(lastPrice)) || lastType == null) return { blocked: false, pivot: null };
     const pivot = Number(lastPrice);
-    if (type === ORDER_TYPES.BUY && numPrice >= pivot) return { blocked: true, pivot, threshold: pivot };
-    if (type === ORDER_TYPES.SELL && numPrice <= pivot) return { blocked: true, pivot, threshold: pivot };
-    return { blocked: false, pivot: null, threshold: null };
-}
-
-// Refused-level markers are gone: every fill arms the guard, so the armed
-// pivot's direction rule (equal counts as blocked) is the sole same-level
-// protection. Compatibility stubs below keep old callers compiling while the
-// call sites are being removed.
-
-export interface RefusedFillLevel { price: number; type: string; at: number }
-
-export function liveRefusedFillLevels(
-    _manager: OrderManagerLike | null | undefined,
-    _type?: string
-): ReadonlyArray<Readonly<RefusedFillLevel>> {
-    return [];
-}
-
-export function hasLiveRefusedFillLevels(_manager: OrderManagerLike | null | undefined, _type?: string): boolean {
-    return false;
-}
-
-export function releaseRefutedRefusedLevels(
-    _manager: OrderManagerLike | null | undefined,
-    _previousMid: number,
-    _freshMid: number
-): number {
-    return 0;
+    if (type === ORDER_TYPES.BUY && numPrice >= pivot) return { blocked: true, pivot };
+    if (type === ORDER_TYPES.SELL && numPrice <= pivot) return { blocked: true, pivot };
+    return { blocked: false, pivot: null };
 }
 
 /**
@@ -2182,18 +2044,18 @@ export function releaseRefutedRefusedLevels(
  * "may this op be placed against the last fill?".
  *
  * The direction rule itself blocks a same-level re-place (equal counts as
- * blocked); no refused-level marker exists any more (§9.16).
+ * blocked); the direction rule is the sole same-level protection (§9.16).
  *
  * @param {Object} manager - OrderManager instance (geometry for the exemption)
  * @param {number} price - Target price
  * @param {string} type - ORDER_TYPES.BUY/SELL
  * @param {number|null} pivotPrice - Resolved pivot (already ladder-snapped by the caller)
  * @param {string|null} pivotType - Pivot side; null keeps the guard cold
- * @returns {{blocked: boolean, pivot: number|null, threshold?: number|null, bandExempt?: boolean}}
+ * @returns {{blocked: boolean, pivot: number|null, bandExempt?: boolean}}
  */
-export function evaluateLastFillGuard(manager: OrderManagerLike | null | undefined, price: number, type: unknown, pivotPrice: number | null, pivotType: string | null): { blocked: boolean; pivot: number | null; threshold?: number | null; bandExempt?: boolean } {
+export function evaluateLastFillGuard(manager: OrderManagerLike | null | undefined, price: number, type: unknown, pivotPrice: number | null, pivotType: string | null): { blocked: boolean; pivot: number | null; bandExempt?: boolean } {
     const check = isLastFillGuardBlocked(price, type, pivotPrice, pivotType);
-    let verdict: { blocked: boolean; pivot: number | null; threshold?: number | null; bandExempt?: boolean };
+    let verdict: { blocked: boolean; pivot: number | null; bandExempt?: boolean };
     if (!check.blocked) verdict = check;
     else if (type === ORDER_TYPES.SELL && isLastFillBandSellExempt(manager, price)) {
         verdict = { blocked: false, pivot: check.pivot, bandExempt: true };
@@ -2317,8 +2179,7 @@ export function isLastFillPlacementBlocked(manager: OrderManagerLike | null | un
     const pivot = reference.price;
     const pivotType = reference.type;
     if (pivot == null || pivotType == null) {
-        // Cold pivot: no fill has been refused (every fill arms), so there is
-        // no marker to fall back to.
+        // Cold pivot: no armed fill reference, so the guard is disabled.
         return { blocked: false, pivot: null };
     }
     if (type !== ORDER_TYPES.BUY && type !== ORDER_TYPES.SELL) return { blocked: false, pivot };
@@ -2827,94 +2688,10 @@ export function normalizeLastMarketFill(row: unknown): { price: number; type: st
 }
 
 /**
- * LAST-FILL-PIVOT MARKET BOUND — is this fill evidence of the CURRENT window,
- * or of something else? Two legs, one reference:
- *
- *   wrong-side  BUY above mid / SELL below mid (past the one-step tolerance).
- *               Fills at/through the opposite side of the book cannot happen on
- *               an honest market — a crossed-book artifact (typically the
- *               bot's own misplaced order swept by an external taker).
- *   too-far     Either side, further than
- *               GRID_LIMITS.LAST_FILL_PIVOT_MAX_MID_DISTANCE_STEPS increments
- *               from the mid. Live: a taker swept our rail up to a level 14.5
- *               steps (4.4%) ABOVE the mid and EVERY one of those fills is on
- *               the honest side by direction, so the wrong-side leg let them
- *               through; the top one armed the pivot at the band's own top,
- *               vetoing every sell the geometry had just derived and freeing
- *               nothing for 86 minutes. A premium sweep is not a window trade.
- *
- * Both legs judge against the cached live market price, and only while it is
- * fresh (GRID_LIMITS.LAST_FILL_PIVOT_MARKET_FRESH_MS) — fail-open otherwise.
- * The reference is deliberately the BOOK read, not the fill-derived one: a
- * trade must be judged against the quotes it traded through, never against
- * itself (which would make the bound self-satisfying).
- *
- * @param {Object} manager - OrderManager instance
- * @param {string} type - ORDER_TYPES.BUY / ORDER_TYPES.SELL
- * @param {number} price - Fill price
- * @returns {{ steps: number, mid: number, kind?: 'wrong-side'|'too-far' } | null}
- *   Off-market detail, or null when the fill is window evidence / unknowable
- */
-export function offMarketFill(_manager: OrderManagerLike, _type: string, _price: number): null {
-    // Fills are market truth. A cached book mid is no longer compared against
-    // an execution: every fill arms the guard, crawls the boundary and may
-    // anchor the geometry. The predicate is kept as the single (now neutral)
-    // owner so call sites need no per-path policy of their own.
-    return null;
-}
-
-/**
- * The two market-bound legs against an EXPLICIT mid — no cache, no freshness
- * gate. offMarketFill supplies the cached/fresh book read; marker release can
- * classify against a newly verified mid without mutating the manager cache
- * just to make the shared predicate see it.
- */
-export function fillOutsideMarket(
-    manager: OrderManagerLike,
-    type: string,
-    price: number,
-    mid: number
-): { steps: number; mid: number; kind?: 'wrong-side' | 'too-far' } | null {
-    const reference = Number(mid);
-    if (!Number.isFinite(reference) || reference <= 0) return null;
-    const incRaw = Number((manager?.config as { incrementPercent?: unknown } | undefined)?.incrementPercent);
-    const stepPct = Number.isFinite(incRaw) && incRaw > 0 ? incRaw : 0.5;
-    const step = 1 + (stepPct / 100);
-    const tolerance = Number(GRID_LIMITS.LAST_FILL_PIVOT_WRONG_SIDE_TOLERANCE_STEPS);
-    const tol = Number.isFinite(tolerance) && tolerance >= 0 ? tolerance : 1;
-    // Relative epsilon so "exactly N steps above mid" is not refused by
-    // floating-point drift in Math.pow (1000 * 1.005 === 1004.9999999999999).
-    const eps = reference * 1e-9;
-    if (type === ORDER_TYPES.BUY) {
-        const limit = reference * Math.pow(step, tol);
-        if (price > limit + eps) {
-            return { steps: Math.max(1, Math.round(Math.log(price / reference) / Math.log(step))), mid: reference, kind: 'wrong-side' };
-        }
-    } else {
-        const limit = reference / Math.pow(step, tol);
-        if (price < limit - eps) {
-            return { steps: Math.max(1, Math.round(Math.log(reference / price) / Math.log(step))), mid: reference, kind: 'wrong-side' };
-        }
-    }
-    // Second leg: a fill inside the direction tolerance can still be a premium
-    // sweep (a taker paying through several of our levels). Distance is judged
-    // symmetrically — both sides are equally far from the market.
-    const maxStepsRaw = Number(GRID_LIMITS.LAST_FILL_PIVOT_MAX_MID_DISTANCE_STEPS);
-    const maxSteps = Number.isFinite(maxStepsRaw) && maxStepsRaw > 0 ? maxStepsRaw : 0;
-    if (maxSteps > 0) {
-        const dist = Math.abs(Math.log(price / reference) / Math.log(step));
-        if (dist > maxSteps + 1e-9) {
-            return { steps: Math.max(1, Math.round(dist)), mid: reference, kind: 'too-far' };
-        }
-    }
-    return null;
-}
-
-/**
  * Fill side + execution price from pays/receives, through the SAME single
  * owners used by unmatched-fill attribution (fill_ledger.resolveTradedSide and
- * order.resolveExecutionPrice). Every fill-pivot verification path judges this
- * evidence, so a caller can never verify one price and record another. A
+ * order.resolveExecutionPrice), so the writer records the same evidence the
+ * guard judges. A
  * missing receives id is inferred as the opposite pair asset; a PRESENT but
  * unrecognized id fails soft instead of fabricating a price.
  *
@@ -2957,41 +2734,6 @@ export function fillEvidenceFromEconomics(
 }
 
 /**
- * VERIFY BEFORE VETO — re-read the book when a fill is about to be refused.
- *
- * offMarketFill judges every fill against the cached book mid. Time-based
- * freshness alone cannot catch a mid that is seconds old yet wrong in value
- * after a fast move (live 2026-11-26: one bot cached `<cached-mid>` and refused
- * ten fills across a sweep as premium sweeps; the sibling bot's older cache had
- * failed open, refreshed to the current market level and re-placed normally).
- *
- * This helper keeps ONE classifier (offMarketFill) and ONE price writer
- * (refreshLiveMarketPrice). It only changes WHEN the book is read: before the
- * veto instead of only on the spread path, which is skipped while fills are
- * queued. In-window batches cost no RPC. After a fresh read the existing
- * setLastFillPivot policy re-evaluates every fill unchanged, and markers a
- * stale mid wrote are released where the new mid refutes them.
- *
- * @param {Object} manager - OrderManager instance
- * @param {unknown} BitShares - BitShares client (needs a `db` surface)
- * @param {Array} fills - Fill batch with `type`+`price`, or raw pays/receives economics
- * @param {Object} [options]
- * @param {number} [options.now] - Injectable clock (tests)
- * @returns {Promise<number|null>} Price used for the decision, or null when no read happened
- */
-export async function verifyFillMarketReference(
-    _manager: OrderManagerLike,
-    _BitShares: unknown,
-    _fills: unknown,
-    _options: { now?: number } = {}
-): Promise<number | null> {
-    // No fill can be refused, so there is nothing to re-verify. Kept as the
-    // single no-op call site so every intake path stays symmetric and no RPC
-    // is spent on the fill path.
-    return null;
-}
-
-/**
  * Write the LAST-FILL-GUARD pivot scalar family in one place (free
  * implementation shared by the manager method, cow_runtime's queued-fill
  * refresh, and restoreLastFillPivot).
@@ -3015,9 +2757,9 @@ export function setLastFillPivot(manager: OrderManagerLike, type: string, price:
     if (type !== ORDER_TYPES.BUY && type !== ORDER_TYPES.SELL) return false;
     const p = Number(price);
     if (!Number.isFinite(p) || p <= 0) return false;
-    // Every fill arms the guard. Same-level re-placement is still refused by
-    // the direction rule (equal counts as blocked), so no separate marker is
-    // needed for a refused arm.
+    // Every fill arms the guard. Same-level re-placement is still blocked by
+    // the direction rule (equal counts as blocked), so no extra state is
+    // needed for a just-filled level.
     const now = Number.isFinite(Number(atMs)) && Number(atMs) > 0 ? Number(atMs) : Date.now();
     manager._lastFilledPrice = p;
     manager._lastFilledType = type;
@@ -3214,9 +2956,8 @@ export function restoreLastFillPivot(manager: OrderManagerLike, persisted: unkno
         const validated = cowRuntimeLadderValidator(manager, row.price);
         if (!validated) return false;
         // Arm through the shared writer, preserving the persisted timestamp.
-        // The writer's wrong-side market bound can refuse (fresh live mid on
-        // the other side of the row) — treat that like any other dead row:
-        // erase the persisted value so a restart cannot re-arm the same veto.
+        // Validated rows always arm (no market-bound veto exists); the guard
+        // below is a defensive fallback for a future writer-side refusal.
         const armed = setLastFillPivot(manager, row.type, validated.price, 'fill', row.fillsAt);
         if (!armed) {
             dropPersistedRow();

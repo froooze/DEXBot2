@@ -126,9 +126,8 @@ async function testPlannerReportsArmedPivotBind() {
     // binds every BUY at/above it through the ordinary direction rule.
     assert.strictEqual(setLastFillPivot(manager, ORDER_TYPES.BUY, 1.02, 'fill'), true);
     assert.strictEqual(manager._lastFilledPrice, 1.02, 'the sweep fill arms the guard');
-    assert.deepStrictEqual(manager._lastRefusedFillLevels || [], [], 'no refused-level marker is written');
-    const { hasLiveRefusedFillLevels } = require('../modules/order/utils/system');
-    assert.strictEqual(hasLiveRefusedFillLevels(manager), false, 'the marker reader is neutral');
+    const system = require('../modules/order/utils/system');
+    assert.strictEqual(system.hasLiveRefusedFillLevels, undefined, 'the marker reader is gone');
 
     const result = await Grid.prepareSpreadCorrectionOrders(manager, ORDER_TYPES.BUY, 1);
     assert.strictEqual(result.ordersToPlace.length, 0,

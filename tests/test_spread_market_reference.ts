@@ -34,7 +34,7 @@ const os = require('os');
 const path = require('path');
 const { OrderManager } = require('../modules/order/manager');
 const { grid: Grid } = require('../modules/order').default;
-const { ORDER_TYPES, ORDER_STATES, GRID_LIMITS } = require('../modules/constants');
+const { ORDER_TYPES, ORDER_STATES } = require('../modules/constants');
 const { AccountOrders } = require('../modules/account_orders');
 const { persistGridSnapshot, restoreLastMarketFill, evaluateSpreadCorrectionReadiness } = require('../modules/order/utils/system');
 const { rejectCorruptedGridSnapshot } = require('../modules/dexbot_state_recovery');
@@ -287,36 +287,14 @@ async function testSmr6BypassGate() {
         true,
         'fresh snapshot with a book pivot keeps the bypass'
     );
-    // Refused-level markers are gone: seeding the legacy fields must not
-    // deny the bypass. The ordinary real-fill references above still do.
-    const legacyMarkerFields = (at: number) => ({
-        lastFillPivotSource: null as string | null,
-        _lastUnmatchedChainOrders: [] as unknown[],
-        _lastSyncAt: Date.now(),
-        _lastRefusedFillPrice: 1050,
-        _lastRefusedFillType: ORDER_TYPES.SELL,
-        _lastRefusedFillAt: at,
-        _lastRefusedFillLevels: [{ price: 1050, type: ORDER_TYPES.SELL, at }]
-    });
-    assert.strictEqual(
-        gate(legacyMarkerFields(NOW)),
-        true,
-        'a live legacy marker no longer denies the bypass (no marker writer remains)'
-    );
-    assert.strictEqual(
-        gate(legacyMarkerFields(NOW - Number(GRID_LIMITS.LAST_FILL_REFUSED_LEVEL_TTL_MS) - 1000)),
-        true,
-        'an expired legacy marker is equally inert'
-    );
-    const { hasLiveRefusedFillLevels, liveRefusedFillLevels } = require('../modules/order/utils/system');
-    assert.strictEqual(hasLiveRefusedFillLevels(legacyMarkerFields(NOW)), false);
-    assert.deepStrictEqual(liveRefusedFillLevels(legacyMarkerFields(NOW)), []);
-    // The planner and the bypass gate no longer carry a refused-level branch.
-    const gridSrc = fs.readFileSync(path.join(__dirname, '../../modules/order/grid.ts'), 'utf8');
-    const cowSrc = fs.readFileSync(path.join(__dirname, '../../modules/dexbot_cow_runtime.ts'), 'utf8');
-    assert.ok(!/hasLiveRefusedFillLevels/.test(gridSrc), 'grid.ts must not read a refused marker');
-    assert.ok(!/hasLiveRefusedFillLevels/.test(cowSrc), 'the bypass gate must not read a refused marker');
-    console.log('  ✓ bypass withheld for real fill evidence / stale snapshots, kept for fresh heuristics; markers inert');
+    // The marker family is gone entirely: only the real-fill reference above
+    // can deny the bypass, so a cold reference with a fresh snapshot keeps it.
+    for (const rel of ['modules/order/grid.ts', 'modules/dexbot_cow_runtime.ts', 'modules/order/utils/system.ts']) {
+        const src = fs.readFileSync(path.join(__dirname, '../../', rel), 'utf8');
+        assert.ok(!/hasLiveRefusedFillLevels|liveRefusedFillLevels|releaseRefutedRefusedLevels/.test(src),
+            `${rel} must not reference a removed marker helper`);
+    }
+    console.log('  ✓ bypass withheld for real fill evidence / stale snapshots, kept for fresh heuristics');
 }
 
 // --- SMR-7: pure readiness gate ---------------------------------------------

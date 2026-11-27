@@ -17,11 +17,9 @@ const {
     setLastFillPivot,
     rearmLastFillPivotFromMarketFill,
     expireLastFillGuardReferences,
-    liveRefusedFillLevels,
-    hasLiveRefusedFillLevels,
 } = require('../modules/order/utils/system');
 const { describeMarketCrossingActions } = require('../modules/order/utils/order');
-const { ORDER_TYPES, GRID_LIMITS } = require('../modules/constants');
+const { ORDER_TYPES } = require('../modules/constants');
 
 let passed = 0;
 let failed = 0;
@@ -41,7 +39,7 @@ function run(name: string, fn: () => void) {
 
 const NOW = Date.now();
 const FRESH_MID_AT = NOW - 5_000;
-const STALE_MID_AT = NOW - (Number(GRID_LIMITS.LAST_FILL_PIVOT_MARKET_FRESH_MS) + 60_000);
+const STALE_MID_AT = NOW - 16 * 60_000;
 
 function makeManager(over: Record<string, unknown> = {}) {
     const logs: Array<{ msg: string; level?: string }> = [];
@@ -56,10 +54,6 @@ function makeManager(over: Record<string, unknown> = {}) {
         _lastMarketFillPrice: null as number | null,
         _lastMarketFillType: null as string | null,
         _lastMarketFillAt: 0,
-        _lastRefusedFillPrice: null as number | null,
-        _lastRefusedFillType: null as string | null,
-        _lastRefusedFillAt: 0,
-        _lastRefusedFillLevels: [] as Array<{ price: number; type: string; at: number }>,
         _liveMarketPrice: null as number | null,
         _liveMarketPriceAt: null as number | null,
         config: { incrementPercent: 0.5 },
@@ -81,7 +75,6 @@ run('BOUND-1 a BUY above mid arms the pivot (crossed-book veto removed)', () => 
     assert.strictEqual(setLastFillPivot(mgr, ORDER_TYPES.BUY, 1010, 'fill'), true);
     assert.strictEqual(mgr._lastFilledPrice, 1010, 'the pivot family must follow the fill');
     assert.strictEqual(mgr._lastMarketFillPrice, 1010, 'the market-fill row follows too');
-    assert.strictEqual(mgr._lastRefusedFillPrice, null, 'no refused marker is written');
     assert.ok(!mgr.logs.some((l: any) => /Refusing to arm pivot/.test(l.msg)),
         `no refusal may be logged (got: ${mgr.logs.map((l: any) => l.msg).join(' | ')})`);
 });
@@ -90,7 +83,6 @@ run('BOUND-2 a SELL below mid arms the pivot', () => {
     const mgr: any = makeManager({ _liveMarketPrice: 1000, _liveMarketPriceAt: FRESH_MID_AT });
     assert.strictEqual(setLastFillPivot(mgr, ORDER_TYPES.SELL, 990, 'fill'), true);
     assert.strictEqual(mgr._lastMarketFillPrice, 990);
-    assert.strictEqual(hasLiveRefusedFillLevels(mgr), false);
 });
 
 run('BOUND-3 a fill within tolerance of mid is allowed (unchanged)', () => {
@@ -129,13 +121,11 @@ run('BOUND-12 the live incident shape: SELL 8.6 steps (4.4%) above mid arms', ()
     assert.strictEqual(mgr._lastFilledPrice, 1469.0989);
 });
 
-run('BOUND-13 distance config is inert: past the old bound still arms, stale mid irrelevant', () => {
+run('BOUND-13 distance is inert: far from the cached mid still arms, stale mid irrelevant', () => {
     const step = 1 + 0.5 / 100;
-    const maxSteps = Number(GRID_LIMITS.LAST_FILL_PIVOT_MAX_MID_DISTANCE_STEPS);
-    assert.ok(maxSteps >= 1, 'the legacy bound may remain in constants but no longer gates fills');
     const mgr: any = makeManager({ _liveMarketPrice: 1000, _liveMarketPriceAt: FRESH_MID_AT });
-    assert.strictEqual(setLastFillPivot(mgr, ORDER_TYPES.SELL, 1000 * Math.pow(step, maxSteps + 1), 'fill'), true,
-        'one step past the old bound must now arm');
+    assert.strictEqual(setLastFillPivot(mgr, ORDER_TYPES.SELL, 1000 * Math.pow(step, 20), 'fill'), true,
+        'twenty steps from the mid must now arm');
     const mgrStale: any = makeManager({ _liveMarketPrice: 1000, _liveMarketPriceAt: STALE_MID_AT });
     assert.strictEqual(setLastFillPivot(mgrStale, ORDER_TYPES.SELL, 1200, 'fill'), true);
 });
@@ -180,7 +170,6 @@ run('BOUND-9 the rebuild re-arm accepts a formerly off-market row', () => {
     assert.strictEqual(rearmLastFillPivotFromMarketFill(mgr), true,
         'a real persisted fill row always re-arms across a rebuild');
     assert.strictEqual(mgr._lastFilledPrice, 1100);
-    assert.deepStrictEqual(liveRefusedFillLevels(mgr), []);
 });
 
 run('BOUND-10 the rebuild re-arm succeeds for an on-market row (unchanged)', () => {

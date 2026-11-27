@@ -475,25 +475,6 @@ let TIMING = {
     // guard applies instead of trusting the stale anchor. Fail-open when no
     // sync timestamp exists yet.
     SPREAD_CORRECTION_SYNC_FRESH_MS: 10 * 60 * 1000,  // 10 minutes
-    // LAST_FILL_MID_VERIFY_MS: pacing for the FORCED live-market read triggered
-    // when a fill would be refused by LAST_FILL_PIVOT_MAX_MID_DISTANCE_STEPS.
-    // A cached mid can be seconds old yet wrong in value after a fast move;
-    // the fill path re-reads the book before it lets that mid veto a fill.
-    // Short (separate from the 10min spread pacing) so a long sweep can refresh
-    // again, but bounded so a failing order-book read cannot become an RPC
-    // loop. 0 falls back to SPREAD_CORRECTION_SYNC_FRESH_MS. The forced pacing
-    // window is widened to at least LAST_FILL_MID_VERIFY_TIMEOUT_MS so a read
-    // that consumes its whole cap cannot leave the next veto candidate outside
-    // the window.
-    LAST_FILL_MID_VERIFY_MS: 5 * 1000,  // 5 seconds
-    // LAST_FILL_MID_VERIFY_TIMEOUT_MS: hard cap on ONE book read made by the
-    // fill-path verification (and by the shared price owner it delegates to,
-    // including the time-based spread read).
-    // Pacing bounds how OFTEN a read is attempted; without a per-read cap a
-    // slow — but not failing — RPC would stall fill processing at the veto
-    // gate. A timed-out read falls back to the cached-mid policy. 0 falls back
-    // to the client RPC timeout (15s if unset); it never removes the cap.
-    LAST_FILL_MID_VERIFY_TIMEOUT_MS: 8 * 1000,  // 8 seconds
     // Dedicated escalation cooldown for the spread-stale watchdog. Deliberately
     // separate from BOUNDARY_HOLD_RESYNC_COOLDOWN_MS so tuning boundary-hold
     // behavior never silently changes the spread watchdog cadence.
@@ -907,55 +888,15 @@ let GRID_LIMITS = {
     // is refreshed by every fresh fill.
     LAST_FILL_PIVOT_TTL_MS: 24 * 60 * 60 * 1000,  // 24 hours
 
-    // LAST_FILL_REFUSED_LEVEL_TTL_MS: how long a fill REFUSED from arming the
-    // pivot (wrong-side / too-far premium sweep, §9.12/P1) still marks its own
-    // level as a same-level re-fill block. The direction pivot deliberately
-    // stays behind such a fill — but the §9.12/P2 same-level refusal keys off
-    // the ARMED pivot, so the P1 refusal silently suspended it: a spread-
-    // correction slot re-placed at the just-filled level ("rises" of sub-sat
-    // rounding dust) refilled 5 times in 2.5 minutes on a live market-pair bot
-    // (2026-11-16). The marker vetoes exactly ONE level — the just-filled one —
-    // and nothing else, so spread correction keeps trading around the live
-    // market and the unquoted-side deadlock P1 was written against cannot
-    // re-open through it. In-memory only and short-lived: it must stop the
-    // immediate re-fill loop, not ratchet for the pivot's 24h TTL.
+    // LAST_FILL_REFUSED_LEVEL_TTL_MS is retained: analysis/grid_correction_check.ts
+    // still uses it to bucket historical refusal events when replaying old logs.
+    // It has no runtime reader — every fill arms the guard now.
     LAST_FILL_REFUSED_LEVEL_TTL_MS: 30 * 60 * 1000,  // 30 minutes
 
-    // LAST_FILL_PIVOT_WRONG_SIDE_TOLERANCE_STEPS: a real FILL may only arm the
-    // LAST-FILL-GUARD pivot when it priced on the market's own side of the
-    // live reference: BUY at/below mid, SELL at/above mid (within this
-    // tolerance in grid increments). A fill on the WRONG side (a BUY above
-    // mid, a SELL below mid) is a crossed-book artifact — usually a misplaced
-    // order that got swept — and arming it vetoed every near-market SELL for
-    // the full 24h TTL in a live incident. The pivot AND the bot-scoped
-    // last-market-fill row are both skipped with the refusal (an off-mid row
-    // as a crossing floor freezes correction the same way), so the last
-    // honest fill stays the reference. Fail-open when no fresh live price
-    // exists.
-    LAST_FILL_PIVOT_WRONG_SIDE_TOLERANCE_STEPS: 1,
-
-    // LAST_FILL_PIVOT_MAX_MID_DISTANCE_STEPS: a real FILL may also only arm the
-    // LAST-FILL-GUARD pivot when it priced within this many grid increments of
-    // the live reference, on EITHER side. The wrong-side tolerance below catches
-    // the direction; this catches a premium SWEEP of our own rail — a taker
-    // paying through several of our levels is on the "honest" side by direction
-    // but is not a window trade. Live: a sell 14.5 steps (4.4%) above the mid
-    // armed the pivot at the top of the gap band the geometry had just derived,
-    // so every band sell was vetoed and the spread stayed 3x wide for 86 min.
-    // One full target spread is ~5 steps at the default increment/spread, so 6
-    // keeps every interior window fill and refuses a fill a full spread away.
-    // 0 disables the distance leg (direction bound only).
-    LAST_FILL_PIVOT_MAX_MID_DISTANCE_STEPS: 6,
-
-    // LAST_FILL_PIVOT_MARKET_FRESH_MS: how old the cached live market price
-    // (manager._liveMarketPrice) may be for the pivot market bound above to
-    // trust it. Older than this, the check fails open — an ancient mid must
-    // never veto a fresh fill after a fast market move. (The crossing FLOOR
-    // does not use this window: resolveSpreadCrossingFloor already picks the
-    // newer of the live read and the fill, and the pre-broadcast crossing
-    // check is an observation, not a veto — see retrospective §9.10/P4.)
-    LAST_FILL_PIVOT_MARKET_FRESH_MS: 15 * 60 * 1000,  // 15 minutes
-
+    // Fill authority note: the pivot's wrong-side/distance/market-freshness
+    // bounds were removed with the fill-authoritative policy. Generated per-bot
+    // profiles may still carry those legacy keys; the merge keeps them as inert
+    // data and no code reads them.
 
     // Grid comparison metrics
     // Detects significant divergence between calculated (in-memory) and persisted grid state

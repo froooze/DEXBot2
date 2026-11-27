@@ -577,15 +577,18 @@ async function reviveVirtualSlotFromChain(
  *   2. the genesis ladder level the fill's own execution price maps to (the
  *      common case, because virtualisation clears the id).
  *
- * Only what the fill PROVES is recorded: the pivot, and — when the resolved
- * slot is a hole — an owed boundary crawl. The slot and the already-booked
- * accounting are never touched: the funds are the accountant's business, this
- * only keeps the geometry honest. A price outside the frozen rail is refused,
- * so a shelf/manual order can never arm the pivot at a level the grid does not
- * trade.
+ * Only what the fill PROVES is recorded: the pivot, an owed boundary crawl
+ * when the resolved slot is a hole, and — for a full fill — a counter debt
+ * keyed by chain fill identity. The slot and the already-booked accounting
+ * are never touched: the funds are the accountant's business, this only keeps
+ * the geometry and the counter obligation honest. A price outside the frozen
+ * rail is refused, so a shelf/manual order can never arm the pivot at a level
+ * the grid does not trade.
  *
  * @param {Object} manager - OrderManager instance
- * @param {Object} params - fill identity {orderId, pays/receives amount+asset, isPartial}
+ * @param {Object} params - fill identity {orderId, blockNum/block_num, historyId,
+ *   pays/receives amount+asset, isPartial}; the chain triple is required so
+ *   both fill writers mint ONE debt for the same fill
  * @returns {boolean} true when the fill was attributed to the grid
  */
 function attributeUnmatchedFillToGrid(
@@ -597,6 +600,9 @@ function attributeUnmatchedFillToGrid(
         receivesAssetId?: string | null;
         receivesAmountRaw?: number | null;
         isPartial?: boolean;
+        blockNum?: number;
+        block_num?: number;
+        historyId?: string;
     }
 ): boolean {
     const mgr = manager as OrderManagerLike & {
@@ -698,13 +704,16 @@ function attributeUnmatchedFillToGrid(
     } catch { /* best-effort: the pivot above is the fail-safe */ }
 
     // 3. Counter obligation: this second attribution writer must mint the
-    // same debt as processFillsOnly. A re-delivery of an already-debited fill
-    // is deduped by the fill-key ledger.
+    // same debt as processFillsOnly. The full chain identity (order id + block
+    // + history id) is threaded from both call sites so a fill seen by both
+    // writers dedupes to ONE debt instead of falling back to a slot-based key.
     recordCounterDebt(mgr, {
         id: slotId ?? undefined,
         type,
         price,
         orderId: chainOrderId as string | undefined,
+        blockNum: input.blockNum ?? input.block_num,
+        historyId: input.historyId,
         isPartial: input.isPartial
     });
 
@@ -3576,7 +3585,7 @@ function isShiftEligibleFill(fill: { isPartial?: boolean; isDelayedRotationTrigg
     return fill?.isPartial !== true || fill?.isDelayedRotationTrigger === true;
 }
 
-function deriveTargetBoundary(fills: Array<{ id?: string; price?: number; type?: string; [key: string]: unknown }> | null | undefined, currentBoundaryIdx: number | null | undefined, allSlots: ManagedOrder[], config: { startPrice?: number | string; genesisStartPrice?: number | string; coreOrders?: { buy?: number; sell?: number; [key: string]: unknown }; [key: string]: unknown } | null | undefined, gapSlots: number, crossChunkBudget?: number | null, pendingCrawls?: Array<{ slotId?: string; side?: string; [key: string]: unknown }> | null, edgeAnchors?: { buy?: number | null; sell?: number | null } | null, isFillEligibleForCrawl?: ((fill: { id?: string; price?: number; type?: string; [key: string]: unknown }) => boolean) | null): { boundaryIdx: number | null; remainingBudget: number; consumedCrawlIds: CrawlEntry[] } {
+function deriveTargetBoundary(fills: Array<{ id?: string; price?: number; type?: string; [key: string]: unknown }> | null | undefined, currentBoundaryIdx: number | null | undefined, allSlots: ManagedOrder[], config: { startPrice?: number | string; genesisStartPrice?: number | string; coreOrders?: { buy?: number; sell?: number; [key: string]: unknown }; [key: string]: unknown } | null | undefined, gapSlots: number, crossChunkBudget?: number | null, pendingCrawls?: Array<{ slotId?: string; side?: string; [key: string]: unknown }> | null, edgeAnchors?: { buy?: number | null; sell?: number | null } | null): { boundaryIdx: number | null; remainingBudget: number; consumedCrawlIds: CrawlEntry[] } {
     let newBoundaryIdx: number | null = currentBoundaryIdx ?? null;
 
     // Recovery when the committed boundary is unknown (GRID-LOAD rejected a
@@ -3590,18 +3599,14 @@ function deriveTargetBoundary(fills: Array<{ id?: string; price?: number; type?:
     let anchoredFromFills = false;
     if (newBoundaryIdx === undefined || newBoundaryIdx === null) {
         // Tier 1 — live fills: gap-side extreme (highest buy / lowest sell,
-        // midpoint when both sides filled). A REAL window fill beats every
-        // config guess, but only window evidence may position absolute geometry
-        // (§9.13/C1): the same market-bound predicate the crawl and the pivot
-        // writer use decides here too. A premium sweep that the guard refused
-        // must not become the recovered boundary through this early return,
-        // which bypasses the filtered crawl loop below. Omitted predicate keeps
-        // legacy/fixture callers unchanged; a stale/missing market read fails
-        // open, so a cold grid still anchors on its first genuine fill.
+        // midpoint when both sides filled). Every full fill is market truth,
+        // including a premium sweep or a crossed-book artifact: it may anchor
+        // the recovered boundary through this early return just as it crawls
+        // the boundary in the loop below. A stale or missing cached mid never
+        // vetoes it, so a cold grid still anchors on its first genuine fill.
         let topBuy = -Infinity;
         let botSell = Infinity;
         for (const fill of fills ?? []) {
-            if (isFillEligibleForCrawl && !isFillEligibleForCrawl(fill)) continue;
             const p = Number(fill?.price);
             if (!Number.isFinite(p)) continue;
             if (fill?.type === ORDER_TYPES.BUY && p > topBuy) topBuy = p;
@@ -3755,9 +3760,7 @@ function deriveTargetBoundary(fills: Array<{ id?: string; price?: number; type?:
     for (const fill of fills ?? []) {
         if (!isShiftEligibleFill(fill)) continue;
         // Fill-authoritative: every eligible fill contributes one boundary
-        // step. The optional predicate is kept only for legacy/fixture callers
-        // that still pass one; live callers omit it.
-        if (isFillEligibleForCrawl && !isFillEligibleForCrawl(fill)) continue;
+        // step; no market-bound predicate gates the crawl.
         if (fill && fill.type === ORDER_TYPES.BUY && edgeBuyIds && fill.id != null && edgeBuyIds.has(fill.id)) continue;
         if (fill && fill.type === ORDER_TYPES.SELL && edgeSellIds && fill.id != null && edgeSellIds.has(fill.id)) continue;
         if (fill.type === ORDER_TYPES.SELL) netShift++;

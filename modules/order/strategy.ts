@@ -75,32 +75,41 @@ interface FillInput {
     [key: string]: unknown;
 }
 
+type CounterSide = 'buy' | 'sell';
+
 /**
- * Resolve the in-memory counter quota for this plan. Debts whose counter slot
- * already holds a placed order on the right rail are cleared (confirmed
- * placement); the rest are capped at `gapSlots + 1` new orders per cycle,
- * oldest first, with a distinct free rail slot each. Nothing is persisted and
- * no funds are reserved — sizing still comes from the side budget.
+ * Resolve the in-memory counter quota AND project the selected counters into
+ * the active window in one coherent pass. Debts are ranked oldest-first; at
+ * most `gapSlots + 1` may be emitted per cycle, with per-side window capacity,
+ * a distinct free rail slot each and the ideal level recomputed from the
+ * ORIGINAL fill. A selected counter replaces the farthest ORDINARY window slot
+ * so a previously selected counter is never dropped. Debts are settled ONLY
+ * by a stamped op's on-chain confirmation (clearCounterDebtsFromContexts);
+ * seeing an order in the slot is not proof this fill's counter was placed.
+ * Nothing is persisted and no funds are reserved — sizing stays fund-driven.
  */
 function resolveCounterQuota(
     manager: OrderManagerLike,
-    slots: ManagedOrder[],
+    sideSlots: Record<CounterSide, ManagedOrder[]>,
     gapSlots: number,
     boundaryIdx: number | null,
-    capacity: { buy: number; sell: number }
-): { buy: CounterDebtEntry[]; sell: CounterDebtEntry[] } {
+    windows: Record<CounterSide, ManagedOrder[]>,
+    windowCapacity: Record<CounterSide, number>
+): { buy: CounterDebtEntry[]; sell: CounterDebtEntry[]; buySlots: ManagedOrder[]; sellSlots: ManagedOrder[] } {
     const owed = { buy: [] as CounterDebtEntry[], sell: [] as CounterDebtEntry[] };
     const debt = manager._counterDebt;
-    if (!(debt instanceof Map) || debt.size === 0) return owed;
+    if (!(debt instanceof Map) || debt.size === 0) {
+        return { ...owed, buySlots: windows.buy, sellSlots: windows.sell };
+    }
     const maxBatch = Math.max(1, Math.floor(gapSlots) + 1);
     const ranked = [...debt.values()].sort((a, b) => a.at - b.at || a.fillKey.localeCompare(b.fillKey));
+    // One rail scan: reuse the exact slot picked for each debt during
+    // projection instead of scanning the rail a second time.
+    const chosenByFill = new Map<string, ManagedOrder>();
     let emitted = 0;
     for (const entry of ranked) {
-        // A debt is settled ONLY by its stamped op being confirmed on chain
-        // (see clearCounterDebtsFromContexts). Seeing any order in the slot is
-        // not proof this fill's counter was placed.
-        const side = entry.counterSide === ORDER_TYPES.BUY ? 'buy' : 'sell';
-        if (emitted >= maxBatch || owed[side].length >= Math.max(1, capacity[side])) {
+        const side: CounterSide = entry.counterSide === ORDER_TYPES.BUY ? 'buy' : 'sell';
+        if (emitted >= maxBatch || owed[side].length >= Math.max(1, windowCapacity[side])) {
             // A counter beyond this side's active window would land VIRTUAL
             // and emit no op; leave it owed instead of consuming the cap.
             entry.lastDeferReason = 'batch-cap';
@@ -114,7 +123,7 @@ function resolveCounterQuota(
         const idealIdx = fillIdx != null
             ? (entry.fillSide === ORDER_TYPES.SELL ? fillIdx - gapSlots : fillIdx + gapSlots)
             : parseSlotIndex(entry.counterSlotId);
-        const candidates = slots
+        const candidates = sideSlots[side]
             .filter((s) => s.type === entry.counterSide
                 && isSlotInRail(boundaryIdx, gapSlots, entry.counterSide, s)
                 && !isOrderPlaced(s)
@@ -132,13 +141,39 @@ function resolveCounterQuota(
             entry.attempts++;
             continue;
         }
+        chosenByFill.set(entry.fillKey, chosen);
         entry.counterSlotId = chosen.id;
         if (entry.lastDeferReason) entry.lastDeferReason = undefined;
         owed[side].push(entry);
         emitted++;
     }
+    // Window projection of the already-selected counters. The replacement
+    // candidate is the slot chosen in the scan above — no second rail scan and
+    // no persisting of a debt whose op never confirmed.
+    const project = (side: CounterSide, dir: number): ManagedOrder[] => {
+        const kept = [...windows[side]];
+        const counterIds = new Set(owed[side].map((d) => d.counterSlotId));
+        for (const debt of owed[side]) {
+            if (kept.some((s) => s.id === debt.counterSlotId)) continue;
+            const candidate = chosenByFill.get(debt.fillKey);
+            if (!candidate) continue;
+            kept.sort((a, b) => dir > 0 ? Number(a.price) - Number(b.price) : Number(b.price) - Number(a.price));
+            let dropIdx = -1;
+            for (let i = kept.length - 1; i >= 0; i--) {
+                if (!counterIds.has(kept[i].id)) { dropIdx = i; break; }
+            }
+            if (dropIdx >= 0) kept.splice(dropIdx, 1);
+            kept.push(candidate);
+        }
+        return kept;
+    };
     if (manager._metrics) manager._metrics.counterDebtSlotsCount = debt.size;
-    return owed;
+    return {
+        buy: owed.buy,
+        sell: owed.sell,
+        buySlots: project('buy', -1),
+        sellSlots: project('sell', +1),
+    };
 }
 
 class StrategyEngine {
@@ -405,9 +440,12 @@ class StrategyEngine {
         // inventory. The fill is the anchor: place it outside its own window.
         // Validated like a boundary commit (strands no live in-band order), and
         // only for an on-ladder fill price.
-        // One batch-extremum anchor per fill cycle covers the whole sweep, so
-        // no per-cycle budget is needed: a refused anchor leaves the boundary
-        // unchanged and a later cycle may try again with fresher geometry.
+        // The anchor is absolute, so each plan needs one batch extremum and no
+        // per-cycle budget: a refused anchor leaves the boundary unchanged and
+        // a later cycle retries with fresher geometry. In chunked mode each
+        // chunk re-anchors from its own (progressively further-out) extremum,
+        // which is the intended catch-up behaviour — not double-spend of a
+        // per-cycle allowance.
         const reanchor = reanchorBoundaryFromLastFill(this.manager, newBoundaryIdx, allSlots, gapSlots, fills);
         if (reanchor.reanchored) {
             newBoundaryIdx = reanchor.boundaryIdx;
@@ -480,32 +518,8 @@ class StrategyEngine {
         // 2. Assign Roles (Buy/Sell/Spread)
         const updatedSlots = assignGridRoles(allSlots, newBoundaryIdx, gapSlots, ORDER_TYPES, ORDER_STATES, { assignOnChain: true });
 
-        // COUNTER QUOTA: settle debts whose counter landed, then pick at most
-        // gap+1 owed counters for this cycle, oldest first.
-        const counterQuota = resolveCounterQuota(
-            this.manager as OrderManagerLike, updatedSlots, gapSlots, newBoundaryIdx,
-            {
-                buy: Math.max(1, config.coreOrders?.buy ?? 1),
-                sell: Math.max(1, config.coreOrders?.sell ?? 1)
-            }
-        );
-        const allDebt = [...(this.manager._counterDebt?.values() ?? [])];
-        const deferred = allDebt.filter((d) => d.lastDeferReason).length;
-        const batchCap = allDebt.filter((d) => d.lastDeferReason === 'batch-cap').length;
-        const attempts = allDebt.reduce((max, d) => Math.max(max, d.attempts || 0), 0);
-        this.manager.logger.log(
-            `[COUNTER-QUOTA] batch buy=${counterQuota.buy.length} sell=${counterQuota.sell.length} `
-            + `owed=${allDebt.length} deferred=${deferred} batchCap=${batchCap} attempts=${attempts}`, 'debug'
-        );
-
-        this.manager.logger.log(`[DEBUG] calculateTargetGrid: boundary=${newBoundaryIdx}, gap=${gapSlots}, allSlots=${updatedSlots.length}`, 'debug');
-        updatedSlots.forEach((s) => this.manager.logger.log(`  Slot ${s.id}: price=${s.price}, size=${s.size ?? 'n/a'}, type=${s.type}`, 'debug'));
-
-        // 3. Calculate Ideal Sizes (Budgeting)
-        const totalTarget = getCoreOrdersTotal(config);
-        const budgetBuy = getSideBudget('buy', funds, config, totalTarget);
-        const budgetSell = getSideBudget('sell', funds, config, totalTarget);
-        
+        // Build the base active windows BEFORE counter selection: the merged
+        // quota pass projects its selected counters into these same windows.
         // Filter slots into BUY/SELL
         const allBuySlots = updatedSlots.filter((o) => o.type === ORDER_TYPES.BUY);
         const allSellSlots = updatedSlots.filter((o) => o.type === ORDER_TYPES.SELL);
@@ -553,40 +567,36 @@ class StrategyEngine {
         let buySlots = snapRail(buyCandidates, -1).slice(0, targetCountBuy);
         let sellSlots = snapRail(sellCandidates, +1).slice(0, targetCountSell);
 
-        // Force the selected counter slots into the active window, replacing
-        // the farthest ordinary slot so the core-order count is preserved.
-        // Sizes are assigned below from the same side budget as every other
-        // slot — the quota changes WHICH slot is active, never its size.
-        const forceCounterSlots = (
-            base: ManagedOrder[],
-            all: ManagedOrder[],
-            debts: CounterDebtEntry[],
-            dir: number
-        ): ManagedOrder[] => {
-            const kept = [...base];
-            for (const debt of debts) {
-                if (kept.some((s) => s.id === debt.counterSlotId)) continue;
-                const candidate = all.find((s) => s.id === debt.counterSlotId
-                    && isSlotInRail(newBoundaryIdx, gapSlots, debt.counterSide, s));
-                // Deferral bookkeeping belongs to resolveCounterQuota; this
-                // is only the window projection of a debt already selected.
-                if (!candidate) continue;
-                kept.sort((a, b) => dir > 0 ? a.price - b.price : b.price - a.price);
-                // Replace the farthest ORDINARY slot, never another selected
-                // counter (which would silently drop its counter op).
-                const counterIds = new Set(debts.map((d) => d.counterSlotId));
-                let dropIdx = -1;
-                for (let i = kept.length - 1; i >= 0; i--) {
-                    if (!counterIds.has(kept[i].id)) { dropIdx = i; break; }
-                }
-                if (dropIdx >= 0) kept.splice(dropIdx, 1);
-                kept.push(candidate);
-            }
-            return kept;
-        };
-        buySlots = forceCounterSlots(buySlots, allBuySlots, counterQuota.buy, -1);
-        sellSlots = forceCounterSlots(sellSlots, allSellSlots, counterQuota.sell, +1);
-        
+        // COUNTER QUOTA: pick at most gap+1 owed counters (oldest first) and
+        // project them into the active window in the same pass. Sizing below
+        // uses the projected window but keeps its fund-driven size.
+        const counterQuota = resolveCounterQuota(
+            this.manager as OrderManagerLike,
+            { buy: allBuySlots, sell: allSellSlots },
+            gapSlots,
+            newBoundaryIdx,
+            { buy: buySlots, sell: sellSlots },
+            { buy: targetCountBuy, sell: targetCountSell }
+        );
+        buySlots = counterQuota.buySlots;
+        sellSlots = counterQuota.sellSlots;
+        const allDebt = [...(this.manager._counterDebt?.values() ?? [])];
+        const deferred = allDebt.filter((d) => d.lastDeferReason).length;
+        const batchCap = allDebt.filter((d) => d.lastDeferReason === 'batch-cap').length;
+        const attempts = allDebt.reduce((max, d) => Math.max(max, d.attempts || 0), 0);
+        this.manager.logger.log(
+            `[COUNTER-QUOTA] batch buy=${counterQuota.buy.length} sell=${counterQuota.sell.length} `
+            + `owed=${allDebt.length} deferred=${deferred} batchCap=${batchCap} attempts=${attempts}`, 'debug'
+        );
+
+        this.manager.logger.log(`[DEBUG] calculateTargetGrid: boundary=${newBoundaryIdx}, gap=${gapSlots}, allSlots=${updatedSlots.length}`, 'debug');
+        updatedSlots.forEach((s) => this.manager.logger.log(`  Slot ${s.id}: price=${s.price}, size=${s.size ?? 'n/a'}, type=${s.type}`, 'debug'));
+
+        // 3. Calculate Ideal Sizes (Budgeting)
+        const totalTarget = getCoreOrdersTotal(config);
+        const budgetBuy = getSideBudget('buy', funds, config, totalTarget);
+        const budgetSell = getSideBudget('sell', funds, config, totalTarget);
+
         // IMPORTANT:
         // Size distribution must be computed on the FULL side topology, not only
         // the active window. Otherwise budgets get concentrated into targetCount

@@ -189,6 +189,7 @@ async function processSweepOrphanFill(bot: BotLike, fill: unknown, fillOp: FillO
     try {
         const pays = fillOp?.pays as { asset_id?: string; amount?: number } | undefined;
         const receives = fillOp?.receives as { asset_id?: string; amount?: number } | undefined;
+        const chainFill = fill as { block_num?: number; blockNum?: number; id?: string } | null | undefined;
         // This path writes the pivot directly through recordLastFilledPrices.
         // No book verification is needed: every fill is market truth.
         attributeUnmatchedFillToGrid(bot.manager, {
@@ -197,6 +198,10 @@ async function processSweepOrphanFill(bot: BotLike, fill: unknown, fillOp: FillO
             paysAmountRaw: pays?.amount ?? null,
             receivesAssetId: receives?.asset_id ?? null,
             receivesAmountRaw: receives?.amount ?? null,
+            // Same chain identity processFillsOnly uses: a fill seen by both
+            // writers must mint ONE counter debt, not a slot-keyed second one.
+            blockNum: chainFill?.block_num ?? chainFill?.blockNum,
+            historyId: chainFill?.id,
         });
     } catch { /* attribution is best-effort: never block the credit */ }
     return accountingResult.status === 'missing_key';

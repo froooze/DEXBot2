@@ -97,7 +97,7 @@ local state.
 | **Stale window after a fill** | A fill is queued but not yet absorbed; the master still counts the filled slot ACTIVE, so a window top-up re-creates the expensive end of the rail and re-buys into a stale pivot | `hasUnsettledFills` defers the targeted reconcile and the window top-up (1:1 repairs still run) + attribution of the real execution price (§9.11.1) |
 | **Fill identity by chain id** | `virtualizeOrder` nulls `orderId`, so a real fill matched no ACTIVE slot and was dropped *after* its accounting was booked; pivot and owed crawl stayed on a stale, higher price | `attributeUnmatchedFillToGrid` falls back to the genesis level of the execution price, refuses prices outside the frozen rail, and owes a crawl only for a hole the grid owns (§9.11.1) |
 | **Chain-existence bookkeeping** | Seven structures with seven clocks; four read sites consulted four subsets and could give four answers for one order | `modules/order/lifecycle.ts`: one record per slot, `unknown` is a real phase, every absence decision asks the same time-bounded `isInFlight()` (§9.11.3) |
-| **Sweep fill drives geometry** | A premium sweep of our own rail is not window evidence, but the crawl counted every swept fill and dragged the boundary ~20 steps below a live market that never traded there; off-market fills could also win the re-anchor extremum | SUPERSEDED by §9.16: the market-bound predicate (`offMarketFill`) was injected into the crawl and applied at the pending-crawl writer, and the anchor filtered its batch extremum through the same single-source classifiers (§9.13/F1, §9.13/C1); fills are now authoritative |
+| **Sweep fill drives geometry** | A premium sweep of our own rail is not window evidence, but the crawl counted every swept fill and dragged the boundary ~20 steps below a live market that never traded there; off-market fills could also win the re-anchor extremum | SUPERSEDED by §9.16: the crawl and the anchor extremum first used a market-bound predicate (§9.13/F1, §9.13/C1); the follow-up cleanup removed that predicate and its parameter entirely — every fill now crawls and may anchor the geometry |
 | **Partial progress counted as a heal** | A correction reducing excess 14 → 12 cleared the stale clock and skipped the level-triggered recheck, so the book sat wide for 63 minutes with no watchdog line | The clock clears only at zero measured excess (or an unmeasurable read, the compatibility path); a partial reduction keeps the original clock and re-arms the recheck (§9.13/F2) |
 
 Families **not** detailed in Part II: silent hangs and stale correction queues are covered in
@@ -937,7 +937,7 @@ independent round trips, so sizes stop following the side budget. Spread repair
 must stay fund-driven from the side pool: a SELL fill returns quote while the
 same-side repair needs base, so no fill can ever fund its own side, and pairing
 would hide that asymmetry instead of resolving it. **§9.16 keeps the rejection and adds
-a quota alternative:** one counter order is still owed per filled slot on the opposite
+a quota alternative:** one counter order is still owed per fill on the opposite
 rail, but the obligation is a bounded in-memory ledger keyed by fill key — never reserved
 proceeds. Sizing still comes from the side budget, so the asymmetry above stays visible.
 
@@ -1085,8 +1085,9 @@ or stale. Separately, `OrderManager.recordLastFilledPrices` skips fills whose cu
 slot is in the gap band: those are stranded residuals, not window trades. Edge-pinned
 fills remain excluded by the existing shared classifier. A rail/window fill is still
 recorded once, by the existing pivot writer. **Superseded:** §9.16 removes the distance
-check, the wrong-side refusal and the gap-band skip; `offMarketFill` is a neutral stub and
-every fill arms the guard and contributes to the crawl and the re-anchor.
+check, the wrong-side refusal and the gap-band skip; the follow-up cleanup also removed
+the classifier/verifier helpers themselves, so every fill arms the guard and contributes
+to the crawl and the re-anchor.
 
 > **Addendum (2026-11-26, fast move with a time-fresh mid; SUPERSEDED by §9.16).** In a live market-pair
 > sweep, one bot cached the book mid at `<cached-mid>` one minute before a taker
@@ -1120,14 +1121,15 @@ every fill arms the guard and contributes to the crawl and the re-anchor.
 > critical path. Only rebuild re-arm and startup restore remain unverified by
 > design (no client, no live mid).
 >
-> **Superseded by §9.16.** This incident is the direct motivation for the policy change.
-> `verifyFillMarketReference` is now a no-op: no live fill path forces a book
-> re-read. The `LAST_FILL_MID_VERIFY_*` pacing/timeout knobs and the `force`
-> branch of the price owner remain only as compatibility surface (config and
-> exported signature) with no fill-path caller; the time-based spread read is
-> unaffected. The refused-level family (writer, readers, release, generation-key
-> branch) is gone. The cached mid can no longer veto a real fill; no historical
-> refusal signature above is emitted by the new policy.
+> **Superseded by §9.16 and its follow-up cleanup.** This incident is the direct
+> motivation for the policy change. `verifyFillMarketReference`, the market-bound
+> classifiers, the refused-level helpers, the `force` branch of the price owner,
+> the `_fillMidVerifyAttemptedAt` clock and the `LAST_FILL_MID_VERIFY_*` timing
+> knobs (plus their policy entries) are all removed — there is no compatibility
+> surface left to call. The time-based spread read still refreshes the shared
+> market cache under `SPREAD_CORRECTION_SYNC_FRESH_MS`, bounded by the client RPC
+> timeout. The cached mid can no longer veto a real fill; no historical refusal
+> signature above is emitted by the new policy.
 
 **P2 — the pivot may not veto its own counter-order territory.** The shared
 `evaluateLastFillGuard` verdict is used by both COW placement checks and the final
@@ -1326,7 +1328,7 @@ Amended policy (still one owner, still no cooldown):
 
 **Superseded by §9.16.** The marker set, its TTL/eviction policy, the bypass denials and the
 generation-key branch are removed. The multi-rung outcome is now produced by the in-memory
-counter-quota ledger: one counter order per filled slot on the opposite rail, sized from the
+counter-quota ledger: one counter order per fill on the opposite rail, sized from the
 side budget, with at most `gapSlots + 1` new counters stacked per cycle and the rest owed.
 The "persisted rows exclude off-market fills" limit above no longer applies — no fill is
 classified off-market. Historical pinning: `tests/test_fill_one_counter_order.ts`
@@ -1369,9 +1371,10 @@ the single fill-provenanced ref when none is eligible; every leg fails open on m
 evidence. This closes an independent gap — an edge-pinned or stranded in-band fill can
 no longer teleport the anchor — and makes §9.6's “nor anchor the geometry” true on the
 geometry path. It did **not** cause the incident's 20-step descent. Tests: REANCHOR-24..27,
-EDGE-8, ELIG-6 (all fail on the pre-fix tree). **§9.16:** the `offMarketFill` leg of the
-extremum filter is removed; batch-extremum selection, the on-ladder check and the
-`validatePersistedBoundary` / strictly-fewer-strands repair remain the safety story.
+EDGE-8, ELIG-6 (all fail on the pre-fix tree). **§9.16 cleanup:** the `offMarketFill` leg
+of the extremum filter and the classifier itself are removed; batch-extremum selection,
+the on-ladder check and the `validatePersistedBoundary` / strictly-fewer-strands repair
+remain the safety story.
 
 **F1 — market-bound crawl eligibility (`391ba444`, root cause of the descent).**
 `offMarketFill()` is exported as the single predicate; `deriveTargetBoundary()` accepts an
@@ -1380,9 +1383,10 @@ legacy behaviour), and `strategy.ts` injects it and applies the same test at the
 pending-crawl writer so an ineligible fill cannot leave an owed crawl for a later
 derivation to apply. No new classifier, no `order ↔ system` import cycle; fail-open on a
 stale/missing read keeps legitimate fast moves followable. Test: PEND-019 (boundary 94
-without the fix, 95 with it). **§9.16:** the injected predicate and the pending-crawl writer
-filter are removed; every full fill contributes to the crawl. The cross-chunk crawl cap and
-the edge-pinned exclusion (documented exception) stay in force.
+without the fix, 95 with it). **§9.16 cleanup:** the injected predicate, the pending-crawl
+writer filter and the `deriveTargetBoundary` eligibility parameter itself are removed;
+every full fill contributes to the crawl. The cross-chunk crawl cap and the edge-pinned
+exclusion (documented exception) stay in force.
 
 **F2 — partial progress is not a heal (`5a703297`, root cause of the silent hour).**
 `trackOutOfSpreadStaleness()` now clears the clock and geometry memory only when the
@@ -1719,9 +1723,9 @@ bind as `last-fill-blocked` — §9.12 Addendum 3's "reporting is not escalation
 limit is lifted now that the dedupe key is fixed, one sweep still gets one
 re-center, and a refused SELL rung is not mistaken for a BUY-side bind (side-aware
 `hasLiveRefusedFillLevels(manager, type)`). The empty-candidate operator line
-still names the refused level; only the stall cause changed. **§9.16:** the
-`refused:price|type` branch and the oldest-live-refused-level key are removed — with no
-marker family, the generation key is the armed pivot (or cold). The one-re-center cap and
+still names the refused level; only the stall cause changed. **§9.16 cleanup:** the
+`refused:price|type` branch, the oldest-live-refused-level key and the marker helpers are
+removed — the generation key is the armed pivot (or cold). The one-re-center cap and
 the bounded `SPREAD_STALE_PIVOT_EXPIRE_MS` exit remain; the bounded `LAST_FILL_PIVOT_TTL_MS`
 is kept unchanged.
 
@@ -1789,22 +1793,29 @@ rejected or accepted as recorded.
 
 ### 9.16 Fill-authoritative policy: every fill is market evidence, one counter per fill (2026-11-27)
 
-> **Status:** design intent; the amending change is in flight. Plan:
+> **Status:** implemented; the follow-up cleanup that removed the retained
+> compatibility surface is complete. Plan:
 > [FILL_AUTHORITATIVE_COUNTER_PLAN.md](FILL_AUTHORITATIVE_COUNTER_PLAN.md). Generic terms
 > only. This section supersedes the refusal/marker machinery in §9.12 (P1 and addenda 1–3),
 > §9.13 (C1/F1/FA-1b), §9.14 Stage 6's first non-goal and §9.15 Track A; the earlier text
 > is kept as the historical record.
 
-**Decision.** Every fill represents the market. `offMarketFill` is a neutral stub returning
-`null` and `verifyFillMarketReference` is a no-op: no cached-mid veto, no forced book read,
-no active fill-path pacing/timeout use (the `LAST_FILL_MID_VERIFY_*` knobs remain as compatibility surface). Fill provenance always arms the last-fill guard, always contributes
-to the boundary crawl and always participates in the re-anchor extremum. The edge-pinned
+**Decision.** Every fill represents the market. No market-bound classifier, verifier,
+refused-level helper, pacing clock or timing knob remains: `offMarketFill`,
+`fillOutsideMarket`, `verifyFillMarketReference`, `resolveFillMidVerifyMs`, the
+refused-level helpers/type, `_fillMidVerifyAttemptedAt`, the `force` branch of the
+price owner, `TIMING.LAST_FILL_MID_VERIFY_MS` / `LAST_FILL_MID_VERIFY_TIMEOUT_MS`
+and their policy entries are all removed, as are the market-bound `GRID_LIMITS`
+entries. `LAST_FILL_PIVOT_TTL_MS` stays; `LAST_FILL_REFUSED_LEVEL_TTL_MS` is kept
+only for historical log replay in `analysis/grid_correction_check.ts`. There is
+no cached-mid veto and no forced book read. Fill provenance always arms the last-fill guard, always contributes to the
+boundary crawl and always participates in the re-anchor extremum; `deriveTargetBoundary`
+no longer accepts the optional `isFillEligibleForCrawl` predicate. The edge-pinned
 insurance exclusion remains the one documented exception; gap-band residual skips are
-removed. The refused-level marker family (writer, readers, release, generation-key branch,
-bypass denials) is removed; same-level re-placement is blocked by the direction rule alone
-(equal counts as blocked).
+removed. Same-level re-placement is blocked by the direction rule alone (equal counts
+as blocked).
 
-**One counter per filled slot.** A SELL fill at slot `s` owes a counter BUY at `s − gap`;
+**One counter per fill.** A SELL fill at slot `s` owes a counter BUY at `s − gap`;
 a BUY fill owes a counter SELL at `s + gap`, at the nearest free rail slot. Debt is an
 in-memory quota ledger keyed by fill key on the order manager — not reserved proceeds:
 sizes still come from the side budget (§9.9). At most `gapSlots + 1` new counter orders may
@@ -1828,7 +1839,10 @@ or residuals. (5) Tests and docs — rewrite the suites that pin refusals and ex
 observability and pipeline contracts.
 
 **Non-goals.** No reserved proceeds / pair ledger, no cooldown or backoff, no new persisted
-row or second writer of a fill fact, no crossing veto, no config or TTL change.
+row or second writer of a fill fact, no crossing veto, and no *behavioral* config or TTL
+change: the follow-up cleanup deleted the now-dead `LAST_FILL_MID_VERIFY_*` and
+market-bound `GRID_LIMITS` keys, but `LAST_FILL_PIVOT_TTL_MS` and the analysis-only
+refused-level TTL are unchanged.
 
 **Remaining safety story.** Bad fill evidence is the risk that is left. Backstops:
 `validatePersistedBoundary` with its strictly-fewer-strands repair, on-ladder price checks,

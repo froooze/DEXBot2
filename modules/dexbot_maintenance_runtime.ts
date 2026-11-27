@@ -3483,11 +3483,8 @@ export function trackOutOfSpreadStaleness(bot: BotLike, spreadChecked: boolean, 
     let geometryPivotKey = '';
     if (geometryBlocked) {
         try {
-            // One owner for the generation identity: an armed pivot, or — when
-            // a refused sweep left the pivot cold — the oldest live refused
-            // level. Without the second leg the key was '' on every cold-pivot
-            // tick, the one-re-center watermark never stuck, and the bounded
-            // pivot-expiry heal below was unreachable (§9.12 Addendum 3).
+            // One owner for the generation identity: the armed fill pivot.
+            // Every fill arms the guard, so no refused-level fallback exists.
             geometryPivotKey = resolveGuardGenerationKey(bot.manager);
         } catch { geometryPivotKey = ''; }
     }

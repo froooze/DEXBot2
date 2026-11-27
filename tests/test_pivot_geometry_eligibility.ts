@@ -19,7 +19,7 @@
 
 const assert = require('assert');
 const { OrderManager } = require('../modules/order/manager');
-const { ORDER_TYPES, ORDER_STATES, GRID_LIMITS } = require('../modules/constants');
+const { ORDER_TYPES, ORDER_STATES } = require('../modules/constants');
 const { isLastFillBandSellExempt, isLastFillPlacementBlocked, evaluateLastFillGuard, reanchorBoundaryFromLastFill } = require('../modules/order/utils/system');
 const { getSellStartIdx, resolveGapSlots } = require('../modules/order/utils/math');
 
@@ -281,12 +281,15 @@ run('ELIG-4 unreadable geometry fails open (a cold grid still arms on its first 
         'without geometry the classifier must not guess (fail-open like collectEdgePinnedFillIds)');
 });
 
-run('ELIG-5 the legacy distance bound is inert on the fill path', () => {
-    assert.ok(Number(GRID_LIMITS.LAST_FILL_PIVOT_MAX_MID_DISTANCE_STEPS) >= 1,
-        'the legacy knob may remain for compatibility');
-    const { offMarketFill } = require('../modules/order/utils/system');
-    assert.strictEqual(offMarketFill({ _liveMarketPrice: 1000, _liveMarketPriceAt: Date.now(), config: {} }, ORDER_TYPES.SELL, 2000), null,
-        'the distance predicate can no longer close the sweep class');
+run('ELIG-5 no market-distance classifier remains on the fill path', () => {
+    const fs = require('fs');
+    const path = require('path');
+    const src = fs.readFileSync(path.join(__dirname, '../../modules/order/utils/system.ts'), 'utf8');
+    assert.ok(!/export (?:async )?function (?:offMarketFill|fillOutsideMarket)\(/.test(src),
+        'no cached-mid or explicit-mid fill classifier may be exported');
+    const runtime = require('../modules/order/utils/system');
+    assert.strictEqual(runtime.offMarketFill, undefined);
+    assert.strictEqual(runtime.fillOutsideMarket, undefined);
 });
 
 run('ELIG-6 every fill arms the pivot AND may be the geometry extremum', () => {

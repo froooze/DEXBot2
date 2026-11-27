@@ -35,7 +35,7 @@ const {
 const { ORDER_TYPES, ORDER_STATES } = require('../modules/constants');
 const { OrderManager } = require('../modules/order/manager');
 const { WorkingGrid } = require('../modules/order/working_grid');
-const { applyPersistedPendingCrawls, offMarketFill } = require('../modules/order/utils/system');
+const { applyPersistedPendingCrawls } = require('../modules/order/utils/system');
 const { loadGrid } = require('../modules/order/grid');
 const { buildGenesisFromPriceLevels, calculateGapSlots } = require('../modules/order/utils/math');
 
@@ -635,8 +635,8 @@ async function testPersistSkip_RestartReplaysCommitOnce() {
 async function testPending_AllEligibleFillsCrawl() {
     console.log('\n[PEND-019] every eligible fill contributes a crawl; no market filter...');
     // slot 95 is one step from the mid; slot 80 is ~16 steps away — a sweep
-    // the old offMarketFill predicate discarded. Fill-authoritative: both
-    // fills are window evidence, so both crawl the boundary.
+    // a cached-mid predicate used to discard. Fill-authoritative: both fills
+    // are window evidence, so both crawl the boundary.
     const { boundaryIdx } = deriveTargetBoundary(
         [buyFill(80), buyFill(95)],
         96,
@@ -648,17 +648,21 @@ async function testPending_AllEligibleFillsCrawl() {
         null
     );
     assert.strictEqual(boundaryIdx, 94, `both fills must crawl 96 -> 94 (got ${boundaryIdx})`);
-    // offMarketFill is now neutral even for a caller that still consults it.
-    const mid = 0.001 + 95 * 0.000004;
-    const mgr = { config: CFG, _liveMarketPrice: mid, _liveMarketPriceAt: Date.now() };
-    assert.strictEqual(offMarketFill(mgr, ORDER_TYPES.BUY, 0.001 + 80 * 0.000004), null,
-        'the cached mid can no longer veto a sweep fill');
-    // The live strategy call site must not inject a market predicate at all.
+    // There is no classifier to consult any more, and the derivation has no
+    // eligibility parameter to inject one through.
+    const systemSrc = fs.readFileSync(path.join(__dirname, '../../modules/order/utils/system.ts'), 'utf8');
+    assert.ok(!/export (?:async )?function offMarketFill\(/.test(systemSrc),
+        'no market classifier may remain');
+    const orderSrc = fs.readFileSync(path.join(__dirname, '../../modules/order/utils/order.ts'), 'utf8');
+    const deriveAt = orderSrc.indexOf('function deriveTargetBoundary(');
+    const signature = orderSrc.slice(deriveAt, orderSrc.indexOf('\n', deriveAt));
+    assert.ok(!/isFillEligibleForCrawl/.test(signature),
+        'deriveTargetBoundary has no eligibility parameter');
     const strategySrc = fs.readFileSync(path.join(__dirname, '../../modules/order/strategy.ts'), 'utf8');
-    const deriveAt = strategySrc.indexOf('deriveTargetBoundary(fills');
-    assert.ok(deriveAt > 0, 'the strategy derivation call must exist');
-    const call = strategySrc.slice(deriveAt, strategySrc.indexOf(';', deriveAt));
-    assert.ok(!/offMarketFill|isCrawlEligible/.test(call),
+    const callAt = strategySrc.indexOf('deriveTargetBoundary(fills');
+    assert.ok(callAt > 0, 'the strategy derivation call must exist');
+    const call = strategySrc.slice(callAt, strategySrc.indexOf(';', callAt));
+    assert.ok(!/isCrawlEligible|offMarketFill/.test(call),
         `no crawl predicate may be injected at the live call site (got ${call})`);
     console.log('✓ PEND-019 passed');
 }

@@ -5,6 +5,10 @@
  * RUNTIME PIVOT TIMELINE — mirror of the runtime's own LAST-FILL-GUARD state,
  * reconstructed from a bot log (profiles/logs/<bot>.log).
  *
+ * HISTORICAL REPLAY (pre-§9.16): the refusal policy described below was
+ * superseded by the fill-authoritative runtime. This tool still parses old
+ * logs correctly; new logs have no refusal lines.
+ *
  * Why this exists (2026-11-16 incident, retrospective §9.12 addendum): since
  * `66667052`/`bc7b5232` the pivot only arms on WINDOW fills — wrong-side,
  * too-far (premium sweep) and gap-band fills are refused. A sweep of the bot's

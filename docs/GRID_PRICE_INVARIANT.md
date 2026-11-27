@@ -124,10 +124,10 @@ the guard would drop. The predicate takes exactly `(price, type, lastPrice,
 lastType)`: there is no size or increment argument, because the old
 `pivot ± increment/2` band was what blocked profitable placements.
 
-**What may become the pivot.** Every fill is market evidence: `offMarketFill` is a
-neutral stub and `verifyFillMarketReference` is a no-op, so no cached-mid veto,
-gap-band skip or refused-level marker can keep a real fill from arming the guard,
-contributing to the crawl or joining the re-anchor extremum. EDGE-pinned insurance
+**What may become the pivot.** Every fill is market evidence: no market classifier,
+verifier or refused-level helper exists, so no cached-mid veto, gap-band skip or
+marker state can keep a real fill from arming the guard, contributing to the crawl
+or joining the re-anchor extremum. EDGE-pinned insurance
 fills (grid floor/ceiling) are the one documented exception: they are skipped by
 `recordLastFilledPrices` via the shared classifier `collectEdgePinnedFillIds`,
 matching the crawl's own edge exclusion — an edge order is static fat-finger

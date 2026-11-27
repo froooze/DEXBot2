@@ -18,6 +18,19 @@ import { resolveGapSlots } from './math.js';
 import { parseSlotIndex } from './slot.js';
 import type { OrderManagerLike, CounterDebtEntry } from '../../types.js';
 
+// Hard bound on unsatisfied obligations. Matches the pending-crawl ledger cap
+// in strategy.ts: an unsatisfiable debt (no rail slot, direction-rule block,
+// phantom CREATE) must not accumulate forever and turn every plan into an
+// O(debts x slots) scan. Deferred-first (then oldest) eviction keeps the
+// freshest fills owed without dropping an in-flight stamped counter.
+const MAX_COUNTER_DEBTS = 500;
+
+// Diagnostics must never abort fill attribution: this helper is called from
+// the fill pipeline, where a throwing logger would lose the whole fill.
+function safeWarn(manager: OrderManagerLike, msg: string): void {
+    try { manager.logger?.log?.(msg, 'warn'); } catch { /* best-effort */ }
+}
+
 export interface CounterFillInput {
     id?: string;
     type?: string;
@@ -69,12 +82,34 @@ export function recordCounterDebt(manager: OrderManagerLike, fill: CounterFillIn
             lastDeferReason: prior?.lastDeferReason
         };
         debt.set(key, entry);
-        if (!prior && manager._metrics) {
-            manager._metrics.counterOrdersOwedCount = (manager._metrics.counterOrdersOwedCount || 0) + 1;
-            manager._metrics.counterDebtSlotsCount = debt.size;
+        if (!prior) {
+            // Prefer an UNSELECTED debt: resolveCounterQuota clears
+            // lastDeferReason when it selects a debt into the current plan, so
+            // evicting a deferred entry cannot invalidate an in-flight stamped
+            // op. Only when every entry is selected do we fall back to the
+            // oldest insertion (Map order is stable on re-delivery).
+            while (debt.size > MAX_COUNTER_DEBTS) {
+                let oldest: string | undefined;
+                for (const [k, v] of debt) {
+                    if (v.lastDeferReason) { oldest = k; break; }
+                }
+                if (oldest == null) oldest = debt.keys().next().value as string | undefined;
+                if (oldest == null) break;
+                debt.delete(oldest);
+                safeWarn(manager, `[COUNTER-DEBT] Dropped oldest debt ${oldest}: ledger cap ${MAX_COUNTER_DEBTS} reached`);
+            }
+            if (manager._metrics) {
+                manager._metrics.counterOrdersOwedCount = (manager._metrics.counterOrdersOwedCount || 0) + 1;
+                manager._metrics.counterDebtSlotsCount = debt.size;
+            }
         }
         return !prior;
-    } catch {
+    } catch (err) {
+        // The single owner of the guarantee must not fail silently: a malformed
+        // manager or a throwing resolver otherwise loses a counter with no
+        // trace. Ordinary partial/type early-returns above stay quiet.
+        safeWarn(manager,
+            `[COUNTER-DEBT] Could not record obligation for fill ${String(fill.id ?? '')}: ${String(err)}`);
         return false;
     }
 }

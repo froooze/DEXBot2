@@ -49,7 +49,7 @@
  *     (recordLastFilledPrices skips them); this reconstruction has no slot
  *     identity for a fill, so it cannot classify edge fills and will still
  *     judge the pair after one. Expect rare false positives on wick fills.
- *   - PIVOT-ARMING REFUSALS (66667052 / bc7b5232, retrospective §9.12/P1): a
+ *   - PIVOT-ARMING REFUSALS (HISTORICAL, pre-§9.16; 66667052 / bc7b5232): a
  *     fill refused from arming the pivot (wrong-side, too-far premium sweep,
  *     gap-band stranded residual) leaves the pivot behind the true last fill,
  *     and a re-quote the gate passes is NOT a discipline breach. The strict
@@ -200,7 +200,7 @@ interface PivotAnchorArtifact {
 }
 
 /**
- * SAME-LEVEL REFUSAL MARKER (§9.12/P2 amended): did the runtime refuse the
+ * SAME-LEVEL REFUSAL MARKER (HISTORICAL, pre-§9.16; §9.12/P2): did the runtime refuse the
  * pivot-arm of the just-filled level shortly before this same-level re-fill?
  * The amended runtime writes a same-level re-fill block when it refuses a
  * pivot arm, so a same-level fill that the log shows SHOULD have been blocked
@@ -344,7 +344,7 @@ function applyRuntimeMirror(
 // `isLastFillGuardBlocked` is IMPORTED from modules/order/utils/system.ts, not
 // re-implemented. The old local copy was labelled "mirrors 1:1" and had already
 // kept the removed band term; a copy of a rule is a second rule waiting to drift
-// (retrospective R3.5 / §9.10/P5). The module returns `{blocked, pivot, threshold}`
+// (retrospective R3.5 / §9.10/P5). The module returns `{blocked, pivot}`
 // — there is no `halfInc`, because the increment no longer participates.
 
 function resolveIncrementPercent(botMeta: { incrementPercent?: unknown } | null | undefined, override: number | null): number {
@@ -702,7 +702,7 @@ function detectViolations(
                     pair: `${curr.baseAsset}:${curr.quoteAsset}`,
                     direction: curr.direction,
                     expected: check.blocked
-                        ? (isSell ? `> ${check.threshold?.toFixed(6)} (last fill ${check.pivot})` : `< ${check.threshold?.toFixed(6)} (last fill ${check.pivot})`)
+                        ? (isSell ? `> ${check.pivot?.toFixed(6)} (last fill)` : `< ${check.pivot?.toFixed(6)} (last fill)`)
                         : `different level (> half a step of ${prev.price.toFixed(6)} — same-level re-fill, §9.12/P2)`,
                     prev: prev as TradeFill,
                     curr: curr as TradeFill,
@@ -710,7 +710,7 @@ function detectViolations(
                     priceDeltaPct: deltaPct,
                     pivot: (check.pivot ?? prev.price) as number,
                     halfInc: 0,
-                    threshold: (check.threshold ?? prev.price) as number,
+                    threshold: (check.pivot ?? prev.price) as number,
                     sameLevel: sameLevel || undefined,
                 });
             }
@@ -904,15 +904,18 @@ function printReport(
 
 /**
  * Report the strict candidates the runtime's own gate would have passed.
- * These are NOT discipline breaches: the pivot-arming policy (§9.12/P1)
- * deliberately excludes wrong-side / too-far premium-sweep / gap-band fills
- * from arming the pivot, so a re-quote below such a fill is expected.
- * Listing them keeps the policy auditable instead of silently hidden.
+ * These are NOT discipline breaches under the HISTORICAL pre-§9.16 policy:
+ * the pivot-arming policy (§9.12/P1) deliberately excluded wrong-side /
+ * too-far premium-sweep / gap-band fills from arming the pivot, so a re-quote
+ * below such a fill was expected. New logs produce no refusal-based divergences
+ * (older pivots and guard allowances still can). Listing them keeps the policy
+ * auditable instead of silently hidden.
  */
 function printDivergences(divergences: PolicyDivergence[]) {
     console.log('  ── Policy divergences (strict candidate vs the runtime pivot at the gate) ──');
-    console.log('  The runtime pivot at placement excluded the strict last fill from arming');
-    console.log('  (window-trade policy: wrong-side / premium-sweep / gap-band refusals).');
+    console.log('  The gate pivot differed from the strict last fill: older pivot, guard');
+    console.log('  allowance, or a historical pre-§9.16 refusal (wrong-side / premium-sweep /');
+    console.log('  gap-band). Only the last class is gone from new logs.');
     console.log('');
     const hdr = '  #  Pair          Dir   Prev Price     Curr Price     Runtime Pivot  Δ%         Prev Time              Curr Time              Curr Order          Refusals  Reason';
     console.log(hdr);
@@ -932,7 +935,9 @@ function printDivergences(divergences: PolicyDivergence[]) {
         const cOrd = (d.curr.orderId || '-').slice(0, 16).padEnd(16);
         const ref = String(d.refusalsInRange).padStart(8);
         const reason = d.sameLevel
-            ? `SAME-LEVEL re-fill (${d.pivot ? 'pivot-arm refused in window' : 'no refusal evidence'})`
+            ? `SAME-LEVEL re-fill (${d.refusalsInRange > 0
+                ? 'pivot-arm refused in window'
+                : d.pivot ? 'pivot older / guard allowance' : 'no refusal evidence'})`
             : d.pivot
             ? (d.refusalsInRange > 0 ? 'pivot-arm refusal(s) in window' : 'pivot older than strict last fill')
             : 'unverifiable pivot';
