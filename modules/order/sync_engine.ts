@@ -122,7 +122,7 @@
 
 import { ORDER_TYPES, ORDER_STATES, TIMING, BTS_PRECISION } from '../constants.js';
 import * as Format from './format.js';
-import { lookupAsset, sleep, resolveAccountRef, verifyFillMarketReference } from './utils/system.js';
+import { lookupAsset, sleep, resolveAccountRef } from './utils/system.js';
 import * as chainOrders from '../chain_orders.js';
 import * as client from '../bitshares_client.js';
 /**
@@ -2049,12 +2049,6 @@ class SyncEngine {
                         // still proves a trade: absorb the pivot + owed crawl from the
                         // real execution price instead of dropping it (see
                         // _absorbUnmatchedFill). Only a truly unknown order is ignored.
-                        // Unmatched attribution writes the pivot directly;
-                        // verify the book first with the shared helper so a
-                        // cached mid cannot veto/arm from an off-market fill.
-                        await verifyFillMarketReference(mgr, BitShares, [{
-                            paysAssetId, paysAmountRaw, receivesAssetId, receivesAmountRaw,
-                        }]);
                         const absorbed = this._absorbUnmatchedFill(mgr, {
                             orderId, paysAssetId, paysAmountRaw, receivesAssetId, receivesAmountRaw,
                         });
@@ -2288,10 +2282,6 @@ class SyncEngine {
                             // Same absorption as the single-fill path: keep the
                             // pivot/crawl ledger honest so the next derivation and the
                             // LAST-FILL-GUARD see the price that actually traded.
-                            await verifyFillMarketReference(mgr, BitShares, [{
-                                paysAssetId, paysAmountRaw,
-                                receivesAssetId: entry.receivesAssetId, receivesAmountRaw: entry.receivesAmountRaw,
-                            }]);
                             const absorbed = this._absorbUnmatchedFill(mgr, {
                                 orderId, paysAssetId, paysAmountRaw,
                                 receivesAssetId: entry.receivesAssetId, receivesAmountRaw: entry.receivesAmountRaw,

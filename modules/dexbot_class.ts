@@ -110,7 +110,6 @@ const getRecalculateTriggerFile = lazyShim('./paths', 'getRecalculateTriggerFile
 const cloneWeightDistribution = lazyShim('./order/utils/math', 'cloneWeightDistribution');
 const resolveBotRuntimeSettings = lazyShim('./runtime_settings', 'resolveBotRuntimeSettings');
 const readBotInFlightFlags = lazyShim('./order/utils/system', 'readBotInFlightFlags');
-const verifyFillMarketReference = lazyShim('./order/utils/system', 'verifyFillMarketReference');
 
 /**
  * Resolve the COALESCE_BACKLOG_REPLAY opt-in.
@@ -1267,14 +1266,6 @@ class DEXBot implements BotLike {
         if (typeof this.manager?.pauseFundRecalc === 'function') {
             this.manager.pauseFundRecalc();
         }
-        // One absolute boundary re-anchor per drained fill batch: each fill
-        // event re-anchoring + a fresh COW plan amplified churn (6 re-anchors
-        // in ~1 min). The crawl still runs per chunk; the absolute anchor is
-        // the expensive geometry jump. A BUDGET (not a boolean) is nest-safe:
-        // a nested/overlapping fill cycle restores the outer budget instead of
-        // silently re-enabling multiple anchors.
-        const prevReanchorBudget = (this.manager as unknown as { _boundaryReanchorBudget?: number })._boundaryReanchorBudget;
-        (this.manager as unknown as { _boundaryReanchorBudget?: number })._boundaryReanchorBudget = 1;
         let anyDeferred = false;
         try {
             const activeSell = this.manager?.config?.coreOrders?.sell ?? 1;
@@ -1290,14 +1281,6 @@ class DEXBot implements BotLike {
                 const batchEnd = Math.min(i + currentBatchSize, totalFills);
                 const fillBatch = fillList.slice(i, batchEnd) as Array<{ id?: unknown; orderId?: unknown }>;
                 i = batchEnd;
-
-                // Verify the book mid BEFORE the LAST-FILL guard can veto any
-                // fill in this chunk. A cached mid that is young in wall-clock
-                // time can still be wrong in value after a fast move; without
-                // this re-read, ordinary window fills are classified as premium
-                // sweeps and their re-places stay blocked for the marker TTL.
-                // No RPC in the normal (in-window) case.
-                try { await verifyFillMarketReference(this.manager, BitShares, fillBatch); } catch { /* best-effort */ }
 
                 // Refresh the LAST-FILL guard pivot for this chunk's broadcast:
                 // recordLastFilledPrices walks the batch in order, so the pivot
@@ -1360,11 +1343,6 @@ class DEXBot implements BotLike {
             if (this.manager) {
                 delete this.manager._boundaryShiftBudget;
                 delete this.manager._boundaryShiftBudgetBase;
-                if (prevReanchorBudget === undefined) {
-                    delete (this.manager as unknown as { _boundaryReanchorBudget?: number })._boundaryReanchorBudget;
-                } else {
-                    (this.manager as unknown as { _boundaryReanchorBudget?: number })._boundaryReanchorBudget = prevReanchorBudget;
-                }
             }
             if (typeof this.manager?.resumeFundRecalc === 'function') {
                 await this.manager.resumeFundRecalc();

@@ -4,12 +4,10 @@
  * Two halves of the same rule — "which fill may become the pivot, and where may
  * that pivot veto a placement?":
  *
- *   ELIGIBILITY (recordLastFilledPrices): only a WINDOW trade may arm the
- *   pivot. A fill at a slot the current geometry classifies as gap-band is a
- *   stranded residual, not a trade the window owes a counter-order for.
- *   Live: the boundary crawled over a resting sell, that sell partially filled
- *   11s later, and its fill armed the pivot at the top of the band the geometry
- *   had just derived — vetoing every band sell (all of them are `<= pivot`).
+ *   ELIGIBILITY (recordLastFilledPrices): every real fill arms the pivot —
+ *   including a gap-band residual and a fill far from a cached mid. Only
+ *   edge-pinned insurance stays excluded. The former geometry/market filters
+ *   were the incident's root cause, not a safeguard.
  *
  *   TERRITORY (isLastFillBandSellExempt): the direction rule is meant for a
  *   geometry fault ("a sell slot below the last sale means the crawl is behind
@@ -200,7 +198,7 @@ run('GEO-6 a book-seeded / cold pivot gets no geometry exemption', () => {
 
 // ── 2. Arming eligibility: in-band fills ──────────────────────────
 
-run('ELIG-1 an in-band fill does not arm the pivot (single writer)', () => {
+run('ELIG-1 a gap-band fill now arms the pivot (single writer)', () => {
     const mgr: any = Object.create(OrderManager.prototype);
     Object.assign(mgr, makeManager());
     mgr._lastFilledPrice = null;
@@ -212,13 +210,14 @@ run('ELIG-1 an in-band fill does not arm the pivot (single writer)', () => {
     mgr._lastMarketFillType = null;
     mgr._lastMarketFillAt = 0;
 
-    // slot-22 is inside the band (21..24).
+    // slot-22 is inside the band (21..24); a residual that traded is still a fill.
     OrderManager.prototype.recordLastFilledPrices.call(mgr, [
         { id: 'slot-22', type: ORDER_TYPES.SELL, price: levels[22], isPartial: true }
     ]);
-    assert.strictEqual(mgr._lastFilledPrice, null, 'a band residual must not become the geometry anchor');
-    assert.ok(mgr.logs.some((l: any) => /gap-band \(stranded residual\)/.test(l.msg)),
-        `the skip must be logged (got: ${mgr.logs.map((l: any) => l.msg).join(' | ')})`);
+    assert.strictEqual(mgr._lastFilledPrice, levels[22], 'a band residual arms the guard');
+    assert.strictEqual(mgr._lastMarketFillPrice, levels[22], 'and writes the market-fill reference');
+    assert.ok(!mgr.logs.some((l: any) => /gap-band \(stranded residual\)|band-skipped/.test(l.msg)),
+        `no geometry skip may be logged (got: ${mgr.logs.map((l: any) => l.msg).join(' | ')})`);
 });
 
 run('ELIG-2 a rail fill still arms the pivot', () => {
@@ -240,7 +239,7 @@ run('ELIG-2 a rail fill still arms the pivot', () => {
     assert.strictEqual(mgr._lastFilledType, ORDER_TYPES.SELL);
 });
 
-run('ELIG-3 both eligibility legs coexist in one batch (in-band skipped, rail recorded)', () => {
+run('ELIG-3 both fills are armed; the last processed fill wins the pivot', () => {
     const mgr: any = Object.create(OrderManager.prototype);
     Object.assign(mgr, makeManager());
     mgr._lastFilledPrice = null;
@@ -257,7 +256,10 @@ run('ELIG-3 both eligibility legs coexist in one batch (in-band skipped, rail re
         { id: `slot-${SELL_START + 5}`, type: ORDER_TYPES.SELL, price: levels[SELL_START + 5], isPartial: false }
     ]);
     assert.strictEqual(mgr._lastFilledPrice, levels[SELL_START + 5],
-        'the last WINDOW trade is the pivot, not the band residual: ' + JSON.stringify(mgr.logs.map((l: any) => l.msg)));
+        'the batch pivot is the last fill (recordLastFilledPrices walks in order)');
+    assert.strictEqual(mgr._lastMarketFillPrice, levels[SELL_START + 5]);
+    assert.ok(!mgr.logs.some((l: any) => /band-skipped/.test(l.msg)),
+        'the band residual is no longer skipped');
 });
 
 run('ELIG-4 unreadable geometry fails open (a cold grid still arms on its first fill)', () => {
@@ -279,22 +281,23 @@ run('ELIG-4 unreadable geometry fails open (a cold grid still arms on its first 
         'without geometry the classifier must not guess (fail-open like collectEdgePinnedFillIds)');
 });
 
-run('ELIG-5 the distance leg is visible in the constants registry', () => {
+run('ELIG-5 the legacy distance bound is inert on the fill path', () => {
     assert.ok(Number(GRID_LIMITS.LAST_FILL_PIVOT_MAX_MID_DISTANCE_STEPS) >= 1,
-        'a configured distance bound keeps the sweep class closed');
+        'the legacy knob may remain for compatibility');
+    const { offMarketFill } = require('../modules/order/utils/system');
+    assert.strictEqual(offMarketFill({ _liveMarketPrice: 1000, _liveMarketPriceAt: Date.now(), config: {} }, ORDER_TYPES.SELL, 2000), null,
+        'the distance predicate can no longer close the sweep class');
 });
 
-run('ELIG-6 one eligibility rule decides BOTH the pivot and the geometry anchor', () => {
-    // The same batch goes through both consumers: a premium sweep 8 steps above
-    // a fresh market read must neither arm the guard nor become the extremum
-    // that drags the boundary to its own level (R5.9 / §9.10/P1 / §9.12/P1).
+run('ELIG-6 every fill arms the pivot AND may be the geometry extremum', () => {
+    // The same batch goes through both consumers. A fill far from the cached
+    // mid is now authoritative: it arms the guard (last processed fill) and
+    // the furthest fill of that side drags the boundary to its own level.
     const mgr: any = Object.create(OrderManager.prototype);
     Object.assign(mgr, makeManager({
         _liveMarketPrice: levels[26],
         _liveMarketPriceAt: NOW
     }));
-    // slot 24 is the band TOP (a stranded residual), so the window fill is at
-    // slot 25 — the first sell-rail level — one step below the live mid.
     const batch = [
         { id: 'slot-25', type: ORDER_TYPES.SELL, price: levels[25] },
         { id: 'slot-34', type: ORDER_TYPES.SELL, price: levels[34] }
@@ -302,8 +305,9 @@ run('ELIG-6 one eligibility rule decides BOTH the pivot and the geometry anchor'
     mgr._lastFilledPrice = null;
     mgr._lastFilledType = null;
     OrderManager.prototype.recordLastFilledPrices.call(mgr, batch);
-    assert.strictEqual(mgr._lastFilledPrice, levels[25],
-        'the sweep fill must not arm the pivot: ' + JSON.stringify(mgr.logs.map((l: any) => l.msg)));
+    assert.strictEqual(mgr._lastFilledPrice, levels[34],
+        'the far sweep fill arms the pivot: ' + JSON.stringify(mgr.logs.map((l: any) => l.msg)));
+    assert.strictEqual(mgr._lastMarketFillPrice, levels[34]);
 
     // Virtual copies isolate the eligibility decision from stranding checks.
     const virtualSlots = Array.from(mgr.orders.values()).map((s: any) => ({
@@ -313,8 +317,8 @@ run('ELIG-6 one eligibility rule decides BOTH the pivot and the geometry anchor'
         size: 0
     }));
     const r = reanchorBoundaryFromLastFill(mgr, 18, virtualSlots, GAP, batch);
-    assert.strictEqual(r.fillSlot, 25, `the sweep fill must not anchor the boundary: ${JSON.stringify(r)}`);
-    assert.strictEqual(r.boundaryIdx, 21, 'a SELL fill at slot 25 => boundary 21 with gap 4');
+    assert.strictEqual(r.fillSlot, 34, `the furthest sweep fill anchors: ${JSON.stringify(r)}`);
+    assert.strictEqual(r.boundaryIdx, 30, 'a SELL fill at slot 34 => boundary 30 with gap 4');
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

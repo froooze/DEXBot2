@@ -632,13 +632,11 @@ async function testPersistSkip_RestartReplaysCommitOnce() {
     console.log('✓ PEND-018 passed');
 }
 
-async function testPending_OffMarketFillsDoNotCrawl() {
-    console.log('\n[PEND-019] off-market sweep fills are not window evidence for the crawl...');
-    const mid = 0.001 + 95 * 0.000004;
-    const mgr = { config: CFG, _liveMarketPrice: mid, _liveMarketPriceAt: Date.now() };
-    const isCrawlEligible = (f: any) => !offMarketFill(mgr, String(f.type), Number(f.price));
-    // slot 95 is one step from the mid (eligible); slot 80 is ~16 steps away
-    // (a premium sweep of our own rail) and must not move the boundary.
+async function testPending_AllEligibleFillsCrawl() {
+    console.log('\n[PEND-019] every eligible fill contributes a crawl; no market filter...');
+    // slot 95 is one step from the mid; slot 80 is ~16 steps away — a sweep
+    // the old offMarketFill predicate discarded. Fill-authoritative: both
+    // fills are window evidence, so both crawl the boundary.
     const { boundaryIdx } = deriveTargetBoundary(
         [buyFill(80), buyFill(95)],
         96,
@@ -647,13 +645,21 @@ async function testPending_OffMarketFillsDoNotCrawl() {
         GAP,
         null,
         null,
-        null,
-        isCrawlEligible
+        null
     );
-    assert.strictEqual(boundaryIdx, 95, `only the window fill may crawl 96 -> 95 (got ${boundaryIdx})`);
-    // Legacy callers without the predicate keep the previous behaviour.
-    const legacy = deriveTargetBoundary([buyFill(80), buyFill(95)], 96, buildSlots(N_SLOTS), CFG, GAP);
-    assert.strictEqual(legacy.boundaryIdx, 94, 'omitting the predicate keeps legacy crawl behaviour');
+    assert.strictEqual(boundaryIdx, 94, `both fills must crawl 96 -> 94 (got ${boundaryIdx})`);
+    // offMarketFill is now neutral even for a caller that still consults it.
+    const mid = 0.001 + 95 * 0.000004;
+    const mgr = { config: CFG, _liveMarketPrice: mid, _liveMarketPriceAt: Date.now() };
+    assert.strictEqual(offMarketFill(mgr, ORDER_TYPES.BUY, 0.001 + 80 * 0.000004), null,
+        'the cached mid can no longer veto a sweep fill');
+    // The live strategy call site must not inject a market predicate at all.
+    const strategySrc = fs.readFileSync(path.join(__dirname, '../../modules/order/strategy.ts'), 'utf8');
+    const deriveAt = strategySrc.indexOf('deriveTargetBoundary(fills');
+    assert.ok(deriveAt > 0, 'the strategy derivation call must exist');
+    const call = strategySrc.slice(deriveAt, strategySrc.indexOf(';', deriveAt));
+    assert.ok(!/offMarketFill|isCrawlEligible/.test(call),
+        `no crawl predicate may be injected at the live call site (got ${call})`);
     console.log('✓ PEND-019 passed');
 }
 
@@ -663,7 +669,7 @@ async function main() {
     await testPending_AbsoluteAnchorSubsumes();
     await testPending_GenesisAnchorKeepsOwed();
     await testPending_ReserveEntriesSkipped();
-    await testPending_OffMarketFillsDoNotCrawl();
+    await testPending_AllEligibleFillsCrawl();
     await testConsume_AppliesOntoRestored();
     await testConsume_DropsOnNull();
     await testConsume_DropsOnEmptyStringBoundary();

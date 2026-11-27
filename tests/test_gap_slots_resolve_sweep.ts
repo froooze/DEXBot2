@@ -81,8 +81,12 @@ async function run() {
     // behaviour change. The negative checks detect a regression to a raw read.
     {
         const managerSrc = source('modules/order/manager.ts');
-        assert.ok(/geometryTypeForSlotIndex\s*\(\s*idx\s*,\s*this\.boundaryIdx\s*,\s*resolveGapSlots\s*\(/.test(managerSrc),
-            'M2-03: fill-eligibility geometry must use resolveGapSlots');
+        // Fill-authoritative policy: a residual in the gap band is still a
+        // real fill, so recordLastFilledPrices has no gap-band eligibility
+        // check at all (§9.16). The remaining geometry reads below still use
+        // the absent-aware resolver.
+        assert.ok(!/geometryTypeForSlotIndex\s*\(\s*idx\s*,\s*this\.boundaryIdx/.test(managerSrc),
+            'M2-03: no gap-band fill eligibility check may remain in manager.ts');
         assert.ok(/const\s+gapSlots\s*=\s*resolveGapSlots\s*\(/.test(managerSrc),
             'M2-03: gap evacuation must use resolveGapSlots');
         assert.ok(!/geometryTypeForSlotIndex\s*\(\s*idx\s*,\s*this\.boundaryIdx\s*,\s*this\._gapSlots/.test(managerSrc),
@@ -112,10 +116,11 @@ async function run() {
             'M2-04: raw gap still fed to fill-virtualization geometry');
 
         const systemSrc = source('modules/order/utils/system.ts');
-        // Two pre-existing resolver calls plus the two added here.
+        // Fill-authoritative policy removed the gap-band eligibility read;
+        // the remaining geometry reads still use the absent-aware resolver.
         const systemResolverCalls = (systemSrc.match(/resolveGapSlots\s*\(\s*manager\s+as\s+never/g) || []).length;
-        assert.ok(systemResolverCalls >= 4,
-            'M2-04: anchor-eligibility and rotation geometry must resolve the gap');
+        assert.ok(systemResolverCalls >= 1,
+            'M2-04: remaining anchor geometry must resolve the gap, never read the raw field');
         assert.ok(!/gapSlots\s*:\s*manager\._gapSlots/.test(systemSrc),
             'M2-04: raw gap still fed to optimizeRebalanceActions');
         assert.ok(!/_gapSlots\?:\s*string\s*\|\s*number\s*\|\s*null\s*\}\s*\)\s*\._gapSlots/.test(systemSrc),

@@ -671,6 +671,24 @@ export interface BotMetrics extends UnknownRecord {
   lastFillGateFailOpenCount: number;
   /** Queued duplicate-orphan cancels that could not be verified as gone after bounded by-id checks (§9.14 Stage 1). */
   duplicateOrphanCancelUnverifiedCount: number;
+  /** Full fills seen with a counter order owed on the opposite rail. */
+  counterOrdersOwedCount: number;
+  /** Counter debts cleared on confirmed on-chain placement of their own op. */
+  counterOrdersPlacedCount: number;
+  /** Current number of unsatisfied counter debts (in-memory ledger size). */
+  counterDebtSlotsCount: number;
+}
+
+/** One unsatisfied counter obligation, keyed by the originating fill id. */
+export interface CounterDebtEntry {
+  fillKey: string;
+  fillSide: string;
+  fillSlotId: string;
+  counterSide: string;
+  counterSlotId: string;
+  at: number;
+  attempts: number;
+  lastDeferReason?: string;
 }
 
 /** An unmatched chain order surfaced by a sync pass. */
@@ -1187,6 +1205,8 @@ export interface OrderManagerLike {
   _orderIdAssignedAt: Map<string, number>;
   _pendingBroadcasts: Map<string, PendingBroadcast>;
   _pendingFillCrawls: Array<{ slotId: string; side: string; ts: number }>;
+  /** In-memory one-counter-per-fill obligations (never persisted). */
+  _counterDebt?: Map<string, CounterDebtEntry>;
   _recentFillKeysSnapshot: Record<string, number> | null;
   _gridSidesUpdated: Set<string>;
   shadowOrderIds: Map<string, number>;
@@ -1243,23 +1263,6 @@ export interface OrderManagerLike {
   _lastMarketFillPrice?: number | null;
   _lastMarketFillType?: string | null;
   _lastMarketFillAt?: number | null;
-  /**
-   * Refused (off-market) fill level: a fill the pivot-arming policy refused
-   * (§9.12/P1) still marks its own level as a same-level re-fill block for a
-   * short TTL (§9.12/P2 amended). In-memory only — never persisted. LEGACY
-   * mirror of the most recent refusal: production reads _lastRefusedFillLevels
-   * below; these scalar fields remain for observability and single-field stubs.
-   */
-  _lastRefusedFillPrice?: number | null;
-  _lastRefusedFillType?: string | null;
-  _lastRefusedFillAt?: number | null;
-  /**
-   * Every level refused from arming in the current batch. A premium sweep can
-   * lift several adjacent rungs at once; the last-refused scalar above is just
-   * the most recent one, so this set is what the same-level guard actually
-   * reads. Same TTL and in-memory-only lifetime as the scalar.
-   */
-  _lastRefusedFillLevels?: Array<{ price: number; type: string; at: number }> | null;
   // Externally-observed live market price (B/A) and its read/attempt clocks.
   _liveMarketPrice?: number | null;
   _liveMarketPriceAt?: number | null;

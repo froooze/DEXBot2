@@ -1,40 +1,24 @@
 /**
- * LAST-FILL-PIVOT MARKET EVIDENCE (both legs) + MARKET-CROSSING OBSERVATION.
+ * LAST-FILL-PIVOT MARKET EVIDENCE — FLIPPED TO FILL-AUTHORITATIVE.
  *
- * A fill may arm the LAST-FILL-GUARD pivot only when it is evidence of the
- * CURRENT window:
- *   - wrong-side: BUY above mid / SELL below mid (crossed-book artifact);
- *   - too-far:    either side, more than
- *                 GRID_LIMITS.LAST_FILL_PIVOT_MAX_MID_DISTANCE_STEPS increments
- *                 from the mid (a premium/discount SWEEP of our own rail).
- * Both are cases where arming the pivot vetoes the band the geometry derives,
- * for the full 24h TTL.
+ * The old suite pinned a market-bound veto: a fill far from (or on the wrong
+ * side of) a cached mid could not arm the LAST-FILL-GUARD pivot. The incident
+ * showed that veto is the bug: a stale mid, not the trade, decided which fills
+ * were real. Under the new policy every fill arms the guard at any distance
+ * and on either side of the cached mid; same-level re-placement stays blocked
+ * by the direction rule alone.
  *
- * Pinned here:
- *   1. Wrong-side fill provenance is refused; book provenance is never bound
- *      (the seed heuristic is not market truth).
- *   2. A fill a full spread away from the mid is refused on EITHER side
- *      (live: a sell 14.5 steps / 4.4% above the mid armed the pivot at the
- *      band's own top and froze the sell side for 86 minutes).
- *   3. Refusal skips BOTH the pivot family AND the bot-scoped market-fill
- *      row (an off-market row as a crossing floor freezes correction the same
- *      way).
- *   4. Fail-open: no cached mid, or a mid older than
- *      GRID_LIMITS.LAST_FILL_PIVOT_MARKET_FRESH_MS, never vetoes.
- *   5. Rebuild re-arm through the same writer is bound too.
- *   6. expireLastFillGuardReferences clears the pivot family AND the
- *      market-fill reference (live + persisted).
- *   7. describeMarketCrossingActions reports CREATE/UPDATE priced across the
- *      SHARED market floor (recency: a fill newer than the book read wins) and
- *      never mutates or vetoes — retrospective §9.10/P4 made it an observation
- *      because a hard veto re-opens the counter-order deadlock.
+ * The market-crossing observation half (DESCRIBE-*) is unchanged: it reports
+ * CREATE/UPDATE actions across the shared recency-aware floor and never vetoes.
  */
 
 const assert = require('assert');
 const {
     setLastFillPivot,
     rearmLastFillPivotFromMarketFill,
-    expireLastFillGuardReferences
+    expireLastFillGuardReferences,
+    liveRefusedFillLevels,
+    hasLiveRefusedFillLevels,
 } = require('../modules/order/utils/system');
 const { describeMarketCrossingActions } = require('../modules/order/utils/order');
 const { ORDER_TYPES, GRID_LIMITS } = require('../modules/constants');
@@ -72,6 +56,10 @@ function makeManager(over: Record<string, unknown> = {}) {
         _lastMarketFillPrice: null as number | null,
         _lastMarketFillType: null as string | null,
         _lastMarketFillAt: 0,
+        _lastRefusedFillPrice: null as number | null,
+        _lastRefusedFillType: null as string | null,
+        _lastRefusedFillAt: 0,
+        _lastRefusedFillLevels: [] as Array<{ price: number; type: string; at: number }>,
         _liveMarketPrice: null as number | null,
         _liveMarketPriceAt: null as number | null,
         config: { incrementPercent: 0.5 },
@@ -86,117 +74,102 @@ function makeManager(over: Record<string, unknown> = {}) {
     };
 }
 
-// ── 1. Wrong-side refusal ─────────────────────────────────────────
+// ── 1. Distance and wrong side no longer refuse ──────────────────────────
 
-run('BOUND-1 a BUY above mid beyond tolerance is refused (fill provenance)', () => {
-    // increment 0.5% → tolerance 1 step → buy limit = mid * 1.005
+run('BOUND-1 a BUY above mid arms the pivot (crossed-book veto removed)', () => {
     const mgr: any = makeManager({ _liveMarketPrice: 1000, _liveMarketPriceAt: FRESH_MID_AT });
-    assert.strictEqual(setLastFillPivot(mgr, ORDER_TYPES.BUY, 1010, 'fill'), false,
-        'a BUY ~1% above mid is a crossed-book artifact and must not arm the guard');
-    assert.strictEqual(mgr._lastFilledPrice, null, 'the pivot family must stay untouched');
-    assert.strictEqual(mgr._lastMarketFillPrice, null, 'the market-fill row must be skipped with the refusal');
-    assert.ok(mgr.logs.some((l: any) => /Refusing to arm pivot/.test(l.msg) && l.level === 'warn'),
-        `the refusal must be logged as a warning (got: ${mgr.logs.map((l: any) => l.msg).join(' | ')})`);
+    assert.strictEqual(setLastFillPivot(mgr, ORDER_TYPES.BUY, 1010, 'fill'), true);
+    assert.strictEqual(mgr._lastFilledPrice, 1010, 'the pivot family must follow the fill');
+    assert.strictEqual(mgr._lastMarketFillPrice, 1010, 'the market-fill row follows too');
+    assert.strictEqual(mgr._lastRefusedFillPrice, null, 'no refused marker is written');
+    assert.ok(!mgr.logs.some((l: any) => /Refusing to arm pivot/.test(l.msg)),
+        `no refusal may be logged (got: ${mgr.logs.map((l: any) => l.msg).join(' | ')})`);
 });
 
-run('BOUND-2 a SELL below mid beyond tolerance is refused', () => {
+run('BOUND-2 a SELL below mid arms the pivot', () => {
     const mgr: any = makeManager({ _liveMarketPrice: 1000, _liveMarketPriceAt: FRESH_MID_AT });
-    assert.strictEqual(setLastFillPivot(mgr, ORDER_TYPES.SELL, 990, 'fill'), false,
-        'a SELL ~1% below mid must not arm the guard');
-    assert.strictEqual(mgr._lastMarketFillPrice, null);
+    assert.strictEqual(setLastFillPivot(mgr, ORDER_TYPES.SELL, 990, 'fill'), true);
+    assert.strictEqual(mgr._lastMarketFillPrice, 990);
+    assert.strictEqual(hasLiveRefusedFillLevels(mgr), false);
 });
 
-run('BOUND-3 a fill within tolerance of mid is allowed (BUY at/below, SELL at/above)', () => {
+run('BOUND-3 a fill within tolerance of mid is allowed (unchanged)', () => {
     const step = 1 + 0.5 / 100;
     const mgr: any = makeManager({ _liveMarketPrice: 1000, _liveMarketPriceAt: FRESH_MID_AT });
-    // BUY at mid + exactly the 1-step tolerance boundary is allowed.
-    assert.strictEqual(setLastFillPivot(mgr, ORDER_TYPES.BUY, 1000 * step, 'fill'), true, 'BUY at the tolerance edge is allowed');
+    assert.strictEqual(setLastFillPivot(mgr, ORDER_TYPES.BUY, 1000 * step, 'fill'), true);
     assert.strictEqual(mgr._lastFilledPrice, 1000 * step);
-    assert.strictEqual(mgr._lastMarketFillPrice, 1000 * step, 'an accepted fill still writes the market-fill row');
+    assert.strictEqual(mgr._lastMarketFillPrice, 1000 * step);
     const mgr2: any = makeManager({ _liveMarketPrice: 1000, _liveMarketPriceAt: FRESH_MID_AT });
-    assert.strictEqual(setLastFillPivot(mgr2, ORDER_TYPES.SELL, 1000 / step, 'fill'), true, 'SELL at the tolerance edge is allowed');
+    assert.strictEqual(setLastFillPivot(mgr2, ORDER_TYPES.SELL, 1000 / step, 'fill'), true);
     assert.strictEqual(mgr2._lastFilledPrice, 1000 / step);
 });
 
-run('BOUND-4 a fill on the market\'s own side, within a spread of the mid, is allowed', () => {
+run('BOUND-4 an on-side fill within a spread arms the pivot (unchanged)', () => {
     const step = 1 + 0.5 / 100;
     const mgr: any = makeManager({ _liveMarketPrice: 1000, _liveMarketPriceAt: FRESH_MID_AT });
-    assert.strictEqual(setLastFillPivot(mgr, ORDER_TYPES.BUY, 1000 / Math.pow(step, 3), 'fill'), true,
-        'BUY three steps below mid is a normal window fill');
+    assert.strictEqual(setLastFillPivot(mgr, ORDER_TYPES.BUY, 1000 / Math.pow(step, 3), 'fill'), true);
     const mgr2: any = makeManager({ _liveMarketPrice: 1000, _liveMarketPriceAt: FRESH_MID_AT });
-    assert.strictEqual(setLastFillPivot(mgr2, ORDER_TYPES.SELL, 1000 * Math.pow(step, 3), 'fill'), true,
-        'SELL three steps above mid is a normal window fill');
+    assert.strictEqual(setLastFillPivot(mgr2, ORDER_TYPES.SELL, 1000 * Math.pow(step, 3), 'fill'), true);
 });
 
-run('BOUND-11 a DEEP sweep on the market\'s own side is refused too (symmetric distance leg)', () => {
-    // Mirror of the live incident: a BUY 10 steps below the mid would arm the
-    // pivot under every buy on the rail (buys must stay below it), freezing the
-    // whole buy side for the 24h TTL — exactly the sell-side freeze this leg
-    // already prevents.
+run('BOUND-11 a DEEP sweep on the market\'s own side still arms the pivot', () => {
     const mgr: any = makeManager({ _liveMarketPrice: 1000, _liveMarketPriceAt: FRESH_MID_AT });
-    assert.strictEqual(setLastFillPivot(mgr, ORDER_TYPES.BUY, 950, 'fill'), false,
-        'a BUY 10 steps below mid is a discounted sweep, not a window trade');
-    assert.strictEqual(mgr._lastFilledPrice, null);
-    assert.strictEqual(mgr._lastMarketFillPrice, null);
-    assert.ok(mgr.logs.some((l: any) => /premium sweep of our own rail/.test(l.msg)),
-        `the distance refusal must name the sweep (got: ${mgr.logs.map((l: any) => l.msg).join(' | ')})`);
+    assert.strictEqual(setLastFillPivot(mgr, ORDER_TYPES.BUY, 950, 'fill'), true,
+        'a deep BUY sweep is market truth and must arm the guard');
+    assert.strictEqual(mgr._lastFilledPrice, 950);
+    assert.strictEqual(mgr._lastMarketFillPrice, 950);
+    assert.ok(!mgr.logs.some((l: any) => /premium sweep of our own rail/.test(l.msg)),
+        'the sweep refusal log is gone');
 });
 
-run('BOUND-12 the live incident shape: SELL 8.6 steps (4.4%) above mid is refused', () => {
-    // Exact numbers from the 2026-11-15 log: mid 1406.6336, swept ask
-    // 1469.0989 → +4.44% = 8.6 increments of 0.5%. Directionally "honest"
-    // (a sell above mid), which is why the wrong-side leg alone let it arm.
+run('BOUND-12 the live incident shape: SELL 8.6 steps (4.4%) above mid arms', () => {
     const mgr: any = makeManager({ _liveMarketPrice: 1406.6336, _liveMarketPriceAt: FRESH_MID_AT });
-    assert.strictEqual(setLastFillPivot(mgr, ORDER_TYPES.SELL, 1469.0989, 'fill'), false,
-        'the top of a premium sweep must not become the geometry anchor');
-    assert.strictEqual(mgr._lastFilledPrice, null, 'the previous (window) pivot survives');
+    assert.strictEqual(setLastFillPivot(mgr, ORDER_TYPES.SELL, 1469.0989, 'fill'), true,
+        'the top of the sweep now becomes the guard reference deliberately');
+    assert.strictEqual(mgr._lastFilledPrice, 1469.0989);
 });
 
-run('BOUND-13 the distance leg honours its configured bound and fails open on stale mid', () => {
+run('BOUND-13 distance config is inert: past the old bound still arms, stale mid irrelevant', () => {
     const step = 1 + 0.5 / 100;
     const maxSteps = Number(GRID_LIMITS.LAST_FILL_PIVOT_MAX_MID_DISTANCE_STEPS);
-    assert.ok(maxSteps >= 1, 'a distance bound must be configured');
+    assert.ok(maxSteps >= 1, 'the legacy bound may remain in constants but no longer gates fills');
     const mgr: any = makeManager({ _liveMarketPrice: 1000, _liveMarketPriceAt: FRESH_MID_AT });
-    assert.strictEqual(setLastFillPivot(mgr, ORDER_TYPES.SELL, 1000 * Math.pow(step, maxSteps), 'fill'), true,
-        'exactly at the bound is still window evidence');
-    const mgr2: any = makeManager({ _liveMarketPrice: 1000, _liveMarketPriceAt: FRESH_MID_AT });
-    assert.strictEqual(setLastFillPivot(mgr2, ORDER_TYPES.SELL, 1000 * Math.pow(step, maxSteps + 1), 'fill'), false,
-        'one step past the bound is refused');
+    assert.strictEqual(setLastFillPivot(mgr, ORDER_TYPES.SELL, 1000 * Math.pow(step, maxSteps + 1), 'fill'), true,
+        'one step past the old bound must now arm');
     const mgrStale: any = makeManager({ _liveMarketPrice: 1000, _liveMarketPriceAt: STALE_MID_AT });
-    assert.strictEqual(setLastFillPivot(mgrStale, ORDER_TYPES.SELL, 1200, 'fill'), true,
-        'a stale mid must never veto a fresh fill (fail-open)');
+    assert.strictEqual(setLastFillPivot(mgrStale, ORDER_TYPES.SELL, 1200, 'fill'), true);
 });
 
-// ── 2. Provenance scoping ─────────────────────────────────────────
+// ── 2. Provenance scoping ───────────────────────────────────────────────
 
-run('BOUND-5 book provenance is never market-bound', () => {
+run('BOUND-5 book provenance still arms but does not write a market-fill row', () => {
     const mgr: any = makeManager({ _liveMarketPrice: 1000, _liveMarketPriceAt: FRESH_MID_AT });
-    assert.strictEqual(setLastFillPivot(mgr, ORDER_TYPES.BUY, 1100, 'book'), true,
-        'the book-seed heuristic is not market truth and must not be bound');
+    assert.strictEqual(setLastFillPivot(mgr, ORDER_TYPES.BUY, 1100, 'book'), true);
     assert.strictEqual(mgr.lastFillPivotSource, 'book');
+    assert.strictEqual(mgr._lastMarketFillPrice, null, 'a book seed is not a trade');
 });
 
-// ── 3. Fail-open paths ────────────────────────────────────────────
+// ── 3. No cached mid is needed any more ─────────────────────────────────
 
-run('BOUND-6 no cached mid fails open', () => {
-    const mgr: any = makeManager(); // _liveMarketPrice null
-    assert.strictEqual(setLastFillPivot(mgr, ORDER_TYPES.BUY, 1100, 'fill'), true,
-        'without live evidence the guard must not guess');
+run('BOUND-6 no cached mid arms normally', () => {
+    const mgr: any = makeManager();
+    assert.strictEqual(setLastFillPivot(mgr, ORDER_TYPES.BUY, 1100, 'fill'), true);
+    assert.strictEqual(mgr._lastFilledPrice, 1100);
 });
 
-run('BOUND-7 a stale mid fails open (never veto a fresh fill with an ancient mid)', () => {
+run('BOUND-7 a stale mid no longer changes the verdict', () => {
     const mgr: any = makeManager({ _liveMarketPrice: 1000, _liveMarketPriceAt: STALE_MID_AT });
     assert.strictEqual(setLastFillPivot(mgr, ORDER_TYPES.BUY, 1100, 'fill'), true);
 });
 
-run('BOUND-8 a fresh mid with a broken clock fails open', () => {
+run('BOUND-8 a broken mid clock no longer changes the verdict', () => {
     const mgr: any = makeManager({ _liveMarketPrice: 1000, _liveMarketPriceAt: 0 });
     assert.strictEqual(setLastFillPivot(mgr, ORDER_TYPES.BUY, 1100, 'fill'), true);
 });
 
-// ── 4. Rebuild re-arm bound ───────────────────────────────────────
+// ── 4. Rebuild re-arm uses the same writer ──────────────────────────────
 
-run('BOUND-9 the rebuild re-arm goes through the same bound', () => {
+run('BOUND-9 the rebuild re-arm accepts a formerly off-market row', () => {
     const mgr: any = makeManager({
         _lastMarketFillPrice: 1100,
         _lastMarketFillType: ORDER_TYPES.BUY,
@@ -204,14 +177,13 @@ run('BOUND-9 the rebuild re-arm goes through the same bound', () => {
         _liveMarketPrice: 1000,
         _liveMarketPriceAt: FRESH_MID_AT
     });
-    assert.strictEqual(rearmLastFillPivotFromMarketFill(mgr), false,
-        'an off-market row must not re-arm across a rebuild');
-    assert.strictEqual(mgr._lastFilledPrice, null, 'no pivot may be armed from the refused row');
-    assert.ok(mgr.logs.some((l: any) => /Refusing to arm pivot/.test(l.msg)),
-        'the refusal must be logged');
+    assert.strictEqual(rearmLastFillPivotFromMarketFill(mgr), true,
+        'a real persisted fill row always re-arms across a rebuild');
+    assert.strictEqual(mgr._lastFilledPrice, 1100);
+    assert.deepStrictEqual(liveRefusedFillLevels(mgr), []);
 });
 
-run('BOUND-10 the rebuild re-arm succeeds for an on-market row', () => {
+run('BOUND-10 the rebuild re-arm succeeds for an on-market row (unchanged)', () => {
     const mgr: any = makeManager({
         _lastMarketFillPrice: 990,
         _lastMarketFillType: ORDER_TYPES.BUY,
@@ -223,7 +195,7 @@ run('BOUND-10 the rebuild re-arm succeeds for an on-market row', () => {
     assert.strictEqual(mgr._lastFilledPrice, 990);
 });
 
-// ── 5. Watchdog expiry helper ─────────────────────────────────────
+// ── 5. Watchdog expiry helper (unchanged) ───────────────────────────────
 
 run('EXPIRE-1 expireLastFillGuardReferences clears pivot + market-fill live and persisted', () => {
     const mgr: any = makeManager({
@@ -231,13 +203,11 @@ run('EXPIRE-1 expireLastFillGuardReferences clears pivot + market-fill live and 
         _lastMarketFillPrice: 1100, _lastMarketFillType: ORDER_TYPES.BUY, _lastMarketFillAt: NOW
     });
     expireLastFillGuardReferences(mgr, 'test expiry');
-    assert.strictEqual(mgr._lastFilledPrice, null, 'the pivot must be cleared');
-    assert.strictEqual(mgr._lastMarketFillPrice, null, 'the market-fill reference must be cleared');
+    assert.strictEqual(mgr._lastFilledPrice, null);
+    assert.strictEqual(mgr._lastMarketFillPrice, null);
     assert.strictEqual(mgr._lastMarketFillAt, 0);
-    assert.deepStrictEqual(mgr.cleared.sort(), ['market-fill', 'pivot'],
-        'both persisted rows must be erased so a restart cannot re-arm');
-    assert.ok(mgr.logs.some((l: any) => /Expired guard references/.test(l.msg) && l.level === 'warn'),
-        'the expiry must be logged loudly');
+    assert.deepStrictEqual(mgr.cleared.sort(), ['market-fill', 'pivot']);
+    assert.ok(mgr.logs.some((l: any) => /Expired guard references/.test(l.msg) && l.level === 'warn'));
 });
 
 run('EXPIRE-2 a cold manager expires silently (no log, no error)', () => {
@@ -259,12 +229,12 @@ run('EXPIRE-4 skipPersistedClear leaves the disk rows for the caller to erase', 
         _lastMarketFillPrice: 1100, _lastMarketFillType: ORDER_TYPES.BUY, _lastMarketFillAt: NOW
     });
     expireLastFillGuardReferences(mgr, 'manual full reset', { skipPersistedClear: true });
-    assert.strictEqual(mgr._lastFilledPrice, null, 'live pivot must still be cleared');
-    assert.strictEqual(mgr._lastMarketFillPrice, null, 'live market row must still be cleared');
-    assert.deepStrictEqual(mgr.cleared, [], 'disk deletes belong to the awaiting caller on this path');
+    assert.strictEqual(mgr._lastFilledPrice, null);
+    assert.strictEqual(mgr._lastMarketFillPrice, null);
+    assert.deepStrictEqual(mgr.cleared, []);
 });
 
-// ── 6. Market-crossing observation ────────────────────────────────
+// ── 6. Market-crossing observation (unchanged) ──────────────────────────
 
 function createAction(over: Record<string, unknown>) {
     return { type: 'create', id: 'slot-1', order: { type: ORDER_TYPES.BUY, price: 1000 }, ...over };
@@ -278,11 +248,11 @@ run('DESCRIBE-1 reports a CREATE BUY above the floor, leaves the batch untouched
         createAction({ id: 'slot-3', order: { type: ORDER_TYPES.SELL, price: 1010 } })
     ];
     const { floor, dropped } = describeMarketCrossingActions(mgr, actions as any);
-    assert.strictEqual(floor, 1000, 'the floor is the shared recency-aware reference');
-    assert.strictEqual(dropped.length, 1, 'one action is reported');
+    assert.strictEqual(floor, 1000);
+    assert.strictEqual(dropped.length, 1);
     assert.strictEqual(dropped[0].action.id, 'slot-1');
     assert.match(dropped[0].reason, /BUY 1010 above the market floor 1000/);
-    assert.strictEqual(actions.length, 3, 'the input array must not be mutated (no veto)');
+    assert.strictEqual(actions.length, 3, 'no veto: input must not be mutated');
 });
 
 run('DESCRIBE-2 reports a CREATE SELL below the floor', () => {
@@ -293,14 +263,13 @@ run('DESCRIBE-2 reports a CREATE SELL below the floor', () => {
     assert.strictEqual(dropped[0].reason.includes('SELL 900 below the market floor 1000'), true);
 });
 
-run('DESCRIBE-3 CANCELs are never reported (a cancel cannot cross anything)', () => {
+run('DESCRIBE-3 CANCELs are never reported', () => {
     const mgr: any = makeManager({ _liveMarketPrice: 1000, _liveMarketPriceAt: FRESH_MID_AT });
     const actions = [
         { type: 'cancel', id: 'slot-1' },
         { type: 'cancel', id: 'slot-2', order: { type: ORDER_TYPES.BUY, price: 9999 } }
     ];
-    const { dropped } = describeMarketCrossingActions(mgr, actions as any);
-    assert.strictEqual(dropped.length, 0);
+    assert.strictEqual(describeMarketCrossingActions(mgr, actions as any).dropped.length, 0);
 });
 
 run('DESCRIBE-4 UPDATE actions are judged at their NEW price and side', () => {
@@ -309,23 +278,17 @@ run('DESCRIBE-4 UPDATE actions are judged at their NEW price and side', () => {
         { type: 'update', id: 'slot-1', newPrice: 1010, order: { type: ORDER_TYPES.BUY, price: 1010 } },
         { type: 'update', id: 'slot-2', newPrice: 990, order: { type: ORDER_TYPES.SELL, price: 990 } }
     ];
-    const { dropped } = describeMarketCrossingActions(mgr, actions as any);
-    assert.strictEqual(dropped.length, 2, 'both updates sit across the floor');
+    assert.strictEqual(describeMarketCrossingActions(mgr, actions as any).dropped.length, 2);
 });
 
 run('DESCRIBE-5 no live read and no fill => no floor (fail-open)', () => {
     const mgr: any = makeManager();
-    const actions = [createAction({ order: { type: ORDER_TYPES.BUY, price: 9999 } })];
-    const { floor, dropped } = describeMarketCrossingActions(mgr, actions as any);
+    const { floor, dropped } = describeMarketCrossingActions(mgr, [createAction({})] as any);
     assert.strictEqual(floor, null);
     assert.strictEqual(dropped.length, 0);
 });
 
-run('DESCRIBE-6 a FILL newer than the book read supplies the floor (the live incident shape)', () => {
-    // Live 14:39: the book read was 8 minutes old (and was itself the midpoint
-    // of the bot's own quotes); five fills at 1434.3..1469.1 were newer. The
-    // rejected filter used the stale book read and reported the repair batch as
-    // crossing; the shared floor prefers the fresher fill, so the batch is not.
+run('DESCRIBE-6 a FILL newer than the book read supplies the floor', () => {
     const fillAt = NOW - 60_000;
     const mgr: any = makeManager({
         _liveMarketPrice: 1000,
@@ -339,16 +302,15 @@ run('DESCRIBE-6 a FILL newer than the book read supplies the floor (the live inc
         _lastMarketFillAt: fillAt
     });
     const actions = [
-        createAction({ id: 'slot-a', order: { type: ORDER_TYPES.BUY, price: 1010 - 0 } }), // below the fill, above the old mid
-        createAction({ id: 'slot-b', order: { type: ORDER_TYPES.SELL, price: 1030 } })     // below the fill => reported
+        createAction({ id: 'slot-a', order: { type: ORDER_TYPES.BUY, price: 1010 } }),
+        createAction({ id: 'slot-b', order: { type: ORDER_TYPES.SELL, price: 1030 } })
     ];
     const { floor, dropped } = describeMarketCrossingActions(mgr, actions as any);
-    assert.strictEqual(floor, 1044, 'the fresher fill wins over the older book read');
-    assert.deepStrictEqual(dropped.map((d: any) => d.action.id), ['slot-b'],
-        'only the action actually across the fill is reported');
+    assert.strictEqual(floor, 1044);
+    assert.deepStrictEqual(dropped.map((d: any) => d.action.id), ['slot-b']);
 });
 
-run('DESCRIBE-7 a book read newer than the fill keeps the floor (recency, not preference)', () => {
+run('DESCRIBE-7 a book read newer than the fill keeps the floor', () => {
     const mgr: any = makeManager({
         _liveMarketPrice: 1000,
         _liveMarketPriceAt: NOW - 1_000,
@@ -360,18 +322,16 @@ run('DESCRIBE-7 a book read newer than the fill keeps the floor (recency, not pr
         _lastMarketFillType: ORDER_TYPES.SELL,
         _lastMarketFillAt: NOW - 60_000
     });
-    const { floor } = describeMarketCrossingActions(mgr, [createAction({})] as any);
-    assert.strictEqual(floor, 1000, 'a fresher market read wins');
+    assert.strictEqual(describeMarketCrossingActions(mgr, [createAction({})] as any).floor, 1000);
 });
 
 run('DESCRIBE-8 malformed actions fail open individually', () => {
     const mgr: any = makeManager({ _liveMarketPrice: 1000, _liveMarketPriceAt: FRESH_MID_AT });
     const actions = [
-        { type: 'create', id: 'slot-x', order: {} }, // no price/type
-        { type: 'create', id: 'slot-y', order: { type: 'weird', price: 1000 } } // unknown type
+        { type: 'create', id: 'slot-x', order: {} },
+        { type: 'create', id: 'slot-y', order: { type: 'weird', price: 1000 } }
     ];
-    const { dropped } = describeMarketCrossingActions(mgr, actions as any);
-    assert.strictEqual(dropped.length, 0, 'unknowable actions must never be reported');
+    assert.strictEqual(describeMarketCrossingActions(mgr, actions as any).dropped.length, 0);
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

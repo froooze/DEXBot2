@@ -104,13 +104,28 @@ function testPivotWriters() {
     })(), []);
 }
 
+function testCounterDebtOwners() {
+    console.log('\n[3] The in-memory counter debt has exactly one writer and one consumer');
+    // OrderManager constructs the Map; the single counter_debt helper creates
+    // and replaces entries on fill intake. No other module may write it.
+    const owners = Array.from(sources.keys()).filter((rel) =>
+        /_counterDebt\s*=|\bdebt\.set\(/.test(sources.get(rel) || '')).sort();
+    check('counter-debt assignment files', owners, [
+        'modules/order/manager.ts',
+        'modules/order/utils/counter_debt.ts',
+    ]);
+    check('no foreign counter-debt writer', owners.filter((rel) =>
+        !['modules/order/manager.ts', 'modules/order/utils/counter_debt.ts'].includes(rel)), []);
+}
+
 function testBoundaryBudgets() {
-    console.log('\n[3] Boundary budgets are still the two known manager fields');
-    check('assignment files', assignmentFiles(['_boundaryReanchorBudget', '_boundaryShiftBudget', '_boundaryShiftBudgetBase']), [
+    console.log('\n[3] Only the two crawl budgets remain; the re-anchor budget is gone');
+    check('crawl budget assignment files', assignmentFiles(['_boundaryShiftBudget', '_boundaryShiftBudgetBase']), [
         'modules/dexbot_class.ts',
         'modules/dexbot_cow_runtime.ts',
         'modules/order/strategy.ts',
     ]);
+    check('removed re-anchor budget has no writer', assignmentFiles(['_boundaryReanchorBudget']), []);
 }
 
 function testDedupeLayers() {
@@ -178,6 +193,7 @@ function run() {
     console.log('Fill pipeline contract (ratchet) tests');
     testFillBatchCallSites();
     testPivotWriters();
+    testCounterDebtOwners();
     testBoundaryBudgets();
     testDedupeLayers();
     testFillIdentityOwner();

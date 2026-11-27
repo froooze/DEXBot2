@@ -2,7 +2,6 @@
 import { lazyShim } from './lazy_shim.js';
 
 import * as chainOrders from './chain_orders.js';
-import { getLazyBitSharesClient } from './lazy_client_access.js';
 import { PROCESSED_FILL_PERSISTENCE_MODES } from './order/processed_fill_store.js';
 import { NATIVE_CLIENT, FILL_PROCESSING, TIMING, MAINTENANCE, ORDER_TYPES } from './constants.js';
 import { getErrorMessage, resolveSeamMsOrNull, getErrorField } from './utils/errors.js';
@@ -20,7 +19,6 @@ const parseChainOrder = lazyShim('./order/utils/order', 'parseChainOrder');
 const retryPersistenceIfNeeded = lazyShim('./order/utils/system', 'retryPersistenceIfNeeded');
 const getPipelineInFlightAgeMs = lazyShim('./order/utils/system', 'getPipelineInFlightAgeMs');
 const readBotInFlightFlags = lazyShim('./order/utils/system', 'readBotInFlightFlags');
-const verifyFillMarketReference = lazyShim('./order/utils/system', 'verifyFillMarketReference');
 const { readOpenOrdersGuarded } = chainOrders;
 
 type ChainOrdersLike = typeof chainOrders;
@@ -191,21 +189,8 @@ async function processSweepOrphanFill(bot: BotLike, fill: unknown, fillOp: FillO
     try {
         const pays = fillOp?.pays as { asset_id?: string; amount?: number } | undefined;
         const receives = fillOp?.receives as { asset_id?: string; amount?: number } | undefined;
-        // This path writes the pivot directly through recordLastFilledPrices,
-        // bypassing the fill batch. Verify the book first with the SAME helper
-        // the batch uses (one classifier, one market read owner) and the SAME
-        // cached lazy client accessor the COW runtime uses. Keep the
-        // verification failure separate so it can never suppress the credit /
-        // crawl attribution that this try/catch originally owned.
-        try {
-            const client = await getLazyBitSharesClient();
-            await verifyFillMarketReference(bot.manager, client, [{
-                paysAssetId: pays?.asset_id ?? null,
-                paysAmountRaw: pays?.amount ?? null,
-                receivesAssetId: receives?.asset_id ?? null,
-                receivesAmountRaw: receives?.amount ?? null,
-            }]);
-        } catch { /* best-effort: attribution must stay independent */ }
+        // This path writes the pivot directly through recordLastFilledPrices.
+        // No book verification is needed: every fill is market truth.
         attributeUnmatchedFillToGrid(bot.manager, {
             orderId: fillOp?.order_id != null ? String(fillOp.order_id) : null,
             paysAssetId: pays?.asset_id ?? null,

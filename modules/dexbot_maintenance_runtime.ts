@@ -1571,7 +1571,6 @@ function performGridResync(bot: BotLike, options: {
                 const liveFields = [
                     '_lastFilledPrice', '_lastFilledType', '_lastFilledAt', 'lastFillPivotSource',
                     '_lastFilledBuyPrice', '_lastFilledSellPrice',
-                    '_lastRefusedFillPrice', '_lastRefusedFillType', '_lastRefusedFillAt', '_lastRefusedFillLevels',
                     '_lastMarketFillPrice', '_lastMarketFillType', '_lastMarketFillAt',
                 ];
                 const liveSnapshot: Record<string, unknown> = {};
@@ -3494,12 +3493,9 @@ export function trackOutOfSpreadStaleness(bot: BotLike, spreadChecked: boolean, 
     }
     const geometryAlreadyRecentered = geometryBlocked && !!geometryPivotKey
         && bot._lastGeometryResyncPivotKey === geometryPivotKey;
-    // Keep the armed-pivot wording byte-identical (operator canaries and the
-    // existing LOGGING rows name "fill pivot"); a refused level gets its own
-    // label so the expiry reason is unambiguous in the log.
-    const geometryBindLabel = geometryPivotKey.startsWith('refused:')
-        ? `refused level ${geometryPivotKey.slice('refused:'.length).split('|')[0]}`
-        : `fill pivot ${geometryPivotKey.split('|')[0]}`;
+    // Every fill arms the guard, so the generation key is always the armed
+    // fill pivot (or '' while cold). No refused-level label exists any more.
+    const geometryBindLabel = `fill pivot ${geometryPivotKey.split('|')[0]}`;
     const geometryEscalateMs = Number(TIMING?.SPREAD_STALE_GEOMETRY_ESCALATE_MS) > 0
         ? Number(TIMING.SPREAD_STALE_GEOMETRY_ESCALATE_MS)
         : 10 * 60 * 1000;
@@ -3534,7 +3530,7 @@ export function trackOutOfSpreadStaleness(bot: BotLike, spreadChecked: boolean, 
         bot._log(
             `[SPREAD-STALE] Still out of tolerance ${staleMin}min after re-centering on ${geometryBindLabel}: ` +
             `the guard bind is outside this generation's placeable side, so a re-center ` +
-            `cannot clear it. A fill, a refused-level expiry, or pivot expiry restores the side; ` +
+            `cannot clear it. A fill or pivot expiry restores the side; ` +
             `no further re-center will be requested for this guard generation.`,
             'warn'
         );
@@ -4360,7 +4356,10 @@ function managerOwnedCounters(bot: BotLike): Partial<BotMetrics> {
         spreadCorrectionRefusedCount: mgr.spreadCorrectionRefusedCount ?? bot._metrics.spreadCorrectionRefusedCount,
         spreadCorrectionRefusalCauses: mgr.spreadCorrectionRefusalCauses ?? bot._metrics.spreadCorrectionRefusalCauses,
         spreadCorrectionRetryCount: mgr.spreadCorrectionRetryCount ?? bot._metrics.spreadCorrectionRetryCount,
-        duplicateOrphanCancelUnverifiedCount: mgr.duplicateOrphanCancelUnverifiedCount ?? bot._metrics.duplicateOrphanCancelUnverifiedCount
+        duplicateOrphanCancelUnverifiedCount: mgr.duplicateOrphanCancelUnverifiedCount ?? bot._metrics.duplicateOrphanCancelUnverifiedCount,
+        counterOrdersOwedCount: mgr.counterOrdersOwedCount ?? bot._metrics.counterOrdersOwedCount,
+        counterOrdersPlacedCount: mgr.counterOrdersPlacedCount ?? bot._metrics.counterOrdersPlacedCount,
+        counterDebtSlotsCount: mgr.counterDebtSlotsCount ?? bot._metrics.counterDebtSlotsCount
     };
 }
 

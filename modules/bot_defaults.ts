@@ -234,6 +234,9 @@ export function createDefaultBotMetrics(): BotMetrics {
         // Historical name kept for metric/API stability: counts unverified
         // cancels of both classes (cancelOnly duplicate orphans AND
         // surplus/type-mismatch). The hard-error log names the actual class.
-        duplicateOrphanCancelUnverifiedCount: 0
+        duplicateOrphanCancelUnverifiedCount: 0,
+        counterOrdersOwedCount: 0,
+        counterOrdersPlacedCount: 0,
+        counterDebtSlotsCount: 0
     };
 }

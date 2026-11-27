@@ -1,26 +1,13 @@
 /**
- * REFUSED-LEVEL SAME-LEVEL RE-FILL BLOCK (§9.12/P2 amended, 2026-11-16).
+ * SAME-LEVEL RE-FILL BLOCK — DIRECTION RULE ONLY (fill-authoritative policy).
  *
- * A fill the pivot-arming policy refuses (§9.12/P1: wrong-side / too-far
- * premium sweep) must NOT arm the direction pivot — that policy is settled and
- * pinned by test_last_fill_pivot_market_bound. But the §9.12/P2 same-level
- * refusal keys off the ARMED pivot, so the P1 refusal silently suspended it:
- * the just-filled level could be re-placed (sub-sat dust "rises") and refill
- * in a loop for as long as a taker kept lifting it. Live: one premium
- * spread-correction slot refilled 5 times in 2.5 minutes at the same level.
+ * The refused-level marker family is retired: a fill can no longer be refused
+ * from arming the pivot, so there is no "refused level" to remember. The sole
+ * same-level protection is the armed pivot's direction rule, where EQUAL is
+ * blocked (a SELL at/below the last SELL, a BUY at/above the last BUY). The
+ * counter side stays placeable, and a cold pivot blocks nothing.
  *
- * Pinned here:
- *   1. The refusal writes an in-memory refused-level marker (price/type/at)
- *      WITHOUT arming the pivot family or the market-fill row.
- *   2. evaluateLastFillGuard — the shared COW-path verdict — blocks a
- *      same-side placement within half a grid step of the refused level,
- *      flagged refusedLevel, even though the (older) direction pivot passes it.
- *   3. A placement beyond half a step passes; the counter-side passes.
- *   4. The marker expires after GRID_LIMITS.LAST_FILL_REFUSED_LEVEL_TTL_MS.
- *   5. isLastFillPlacementBlocked reports it as reason 'refused-level' —
- *      including on a COLD direction pivot.
- *   6. resetLastFillPivot clears the marker (grid rebuild invalidates it).
- *   7. A NORMAL (window) fill never writes the marker.
+ * This suite flips the old marker assertions and pins the neutral stubs.
  */
 
 const assert = require('assert');
@@ -28,9 +15,14 @@ const {
     setLastFillPivot,
     evaluateLastFillGuard,
     isLastFillPlacementBlocked,
-    resetLastFillPivot
+    isLastFillGuardBlocked,
+    resetLastFillPivot,
+    expireLastFillGuardReferences,
+    liveRefusedFillLevels,
+    hasLiveRefusedFillLevels,
+    releaseRefutedRefusedLevels,
 } = require('../modules/order/utils/system');
-const { ORDER_TYPES, GRID_LIMITS } = require('../modules/constants');
+const { ORDER_TYPES } = require('../modules/constants');
 
 let passed = 0;
 let failed = 0;
@@ -60,6 +52,7 @@ function makeManager(over: Record<string, unknown> = {}) {
         _lastMarketFillPrice: null as number | null,
         _lastMarketFillType: null as string | null,
         _lastMarketFillAt: 0,
+        // Legacy marker fields are inert: no writer and no reader consults them.
         _lastRefusedFillPrice: null as number | null,
         _lastRefusedFillType: null as string | null,
         _lastRefusedFillAt: 0,
@@ -73,115 +66,118 @@ function makeManager(over: Record<string, unknown> = {}) {
     };
 }
 
-// Sweep geometry (increment 0.5%): mid 1000, SELL 7 steps above mid exceeds
-// LAST_FILL_PIVOT_MAX_MID_DISTANCE_STEPS (6) and is refused as a premium sweep.
 const MID = 1000;
-const SWEEP_SELL = 1050;   // ~9.8 steps above mid
+const SWEEP_SELL = 1050;   // ~9.8 steps above mid: formerly refused, now armed
 const NOW_MS = Date.now();
 const FRESH_MID_AT = NOW_MS - 5_000;
 
-function refuseSweepSell(mgr: any): void {
+function armSweepSell(mgr: any): void {
     mgr._liveMarketPrice = MID;
     mgr._liveMarketPriceAt = FRESH_MID_AT;
-    assert.strictEqual(setLastFillPivot(mgr, ORDER_TYPES.SELL, SWEEP_SELL, 'fill'), false,
-        'a premium sweep sell ~10 steps above mid must be refused from arming');
+    assert.strictEqual(setLastFillPivot(mgr, ORDER_TYPES.SELL, SWEEP_SELL, 'fill'), true,
+        'a premium sweep now arms the guard');
 }
 
-// ── 1. The refusal writes the marker without arming anything ─────────────────
+// ── 1. Arming replaces the old refusal ────────────────────────────────────
 
-run('REFUSED-1 the refusal writes the marker and leaves the pivot family cold', () => {
+run('REFUSED-1 the sweep arms the pivot and writes no marker', () => {
     const mgr: any = makeManager();
-    refuseSweepSell(mgr);
-    assert.strictEqual(mgr._lastRefusedFillPrice, SWEEP_SELL, 'the refused level must be marked');
-    assert.strictEqual(mgr._lastRefusedFillType, ORDER_TYPES.SELL);
-    assert.ok(mgr._lastRefusedFillAt > 0, 'the marker must carry a timestamp for its TTL');
-    assert.strictEqual(mgr._lastFilledPrice, null, 'the direction pivot must stay untouched');
-    assert.strictEqual(mgr._lastMarketFillPrice, null, 'the market-fill row must stay skipped');
-    assert.ok(mgr.logs.some((l: any) => /same-level re-fill/.test(l.msg)),
-        'the refusal log must state the same-level block');
+    armSweepSell(mgr);
+    assert.strictEqual(mgr._lastFilledPrice, SWEEP_SELL, 'the pivot family follows the fill');
+    assert.strictEqual(mgr._lastFilledType, ORDER_TYPES.SELL);
+    assert.strictEqual(mgr._lastMarketFillPrice, SWEEP_SELL, 'the market-fill row follows too');
+    assert.strictEqual(mgr._lastRefusedFillPrice, null, 'no marker writer survives');
+    assert.deepStrictEqual(mgr._lastRefusedFillLevels, [], 'no per-level set survives');
+    assert.ok(!mgr.logs.some((l: any) => /same-level re-fill|Refusing to arm pivot/.test(l.msg)));
 });
 
-run('REFUSED-2 the refusal does not displace an already-armed pivot', () => {
+run('REFUSED-2 the new fill displaces an already-armed pivot', () => {
     const mgr: any = makeManager({ _lastFilledPrice: 900, _lastFilledType: ORDER_TYPES.BUY, _lastFilledAt: NOW_MS - 60_000, _lastFilledBuyPrice: 900, lastFillPivotSource: 'fill' });
-    refuseSweepSell(mgr);
-    assert.strictEqual(mgr._lastFilledPrice, 900, 'the older window pivot must stay');
-    assert.strictEqual(mgr._lastFilledType, ORDER_TYPES.BUY);
-    assert.strictEqual(mgr._lastRefusedFillPrice, SWEEP_SELL);
+    armSweepSell(mgr);
+    assert.strictEqual(mgr._lastFilledPrice, SWEEP_SELL, 'the latest fill wins');
+    assert.strictEqual(mgr._lastFilledType, ORDER_TYPES.SELL);
+    assert.strictEqual(mgr._lastRefusedFillPrice, null);
 });
 
-run('REFUSED-3 a normal window fill never writes the marker', () => {
+run('REFUSED-3 all fills arm, including an ordinary window fill', () => {
     const mgr: any = makeManager();
     mgr._liveMarketPrice = MID;
     mgr._liveMarketPriceAt = FRESH_MID_AT;
-    assert.strictEqual(setLastFillPivot(mgr, ORDER_TYPES.SELL, MID * 1.005, 'fill'), true, 'sell one step above mid is a window trade');
-    assert.strictEqual(mgr._lastRefusedFillPrice, null, 'an accepted fill must not write the marker');
+    assert.strictEqual(setLastFillPivot(mgr, ORDER_TYPES.SELL, MID * 1.005, 'fill'), true);
+    assert.strictEqual(mgr._lastRefusedFillPrice, null);
 });
 
-// ── 2. The shared verdict blocks the same-level re-fill ──────────────────────
+// ── 2. Direction rule: equal counts as blocked ───────────────────────────
 
-run('REFUSED-4 evaluateLastFillGuard blocks the same-side same-level re-place (refusedLevel)', () => {
-    const mgr: any = makeManager({ _lastFilledPrice: 900, _lastFilledType: ORDER_TYPES.BUY, _lastFilledAt: NOW_MS - 60_000, _lastFilledBuyPrice: 900, lastFillPivotSource: 'fill' });
-    refuseSweepSell(mgr);
-    // SELL at the refused level (direction pivot 900 passes it — this is the
-    // exact loop shape the amendment closes).
-    const check = evaluateLastFillGuard(mgr, SWEEP_SELL + 0.0001, ORDER_TYPES.SELL, 900, ORDER_TYPES.BUY);
-    assert.strictEqual(check.blocked, true, 'the same-level re-fill must be blocked');
-    assert.strictEqual((check as any).refusedLevel, true, 'the verdict must be flagged refusedLevel');
-    assert.strictEqual(check.pivot, SWEEP_SELL, 'the reported pivot is the refused level');
+run('REFUSED-4 evaluateLastFillGuard blocks the same-side same-level re-place', () => {
+    const mgr: any = makeManager();
+    armSweepSell(mgr);
+    // The pivot is the swept level itself. Equality is blocked; a hair above
+    // is the only legal same-side re-place.
+    const equal = evaluateLastFillGuard(mgr, SWEEP_SELL, ORDER_TYPES.SELL, SWEEP_SELL, ORDER_TYPES.SELL);
+    assert.strictEqual(equal.blocked, true, 'equal to the pivot must be blocked');
+    assert.strictEqual(equal.pivot, SWEEP_SELL);
+    assert.strictEqual((equal as any).refusedLevel, undefined, 'no marker flag survives');
+    const below = evaluateLastFillGuard(mgr, SWEEP_SELL - 0.0001, ORDER_TYPES.SELL, SWEEP_SELL, ORDER_TYPES.SELL);
+    assert.strictEqual(below.blocked, true, 'below the pivot is blocked too');
+    const above = evaluateLastFillGuard(mgr, SWEEP_SELL + 1, ORDER_TYPES.SELL, SWEEP_SELL, ORDER_TYPES.SELL);
+    assert.strictEqual(above.blocked, false, 'above the pivot is placeable');
 });
 
-run('REFUSED-5 half a step bounds the block: beyond it, or the counter-side, passes', () => {
-    const mgr: any = makeManager({ _lastFilledPrice: 900, _lastFilledType: ORDER_TYPES.BUY, _lastFilledAt: NOW_MS - 60_000, _lastFilledBuyPrice: 900, lastFillPivotSource: 'fill' });
-    refuseSweepSell(mgr);
-    // Half a step at 1050 with 0.5% increment is 1050 * 0.0025 = 2.625.
-    const ok = evaluateLastFillGuard(mgr, SWEEP_SELL - 5, ORDER_TYPES.SELL, 900, ORDER_TYPES.BUY);
-    assert.strictEqual(ok.blocked, false, 'a placement more than half a step below the refused level passes');
-    const counter = evaluateLastFillGuard(mgr, 850, ORDER_TYPES.BUY, 900, ORDER_TYPES.SELL);
-    assert.strictEqual(counter.blocked, false, 'the counter-side is governed by the direction pivot alone');
+run('REFUSED-5 the counter side is governed by direction, not a level marker', () => {
+    const mgr: any = makeManager();
+    armSweepSell(mgr);
+    assert.strictEqual(isLastFillGuardBlocked(SWEEP_SELL - 5, ORDER_TYPES.BUY, SWEEP_SELL, ORDER_TYPES.SELL).blocked, false,
+        'a BUY below the filled SELL price is the counter order');
+    const counter = evaluateLastFillGuard(mgr, SWEEP_SELL - 5, ORDER_TYPES.BUY, SWEEP_SELL, ORDER_TYPES.SELL);
+    assert.strictEqual(counter.blocked, false, 'the shared verdict keeps the counter side open');
+    assert.strictEqual(isLastFillGuardBlocked(SWEEP_SELL, ORDER_TYPES.BUY, SWEEP_SELL, ORDER_TYPES.SELL).blocked, true,
+        'a BUY at/above ANY last fill is blocked by the direction rule itself');
 });
 
-run('REFUSED-6 the marker expires after LAST_FILL_REFUSED_LEVEL_TTL_MS', () => {
-    const ttl = Number(GRID_LIMITS.LAST_FILL_REFUSED_LEVEL_TTL_MS);
-    assert.ok(ttl > 0 && ttl < Number(GRID_LIMITS.LAST_FILL_PIVOT_TTL_MS), 'the marker TTL must be positive and shorter than the pivot TTL');
-    const mgr: any = makeManager({ _lastFilledPrice: 900, _lastFilledType: ORDER_TYPES.BUY, _lastFilledAt: NOW_MS - 60_000, _lastFilledBuyPrice: 900, lastFillPivotSource: 'fill' });
-    refuseSweepSell(mgr);
-    for (const entry of mgr._lastRefusedFillLevels) entry.at = Date.now() - ttl - 1000;
-    const check = evaluateLastFillGuard(mgr, SWEEP_SELL, ORDER_TYPES.SELL, 900, ORDER_TYPES.BUY);
-    assert.strictEqual(check.blocked, false, 'an expired marker must not veto');
-});
-
-// ── 3. The reconcile/startup path reports the right reason ───────────────────
-
-run('REFUSED-7 isLastFillPlacementBlocked reports reason refused-level (armed pivot)', () => {
-    const mgr: any = makeManager({ _lastFilledPrice: 900, _lastFilledType: ORDER_TYPES.BUY, _lastFilledAt: NOW_MS - 60_000, _lastFilledBuyPrice: 900, lastFillPivotSource: 'fill' });
-    refuseSweepSell(mgr);
+run('REFUSED-6 same-level reason is "same-level" (never "refused-level")', () => {
+    const mgr: any = makeManager();
+    armSweepSell(mgr);
     const guard = isLastFillPlacementBlocked(mgr, SWEEP_SELL, ORDER_TYPES.SELL);
     assert.strictEqual(guard.blocked, true);
-    assert.strictEqual(guard.reason, 'refused-level');
+    assert.strictEqual(guard.reason, 'same-level', 'the sole same-level rule owns the verdict');
     assert.strictEqual(guard.pivot, SWEEP_SELL);
+    const direction = isLastFillPlacementBlocked(mgr, SWEEP_SELL - 5, ORDER_TYPES.SELL);
+    assert.strictEqual(direction.blocked, true);
+    assert.strictEqual(direction.reason, 'direction');
 });
 
-run('REFUSED-8 isLastFillPlacementBlocked still blocks on a COLD direction pivot', () => {
-    const mgr: any = makeManager();
-    refuseSweepSell(mgr);
-    const guard = isLastFillPlacementBlocked(mgr, SWEEP_SELL, ORDER_TYPES.SELL);
-    assert.strictEqual(guard.blocked, true, 'the marker must hold on a cold pivot too');
-    assert.strictEqual(guard.reason, 'refused-level');
+// ── 3. Cold pivot and neutral marker stubs ───────────────────────────────
+
+run('REFUSED-7 a cold pivot blocks nothing, even with legacy marker fields seeded', () => {
+    const mgr: any = makeManager({
+        _lastRefusedFillPrice: SWEEP_SELL,
+        _lastRefusedFillType: ORDER_TYPES.SELL,
+        _lastRefusedFillAt: Date.now(),
+        _lastRefusedFillLevels: [{ price: SWEEP_SELL, type: ORDER_TYPES.SELL, at: Date.now() }]
+    });
+    assert.strictEqual(isLastFillPlacementBlocked(mgr, SWEEP_SELL, ORDER_TYPES.SELL).blocked, false,
+        'the marker must not become a second guard');
+    assert.deepStrictEqual(liveRefusedFillLevels(mgr), []);
+    assert.strictEqual(hasLiveRefusedFillLevels(mgr), false);
+    assert.strictEqual(releaseRefutedRefusedLevels(mgr, MID, SWEEP_SELL), 0);
+    assert.strictEqual(mgr._lastRefusedFillLevels.length, 1, 'the stub must not mutate legacy fields');
 });
 
-// ── 4. Lifecycle ──────────────────────────────────────────────────────────────
-
-run('REFUSED-9 resetLastFillPivot clears the marker', () => {
+run('REFUSED-8 reset clears the pivot scalars; the market row still arms the guard', () => {
     const mgr: any = makeManager();
-    refuseSweepSell(mgr);
-    assert.strictEqual(mgr._lastRefusedFillPrice, SWEEP_SELL);
-    resetLastFillPivot(mgr, 'grid rebuild');
-    assert.strictEqual(mgr._lastRefusedFillPrice, null);
-    assert.strictEqual(mgr._lastRefusedFillType, null);
-    assert.strictEqual(mgr._lastRefusedFillAt, 0);
-    assert.strictEqual(mgr._lastRefusedFillLevels.length, 0, 'the whole marker set must be cleared');
-    const check = evaluateLastFillGuard(mgr, SWEEP_SELL, ORDER_TYPES.SELL, null, null);
-    assert.strictEqual(check.blocked, false, 'after the reset the placement must pass again');
+    armSweepSell(mgr);
+    assert.strictEqual(isLastFillPlacementBlocked(mgr, SWEEP_SELL, ORDER_TYPES.SELL).blocked, true);
+    assert.strictEqual(resetLastFillPivot(mgr, 'grid rebuild'), true);
+    assert.strictEqual(mgr._lastFilledPrice, null);
+    assert.strictEqual(mgr._lastRefusedFillLevels.length, 0);
+    // The bot-scoped market-fill row is deliberately NOT cleared by a grid
+    // rebuild: it survives regeneration and keeps the guard armed.
+    assert.strictEqual(isLastFillPlacementBlocked(mgr, SWEEP_SELL, ORDER_TYPES.SELL).blocked, true);
+    // Only the full watchdog expiry drops BOTH references.
+    expireLastFillGuardReferences(mgr, 'test full clear');
+    assert.strictEqual(mgr._lastMarketFillPrice, null);
+    assert.strictEqual(isLastFillPlacementBlocked(mgr, SWEEP_SELL, ORDER_TYPES.SELL).blocked, false);
 });
 
 console.log(`\n  ${passed} passed, ${failed} failed`);

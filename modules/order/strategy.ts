@@ -51,7 +51,7 @@
 import { ORDER_TYPES, ORDER_STATES } from '../constants.js';
 import { isSlotInRail, resolveGapSlots } from './utils/math.js';
 import { deriveTargetBoundary, getSideBudget, calculateBudgetedSizes, getCoreOrdersTotal, resolveEdgeCount, resolveLiveEdgeAnchorPrice, selectEdgeSlots, isShiftEligibleFill } from './utils/order.js';
-import { reanchorBoundaryFromLastFill, offMarketFill } from './utils/system.js';
+import { reanchorBoundaryFromLastFill } from './utils/system.js';
 import { assignGridRoles } from './utils/order.js';
 import {
     convertToSpreadPlaceholder,
@@ -61,7 +61,8 @@ import {
     isOrderPlaced
 } from "./utils/order.js";
 import { parseSlotIndex } from "./utils/slot.js";
-import type { OrderManagerLike, ManagedOrder, GridConfig, AssetPair, ProjectedFunds } from "../types.js";
+import { recordCounterDebt } from "./utils/counter_debt.js";
+import type { OrderManagerLike, ManagedOrder, GridConfig, AssetPair, ProjectedFunds, CounterDebtEntry } from "../types.js";
 
 interface FillInput {
     id?: string;
@@ -72,6 +73,72 @@ interface FillInput {
     isDelayedRotationTrigger?: boolean;
     orderId?: string | null;
     [key: string]: unknown;
+}
+
+/**
+ * Resolve the in-memory counter quota for this plan. Debts whose counter slot
+ * already holds a placed order on the right rail are cleared (confirmed
+ * placement); the rest are capped at `gapSlots + 1` new orders per cycle,
+ * oldest first, with a distinct free rail slot each. Nothing is persisted and
+ * no funds are reserved — sizing still comes from the side budget.
+ */
+function resolveCounterQuota(
+    manager: OrderManagerLike,
+    slots: ManagedOrder[],
+    gapSlots: number,
+    boundaryIdx: number | null,
+    capacity: { buy: number; sell: number }
+): { buy: CounterDebtEntry[]; sell: CounterDebtEntry[] } {
+    const owed = { buy: [] as CounterDebtEntry[], sell: [] as CounterDebtEntry[] };
+    const debt = manager._counterDebt;
+    if (!(debt instanceof Map) || debt.size === 0) return owed;
+    const maxBatch = Math.max(1, Math.floor(gapSlots) + 1);
+    const ranked = [...debt.values()].sort((a, b) => a.at - b.at || a.fillKey.localeCompare(b.fillKey));
+    let emitted = 0;
+    for (const entry of ranked) {
+        // A debt is settled ONLY by its stamped op being confirmed on chain
+        // (see clearCounterDebtsFromContexts). Seeing any order in the slot is
+        // not proof this fill's counter was placed.
+        const side = entry.counterSide === ORDER_TYPES.BUY ? 'buy' : 'sell';
+        if (emitted >= maxBatch || owed[side].length >= Math.max(1, capacity[side])) {
+            // A counter beyond this side's active window would land VIRTUAL
+            // and emit no op; leave it owed instead of consuming the cap.
+            entry.lastDeferReason = 'batch-cap';
+            entry.attempts++;
+            continue;
+        }
+        // Recompute the true counter level from the ORIGINAL fill on every
+        // cycle: `counterSlotId` is only the last planned slot and must not
+        // drift when a debt is deferred or guard-skipped.
+        const fillIdx = parseSlotIndex(entry.fillSlotId);
+        const idealIdx = fillIdx != null
+            ? (entry.fillSide === ORDER_TYPES.SELL ? fillIdx - gapSlots : fillIdx + gapSlots)
+            : parseSlotIndex(entry.counterSlotId);
+        const candidates = slots
+            .filter((s) => s.type === entry.counterSide
+                && isSlotInRail(boundaryIdx, gapSlots, entry.counterSide, s)
+                && !isOrderPlaced(s)
+                && !owed[side].some((o) => o.counterSlotId === s.id))
+            .sort((a, b) => {
+                const ia = parseSlotIndex(a.id);
+                const ib = parseSlotIndex(b.id);
+                return idealIdx != null && ia != null && ib != null
+                    ? Math.abs(ia - idealIdx) - Math.abs(ib - idealIdx)
+                    : 0;
+            });
+        const chosen = candidates[0];
+        if (!chosen) {
+            entry.lastDeferReason = 'no-slot';
+            entry.attempts++;
+            continue;
+        }
+        entry.counterSlotId = chosen.id;
+        if (entry.lastDeferReason) entry.lastDeferReason = undefined;
+        owed[side].push(entry);
+        emitted++;
+    }
+    if (manager._metrics) manager._metrics.counterDebtSlotsCount = debt.size;
+    return owed;
 }
 
 class StrategyEngine {
@@ -141,10 +208,6 @@ class StrategyEngine {
             // buys re-bought after restart). Cleared on any accepted
             // non-null boundary commit. Same eligibility as the crawl itself.
             if (isShiftEligibleFill(filledOrder)
-                // Same market-bound eligibility as the crawl and the anchor: a
-                // premium sweep must not leave an owed crawl that a later
-                // derivation would apply, undoing this filter one cycle later.
-                && !offMarketFill(mgr, String(filledOrder.type), Number(filledOrder.price))
                 && typeof filledOrder.id === 'string' && filledOrder.id.length > 0
                 && (filledOrder.type === ORDER_TYPES.BUY || filledOrder.type === ORDER_TYPES.SELL)
                 // dryRun never commits a boundary, so a recorded crawl could
@@ -169,6 +232,10 @@ class StrategyEngine {
                     if (typeof mgr._markGridDirty === 'function') mgr._markGridDirty();
                 }
             }
+
+            // COUNTER QUOTA: one obligation per full fill, recorded by the
+            // single owner (partial residuals and dust synthetics owe nothing).
+            recordCounterDebt(mgr, filledOrder);
 
             if (!isPartial || filledOrder.isDelayedRotationTrigger) {
                 const currentSlot = filledOrder.id != null ? mgr.orders.get(filledOrder.id) : undefined;
@@ -325,12 +392,9 @@ class StrategyEngine {
             buy: resolveLiveEdgeAnchorPrice(this.manager, 'buy'),
             sell: resolveLiveEdgeAnchorPrice(this.manager, 'sell'),
         };
-        // One market-bound predicate for the pivot, the anchor and the crawl
-        // (R5.9): off-market sweep fills are not window evidence and must not
-        // drag the boundary away from the live market.
-        const isCrawlEligible = (fill: { id?: string; price?: number; type?: string; [key: string]: unknown }) =>
-            !offMarketFill(this.manager, String(fill?.type), Number(fill?.price));
-        let { boundaryIdx: newBoundaryIdx, remainingBudget, consumedCrawlIds } = deriveTargetBoundary(fills, currentBoundaryIdx, allSlots, boundaryConfig, gapSlots, crossChunkBudget, this.manager._pendingFillCrawls, edgeAnchors, isCrawlEligible);
+        // Every fill is window evidence: the boundary crawls with all eligible
+        // fills and the batch extremum anchors it. No market-bound predicate.
+        let { boundaryIdx: newBoundaryIdx, remainingBudget, consumedCrawlIds } = deriveTargetBoundary(fills, currentBoundaryIdx, allSlots, boundaryConfig, gapSlots, crossChunkBudget, this.manager._pendingFillCrawls, edgeAnchors);
         if (crossChunkBudget != null) {
             this.manager._boundaryShiftBudget = remainingBudget;
         }
@@ -341,20 +405,11 @@ class StrategyEngine {
         // inventory. The fill is the anchor: place it outside its own window.
         // Validated like a boundary commit (strands no live in-band order), and
         // only for an on-ladder fill price.
-        const allowReanchor = (() => {
-            const budget = (this.manager as unknown as { _boundaryReanchorBudget?: unknown })._boundaryReanchorBudget;
-            // undefined = legacy/no fill cycle: allowed. 0 = this fill cycle
-            // already consumed its one absolute anchor. >0 = budget remaining.
-            return budget === undefined || Number(budget) !== 0;
-        })();
-        const reanchor = allowReanchor
-            ? reanchorBoundaryFromLastFill(this.manager, newBoundaryIdx, allSlots, gapSlots, fills)
-            : { boundaryIdx: newBoundaryIdx, reanchored: false };
+        // One batch-extremum anchor per fill cycle covers the whole sweep, so
+        // no per-cycle budget is needed: a refused anchor leaves the boundary
+        // unchanged and a later cycle may try again with fresher geometry.
+        const reanchor = reanchorBoundaryFromLastFill(this.manager, newBoundaryIdx, allSlots, gapSlots, fills);
         if (reanchor.reanchored) {
-            const budget = Number((this.manager as unknown as { _boundaryReanchorBudget?: unknown })._boundaryReanchorBudget);
-            (this.manager as unknown as { _boundaryReanchorBudget?: number })._boundaryReanchorBudget = Number.isFinite(budget) && budget > 0
-                ? budget - 1
-                : 0;
             newBoundaryIdx = reanchor.boundaryIdx;
             // An absolute fill anchor already reflects every older owed crawl.
             // The derivation may have left records owed (cap exhausted, mixed
@@ -425,6 +480,24 @@ class StrategyEngine {
         // 2. Assign Roles (Buy/Sell/Spread)
         const updatedSlots = assignGridRoles(allSlots, newBoundaryIdx, gapSlots, ORDER_TYPES, ORDER_STATES, { assignOnChain: true });
 
+        // COUNTER QUOTA: settle debts whose counter landed, then pick at most
+        // gap+1 owed counters for this cycle, oldest first.
+        const counterQuota = resolveCounterQuota(
+            this.manager as OrderManagerLike, updatedSlots, gapSlots, newBoundaryIdx,
+            {
+                buy: Math.max(1, config.coreOrders?.buy ?? 1),
+                sell: Math.max(1, config.coreOrders?.sell ?? 1)
+            }
+        );
+        const allDebt = [...(this.manager._counterDebt?.values() ?? [])];
+        const deferred = allDebt.filter((d) => d.lastDeferReason).length;
+        const batchCap = allDebt.filter((d) => d.lastDeferReason === 'batch-cap').length;
+        const attempts = allDebt.reduce((max, d) => Math.max(max, d.attempts || 0), 0);
+        this.manager.logger.log(
+            `[COUNTER-QUOTA] batch buy=${counterQuota.buy.length} sell=${counterQuota.sell.length} `
+            + `owed=${allDebt.length} deferred=${deferred} batchCap=${batchCap} attempts=${attempts}`, 'debug'
+        );
+
         this.manager.logger.log(`[DEBUG] calculateTargetGrid: boundary=${newBoundaryIdx}, gap=${gapSlots}, allSlots=${updatedSlots.length}`, 'debug');
         updatedSlots.forEach((s) => this.manager.logger.log(`  Slot ${s.id}: price=${s.price}, size=${s.size ?? 'n/a'}, type=${s.type}`, 'debug'));
 
@@ -477,8 +550,42 @@ class StrategyEngine {
             return kept;
         };
 
-        const buySlots = snapRail(buyCandidates, -1).slice(0, targetCountBuy);
-        const sellSlots = snapRail(sellCandidates, +1).slice(0, targetCountSell);
+        let buySlots = snapRail(buyCandidates, -1).slice(0, targetCountBuy);
+        let sellSlots = snapRail(sellCandidates, +1).slice(0, targetCountSell);
+
+        // Force the selected counter slots into the active window, replacing
+        // the farthest ordinary slot so the core-order count is preserved.
+        // Sizes are assigned below from the same side budget as every other
+        // slot — the quota changes WHICH slot is active, never its size.
+        const forceCounterSlots = (
+            base: ManagedOrder[],
+            all: ManagedOrder[],
+            debts: CounterDebtEntry[],
+            dir: number
+        ): ManagedOrder[] => {
+            const kept = [...base];
+            for (const debt of debts) {
+                if (kept.some((s) => s.id === debt.counterSlotId)) continue;
+                const candidate = all.find((s) => s.id === debt.counterSlotId
+                    && isSlotInRail(newBoundaryIdx, gapSlots, debt.counterSide, s));
+                // Deferral bookkeeping belongs to resolveCounterQuota; this
+                // is only the window projection of a debt already selected.
+                if (!candidate) continue;
+                kept.sort((a, b) => dir > 0 ? a.price - b.price : b.price - a.price);
+                // Replace the farthest ORDINARY slot, never another selected
+                // counter (which would silently drop its counter op).
+                const counterIds = new Set(debts.map((d) => d.counterSlotId));
+                let dropIdx = -1;
+                for (let i = kept.length - 1; i >= 0; i--) {
+                    if (!counterIds.has(kept[i].id)) { dropIdx = i; break; }
+                }
+                if (dropIdx >= 0) kept.splice(dropIdx, 1);
+                kept.push(candidate);
+            }
+            return kept;
+        };
+        buySlots = forceCounterSlots(buySlots, allBuySlots, counterQuota.buy, -1);
+        sellSlots = forceCounterSlots(sellSlots, allSellSlots, counterQuota.sell, +1);
         
         // IMPORTANT:
         // Size distribution must be computed on the FULL side topology, not only
@@ -556,6 +663,15 @@ class StrategyEngine {
 
         applySizes(buySlotsAll, buySizes);
         applySizes(sellSlotsAll, sellSizes);
+
+        // Stamp the planned counter slots with their fill key so the op that
+        // lands them can be traced back to the exact debt it settles.
+        for (const debt of [...counterQuota.buy, ...counterQuota.sell]) {
+            const target = targetGrid.get(debt.counterSlotId);
+            if (target) {
+                target.metadata = { ...(target.metadata ?? {}), counterForFillKey: debt.fillKey };
+            }
+        }
         
         // Handle slots outside the window: preserve their calculated sizes
         // Window Discipline only controls WHICH orders are placed on-chain,

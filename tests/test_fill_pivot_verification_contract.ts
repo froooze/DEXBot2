@@ -1,16 +1,16 @@
 /**
- * FILL-PIVOT VERIFICATION CONTRACT.
+ * FILL-PIVOT CONTRACT (fill-authoritative policy).
  *
- * One writer owns the LAST-FILL-GUARD scalar family (setLastFillPivot in
- * order/utils/system.ts), one verifier owns the market re-read
- * (verifyFillMarketReference), and one helper derives fill evidence from
- * pays/receives (fillEvidenceFromEconomics). Every LIVE path that writes a
- * fill-provenance pivot must verify at an async boundary first; this test is
- * the ratchet that stops a new path from silently bypassing it.
+ * The old contract required a market re-verification at every async boundary
+ * before a pivot could be written. With fills authoritative there is nothing
+ * to verify: verifyFillMarketReference is a no-op, no book RPC is spent on a
+ * fill, and nothing may sit between fill intake and the synchronous
+ * setLastFillPivot writer. This suite pins the new contract:
  *
- * Documented exceptions: rearmLastFillPivotFromMarketFill and
- * restoreLastFillPivot run with no client and no live mid (fail-open by
- * design, §9.12/P1) — they are in the same module as the single writer.
+ *   - no verification call in the fill-batch loop or in the writer chain;
+ *   - any surviving verifier call site is a standalone no-op (result unused);
+ *   - writer stays synchronous and has no marker/market-bound branch;
+ *   - evidence derivation from pays/receives still has one owner.
  */
 
 const assert = require('assert');
@@ -35,90 +35,103 @@ function run(name: string, fn: () => void) {
 const root = path.join(__dirname, '..', '..');
 const read = (rel: string) => fs.readFileSync(path.join(root, rel), 'utf8');
 
+/** Extract a function body by signature so a check is scoped to that function. */
+function body(src: string, signature: string): string {
+    const start = src.indexOf(signature);
+    assert.ok(start >= 0, `missing ${signature}`);
+    const open = src.indexOf('{', start + signature.length);
+    assert.ok(open >= 0, `${signature} must have a body`);
+    let depth = 0;
+    for (let i = open; i < src.length; i++) {
+        if (src[i] === '{') depth++;
+        else if (src[i] === '}' && --depth === 0) return src.slice(start, i + 1);
+    }
+    assert.fail(`unbalanced body for ${signature}`);
+    return '';
+}
+
 function main() {
-    console.log('\n=== FILL-PIVOT VERIFICATION CONTRACT ===\n');
+    console.log('\n=== FILL-PIVOT CONTRACT ===\n');
 
-    run('CONTRACT-1 dexbot_class verifies before the fill-batch pivot stamp', () => {
+    run('CONTRACT-1 no verification between chunk intake and the pivot stamp', () => {
         const src = read('modules/dexbot_class.ts');
-        const verify = src.indexOf('await verifyFillMarketReference(');
+        assert.strictEqual(src.split('verifyFillMarketReference(').length - 1, 0,
+            'the fill-batch loop must not call the verifier');
         const stamp = src.indexOf('recordLastFilledPrices?.(fillBatch)');
-        assert.ok(verify > 0 && stamp > verify, 'verification must precede recordLastFilledPrices');
+        assert.ok(stamp > 0, 'the per-chunk pivot stamp must remain');
+        const chunk = src.slice(Math.max(0, stamp - 900), stamp);
+        assert.ok(/fillBatch/.test(chunk), 'the stamp is still inside the per-chunk loop');
+        assert.ok(!/await\s/.test(chunk.slice(chunk.lastIndexOf('fillList.slice'))),
+            'no await may sit between slice and stamp');
     });
 
-    run('CONTRACT-2 COW freeze and final gate both verify before the queued pivot write', () => {
-        const src = read('modules/dexbot_cow_runtime.ts');
-        const freezeVerify = src.indexOf('await verifyQueuedFillMarket(bot)');
-        const freezeWrite = src.indexOf('if (refreshLastFillPivotFromQueue(bot))');
-        assert.ok(freezeVerify > 0 && freezeWrite > freezeVerify, 'freeze must verify first');
-        const gateVerify = src.indexOf('await verifyQueuedFillMarket(bot)', freezeWrite + 1);
-        const gate = src.indexOf('finalGate = runFinalPivotGate(bot', freezeWrite);
-        assert.ok(gateVerify > 0 && gate > gateVerify, 'final gate must verify first');
-        assert.ok(/await verifyFillMarketReference\(/.test(src), 'the queued verifier must use the shared helper');
-    });
-
-    run('CONTRACT-3 orphan-fill sweep verifies before direct attribution', () => {
-        const src = read('modules/dexbot_fill_runtime.ts');
-        const verify = src.indexOf('await verifyFillMarketReference(');
-        const write = src.indexOf('attributeUnmatchedFillToGrid(bot.manager');
-        assert.ok(verify > 0 && write > verify, 'orphan attribution must verify first');
-    });
-
-    run('CONTRACT-4 sync-engine verifies at BOTH unmatched-fill absorption sites', () => {
-        const src = read('modules/order/sync_engine.ts');
-        const verifies = src.split('await verifyFillMarketReference(').length - 1;
-        const writes = src.split('this._absorbUnmatchedFill(mgr,').length - 1;
-        assert.ok(writes >= 2, `expected both absorption sites, found ${writes}`);
-        assert.strictEqual(verifies, writes, 'one verification per unmatched-fill absorption site');
-    });
-
-    run('CONTRACT-5 unmatched attribution uses the shared evidence derivation', () => {
-        const src = read('modules/order/utils/order.ts');
-        assert.ok(src.includes('fillEvidenceFromEconomics('), 'attribution must use the shared evidence helper');
-    });
-
-    run('CONTRACT-6 the low-level pivot writer stays synchronous with documented exceptions', () => {
+    run('CONTRACT-2 the writer stays synchronous and has no verification branch', () => {
         const src = read('modules/order/utils/system.ts');
-        assert.ok(/export function setLastFillPivot\(/.test(src), 'the single writer must stay sync');
-        assert.ok(!/export async function setLastFillPivot\(/.test(src), 'never make the writer async');
-        for (const exception of ['rearmLastFillPivotFromMarketFill', 'restoreLastFillPivot']) {
-            assert.ok(src.includes(exception), `documented exception ${exception} must remain in the owner module`);
+        const writer = body(src, 'export function setLastFillPivot(');
+        assert.ok(!/async|await/.test(writer.split('(')[0] + writer), 'setLastFillPivot must be sync');
+        assert.ok(!/verifyFillMarketReference|offMarketFill|RefusedFill|Refusing to arm/.test(writer),
+            'no market read or marker may gate the writer');
+        assert.ok(/manager\._lastFilledPrice = p/.test(writer), 'the writer still arms the pivot directly');
+        const verifier = body(src, 'export async function verifyFillMarketReference(');
+        assert.ok(!/db\.|get_ticker|get_order_book|maybeRefreshLiveMarketPrice/.test(verifier),
+            'the no-op verifier must not read the book');
+    });
+
+    run('CONTRACT-3 recordLastFilledPrices goes straight to the single writer', () => {
+        const src = read('modules/order/manager.ts');
+        const writer = body(src, 'recordLastFilledPrices(fills:');
+        assert.strictEqual(writer.split('verifyFillMarketReference(').length - 1, 0);
+        assert.ok(/this\._setLastFillPivot\(/.test(writer), 'the funnel must still call the single writer');
+        assert.ok(!/band-skipped|skippedInBand/.test(writer), 'gap-band skip is gone');
+        assert.ok(/edgeFillIds\.has/.test(writer), 'edge-pinned insurance exclusion stays');
+    });
+
+    run('CONTRACT-4 no verifier result may gate a pivot write', () => {
+        const files = ['modules/dexbot_cow_runtime.ts', 'modules/dexbot_fill_runtime.ts',
+            'modules/order/sync_engine.ts', 'modules/dexbot_class.ts'];
+        let calls = 0;
+        for (const file of files) {
+            const src = read(file);
+            calls += src.split('verifyFillMarketReference(').length - 1;
+            assert.ok(!/(?:const|let|var)\s+\w+\s*=\s*await\s+verifyFillMarketReference\(/.test(src),
+                `${file} must not branch on the verifier result`);
+            assert.ok(!/if\s*\(\s*await\s+verifyFillMarketReference\(/.test(src),
+                `${file} must not gate on the verifier result`);
+            assert.ok(!/verifyQueuedFillMarket\(/.test(src),
+                `${file} must not keep the async queued-fill verification step`);
         }
+        // Every remaining call (if any) is a standalone no-op; the writer chain
+        // never depends on its result.
+        assert.ok(calls === 0 || calls === 2, `unexpected verifier call count: ${calls}`);
     });
 
-    run('CONTRACT-7 COW verification resolves the client before peeking the queue', () => {
-        const src = read('modules/dexbot_cow_runtime.ts');
-        const fn = src.indexOf('async function verifyQueuedFillMarket(');
-        assert.ok(fn > 0, 'the queued verifier must exist');
-        const body = src.slice(fn, src.indexOf('\n}', fn) + 2);
-        const clientAt = body.indexOf('await guardMarketClient()');
-        const peekAt = body.indexOf('latestQueuedFillEvidence(bot)');
-        assert.ok(clientAt > 0 && peekAt > clientAt,
-            'a queued fill arriving during the client await must be included in the peek');
-    });
-
-    run('CONTRACT-8 marker release belongs to the single price owner, with its own step guard', () => {
+    run('CONTRACT-5 fill evidence derivation still has a single owner', () => {
         const src = read('modules/order/utils/system.ts');
-        const owner = src.indexOf('export async function maybeRefreshLiveMarketPrice(');
-        const releaseCall = src.indexOf('releaseRefutedRefusedLevels(manager, previousMid, refreshed)', owner);
-        assert.ok(owner > 0 && releaseCall > owner, 'both read paths must release through the price owner');
-        const verifier = src.indexOf('export async function verifyFillMarketReference(');
-        assert.ok(src.indexOf('releaseRefutedRefusedLevels(', verifier) === -1,
-            'the fill gate must not duplicate release policy');
-        const helper = src.indexOf('export function releaseRefutedRefusedLevels(');
-        assert.ok(helper > 0 && /midStepDistance\(manager, before, after\) < 1/.test(src.slice(helper, helper + 900)),
-            'the one-step guard must live inside the release helper');
+        assert.ok(/export function fillEvidenceFromEconomics\(/.test(src));
+        const cow = read('modules/dexbot_cow_runtime.ts');
+        assert.ok(cow.includes('fillEvidenceFromEconomics('), 'queued evidence uses the shared helper');
+        const order = read('modules/order/utils/order.ts');
+        assert.ok(order.includes('fillEvidenceFromEconomics('), 'unmatched attribution uses the shared helper');
     });
 
-    run('CONTRACT-9 both market verifiers share one lazy client accessor', () => {
-        const cow = read('modules/dexbot_cow_runtime.ts');
-        const fill = read('modules/dexbot_fill_runtime.ts');
-        const shared = read('modules/lazy_client_access.ts');
-        assert.ok(/export function getLazyBitSharesClient\(/.test(shared), 'the shared accessor must exist');
-        assert.ok(cow.includes('getLazyBitSharesClient as guardMarketClient'), 'COW must use the shared accessor');
-        assert.ok(fill.includes("import { getLazyBitSharesClient } from './lazy_client_access.js';"),
-            'the fill runtime must use the same accessor');
-        assert.ok(!/from '\.\/bitshares_client\.js'/.test(fill),
-            'the fill runtime must not reintroduce a static client import');
+    run('CONTRACT-6 no refused-level writer survives; marker readers are stubs', () => {
+        const src = read('modules/order/utils/system.ts');
+        const live = body(src, 'export function liveRefusedFillLevels(');
+        const has = body(src, 'export function hasLiveRefusedFillLevels(');
+        const release = body(src, 'export function releaseRefutedRefusedLevels(');
+        assert.ok(/return \[\]/.test(live), 'liveRefusedFillLevels returns an empty set');
+        assert.ok(/return false/.test(has), 'hasLiveRefusedFillLevels is always false');
+        assert.ok(/return 0/.test(release), 'releaseRefutedRefusedLevels is a no-op');
+        assert.ok(!/export function isRefusedLevelRefillBlocked\(/.test(src), 'the marker writer/reader is gone');
+        assert.ok(!/_lastRefusedFillLevels\s*=|\[[^\]]*\]\s*\.push/.test(live + has + release),
+            'the stubs must never write a marker');
+    });
+
+    run('CONTRACT-7 generation key falls back to cold, with no refused-level branch', () => {
+        const src = read('modules/order/utils/system.ts');
+        const key = body(src, 'export function resolveGuardGenerationKey(');
+        assert.ok(!/refused:/.test(key), 'the refused marker branch is gone');
+        assert.ok(/return ''/.test(key), 'cold reference yields the empty key');
     });
 
     console.log(`\n${passed} passed, ${failed} failed\n`);

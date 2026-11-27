@@ -618,24 +618,28 @@ SELL fill at slot f  ->  boundary >= f - gapSlots     (sellStart = f + 1)
 BUY  fill at slot f  ->  boundary <= f - 1            (buy window ends below f)
 ```
 
-Preconditions, all fail-closed: a real fill-provenanced pivot (`lastFillPivotSource`
-must be `fill`; a book-seeded max-bid/min-ask heuristic never anchors, and the
-bot-scoped last-market-fill row is the fallback), an on-ladder price within one
-increment (`off-ladder-fill`), a target that actually puts the fill outside the
-window after the grid-ceiling clamp (`ceiling-clamped`), and the candidate must
-pass `validatePersistedBoundary` — the SAME gate the restore and commit paths
-use (`validatePersistedBoundary` is the disk-trust wrapper over
-`validateBoundaryCommit`: in-band placement rejection plus an optional
+Fills are authoritative: every fill arms the guard (`lastFillPivotSource` is
+`fill`; the bot-scoped last-market-fill row is the fallback) and contributes to
+the crawl and the extremum. `offMarketFill` is a neutral stub and
+`verifyFillMarketReference` is a no-op — there is no off-market classification
+and no cached-mid veto; a book-seeded max-bid/min-ask value is a startup proxy,
+never a reason to exclude a real fill. Remaining preconditions are fail-closed:
+an on-ladder price within one increment (`off-ladder-fill`), a target that
+actually puts the fill outside the window after the grid-ceiling clamp
+(`ceiling-clamped`), and the candidate must pass `validatePersistedBoundary` — the
+SAME gate the restore and commit paths use (`validatePersistedBoundary` is the
+disk-trust wrapper over `validateBoundaryCommit`: in-band placement rejection plus an optional
 allow-list), so every boundary writer ends in one validator.
 
-**Eligibility is the crawl's eligibility.** EDGE-pinned insurance fills never
-arm the pivot (`recordLastFilledPrices` skips them via
-`collectEdgePinnedFillIds`) and therefore never anchor: an edge order is static
-fat-finger insurance, not market movement, and an absolute anchor from a
-rail-edge price would teleport the window to that edge (observed: boundary 29 →
-0 after a floor insurance BUY filled on a 60-slot ladder). PARTIAL fills DO
-anchor — a partial at a far slot is still a real trade, and its residual is the
-allow-listed case below.
+**Eligibility is the crawl's eligibility.** EDGE-pinned insurance fills are the
+one documented exception: they never arm the pivot (`recordLastFilledPrices`
+skips them via `collectEdgePinnedFillIds`) and therefore never anchor, because
+an absolute anchor from a rail-edge price would teleport the window to that
+edge (observed: boundary 29 → 0 after a floor insurance BUY filled on a
+60-slot ladder). Every other fill, including a gap-band residual, arms the
+guard and contributes to the crawl and the extremum; the market-bound predicate
+and the gap-band skip are removed. PARTIAL fills DO anchor — a partial at a far
+slot is still a real trade, and its residual is the allow-listed case below.
 
 A move that strands **strictly fewer** placed orders than the committed boundary
 is accepted as a violation-reducing repair; an equal count still refuses
@@ -691,6 +695,15 @@ guard-skipped, those counters are reclassified as in-band and the next plan
 places sells on top of them (live 2026‑10‑30: counters at 1329.7–1345.7 were
 held behind boundary 133, then sells were rotated onto 1345.728664 — the exact
 price of the buy that had just filled; visible spread 1.5% → 0.3%).
+
+Under the fill-authoritative policy each full fill owes exactly one counter order
+on the opposite rail (`SELL fill at s => counter BUY at s − gapSlots`, `BUY fill
+=> counter SELL at s + gapSlots`). The obligation lives in an in-memory ledger
+keyed by fill key, not in reserved proceeds; sizes stay fund-driven from the side
+budget. At most `gapSlots + 1` new counters are stacked into the grid per cycle
+(oldest debt first); the remainder stays owed. Dust-cancel synthetic fills and
+partial residuals owe no counter — a dust residue is cancelled and the normal
+rotation path re-fills the freed slot.
 
 `deriveRailBoundary` (`dexbot_cow_runtime.ts`, pre-broadcast) therefore clamps
 the boundary to the batch's resulting rails — the batch's own op destinations

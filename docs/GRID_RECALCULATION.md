@@ -533,6 +533,15 @@ All reset/update sources are **independent**:
 - Available-funds resize is triggered by accumulated free funds
 - Runtime execution is serialized by the fill-processing lock and idle/dust deferral
 
+### Partial Residuals and Dust
+
+A partial fill leaves its residual order active; neither that residual nor the
+synthetic fill emitted when a dust residue is cancelled mints a counter debt.
+The counter quota is owed only by a full fill (one counter on the opposite rail).
+When a residual reaches dust size it is cancelled, and the normal rotation path
+re-fills the freed slot. This keeps recalculation cycles from stacking an extra
+counter for the same economic event.
+
 ### Configuration Priority
 1. **All mechanisms are independent** — no global priority or suppression
 2. Each can be configured and disabled separately

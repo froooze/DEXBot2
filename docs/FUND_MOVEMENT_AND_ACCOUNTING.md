@@ -120,6 +120,8 @@ See [developer_guide.md#order-state-helper-functions](developer_guide.md#order-s
 
 **Batch Sizing Algorithm**: Batch size is derived from the grid gap-slot count + 1 (`DEXBot._getGapSlotBatchSize`): a queue depth at or below gapSlots+1 is processed as one unified batch; deeper queues are chunked into repeated batches of gapSlots+1 (the last chunk may be smaller). The same gapSlots+1 size caps order operations per broadcast transaction (oversized op batches are split into sequential broadcasts).
 
+**Counter stacking cap**: every full fill owes one counter order on the opposite rail (SELL fill at slot `s` ⇒ counter BUY at `s − gapSlots`; BUY fill ⇒ counter SELL at `s + gapSlots`). At most `gapSlots + 1` new counters may be stacked into the grid per cycle, oldest debt first; the remainder stays owed in an in-memory ledger keyed by fill key, not in reserved proceeds. Counter sizes remain fund-driven from the side budget (§3.2). Dust-cancel synthetic fills and partial residuals owe no counter; a dust residue is cancelled and the normal rotation path re-fills the freed slot.
+
 **Configuration**: no fixed constant — both `FILL_PROCESSING.MAX_FILL_BATCH_SIZE` and `COW_PERFORMANCE.MAX_OPS_PER_BROADCAST` were removed; batch sizing follows the grid gap-slot count + 1.
 
 #### Fill Batch Processing Timeline

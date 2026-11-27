@@ -285,17 +285,34 @@ function testGetMetricsExposesNewCounters() {
         'boundaryDriftExceedsWindowCount',
         'gapBandPlacementShadowCount',
         'duplicateOrphanCancelUnverifiedCount',
+        'counterOrdersOwedCount',
+        'counterOrdersPlacedCount',
+        'counterDebtSlotsCount',
     ]) {
         assert.strictEqual(metrics[key], 0, `${key} must be initialized to 0 and surfaced by getMetrics()`);
     }
 
     // The boundary-drift counter is written on the MANAGER metrics object; it
     // must still be surfaced (overlaid) by getMetrics().
-    bot.manager = { _metrics: { boundaryDriftExceedsWindowCount: 7, duplicateOrphanCancelUnverifiedCount: 3 } };
+    bot.manager = {
+        _metrics: {
+            boundaryDriftExceedsWindowCount: 7,
+            duplicateOrphanCancelUnverifiedCount: 3,
+            counterOrdersOwedCount: 11,
+            counterOrdersPlacedCount: 4,
+            counterDebtSlotsCount: 7,
+        },
+    };
     assert.strictEqual(bot.getMetrics().boundaryDriftExceedsWindowCount, 7,
         'manager-side boundary-drift counter must be overlaid into getMetrics()');
     assert.strictEqual(bot.getMetrics().duplicateOrphanCancelUnverifiedCount, 3,
         'manager-owned cancel-verification counter must be overlaid into getMetrics()');
+    assert.strictEqual(bot.getMetrics().counterOrdersOwedCount, 11,
+        'manager-owned counter-owed counter must be overlaid into getMetrics()');
+    assert.strictEqual(bot.getMetrics().counterOrdersPlacedCount, 4,
+        'manager-owned counter-placed counter must be overlaid into getMetrics()');
+    assert.strictEqual(bot.getMetrics().counterDebtSlotsCount, 7,
+        'manager-owned current-debt counter must be overlaid into getMetrics()');
 
     console.log('  PASS');
 }

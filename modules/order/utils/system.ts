@@ -63,7 +63,7 @@
  *   - offMarketFill(manager, type, price) - Cached/fresh-read market bound wrapper
  *   - fillOutsideMarket(manager, type, price, mid) - Same bound against an explicit mid
  *   - fillEvidenceFromEconomics(manager, params, fallbackType) - Shared fill side+price derivation
- *   - releaseRefutedRefusedLevels(manager, previousMid, freshMid) - Drop markers the fresh mid refutes
+ *   - releaseRefutedRefusedLevels(manager, previousMid, freshMid) - Compatibility no-op (no markers exist)
  *   - readFillPipelineState(source) - Projection of the fill-pipeline state
  *   - resolveGridUpdateBlockers(source, options) - Blockers that forbid a grid update right now
  *   - noteGridUpdateBlockers(...) - Log/record the blockers for one decision
@@ -1406,17 +1406,14 @@ export async function refreshLiveMarketPrice(manager: OrderManagerLike, BitShare
  * freshness window so a chain that keeps failing cannot turn the spread check
  * into an RPC loop. The spread path stays RPC-free while the cache is fresh.
  *
- * Forced mode is used by the fill path only, when a fill is about to be vetoed
- * as off-market: a book read that is young in wall-clock time can still be
- * wrong in value after a fast move. It bypasses the fresh-cache shortcut but
- * keeps an independent (short) pacing bound, and returns the CACHED price when
+ * The `force` option and its pacing knobs remain only as compatibility surface:
+ * no live fill path forces a read under the fill-authoritative policy. Forced
+ * mode bypasses the fresh-cache shortcut and returns the CACHED price when
  * paced out — unlike normal mode, where null means "no fresh read".
  *
- * This is the single owner of the market cache, so marker release lives here
- * too: a fresh read from EITHER path (forced fill verification or the
- * time-based spread check) can refute refused-level markers written against an
- * older mid. Releasing only on the fill path left the user-visible symptom in
- * place after a sweep ended and the book recovered on the spread path.
+ * This is the single owner of the market cache. The refused-level marker
+ * release that used to live here is gone (no markers are written); the plain
+ * time-based re-verification diagnostic remains.
  *
  * @param {Object} manager - OrderManager instance
  * @param {unknown} BitShares - BitShares client
@@ -1486,17 +1483,13 @@ export async function maybeRefreshLiveMarketPrice(manager: OrderManagerLike, Bit
     }
     if (Number.isFinite(previousMid) && previousMid > 0 && Math.abs(refreshed - previousMid) > 1e-9) {
         const steps = midStepDistance(manager, previousMid, refreshed);
-        // The step guard is INSIDE the release helper, so both read paths get
-        // the same sub-step-noise protection without duplicating the policy.
-        const released = releaseRefutedRefusedLevels(manager, previousMid, refreshed);
         manager.logger?.log?.(
-            `[LAST-FILL-GUARD] Live mid re-verified: ${previousMid} -> ${refreshed} `
-            + `(${steps.toFixed(1)} step(s)); released ${released} refused level(s) refuted by the fresh read`,
-            'info'
+            `[LAST-FILL-GUARD] Live mid re-verified: ${previousMid} -> ${refreshed} (${steps.toFixed(1)} step(s))`,
+            'debug'
         );
     } else {
         manager.logger?.log?.(
-            `[LAST-FILL-GUARD] Live mid re-verified: ${refreshed}; veto policy unchanged`,
+            `[LAST-FILL-GUARD] Live mid re-verified: ${refreshed}`,
             'debug'
         );
     }
@@ -1688,12 +1681,10 @@ export function reanchorBoundaryFromLastFill(manager: OrderManagerLike, boundary
     // the last chunk under-advances the window and leaves the furthest fill's
     // counter-order in-band. The rail must clear the FURTHEST fill of the side:
     // max slot for SELL fills, min slot for BUY fills.
-    // ELIGIBILITY (R5.9 / §9.10/P1 / §9.12/P1): only fills that could have armed
-    // the guard may move the geometry. Without this filter a premium-sweep fill
-    // that setLastFillPivot refuses can still become the extremum and drag the
-    // boundary down to its own (off-market) level, putting the counter-order
-    // window below a legitimately armed pivot. Every filter leg fails open when
-    // its evidence is absent, so a cold grid still anchors on its first fill.
+    // ELIGIBILITY (§9.16): every fill is market truth and may move the geometry;
+    // only edge-pinned insurance fills are excluded (they are not window
+    // trades). Unreadable classification fails open so a cold grid still
+    // anchors on its first fill.
     let anchorIdx = idx;
     let anchorPrice = price;
     const eligibleFills = Array.isArray(fills)
@@ -1897,44 +1888,22 @@ function isEligibleAnchorFill(
     f: { id?: string; type?: string; price?: unknown } | null | undefined,
     side: string,
     genesis: Parameters<typeof MathUtils.slotIndexForPrice>[1],
-    maxDrift: number
+    _maxDrift: number
 ): boolean {
     if (!f || f.type !== side) return false;
+    // The extremum is resolved from real execution prices by
+    // resolveFillAnchorIndex; only the on-ladder fallback and the edge
+    // exclusion are needed here.
     let price = Number(f.price);
-    let idx: number | null = null;
-    const idIdx = parseSlotIndex(String(f.id ?? ''));
-    const slotIdx = idIdx !== null && idIdx !== undefined && Number.isFinite(Number(idIdx)) ? Number(idIdx) : null;
     if (!Number.isFinite(price) || price <= 0) {
-        if (slotIdx !== null) {
-            try { price = Number(MathUtils.priceForSlot(slotIdx, genesis)); } catch { price = NaN; }
+        const idIdx = parseSlotIndex(String(f.id ?? ''));
+        if (idIdx != null && Number.isFinite(Number(idIdx))) {
+            try { price = Number(MathUtils.priceForSlot(Number(idIdx), genesis)); } catch { price = NaN; }
         }
-    } else {
-        try {
-            const candidateIdx = Number(MathUtils.slotIndexForPrice(price, genesis));
-            const candidateLevel = Number(MathUtils.priceForSlot(candidateIdx, genesis));
-            if (Number.isFinite(candidateIdx) && candidateIdx >= 0
-                && Number.isFinite(candidateLevel) && candidateLevel > 0
-                && Math.abs(candidateLevel - price) / price <= maxDrift) {
-                idx = candidateIdx;
-            }
-        } catch { /* fall through to the slot id */ }
-        if (idx === null && slotIdx !== null) idx = slotIdx;
     }
-    // Off-market: the exact predicate setLastFillPivot applies at every
-    // fill-provenance write. A missing/stale market read returns null (fail open).
-    if (Number.isFinite(price) && price > 0 && offMarketFill(manager, side, price)) return false;
-    // Gap-band residual: not a window trade. Only genuinely unreadable geometry
-    // (missing boundary/manager) fails open to eligible; an unpublished _gapSlots
-    // resolves from the frozen genesis gap / config instead of collapsing to 0.
-    if (idx !== null) {
-        try {
-            const boundaryIdx = (manager as unknown as { boundaryIdx?: string | number | null }).boundaryIdx;
-            const genesisGap = (manager as unknown as { _genesis?: { gapSlots?: unknown } })._genesis?.gapSlots;
-            const gapSlots = MathUtils.resolveGapSlots(manager as never, genesisGap);
-            const geo = OrderUtils.geometryTypeForSlotIndex(idx, boundaryIdx, gapSlots);
-            if (geo === ORDER_TYPES.SPREAD) return false;
-        } catch { /* unreadable geometry: fail open */ }
-    }
+    // Every fill is market truth: no market-bound or gap-band eligibility
+    // filter. A residual that traded in the band still anchors the geometry
+    // and owes its counter. Edge-pinned insurance stays excluded below.
     // Edge-pinned insurance: the same classifier the pivot writer uses. No id
     // means it cannot be classified -> eligible.
     if (f.id != null && String(f.id)) {
@@ -2122,35 +2091,24 @@ export function resolveLastFillGuardReference(manager: OrderManagerLike | null |
 /**
  * GUARD-GENERATION IDENTITY for the spread-stale re-center dedupe.
  *
- * The maintenance watchdog used to key "one re-center per guard generation"
- * off `resolveLastFillGuardReference` alone. A refused (off-market) sweep
- * deliberately leaves that reference COLD, so the key was `''`, the
- * `geometryAlreadyRecentered` watermark could never be set, and the bounded
- * pivot-expiry exit was unreachable for exactly the case it was written for
- * (§9.12 Addendum 3 / retrospective §9.14). Derive the key from the SAME two
- * owners the guard reads: an armed pivot wins; otherwise the oldest live
- * refused level is the generation identity. The oldest entry is stable while a
- * sweep adds adjacent rungs, so one sweep gets one re-center; when it expires
- * the generation genuinely changed and a new key is correct. No new state and
- * no timing value — this is a read contract over existing owners.
+ * The maintenance watchdog keys "one re-center per guard generation" off this
+ * identity so a refused band cannot re-center every cycle. Under the
+ * fill-authoritative policy every fill arms the guard, so the identity is the
+ * armed fill reference (`price|type`); a cold reference returns '' (no refused
+ * fallback exists any more). No new state and no timing value — this is a read
+ * contract over the existing guard reference.
  *
  * @param {Object} manager - OrderManager instance
- * @returns {string} `price|type`, `refused:price|type`, or '' when both cold
+ * @returns {string} `price|type`, or '' when the guard reference is cold
  */
 export function resolveGuardGenerationKey(manager: OrderManagerLike | null | undefined): string {
     const ref = resolveLastFillGuardReference(manager);
     if (ref?.price != null && Number.isFinite(Number(ref.price))) {
         return `${Number(ref.price)}|${String(ref.type ?? '')}`;
     }
-    let oldest: RefusedFillLevel | null = null;
-    for (const entry of refusedFillLevels(manager)) {
-        const at = Number(entry.at);
-        if (oldest === null || at < Number(oldest.at)
-            || (at === Number(oldest.at) && Number(entry.price) < Number(oldest.price))) {
-            oldest = entry;
-        }
-    }
-    return oldest ? `refused:${Number(oldest.price)}|${String(oldest.type)}` : '';
+    // No refused-level markers exist (every fill arms the guard), so a cold
+    // reference is the only generation identity.
+    return '';
 }
 
 /**
@@ -2192,177 +2150,30 @@ export function isLastFillGuardBlocked(price: number, type: unknown, lastPrice: 
     return { blocked: false, pivot: null, threshold: null };
 }
 
-/** Upper bound on distinct refused levels kept in memory (one sweep batch). */
-const MAX_REFUSED_FILL_LEVELS = 64;
+// Refused-level markers are gone: every fill arms the guard, so the armed
+// pivot's direction rule (equal counts as blocked) is the sole same-level
+// protection. Compatibility stubs below keep old callers compiling while the
+// call sites are being removed.
 
 export interface RefusedFillLevel { price: number; type: string; at: number }
 
-/**
- * The refused-level marker set, read with the marker TTL at read time.
- *
- * A premium sweep lifts several adjacent rungs in one batch; keeping only the
- * last refused price let the others be re-placed immediately (live 2026-11-18:
- * five adjacent premium rungs refilled repeatedly in ~7 minutes). The set is
- * the single owner of "which levels may not be re-placed on the same side" —
- * COW placements, startup reconcile and spread correction all read it through
- * isRefusedLevelRefillBlocked. Single-field managers (older stubs/direct test
- * fixtures) fall back to the scalar marker. Expired entries are pruned on read
- * AND before a write extends the set to the cap.
- */
-function isFreshRefusedLevel(e: RefusedFillLevel | null | undefined, now: number, ttl: number): boolean {
-    return !!e && Number.isFinite(e.price) && e.price > 0
-        && (e.type === ORDER_TYPES.BUY || e.type === ORDER_TYPES.SELL)
-        && Number.isFinite(e.at) && e.at > 0 && ttl > 0 && (now - e.at) <= ttl;
-}
-
-function refusedFillLevels(manager: OrderManagerLike | null | undefined): RefusedFillLevel[] {
-    const ttl = Number(GRID_LIMITS.LAST_FILL_REFUSED_LEVEL_TTL_MS);
-    const now = Date.now();
-    const list = manager?._lastRefusedFillLevels;
-    if (Array.isArray(list) && list.length > 0) {
-        const out = list.filter((e) => isFreshRefusedLevel(e, now, ttl));
-        if (out.length !== list.length) {
-            list.length = 0;
-            list.push(...out);
-        }
-        return out;
-    }
-    const one: RefusedFillLevel = {
-        price: Number(manager?._lastRefusedFillPrice),
-        type: String(manager?._lastRefusedFillType ?? ''),
-        at: Number(manager?._lastRefusedFillAt)
-    };
-    return isFreshRefusedLevel(one, now, ttl) ? [one] : [];
-}
-
-/**
- * Read the marker set through its single owner, TTL-pruned at read time. An
- * optional side filter serves callers that need the bind for one rail only —
- * a refused SELL rung is not a BUY-side geometry bind. The returned entries are
- * copies so no caller can mutate the marker behind the owner's back.
- */
 export function liveRefusedFillLevels(
-    manager: OrderManagerLike | null | undefined,
-    type?: string
+    _manager: OrderManagerLike | null | undefined,
+    _type?: string
 ): ReadonlyArray<Readonly<RefusedFillLevel>> {
-    const levels = refusedFillLevels(manager);
-    const matching = (type === ORDER_TYPES.BUY || type === ORDER_TYPES.SELL)
-        ? levels.filter((e) => e.type === type)
-        : levels;
-    return matching.map((e) => ({ price: e.price, type: e.type, at: e.at }));
+    return [];
 }
 
-/** Fill evidence for the COW spread-correction bypass gate: a refused fill is a fill. */
-export function hasLiveRefusedFillLevels(manager: OrderManagerLike | null | undefined, type?: string): boolean {
-    return liveRefusedFillLevels(manager, type).length > 0;
+export function hasLiveRefusedFillLevels(_manager: OrderManagerLike | null | undefined, _type?: string): boolean {
+    return false;
 }
 
-/**
- * Release refused-level markers that a FRESH market read refutes.
- *
- * The marker policy (§9.12/P2 amended) is deliberately narrow: only levels
- * that actually traded stay blocked, for a short TTL. But the classification
- * that WROTE them used the cached mid; when a fast move makes that mid wrong in
- * value, ordinary window fills get marked and their re-places are suppressed
- * for the full marker TTL. Once a new book read proves those levels are inside
- * the market bound again, they are no longer evidence of a premium sweep and
- * must stop blocking. Levels still off-market against the fresh mid stay.
- *
- * The authoritative set AND its legacy scalar mirror are cleared together, so
- * an emptied set cannot resurrect a marker through the scalar fallback.
- *
- * The one-grid-step guard is INSIDE this helper, not at a caller's discretion:
- * sub-step noise in a fresh read must never invalidate a premium-sweep marker.
- * Both the forced fill read and the time-based spread read route through the
- * single price owner, which supplies both mids here.
- *
- * @param {Object} manager - OrderManager instance (or legacy stub)
- * @param {number} previousMid - Mid the refusing classification was made against
- * @param {number} freshMid - Fresh live market price (B/A)
- * @returns {number} Number of released levels
- */
 export function releaseRefutedRefusedLevels(
-    manager: OrderManagerLike | null | undefined,
-    previousMid: number,
-    freshMid: number
+    _manager: OrderManagerLike | null | undefined,
+    _previousMid: number,
+    _freshMid: number
 ): number {
-    const before = Number(previousMid);
-    const after = Number(freshMid);
-    if (!manager || !Number.isFinite(before) || before <= 0
-        || !Number.isFinite(after) || after <= 0) return 0;
-    if (midStepDistance(manager, before, after) < 1) return 0;
-    const fresh = refusedFillLevels(manager);
-    if (fresh.length === 0) return 0;
-    const refuted = fresh.filter((e) => !fillOutsideMarket(manager, e.type, e.price, freshMid));
-    if (refuted.length === 0) return 0;
-    const keyOf = (e: RefusedFillLevel) => `${e.type}|${e.price}|${e.at}`;
-    const refutedKeys = new Set(refuted.map(keyOf));
-    const list = manager._lastRefusedFillLevels;
-    if (Array.isArray(list)) {
-        const kept = list.filter((e: RefusedFillLevel) => !refutedKeys.has(keyOf(e)));
-        if (kept.length !== list.length) {
-            list.length = 0;
-            list.push(...kept);
-        }
-    }
-    // The scalar mirror is legacy observability, but refusedFillLevels falls
-    // back to it when the set is empty — clear it in both shapes.
-    const scalar: RefusedFillLevel = {
-        price: Number(manager._lastRefusedFillPrice),
-        type: String(manager._lastRefusedFillType ?? ''),
-        at: Number(manager._lastRefusedFillAt)
-    };
-    if (refutedKeys.has(keyOf(scalar))) {
-        manager._lastRefusedFillPrice = null;
-        manager._lastRefusedFillType = null;
-        manager._lastRefusedFillAt = 0;
-    }
-    manager.logger?.log?.(
-        `[LAST-FILL-GUARD] Released ${refuted.length} refused level(s) refuted by fresh market mid ${freshMid}`,
-        'info'
-    );
-    return refuted.length;
-}
-
-/**
- * REFUSED-LEVEL SAME-LEVEL RE-FILL BLOCK (§9.12/P2 amended, 2026-11-16).
- *
- * A fill the pivot-arming policy refused (wrong-side / too-far premium sweep)
- * does not arm the direction pivot — deliberately, so the guard keeps trading
- * around the live market instead of deadlocking the side for the pivot TTL.
- * But the same-level re-fill refusal (§9.12/P2: "the exact pivot level remains
- * blocked as a same-level re-fill") keys off the ARMED pivot, so the P1
- * refusal silently suspended it: a spread-correction slot could be re-armed at
- * the identical level and refill immediately, in a loop, for as long as a
- * taker kept lifting it.
- *
- * This predicate closes that gap with a minimal role: every level the current
- * batch refused to arm, same side only, within half a grid step (the shared
- * pricesWithinHalfStep test), for a short in-memory TTL
- * (GRID_LIMITS.LAST_FILL_REFUSED_LEVEL_TTL_MS). Only levels that actually
- * traded are vetoed — a contiguous sweep blocks its own rungs, not a band of
- * prices the market never touched. The counter-side stays governed by the
- * (older) direction pivot and spread correction can still trade around the
- * live market, so the unquoted-side deadlock P1 was written against cannot
- * re-open through it. Fail-open on anything unreadable.
- *
- * @param {Object} manager - OrderManager instance
- * @param {number} price - Candidate placement price
- * @param {string} type - ORDER_TYPES.BUY / ORDER_TYPES.SELL
- * @returns {{blocked: boolean, level: number|null}} Verdict + the matched level
- */
-function isRefusedLevelRefillBlocked(manager: OrderManagerLike | null | undefined, price: unknown, type: unknown): { blocked: boolean; level: number | null } {
-    const p = Number(price);
-    if (!Number.isFinite(p) || p <= 0) return { blocked: false, level: null };
-    if (type !== ORDER_TYPES.BUY && type !== ORDER_TYPES.SELL) return { blocked: false, level: null };
-    const inc = Number((manager?.config as { incrementPercent?: unknown } | undefined)?.incrementPercent);
-    for (const entry of refusedFillLevels(manager)) {
-        if (entry.type !== type) continue;
-        let sameLevel = false;
-        try { sameLevel = MathUtils.pricesWithinHalfStep(p, entry.price, inc); } catch { sameLevel = p === entry.price; }
-        if (sameLevel) return { blocked: true, level: entry.price };
-    }
-    return { blocked: false, level: null };
+    return 0;
 }
 
 /**
@@ -2370,39 +2181,23 @@ function isRefusedLevelRefillBlocked(manager: OrderManagerLike | null | undefine
  * every COW-path guard shares (probe and final gate), so no site re-implements
  * "may this op be placed against the last fill?".
  *
- * Also applies the REFUSED-LEVEL same-level re-fill block (§9.12/P2 amended):
- * a placement on the same side within half a grid step of a fill whose
- * pivot-arm was refused stays blocked even though the direction pivot itself
- * stayed behind that fill. See isRefusedLevelRefillBlocked.
+ * The direction rule itself blocks a same-level re-place (equal counts as
+ * blocked); no refused-level marker exists any more (§9.16).
  *
  * @param {Object} manager - OrderManager instance (geometry for the exemption)
  * @param {number} price - Target price
  * @param {string} type - ORDER_TYPES.BUY/SELL
  * @param {number|null} pivotPrice - Resolved pivot (already ladder-snapped by the caller)
  * @param {string|null} pivotType - Pivot side; null keeps the guard cold
- * @returns {{blocked: boolean, pivot: number|null, threshold?: number|null, bandExempt?: boolean, refusedLevel?: boolean}}
+ * @returns {{blocked: boolean, pivot: number|null, threshold?: number|null, bandExempt?: boolean}}
  */
-export function evaluateLastFillGuard(manager: OrderManagerLike | null | undefined, price: number, type: unknown, pivotPrice: number | null, pivotType: string | null): { blocked: boolean; pivot: number | null; threshold?: number | null; bandExempt?: boolean; refusedLevel?: boolean } {
+export function evaluateLastFillGuard(manager: OrderManagerLike | null | undefined, price: number, type: unknown, pivotPrice: number | null, pivotType: string | null): { blocked: boolean; pivot: number | null; threshold?: number | null; bandExempt?: boolean } {
     const check = isLastFillGuardBlocked(price, type, pivotPrice, pivotType);
     let verdict: { blocked: boolean; pivot: number | null; threshold?: number | null; bandExempt?: boolean };
     if (!check.blocked) verdict = check;
     else if (type === ORDER_TYPES.SELL && isLastFillBandSellExempt(manager, price)) {
         verdict = { blocked: false, pivot: check.pivot, bandExempt: true };
     } else verdict = check;
-    if (!verdict.blocked) {
-        // Fail open on anything unreadable, exactly as isLastFillPlacementBlocked
-        // does: a broken marker must never veto a healthy placement.
-        try {
-            const refused = isRefusedLevelRefillBlocked(manager, price, type);
-            if (refused?.blocked) {
-                // Defensive: an undefined marker result must not throw out of
-                // this best-effort check (the old unguarded `.level` read on a
-                // guard object is the exact shape of a live startup error).
-                const level = Number.isFinite(Number(refused?.level)) ? Number(refused.level) : null;
-                return { blocked: true, pivot: level, threshold: level, refusedLevel: true };
-            }
-        } catch { /* marker is best-effort */ }
-    }
     return verdict;
 }
 
@@ -2512,9 +2307,9 @@ interface GridGenesisLike { priceLevels?: readonly number[] }
  * @param {Object} manager - OrderManager instance (pivot + config.incrementPercent)
  * @param {number} price - Target placement price
  * @param {string} type - ORDER_TYPES.BUY / ORDER_TYPES.SELL
- * @returns {{blocked: boolean, pivot: number|null, reason?: 'direction'|'same-level'|'refused-level'}}
+ * @returns {{blocked: boolean, pivot: number|null, reason?: 'direction'|'same-level'}}
  */
-export function isLastFillPlacementBlocked(manager: OrderManagerLike | null | undefined, price: unknown, type: unknown): { blocked: boolean; pivot: number | null; reason?: 'direction' | 'same-level' | 'refused-level' } {
+export function isLastFillPlacementBlocked(manager: OrderManagerLike | null | undefined, price: unknown, type: unknown): { blocked: boolean; pivot: number | null; reason?: 'direction' | 'same-level' } {
     const numPrice = Number(price);
     if (!Number.isFinite(numPrice) || numPrice <= 0) return { blocked: false, pivot: null };
     let reference: { price: number | null; type: string | null } = { price: null, type: null };
@@ -2522,15 +2317,8 @@ export function isLastFillPlacementBlocked(manager: OrderManagerLike | null | un
     const pivot = reference.price;
     const pivotType = reference.type;
     if (pivot == null || pivotType == null) {
-        // Cold direction pivot: a refused (off-market) fill marker can still be
-        // live and must keep blocking the same-level re-fill (§9.12/P2 amended).
-        try {
-            const refused = isRefusedLevelRefillBlocked(manager, numPrice, type);
-            if (refused?.blocked) {
-                const level = Number.isFinite(Number(refused?.level)) ? Number(refused.level) : null;
-                return { blocked: true, pivot: level, reason: 'refused-level' };
-            }
-        } catch { /* fail-open */ }
+        // Cold pivot: no fill has been refused (every fill arms), so there is
+        // no marker to fall back to.
         return { blocked: false, pivot: null };
     }
     if (type !== ORDER_TYPES.BUY && type !== ORDER_TYPES.SELL) return { blocked: false, pivot };
@@ -2540,7 +2328,7 @@ export function isLastFillPlacementBlocked(manager: OrderManagerLike | null | un
         }
     } catch { /* fall through to the direction rule */ }
     const guard = evaluateLastFillGuard(manager, numPrice, type, pivot, pivotType);
-    if (guard.blocked) return { blocked: true, pivot: guard.pivot, reason: (guard as { refusedLevel?: boolean }).refusedLevel ? 'refused-level' : 'direction' };
+    if (guard.blocked) return { blocked: true, pivot: guard.pivot, reason: 'direction' };
     return { blocked: false, pivot };
 }
 
@@ -3067,14 +2855,12 @@ export function normalizeLastMarketFill(row: unknown): { price: number; type: st
  * @returns {{ steps: number, mid: number, kind?: 'wrong-side'|'too-far' } | null}
  *   Off-market detail, or null when the fill is window evidence / unknowable
  */
-export function offMarketFill(manager: OrderManagerLike, type: string, price: number): { steps: number; mid: number; kind?: 'wrong-side' | 'too-far' } | null {
-    const mid = Number(manager?._liveMarketPrice);
-    const midAt = Number(manager?._liveMarketPriceAt);
-    if (!Number.isFinite(mid) || mid <= 0) return null;
-    if (!Number.isFinite(midAt) || midAt <= 0) return null;
-    const freshMs = Number(GRID_LIMITS.LAST_FILL_PIVOT_MARKET_FRESH_MS);
-    if (!(freshMs > 0) || (Date.now() - midAt) > freshMs) return null;
-    return fillOutsideMarket(manager, type, price, mid);
+export function offMarketFill(_manager: OrderManagerLike, _type: string, _price: number): null {
+    // Fills are market truth. A cached book mid is no longer compared against
+    // an execution: every fill arms the guard, crawls the boundary and may
+    // anchor the geometry. The predicate is kept as the single (now neutral)
+    // owner so call sites need no per-path policy of their own.
+    return null;
 }
 
 /**
@@ -3194,109 +2980,15 @@ export function fillEvidenceFromEconomics(
  * @returns {Promise<number|null>} Price used for the decision, or null when no read happened
  */
 export async function verifyFillMarketReference(
-    manager: OrderManagerLike,
-    BitShares: unknown,
-    fills: unknown,
-    options: { now?: number } = {}
+    _manager: OrderManagerLike,
+    _BitShares: unknown,
+    _fills: unknown,
+    _options: { now?: number } = {}
 ): Promise<number | null> {
-    if (!manager || !Array.isArray(fills) || fills.length === 0) return null;
-    // Only fills the writer can actually veto are worth a forced read.
-    // recordLastFilledPrices skips edge-pinned fills and gap-band residuals
-    // BEFORE the pivot writer runs, so a read for those batches would burn an
-    // RPC for a veto that can never be applied. Reuse both shared classifiers
-    // so the gate and the writer cannot disagree on eligibility. Economics-
-    // derived unmatched fills carry no slot id and stay eligible — they DO
-    // write the pivot at the attribution sites.
-    let edgeFillIds: Set<string> | null = null;
-    let gapSlots: number | null = null;
-    const boundaryIdx = (manager as unknown as { boundaryIdx?: number | string | null })?.boundaryIdx;
-    try {
-        edgeFillIds = OrderUtils.collectEdgePinnedFillIds(
-            manager as unknown as Parameters<typeof OrderUtils.collectEdgePinnedFillIds>[0],
-            fills as Array<{ id?: string; type?: string }>
-        );
-        gapSlots = MathUtils.resolveGapSlots(manager);
-    } catch { /* unreadable geometry: keep every candidate eligible (fail open) */ }
-    const candidates: Array<{ type: string; price: number }> = [];
-    for (const raw of fills) {
-        const item = raw as {
-            type?: unknown; price?: unknown; order?: { price?: unknown }; id?: unknown;
-            paysAssetId?: unknown; paysAmountRaw?: unknown;
-            receivesAssetId?: unknown; receivesAmountRaw?: unknown;
-        } | null;
-        let type = String(item?.type ?? '');
-        let price = Number(item?.price ?? item?.order?.price);
-        if ((type !== ORDER_TYPES.BUY && type !== ORDER_TYPES.SELL) || !Number.isFinite(price) || price <= 0) {
-            // Raw fill economics: derive through the SAME single owners the
-            // unmatched-fill attribution path uses, so the evidence judged by
-            // this gate is the evidence the pivot writer will record.
-            try {
-                const derived = fillEvidenceFromEconomics(manager, {
-                    paysAssetId: item?.paysAssetId,
-                    paysAmountRaw: item?.paysAmountRaw,
-                    receivesAssetId: item?.receivesAssetId,
-                    receivesAmountRaw: item?.receivesAmountRaw,
-                }, type === ORDER_TYPES.BUY || type === ORDER_TYPES.SELL ? type : undefined);
-                if (derived) { type = derived.type; price = derived.price; }
-            } catch { /* malformed fill: fall through to the slot fallback */ }
-        }
-        if (!Number.isFinite(price) || price <= 0) {
-            try {
-                const slot = item?.id != null ? manager.orders?.get(String(item.id)) : null;
-                price = Number((slot as { price?: unknown } | null)?.price);
-            } catch { price = NaN; }
-        }
-        const fillId = item?.id != null ? String(item.id) : null;
-        if (fillId && edgeFillIds?.has(fillId)) continue;
-        if (fillId) {
-            try {
-                const idx = parseSlotIndex(fillId);
-                if (OrderUtils.geometryTypeForSlotIndex(idx, boundaryIdx, gapSlots) === ORDER_TYPES.SPREAD) continue;
-            } catch { /* unreadable geometry — treat as eligible */ }
-        }
-        if ((type === ORDER_TYPES.BUY || type === ORDER_TYPES.SELL) && Number.isFinite(price) && price > 0) {
-            candidates.push({ type, price });
-        }
-    }
-    if (candidates.length === 0) return null;
-    // Fast path: no veto candidate against the cached mid — no extra RPC.
-    if (!candidates.some((c) => offMarketFill(manager, c.type, c.price))) return null;
-
-    const before = Number(manager?._liveMarketPrice);
-    const hasClientSurface = Boolean((BitShares as { db?: unknown } | null | undefined)?.db);
-    const readState = { value: false };
-    const refreshed = await maybeRefreshLiveMarketPrice(manager, BitShares, { force: true, now: options?.now, didRead: readState });
-    if (refreshed == null) {
-        // A missing client is not a failed read: the price owner skips it
-        // without stamping the forced clock. Warn only when a real book read
-        // was attempted and came back unusable, so a dry/no-client path with a
-        // cached mid does not warn once per fill chunk.
-        manager.logger?.log?.(
-            hasClientSurface
-                ? '[LAST-FILL-GUARD] Off-market fill candidate could not re-verify the live mid; '
-                    + `cached ${Number.isFinite(before) && before > 0 ? before : 'none'} retained — veto policy unchanged`
-                : '[LAST-FILL-GUARD] Off-market fill candidate not re-verified: no order-book client; cached veto policy unchanged',
-            hasClientSurface ? 'warn' : 'debug'
-        );
-        return null;
-    }
-    if (!readState.value) {
-        manager.logger?.log?.('[LAST-FILL-GUARD] Live mid verification paced out; cached veto policy unchanged', 'debug');
-        return refreshed;
-    }
-    // Marker release is owned by the single price writer, which runs this
-    // refresh for BOTH forced fill reads and time-based spread reads. Keeping
-    // it there means a sweep whose markers were written from a stale mid is
-    // also cleared when the book recovers on the spread path after the sweep
-    // ends (no further veto candidate to re-enter this gate). The gate only
-    // reports the veto consequence; it does not re-implement release policy.
-    manager.logger?.log?.(
-        Number.isFinite(before) && before > 0 && Math.abs(refreshed - before) > 1e-9
-            ? `[LAST-FILL-GUARD] Fill veto candidates judged against re-verified mid ${before} -> ${refreshed}`
-            : `[LAST-FILL-GUARD] Fill veto candidates judged against unchanged mid ${refreshed}; veto stands`,
-        'debug'
-    );
-    return refreshed;
+    // No fill can be refused, so there is nothing to re-verify. Kept as the
+    // single no-op call site so every intake path stays symmetric and no RPC
+    // is spent on the fill path.
+    return null;
 }
 
 /**
@@ -3323,77 +3015,9 @@ export function setLastFillPivot(manager: OrderManagerLike, type: string, price:
     if (type !== ORDER_TYPES.BUY && type !== ORDER_TYPES.SELL) return false;
     const p = Number(price);
     if (!Number.isFinite(p) || p <= 0) return false;
-    // LAST-FILL-PIVOT MARKET BOUND (fill provenance only): a real fill may arm
-    // the guard only when it is evidence of the CURRENT window — on the
-    // market's own side of the live reference AND within a full spread of it.
-    // A wrong-side fill is a crossed-book artifact; a fill many steps away on
-    // the honest side is a premium sweep of our own rail. Both are cases where
-    // arming the pivot vetoes the very band the geometry derives, for the full
-    // 24h TTL. Fail-open when no fresh live price exists: an ancient mid must
-    // never veto a fresh fill after a fast move.
-    // Deliberately applied to EVERY fill-provenance write (direct fills,
-    // queued-fill refresh, rebuild re-arm) so no path can re-arm an
-    // off-market row. The market-fill reference is skipped with it — an
-    // off-market row as the crossing floor would freeze correction the same
-    // way.
-    if (provenance === 'fill') {
-        const offMarket = offMarketFill(manager, type, p);
-        if (offMarket) {
-            const why = offMarket.kind === 'too-far'
-                ? `it priced ${offMarket.steps} grid step(s) away from the live market `
-                    + `${offMarket.mid} — a premium sweep of our own rail, not a window trade`
-                : `it priced ${offMarket.steps} grid step(s) on the wrong side of the live market `
-                    + `${offMarket.mid} — a crossed-book artifact, not market truth`;
-            // REFUSED-LEVEL MARKER (§9.12/P2 amended): the fill does not arm the
-            // direction pivot, but its LEVEL must still refuse the immediate
-            // re-place at the just-filled price. Without this the P1 refusal
-            // silently suspended the P2 same-level block (which keys off the
-            // ARMED pivot): a spread-correction slot re-armed at the identical
-            // level and refilled in a loop for as long as a taker kept lifting
-            // it (live 2026-11-16: 5 full fills at one premium level in 2.5
-            // minutes). In-memory, TTL-bounded (LAST_FILL_REFUSED_LEVEL_TTL_MS).
-            try {
-                const now = Date.now();
-                manager._lastRefusedFillPrice = p;
-                manager._lastRefusedFillType = type;
-                manager._lastRefusedFillAt = now;
-                // The set is the authoritative marker: a sweep refuses several
-                // rungs in one batch, and each must stay blocked for the TTL.
-                const levels = manager._lastRefusedFillLevels || (manager._lastRefusedFillLevels = []);
-                const ttl = Number(GRID_LIMITS.LAST_FILL_REFUSED_LEVEL_TTL_MS);
-                // Prune before dedup/cap so an expired rung never survives just
-                // because it sat at index 0, and eviction is TTL-ordered (oldest
-                // clock first) instead of insertion-ordered — a re-refused level
-                // gets a fresh `at` and must not be evicted ahead of staler ones.
-                const fresh = levels.filter((e) => isFreshRefusedLevel(e, now, ttl));
-                if (fresh.length !== levels.length) {
-                    levels.length = 0;
-                    levels.push(...fresh);
-                }
-                const inc = Number((manager?.config as { incrementPercent?: unknown } | undefined)?.incrementPercent);
-                let merged = false;
-                for (const entry of levels) {
-                    if (entry.type !== type) continue;
-                    let same = false;
-                    try { same = MathUtils.pricesWithinHalfStep(p, entry.price, inc); } catch { same = p === entry.price; }
-                    if (same) { entry.price = p; entry.at = now; merged = true; break; }
-                }
-                if (!merged) levels.push({ price: p, type, at: now });
-                if (levels.length > MAX_REFUSED_FILL_LEVELS) {
-                    levels.sort((a, b) => a.at - b.at);
-                    levels.splice(0, levels.length - MAX_REFUSED_FILL_LEVELS);
-                }
-            } catch { /* marker is best-effort */ }
-            const ttlMin = Math.round(Number(GRID_LIMITS.LAST_FILL_REFUSED_LEVEL_TTL_MS) / 60000);
-            manager.logger?.log?.(
-                `[LAST-FILL-GUARD] Refusing to arm pivot ${p}(${type}): ${why}; the guard `
-                + `stays as-is and spread correction keeps trading around the live market; `
-                + `the just-filled level stays blocked as a same-level re-fill for ${ttlMin}m`,
-                'warn'
-            );
-            return false;
-        }
-    }
+    // Every fill arms the guard. Same-level re-placement is still refused by
+    // the direction rule (equal counts as blocked), so no separate marker is
+    // needed for a refused arm.
     const now = Number.isFinite(Number(atMs)) && Number(atMs) > 0 ? Number(atMs) : Date.now();
     manager._lastFilledPrice = p;
     manager._lastFilledType = type;
@@ -3440,12 +3064,6 @@ export function resetLastFillPivot(manager: OrderManagerLike, reason: string = '
     manager.lastFillPivotSource = null;
     manager._lastFilledBuyPrice = null;
     manager._lastFilledSellPrice = null;
-    // The refused-level marker belongs to the same guard generation: a grid
-    // rebuild invalidates the geometry (and any marker read against it).
-    manager._lastRefusedFillPrice = null;
-    manager._lastRefusedFillType = null;
-    manager._lastRefusedFillAt = 0;
-    manager._lastRefusedFillLevels = [];
     if (wasArmed) {
         try {
             manager.logger?.log?.(`[LAST-FILL-GUARD] Pivot cleared (${reason}); guard re-arms on the next fill`, 'info');

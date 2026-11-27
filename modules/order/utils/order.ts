@@ -130,7 +130,8 @@ import { ORDER_TYPES, ORDER_STATES, TIMING, FEE_PARAMETERS, GRID_LIMITS, NATIVE_
 import * as Format from '../format.js';
 import * as MathUtils from './math.js';
 import Logger from '../../order/logger.js';
-import { sleep, resolveSpreadCrossingFloor, offMarketFill, fillEvidenceFromEconomics } from './system.js';
+import { sleep, resolveSpreadCrossingFloor, fillEvidenceFromEconomics } from './system.js';
+import { recordCounterDebt } from './counter_debt.js';
 import { withTimeout } from './timeout.js';
 import { getErrorMessage, getErrorCode, getErrorName } from '../../utils/errors.js';
 import { hasGenesisLadder } from '../genesis_policy.js';
@@ -679,21 +680,12 @@ function attributeUnmatchedFillToGrid(
     //    slot that is actually a HOLE the grid owns — a crawl is owed because
     //    the level must be re-placed, which cannot happen while an order still
     //    occupies it (and cannot be consumed for a slot that does not exist).
-    //    MARKET-BOUND ELIGIBILITY (§9.13/F1): strategy.processFillsOnly refuses
-    //    an off-market fill at THIS writer, because the record stores no price
-    //    and the downstream derivation cannot re-judge it. This path is the
-    //    second writer of the same ledger (orphan-credit / unmatched-fill), so
-    //    it must apply the identical single predicate or a premium sweep can
-    //    re-enter the owed crawl the guard just refused and drag the boundary
-    //    after it. Fail-open on a stale/missing market read: a cold grid still
-    //    owes its first genuine crawl. Re-delivery replaces, never stacks; dry
-    //    runs never commit a boundary, so they must not grow the ledger.
+    //    Every fill is market truth: an eligible fill leaves an owed crawl at
+    //    this second writer too. Re-delivery replaces, never stacks; dry runs
+    //    never commit a boundary, so they must not grow the ledger.
     const slotIsHole = !!slot && !isOrderPlaced(slot);
-    let marketEligible = true;
-    try { marketEligible = !offMarketFill(mgr as OrderManagerLike, type, price); }
-    catch { /* unreadable market read fails open — same as the pivot writer */ }
     const ledgerAvailable = Array.isArray(mgr._pendingFillCrawls);
-    const crawlOwed = slotIsHole && marketEligible && mgr.config?.dryRun !== true && ledgerAvailable;
+    const crawlOwed = slotIsHole && mgr.config?.dryRun !== true && ledgerAvailable;
     try {
         if (crawlOwed && slotId) {
             const pending = mgr._pendingFillCrawls as Array<{ slotId?: string; side?: string; ts?: number }>;
@@ -705,15 +697,25 @@ function attributeUnmatchedFillToGrid(
         }
     } catch { /* best-effort: the pivot above is the fail-safe */ }
 
+    // 3. Counter obligation: this second attribution writer must mint the
+    // same debt as processFillsOnly. A re-delivery of an already-debited fill
+    // is deduped by the fill-key ledger.
+    recordCounterDebt(mgr, {
+        id: slotId ?? undefined,
+        type,
+        price,
+        orderId: chainOrderId as string | undefined,
+        isPartial: input.isPartial
+    });
+
     mgr.logger?.log?.(
         `[SYNC] Fill for order ${chainOrderId ?? 'unknown'} attributed to ${slotId} via ${identity} ` +
         `(${type} @ ${Format.formatPrice6(price)}): ` +
         `${pivotRecorded ? 'pivot recorded' : 'pivot NOT armed (edge-pinned fill or no writer)'}` +
         `${crawlOwed ? ' + owed boundary crawl'
             : (slotIsHole
-                ? (!marketEligible ? ' (off-market fill: no crawl)'
-                    : (mgr.config?.dryRun === true ? ' (dry run: no crawl)'
-                        : (ledgerAvailable ? '' : ' (no crawl ledger: no crawl)')))
+                ? (mgr.config?.dryRun === true ? ' (dry run: no crawl)'
+                    : (ledgerAvailable ? '' : ' (no crawl ledger: no crawl)'))
                 : ' (slot still holds a live order: no crawl)')}` +
         `; accounting already booked`,
         'warn'
@@ -3752,13 +3754,9 @@ function deriveTargetBoundary(fills: Array<{ id?: string; price?: number; type?:
     const consumedAll = (): CrawlEntry[] => allPending.map(toCrawlEntry);
     for (const fill of fills ?? []) {
         if (!isShiftEligibleFill(fill)) continue;
-        // MARKET-BOUND ELIGIBILITY (R5.9 / §9.12/P1): a premium sweep of our own
-        // rail is not window evidence. Letting every swept fill crawl the
-        // boundary one step drags the whole window away from a live market that
-        // never traded there; the guard and the anchor already refuse these
-        // fills, so the crawl must use the SAME predicate. Injected by the caller
-        // (system.ts owns offMarketFill) to keep this module free of a circular
-        // import; omitted => legacy behaviour for older/fixture callers.
+        // Fill-authoritative: every eligible fill contributes one boundary
+        // step. The optional predicate is kept only for legacy/fixture callers
+        // that still pass one; live callers omit it.
         if (isFillEligibleForCrawl && !isFillEligibleForCrawl(fill)) continue;
         if (fill && fill.type === ORDER_TYPES.BUY && edgeBuyIds && fill.id != null && edgeBuyIds.has(fill.id)) continue;
         if (fill && fill.type === ORDER_TYPES.SELL && edgeSellIds && fill.id != null && edgeSellIds.has(fill.id)) continue;

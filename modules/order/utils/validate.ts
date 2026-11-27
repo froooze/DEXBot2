@@ -650,7 +650,15 @@ function reconcileGrid(masterGrid: Map<string, ManagedOrder>, targetGrid: Map<st
 
         const isBuy = surpluses[0]?.master?.type === ORDER_TYPES.BUY;
         const slotIdx = (id: string) => { const p = parseSlotIndex(id); return p == null ? Number.MAX_SAFE_INTEGER : p; };
+        // Counter-quota holes go first: one fill owes one counter, and an
+        // older ordinary hole must not consume the rotation/CREATE budget.
+        const isCounter = (h: HoleEntry) => Boolean(
+            (h.order.metadata as { counterForFillKey?: unknown } | undefined)?.counterForFillKey
+        );
         healthyHoles.sort((a, b) => {
+            const ca = isCounter(a);
+            const cb = isCounter(b);
+            if (ca !== cb) return ca ? -1 : 1;
             const da = slotIdx(a.id);
             const db = slotIdx(b.id);
             if (da !== db) return da - db;

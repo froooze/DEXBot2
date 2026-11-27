@@ -99,7 +99,8 @@ import type {
     ChainFundsSnapshot,
     OrderType,
     OrderState,
-    UnknownRecord
+    UnknownRecord,
+    CounterDebtEntry
 } from '../types.js';
 const { toFiniteNumber } = Format;
 
@@ -686,6 +687,8 @@ class OrderManager implements OrderManagerLike {
     _fundDriftLedger: { side: string; direction: string; count: number; firstAt: number; lastAt: number } | null;
     _pendingRecovery: Promise<void> | null;
     _pendingFillCrawls: { slotId: string; side: string; ts: number }[];
+    /** In-memory one-counter-per-fill obligations; never persisted. */
+    _counterDebt: Map<string, CounterDebtEntry>;
     /**
      * Chain-size resizes already absorbed by sync pass 1 (partial fill seen in
      * an open-orders snapshot). The fill-history batch that follows the same
@@ -705,15 +708,6 @@ class OrderManager implements OrderManagerLike {
     _lastFilledPrice: number | null;
     _lastFilledType: string | null;
     _lastFilledAt: number;
-    // Refused (off-market) fill level: the pivot-arming refusal (§9.12/P1)
-    // still marks its level as a same-level re-fill block (§9.12/P2 amended).
-    // In-memory only — never persisted, cleared by resetLastFillPivot.
-    // LEGACY mirror of the latest refusal; production reads the set below.
-    _lastRefusedFillPrice: number | null;
-    _lastRefusedFillType: string | null;
-    _lastRefusedFillAt: number;
-    /** All levels refused from arming in this batch (multi-rung sweeps). */
-    _lastRefusedFillLevels: Array<{ price: number; type: string; at: number }>;
     /** Timestamp of the fill reference whose read-time expiry was already logged (one line per expired value). */
     _lastFillPivotExpiryLoggedAt: number;
     lastFillPivotSource: 'fill' | 'book' | null;
@@ -893,6 +887,7 @@ class OrderManager implements OrderManagerLike {
         this._fundDriftLedger = null;
         this._pendingRecovery = null;
         this._pendingFillCrawls = [];
+        this._counterDebt = new Map();
         this._chainSizeAppliedFills = new Map();
         this._recentFillKeysSnapshot = null;
         this._lastStaleTotalsWarnAt = {};
@@ -901,10 +896,6 @@ class OrderManager implements OrderManagerLike {
         this._lastFilledPrice = null;
         this._lastFilledType = null;
         this._lastFilledAt = 0;
-        this._lastRefusedFillPrice = null;
-        this._lastRefusedFillType = null;
-        this._lastRefusedFillAt = 0;
-        this._lastRefusedFillLevels = [];
         this._lastFillPivotExpiryLoggedAt = 0;
         // Pivot provenance for the LAST-FILL-GUARD persist/restore contract:
         // 'fill' = armed by a real fill (persist-eligible), 'book' = armed by
@@ -2414,12 +2405,8 @@ class OrderManager implements OrderManagerLike {
             // the boundary crawls, so a later derivation applies them. The
             // region-end hook schedules the deferred rebalance.
             //
-            // RE-ANCHOR BUDGET SNAPSHOT: the absolute fill anchor is a per-batch
-            // budget spent at PLAN time (strategy.calculateTargetGrid). Carry the
-            // pre-plan value so a stale-plan re-plan can hand back exactly what
-            // the abandoned plan spent (a static batch base would wrongly refund
-            // an anchor an earlier chunk legitimately committed).
-            const reanchorBudgetBefore = Number((this as unknown as { _boundaryReanchorBudget?: unknown })._boundaryReanchorBudget);
+            // The absolute fill anchor is one batch-extremum move per plan; no
+            // budget snapshot is needed any more.
             const rebalanceResult = await this.performSafeRebalance(orders, excl, {
                 ...(options || {}),
                 deferIfBroadcasting: true,
@@ -2432,7 +2419,6 @@ class OrderManager implements OrderManagerLike {
             // stale between planning and broadcast.
             rebalanceResult.fills = orders;
             rebalanceResult.excludeIds = excl || new Set();
-            (rebalanceResult as unknown as { _reanchorBudgetBeforePlan?: number })._reanchorBudgetBeforePlan = reanchorBudgetBefore;
             return rebalanceResult;
         }
 
@@ -2852,24 +2838,15 @@ class OrderManager implements OrderManagerLike {
         const edgeFillIds = collectEdgePinnedFillIds(this as unknown as Parameters<typeof collectEdgePinnedFillIds>[0], fills as Array<{ id?: string; type?: string }>);
         let recorded = 0;
         let skippedEdge = 0;
-        let skippedInBand = 0;
+
         let lastKind = 'unknown';
         let lastPriceSrc = 'direct';
         for (const f of fills) {
             if (!f || (f.type !== ORDER_TYPES.BUY && f.type !== ORDER_TYPES.SELL)) continue;
             if (f.id != null && edgeFillIds.has(String(f.id))) { skippedEdge++; continue; }
-            // Geometry eligibility: an in-band slot is not a window trade. Fails
-            // OPEN when the geometry is unreadable (no boundary/gap yet), because
-            // a cold grid must still arm on its first real fill.
-            if (f.id != null) {
-                try {
-                    const idx = parseSlotIndex(String(f.id));
-                    // Live drain-time geometry: the published/config gap is
-                    // authoritative here, not the frozen genesis gap.
-                    const geom = geometryTypeForSlotIndex(idx, this.boundaryIdx, resolveGapSlots(this));
-                    if (geom === ORDER_TYPES.SPREAD) { skippedInBand++; continue; }
-                } catch { /* unreadable geometry — treat as eligible */ }
-            }
+            // A residual in the gap band is still a real fill. Under the
+            // fill-authoritative policy it arms the guard and owes its counter;
+            // gap-band geometry no longer suppresses it.
             let price: number | null = Number(f.price ?? f.order?.price);
             let priceSrc = 'direct';
             if (!Number.isFinite(price) || (price as number) <= 0) {
@@ -2896,18 +2873,14 @@ class OrderManager implements OrderManagerLike {
                     `[FILL-PIVOT] pivot=${fmt(this._lastFilledPrice)}(${this._lastFilledType}) ` +
                     `buy=${fmt(this._lastFilledBuyPrice)} sell=${fmt(this._lastFilledSellPrice)} ` +
                     `n=${recorded} src=${lastKind}/${lastPriceSrc}` +
-                    `${skippedEdge > 0 ? ` edge-skipped=${skippedEdge}` : ''}` +
-                    `${skippedInBand > 0 ? ` band-skipped=${skippedInBand}` : ''}`,
+                    `${skippedEdge > 0 ? ` edge-skipped=${skippedEdge}` : ''}`,
                     'info'
                 );
             } catch { /* logging is best-effort */ }
-        } else if (skippedEdge > 0 || skippedInBand > 0) {
+        } else if (skippedEdge > 0) {
             try {
-                const parts: string[] = [];
-                if (skippedEdge > 0) parts.push(`${skippedEdge} edge-pinned`);
-                if (skippedInBand > 0) parts.push(`${skippedInBand} gap-band (stranded residual)`);
                 this.logger?.log?.(
-                    `[FILL-PIVOT] ${parts.join(' + ')} fill(s) ignored — the guard pivot and the boundary anchor stay on the last window trade`,
+                    `[FILL-PIVOT] ${skippedEdge} edge-pinned fill(s) skipped — edge insurance is not a window trade`,
                     'info'
                 );
             } catch { /* logging is best-effort */ }

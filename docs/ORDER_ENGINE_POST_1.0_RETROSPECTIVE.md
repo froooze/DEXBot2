@@ -15,7 +15,9 @@
 > its change landed as `06b9d6a4`. §9 is the v1.6.4 → v1.6.17 addendum; §9.10 closes the
 > v1.6.18 review pass, §9.11 carries v1.6.18 → v1.7.1, §9.12 records the revised-priority
 > review, §9.13 records the post-1.7.3 out-of-spread incident and its fixes, and §9.14
-> records the LAST-FILL-GUARD audit-side defect and the post-1.0 residuals.
+> records the LAST-FILL-GUARD audit-side defect and the post-1.0 residuals; §9.16
+> records the fill-authoritative counter policy that supersedes the refusal machinery
+> described in §9.12/§9.13/§9.15 (as design intent — the amending change is in flight).
 >
 > **Section numbering:** Part II deliberately keeps its original `§0`–`§8` numbers because
 > source-code comments and tests cite them (e.g. `… §2 fix #1`, `… §3 lineage`); §9 is a
@@ -58,6 +60,8 @@
   - 9.12 Revised priority list: counter-orders, pivot evidence and level-triggered repair
   - 9.13 Post-1.7.3 out-of-spread incident: sweep eligibility and the silent watchdog
   - 9.14 Fix plan — LAST-FILL-GUARD audit-side defect and post-1.0 residuals
+   - 9.15 Post-v1.7.3 propagation fixes: guard generation and gate ownership
+   - 9.16 Fill-authoritative policy: every fill is market evidence, one counter per fill
 - A. Grid-Price Invariant — former failure trace (appendix)
 
 ---
@@ -93,7 +97,7 @@ local state.
 | **Stale window after a fill** | A fill is queued but not yet absorbed; the master still counts the filled slot ACTIVE, so a window top-up re-creates the expensive end of the rail and re-buys into a stale pivot | `hasUnsettledFills` defers the targeted reconcile and the window top-up (1:1 repairs still run) + attribution of the real execution price (§9.11.1) |
 | **Fill identity by chain id** | `virtualizeOrder` nulls `orderId`, so a real fill matched no ACTIVE slot and was dropped *after* its accounting was booked; pivot and owed crawl stayed on a stale, higher price | `attributeUnmatchedFillToGrid` falls back to the genesis level of the execution price, refuses prices outside the frozen rail, and owes a crawl only for a hole the grid owns (§9.11.1) |
 | **Chain-existence bookkeeping** | Seven structures with seven clocks; four read sites consulted four subsets and could give four answers for one order | `modules/order/lifecycle.ts`: one record per slot, `unknown` is a real phase, every absence decision asks the same time-bounded `isInFlight()` (§9.11.3) |
-| **Sweep fill drives geometry** | A premium sweep of our own rail is not window evidence, but the crawl counted every swept fill and dragged the boundary ~20 steps below a live market that never traded there; off-market fills could also win the re-anchor extremum | The market-bound predicate (`offMarketFill`) is injected into the crawl and applied at the pending-crawl writer, and the anchor filters its batch extremum through the same single-source classifiers (§9.13/F1, §9.13/C1) |
+| **Sweep fill drives geometry** | A premium sweep of our own rail is not window evidence, but the crawl counted every swept fill and dragged the boundary ~20 steps below a live market that never traded there; off-market fills could also win the re-anchor extremum | SUPERSEDED by §9.16: the market-bound predicate (`offMarketFill`) was injected into the crawl and applied at the pending-crawl writer, and the anchor filtered its batch extremum through the same single-source classifiers (§9.13/F1, §9.13/C1); fills are now authoritative |
 | **Partial progress counted as a heal** | A correction reducing excess 14 → 12 cleared the stale clock and skipped the level-triggered recheck, so the book sat wide for 63 minutes with no watchdog line | The clock clears only at zero measured excess (or an unmeasurable read, the compatibility path); a partial reduction keeps the original clock and re-arms the recheck (§9.13/F2) |
 
 Families **not** detailed in Part II: silent hangs and stale correction queues are covered in
@@ -158,13 +162,15 @@ notes; the grid-price invariant has its own doc — [GRID_PRICE_INVARIANT.md](GR
 - **Observability instead of a veto (§9.10/P4):** where a hard guard would re-create a
   deadlock (a counter order crossing the floor by construction), log it once and let the
   chain price it as a taker fill.
-- **One market-bound fill test (§9.13):** `offMarketFill` is the single definition of
+- **One market-bound fill test (§9.13; SUPERSEDED by §9.16):** `offMarketFill` was the single definition of
   “not window evidence”; the pivot writer, the boundary crawl, the re-anchor extremum,
   the unmatched-fill pending-crawl writer and the null-boundary recovery anchor all
   consume it, so a premium sweep cannot move geometry through a path that only the guard
   refuses (fail-open on a stale/missing market read). The second pending-crawl writer was
   the missed case in the original incident review: it records no price, so eligibility
-  cannot be re-applied downstream and must be decided at write time.
+  cannot be re-applied downstream and must be decided at write time. Under §9.16 this whole
+  classifier chain is removed: fills are authoritative at both writers, with no market-bound
+  eligibility decision to re-apply.
 - **A heal is zero excess, not less excess (§9.13):** the stale watchdog clears only
   when the measured violation is gone; a partial improvement keeps the original clock
   so the bounded expiry and level-triggered recheck stay reachable.
@@ -930,7 +936,10 @@ order (reserve the exact proceeds) would prove per-trade funding and delete the
 independent round trips, so sizes stop following the side budget. Spread repair
 must stay fund-driven from the side pool: a SELL fill returns quote while the
 same-side repair needs base, so no fill can ever fund its own side, and pairing
-would hide that asymmetry instead of resolving it.
+would hide that asymmetry instead of resolving it. **§9.16 keeps the rejection and adds
+a quota alternative:** one counter order is still owed per filled slot on the opposite
+rail, but the obligation is a bounded in-memory ledger keyed by fill key — never reserved
+proceeds. Sizing still comes from the side budget, so the asymmetry above stays visible.
 
 #### 9.10 Review pass over v1.6.12 → v1.6.17 (released in v1.6.18)
 
@@ -941,8 +950,10 @@ found the arc sound and identified five gaps. All five are fixed here.
 
 | # | Finding | Fix |
 |---|---|---|
-| P1 | The re-anchor ignored the crawl's EDGE-fill exclusion: `recordLastFilledPrices` armed the pivot on every fill, and the re-anchor is absolute, so one wick on a floor insurance BUY teleported the window to the grid floor (repro: boundary 29 → 0 on a 60-slot ladder; mirror at the ceiling). | Eligibility now lives at the single pivot writer: `collectEdgePinnedFillIds` (the placement pickers' own classifier) is applied in `recordLastFilledPrices`, so an edge fill can neither arm the guard nor anchor the geometry. Partials still anchor (a real trade; residual allow-listed). Pinned by `tests/test_edge_fill_pivot.ts`. |
-| P2 | The rebuild site claimed "the guard re-arms on the first real fill of the new generation" while the read-time fallback silently kept the old-generation pivot — so after a re-center in a market that had moved away, one whole side read `last-fill-blocked` forever AND the 10-minute geometry clock rebuilt the new generation again every cooldown, with no way to succeed. | Re-arm is explicit and logged (`rearmLastFillPivotFromMarketFill`, provenance `fill`, original timestamp) so code and docs agree; the geometry escalation is capped at ONE re-center per pivot (`_lastGeometryResyncPivotKey`) and then reports that only a fill or the pivot TTL restores the side. The pivot's survival is the decision, not an accident. Pinned by `tests/test_last_fill_pivot_rearm.ts` and SLF-11. **v1.7.3:** the 24h-only exit was replaced by the bounded `SPREAD_STALE_PIVOT_EXPIRE_MS` (20 min) after that one re-center; see §9.6. |
+| P1 | The re-anchor ignored the crawl's EDGE-fill exclusion: `recordLastFilledPrices` armed the pivot on every fill, and the re-anchor is absolute, so one wick on a floor insurance BUY teleported the window to the grid floor (repro: boundary 29 → 0 on a 60-slot ladder; mirror at the ceiling). | Eligibility now lives at the single pivot writer: `collectEdgePinnedFillIds` (the placement pickers' own classifier) is applied in `recordLastFilledPrices`, so an edge fill can neither arm the guard nor anchor the geometry. Partials still anchor (a real trade; residual allow-listed). Pinned by `tests/test_edge_fill_pivot.ts`. **§9.16:** the edge-pinned exclusion survives as the documented exception; the market-bound and gap-band fill skips added later under §9.12/P1 are removed. |
+| P2 | The rebuild site claimed "the guard re-arms on the first real fill of the new generation" while the read-time fallback silently kept the old-generation pivot — so after a re-center in a market that had moved away, one whole side read `last-fill-blocked` forever AND the 10-minute geometry clock rebuilt the new generation again every cooldown, with no way to succeed. | Re-arm is explicit and logged (`rearmLastFillPivotFromMarketFill`, provenance `fill`, original timestamp) so code and docs agree; the geometry escalation is capped at ONE re-center per pivot (`_lastGeometryResyncPivotKey`) and then reports that only a fill or the pivot TTL restores the side. The pivot's survival is the decision, not an accident. Pinned by `tests/test_last_fill_pivot_rearm.ts` and SLF-11. **v1.7.3:** the 24h-only exit was replaced by the bounded `SPREAD_STALE_PIVOT_EXPIRE_MS` (20 min) after that one re-center; see §9.6. **§9.16:** the one-re-center cap and bounded expiry stay; the refused-level
+markers later layered around this exemption (§9.12 addenda 2/3, §9.15 Track A) are removed, and
+same-level re-placement is blocked by the direction rule alone (equal counts as blocked). |
 | P3 | `deriveRailBoundary` clamped the boundary to EVERY live rail order: one stray order 18 slots off clamped 138 → 115 and re-typed the whole window (self-legalizing the corrupt state), and it classified rails by slot id while the rest of the engine had moved to live chain prices. | Rail membership = the batch's own op destinations + master orders on their own side of the planned boundary; strays are skipped and named in the log; rail indices come from `resolveLiveOrderLadderPosition`; the result passes the shared `validatePersistedBoundary` gate (cancel/rotation sources allow-listed, sparse ladders excluded because that gate's ceiling is array-derived). Pinned by RAIL-10..14. |
 | P4 | The crossing floor (`doesNotCrossMarket`) exists only in the spread-correction planner, so a generic reconcile/re-fill CREATE can execute as a taker fill where the planner would refuse. | Deliberately NOT blocked (a hard veto re-opens the counter-order deadlock: after a gap the counter sits across the floor by construction and executes at the best available price). Made visible instead: `warnCrossingCreate`, once per batch, from cached evidence only. Pinned by SLF-12. |
 | P5 | `analysis/grid_correction_check.ts` still implemented the OLD `pivot ± increment/2` band and claimed to mirror the guard 1:1, so it reported the tightening placements the direction-only guard allows as violations. | Predicate reduced to the live direction rule (arity-pinned in LFG-5), report/help text updated, `--increment` documented as informational, edge-fill false-positive class documented. |
@@ -1066,16 +1077,18 @@ assertion remains blocking: BUY-versus-SELL collisions inside the bot's own simu
 book are a different invariant. A stale bot-mid must not provide a second floor or veto
 the only action that can narrow a gap.
 
-**P1 — only current-window evidence may arm the pivot.** Fill provenance now has two
+**P1 — only current-window evidence may arm the pivot (SUPERSEDED by §9.16).** Fill provenance then had two
 market-bound checks while the cached market read is fresh: wrong-side fills are refused,
 and fills more than `GRID_LIMITS.LAST_FILL_PIVOT_MAX_MID_DISTANCE_STEPS` ladder steps
 from the market are refused symmetrically. The check fails open when the read is absent
 or stale. Separately, `OrderManager.recordLastFilledPrices` skips fills whose current
 slot is in the gap band: those are stranded residuals, not window trades. Edge-pinned
 fills remain excluded by the existing shared classifier. A rail/window fill is still
-recorded once, by the existing pivot writer.
+recorded once, by the existing pivot writer. **Superseded:** §9.16 removes the distance
+check, the wrong-side refusal and the gap-band skip; `offMarketFill` is a neutral stub and
+every fill arms the guard and contributes to the crawl and the re-anchor.
 
-> **Addendum (2026-11-26, fast move with a time-fresh mid).** In a live market-pair
+> **Addendum (2026-11-26, fast move with a time-fresh mid; SUPERSEDED by §9.16).** In a live market-pair
 > sweep, one bot cached the book mid at `<cached-mid>` one minute before a taker
 > walked it down to `<post-move-mid>`; the mid was *time-fresh* (well inside the
 > 15-minute trust window) but wrong in value. Ten fills across the sweep were
@@ -1106,6 +1119,15 @@ recorded once, by the existing pivot writer.
 > (`TIMING.LAST_FILL_MID_VERIFY_TIMEOUT_MS`) keeps a slow RPC off the fill
 > critical path. Only rebuild re-arm and startup restore remain unverified by
 > design (no client, no live mid).
+>
+> **Superseded by §9.16.** This incident is the direct motivation for the policy change.
+> `verifyFillMarketReference` is now a no-op: no live fill path forces a book
+> re-read. The `LAST_FILL_MID_VERIFY_*` pacing/timeout knobs and the `force`
+> branch of the price owner remain only as compatibility surface (config and
+> exported signature) with no fill-path caller; the time-based spread read is
+> unaffected. The refused-level family (writer, readers, release, generation-key
+> branch) is gone. The cached mid can no longer veto a real fill; no historical
+> refusal signature above is emitted by the new policy.
 
 **P2 — the pivot may not veto its own counter-order territory.** The shared
 `evaluateLastFillGuard` verdict is used by both COW placement checks and the final
@@ -1194,7 +1216,7 @@ Lesson: an offline checker that re-implements gate inputs drifts from the gate i
 audits; it must reconstruct the gate's actual state, and every reconciliation shortcut
 (timestamps, ids, anchors) is a potential false verdict in either direction.
 
-**Addendum 2 (2026-11-16, same-level re-fill loop): the P1 refusal silently suspended
+**Addendum 2 (2026-11-16, same-level re-fill loop; SUPERSEDED by §9.16): the P1 refusal then suspended
 the P2 same-level block.** The sweep window that produced the six policy divergences
 above also produced a second, previously invisible pattern: one premium
 spread-correction slot was re-armed by the correction loop at the identical level and
@@ -1238,13 +1260,19 @@ Amended policy (both sides of the audit line):
    it filled anyway); without marker evidence it is a policy divergence tagged
    `sameLevel`. `--strict` counts every same-level candidate as a violation.
 
-Pinned by `tests/test_refused_level_refill_block.ts` (REFUSED-1..9) and
-`tests/test_same_level_refill_check.ts` (SL-1..10). With the amendment applied, the
-2026-11-16 audit baseline reads: 10 strict candidates = 4 same-level violations (the
+**Superseded by §9.16.** The marker remedy above is removed, not merely narrowed. With every
+fill arming the pivot, the direction rule covers the exact level (equal counts as blocked),
+so no second same-level owner is needed. The historical loop record stays: it explains why
+the marker family existed and why its removal is safe only together with fill-authoritative
+arming.
+
+Historically pinned by `tests/test_refused_level_refill_block.ts` (REFUSED-1..9) and
+`tests/test_same_level_refill_check.ts` (SL-1..10); both suites are to be rewritten under
+§9.16, which removes the marker they pin. With the amendment applied, the 2026-11-16 audit baseline reads: 10 strict candidates = 4 same-level violations (the
 loop) + 6 policy divergences (the sweep re-quotes, unchanged).
 
-**Addendum 3 (2026-11-18, multi-rung sweeps): the refused-level marker is a set,
-not a scalar.** On a live market-pair bot an external taker swept several adjacent
+**Addendum 3 (2026-11-18, multi-rung sweeps; SUPERSEDED by §9.16): the refused-level
+marker was then a set, not a scalar.** On a live market-pair bot an external taker swept several adjacent
 premium SELL rungs in one batch while the market stayed six-to-eleven ladder steps
 below. Every fill was correctly refused from arming the pivot (§9.12/P1), but the
 Addendum-2 marker kept only the LAST refused price, so the other just-filled rungs
@@ -1296,10 +1324,14 @@ Amended policy (still one owner, still no cooldown):
   second writer and a new persisted row against `FILL_PIPELINE.md §2.3` and the
   "no new state" constraint, so it is deliberately out of scope here.
 
-Pinned by `tests/test_fill_one_counter_order.ts` (MULTI-1..14, covering the
-multi-rung sweep, multi-chunk accumulation, TTL-ordered eviction and both
-spread-correction gates) alongside `tests/test_refused_level_refill_block.ts`
-(REFUSED-1..9).
+**Superseded by §9.16.** The marker set, its TTL/eviction policy, the bypass denials and the
+generation-key branch are removed. The multi-rung outcome is now produced by the in-memory
+counter-quota ledger: one counter order per filled slot on the opposite rail, sized from the
+side budget, with at most `gapSlots + 1` new counters stacked per cycle and the rest owed.
+The "persisted rows exclude off-market fills" limit above no longer applies — no fill is
+classified off-market. Historical pinning: `tests/test_fill_one_counter_order.ts`
+(MULTI-1..14) and `tests/test_refused_level_refill_block.ts` (REFUSED-1..9); both are to be
+rewritten for the new policy.
 
 ---
 
@@ -1337,7 +1369,9 @@ the single fill-provenanced ref when none is eligible; every leg fails open on m
 evidence. This closes an independent gap — an edge-pinned or stranded in-band fill can
 no longer teleport the anchor — and makes §9.6's “nor anchor the geometry” true on the
 geometry path. It did **not** cause the incident's 20-step descent. Tests: REANCHOR-24..27,
-EDGE-8, ELIG-6 (all fail on the pre-fix tree).
+EDGE-8, ELIG-6 (all fail on the pre-fix tree). **§9.16:** the `offMarketFill` leg of the
+extremum filter is removed; batch-extremum selection, the on-ladder check and the
+`validatePersistedBoundary` / strictly-fewer-strands repair remain the safety story.
 
 **F1 — market-bound crawl eligibility (`391ba444`, root cause of the descent).**
 `offMarketFill()` is exported as the single predicate; `deriveTargetBoundary()` accepts an
@@ -1346,7 +1380,9 @@ legacy behaviour), and `strategy.ts` injects it and applies the same test at the
 pending-crawl writer so an ineligible fill cannot leave an owed crawl for a later
 derivation to apply. No new classifier, no `order ↔ system` import cycle; fail-open on a
 stale/missing read keeps legitimate fast moves followable. Test: PEND-019 (boundary 94
-without the fix, 95 with it).
+without the fix, 95 with it). **§9.16:** the injected predicate and the pending-crawl writer
+filter are removed; every full fill contributes to the crawl. The cross-chunk crawl cap and
+the edge-pinned exclusion (documented exception) stay in force.
 
 **F2 — partial progress is not a heal (`5a703297`, root cause of the silent hour).**
 `trackOutOfSpreadStaleness()` now clears the clock and geometry memory only when the
@@ -1365,7 +1401,8 @@ level here, so it did not block the two placements. The multi-rung capacity was 
 later by §9.12 Addendum 3 (a set of actually-traded levels, still not a cooldown).
 (3) No crossing veto: §9.10/P4 and §9.2 — a hard reject re-opens the counter-order
 deadlock. (4) No config/sizing/24h-TTL
-change and no new timing window.
+change and no new timing window. Item (2) is historical: §9.16 removes the marker family
+outright rather than changing it; the no-cooldown and no-crossing-veto decisions stand.
 
 **C3 — gone-target routing (`bad3cc30`).** The two pre-broadcast absence checks had
 different failure paths. `runPreBroadcastGuards()` (MODE C(b)) found a missing UPDATE
@@ -1396,7 +1433,9 @@ fixed with mutation-checked regressions:
   second writer of `_pendingFillCrawls` (orphan-credit / unmatched-fill path). `391ba444`
   added the market-bound predicate to the strategy writer only; this writer stores no
   price, so the downstream derivation cannot re-judge it. It now applies the same
-  `offMarketFill` at write time (FA-1b).
+  `offMarketFill` at write time (FA-1b). **§9.16:** that write-time classifier is removed;
+  the attribution path remains the single owner of the owed-crawl record, now with no
+  market-bound test to apply.
   **Migration residual (accepted):** crawls persisted by an older build contain only
   `{slotId, side, ts}`, so a restart cannot retroactively re-judge them against the
   live market. They are not purged here; they are consumed by the next accepted
@@ -1599,7 +1638,9 @@ deadlock, and the queue-refresh line remains non-evidence per §9.12. **Landed:*
 change. Stage 3's spike changed no broadcast code: it first recorded "no test seam",
 then a reproducing fixture was found and landed (see Stage 3 outcome above); the
 decision to leave replay behaviour alone is unchanged. Stage 1 landed separately
-after the log supplied a reproducing case (see above).
+after the log supplied a reproducing case (see above). **§9.16 extends this counter-only
+stance** with `counterOrdersOwedCount`, `counterOrdersPlacedCount` and
+`counterDebtSlotsCount` plus one batch-summary line; none of them gates placement.
 
 **Stage 5 — mirror provenance.** Merged into Stage 0: export anchor kind, pivot source
 and both timestamps with each candidate. Do not introduce a `queue-refresh` observation
@@ -1608,7 +1649,11 @@ class.
 **Stage 6 — non-goals.** No refused-level marker persistence (§9.12 Addendum 3), no
 cooldown/backoff (Addendum 2), no BUY-pivot §9.12/P2 exemption and no crossing veto
 (§9.13 lines 1314–1322), no general market-runaway re-anchor without soak evidence
-(§9.13 lines 1341–1343), and no config/sizing or 24h-TTL change.
+(§9.13 lines 1341–1343), and no config/sizing or 24h-TTL change. **§9.16 supersedes only
+the first clause:** the marker family is removed outright rather than left unpersisted.
+Its counter ledger is in-memory and keyed by fill key; sizing stays fund-driven from the
+side budget (no reserved proceeds), and no config/TTL value changes. The other non-goals
+stand.
 
 **Verification gate for this plan.**
 
@@ -1624,6 +1669,10 @@ Expected: 0 pivot-classified violations; the 11 reclassified candidates listed u
 104 divergences still reported in their own section. Regression suites to keep green:
 `test_refused_level_refill_block`, `test_same_level_refill_check`,
 `test_fill_one_counter_order`, `test_stale_grid_hardening`, `test_incident_replay`.
+**Historical gate:** the two marker suites are to be rewritten under §9.16 (the marker no
+longer exists), and the audit-side expected divergences are no longer produced by a
+market-bound refusal policy; keep the verification commands, update the suite set with the
+change.
 
 **Runner note (from the working copy).** The four-way parallel runner has an
 intermittent cross-file fixture race in two fund tests (they pass standalone; a re-run
@@ -1670,7 +1719,11 @@ bind as `last-fill-blocked` — §9.12 Addendum 3's "reporting is not escalation
 limit is lifted now that the dedupe key is fixed, one sweep still gets one
 re-center, and a refused SELL rung is not mistaken for a BUY-side bind (side-aware
 `hasLiveRefusedFillLevels(manager, type)`). The empty-candidate operator line
-still names the refused level; only the stall cause changed.
+still names the refused level; only the stall cause changed. **§9.16:** the
+`refused:price|type` branch and the oldest-live-refused-level key are removed — with no
+marker family, the generation key is the armed pivot (or cold). The one-re-center cap and
+the bounded `SPREAD_STALE_PIVOT_EXPIRE_MS` exit remain; the bounded `LAST_FILL_PIVOT_TTL_MS`
+is kept unchanged.
 
 **Track B — one liveness owner in the deferral gates.** Seven gates used raw
 `!counter` / `(counter || 0) > 0` peeks that read an unreadable counter as "idle"
@@ -1731,6 +1784,57 @@ All other non-goals stand: the C3/C4 refactors still depend on P3, D2/P5 still
 need soak/live evidence, and the marker
 persistence, cooldown, crossing veto, BUY exemption and one-cycle marker race stay
 rejected or accepted as recorded.
+
+---
+
+### 9.16 Fill-authoritative policy: every fill is market evidence, one counter per fill (2026-11-27)
+
+> **Status:** design intent; the amending change is in flight. Plan:
+> [FILL_AUTHORITATIVE_COUNTER_PLAN.md](FILL_AUTHORITATIVE_COUNTER_PLAN.md). Generic terms
+> only. This section supersedes the refusal/marker machinery in §9.12 (P1 and addenda 1–3),
+> §9.13 (C1/F1/FA-1b), §9.14 Stage 6's first non-goal and §9.15 Track A; the earlier text
+> is kept as the historical record.
+
+**Decision.** Every fill represents the market. `offMarketFill` is a neutral stub returning
+`null` and `verifyFillMarketReference` is a no-op: no cached-mid veto, no forced book read,
+no active fill-path pacing/timeout use (the `LAST_FILL_MID_VERIFY_*` knobs remain as compatibility surface). Fill provenance always arms the last-fill guard, always contributes
+to the boundary crawl and always participates in the re-anchor extremum. The edge-pinned
+insurance exclusion remains the one documented exception; gap-band residual skips are
+removed. The refused-level marker family (writer, readers, release, generation-key branch,
+bypass denials) is removed; same-level re-placement is blocked by the direction rule alone
+(equal counts as blocked).
+
+**One counter per filled slot.** A SELL fill at slot `s` owes a counter BUY at `s − gap`;
+a BUY fill owes a counter SELL at `s + gap`, at the nearest free rail slot. Debt is an
+in-memory quota ledger keyed by fill key on the order manager — not reserved proceeds:
+sizes still come from the side budget (§9.9). At most `gapSlots + 1` new counter orders may
+be stacked into the grid per cycle (oldest debt first); the remainder stays owed with a
+batch-cap reason. Three in-memory metrics — `counterOrdersOwedCount`,
+`counterOrdersPlacedCount`, `counterDebtSlotsCount` — plus one batch-summary log line.
+Dust-cancel synthetic fills and partial residuals owe no counter; when a residual reaches
+dust size it is cancelled and the normal rotation path re-fills the freed slot. Debt
+survives guard skips, final-gate drops, deferrals, batch-cap truncation and refused
+commits; it clears only on confirmed placement of its stamped op, and ambiguous adoption
+leaves it owed. Re-delivery of the same fill replaces rather than stacks.
+
+**Stages / gates.** (0) Fills authoritative — replay the incident window: the pivot follows
+fills, no markers are written, no forced book RPC; stop and fix counter selection first if
+a counter BUY is blocked by the newly armed pivot. (1) Remove the dead machinery — no live
+references remain; typecheck and `check:any` green. (2) Quota ledger, batch stacking and
+counters — one distinct counter slot per fill, a zero-size quota stays owed, stamped ops
+carried into op contexts. (3) Geometry — no gap-band skips, one batch-extremum re-anchor;
+stop if validator refusals rise. (4) Debt lifecycle — as above; no debt from dust cancels
+or residuals. (5) Tests and docs — rewrite the suites that pin refusals and extend the
+observability and pipeline contracts.
+
+**Non-goals.** No reserved proceeds / pair ledger, no cooldown or backoff, no new persisted
+row or second writer of a fill fact, no crossing veto, no config or TTL change.
+
+**Remaining safety story.** Bad fill evidence is the risk that is left. Backstops:
+`validatePersistedBoundary` with its strictly-fewer-strands repair, on-ladder price checks,
+the direction rule (equal blocked) and the final pre-broadcast gate, pending crawls,
+refill-hold / rail clamp, the cross-chunk crawl cap, fill dedupe, the 24 h pivot TTL and the
+bounded generation exit.
 
 ---
 

@@ -3,13 +3,12 @@
  *
  * Post-v1.7.3 propagation fixes, two families:
  *
- * GG-001..004 — the spread-stale watchdog used to key "one re-center per guard
- *   generation" off the armed pivot alone. A refused (off-market) sweep leaves
- *   that pivot COLD, so the key was '', the watermark could never be set, and
- *   the bounded pivot-expiry heal was unreachable for exactly the cold-pivot
- *   case it was written for (retrospective §9.12 Addendum 3 / §9.14). The key
- *   now has one owner over BOTH guard references, and the planner may report
- *   the cold-pivot bind by name without re-centering every cycle.
+ * GG-001..004 — the generation key used to have a second leg: the oldest live
+ *   refused-level marker supplied an identity while the fill pivot was cold.
+ *   Under the fill-authoritative policy no fill is refused, so that branch is
+ *   gone: an armed pivot keys as `price|side`, a cold reference keys as '' and
+ *   the marker stubs are always empty/false. The bounded-expiry heal still
+ *   works for an ARMED generation; a cold one has no marker to clear.
  *
  * GG-005..006 — deferral/scheduling gates still peeked raw in-flight counters,
  *   so an unreadable counter read as "idle" and opened the gate (INV-FILL-003).
@@ -96,7 +95,7 @@ function stubSpreadBot(): any {
 async function main() {
     console.log('=== Guard-generation key & in-flight owner tests ===\n');
 
-    await test('GG-001 armed pivot wins; key unchanged from the old rule', () => {
+    await test('GG-001 armed pivot wins; legacy marker fields are ignored', () => {
         const mgr: any = {
             _lastFilledPrice: 0.44764,
             _lastFilledType: ORDER_TYPES.SELL,
@@ -104,9 +103,11 @@ async function main() {
             _lastRefusedFillLevels: [{ price: 0.44, type: ORDER_TYPES.SELL, at: Date.now() - 1000 }],
         };
         assert.strictEqual(resolveGuardGenerationKey(mgr), `0.44764|${ORDER_TYPES.SELL}`);
+        assert.deepStrictEqual(liveRefusedFillLevels(mgr), [], 'marker stubs stay empty');
+        assert.strictEqual(hasLiveRefusedFillLevels(mgr), false);
     });
 
-    await test('GG-002 cold pivot keys on the oldest live refused level, stably across a sweep', () => {
+    await test('GG-002 a cold pivot keys as empty regardless of a swept marker set', () => {
         const now = Date.now();
         const mgr: any = {
             _lastRefusedFillLevels: [
@@ -116,17 +117,15 @@ async function main() {
             ],
         };
         const key = resolveGuardGenerationKey(mgr);
-        assert.strictEqual(key, `refused:0.44|${ORDER_TYPES.SELL}`);
-        // Adding another rung of the same sweep must not fork the generation.
+        assert.strictEqual(key, '', 'there is no refused-level leg to the generation key');
         mgr._lastRefusedFillLevels.push({ price: 0.4415, type: ORDER_TYPES.SELL, at: now - 1000 });
-        assert.strictEqual(resolveGuardGenerationKey(mgr), key, 'a sweep must get ONE re-center budget');
-        // A refused SELL rung must not be mistaken for a BUY-side geometry bind.
+        assert.strictEqual(resolveGuardGenerationKey(mgr), key, 'more swept rungs cannot fork the generation');
         assert.strictEqual(hasLiveRefusedFillLevels(mgr, ORDER_TYPES.BUY), false);
-        assert.strictEqual(hasLiveRefusedFillLevels(mgr, ORDER_TYPES.SELL), true);
-        assert.strictEqual(liveRefusedFillLevels(mgr, ORDER_TYPES.SELL).length, 4);
+        assert.strictEqual(hasLiveRefusedFillLevels(mgr, ORDER_TYPES.SELL), false);
+        assert.strictEqual(liveRefusedFillLevels(mgr, ORDER_TYPES.SELL).length, 0);
     });
 
-    await test('GG-003 an expired marker leaves the key cold; legacy scalar still works', () => {
+    await test('GG-003 neither an expired nor a fresh legacy scalar supplies a key', () => {
         const ttl = Number(GRID_LIMITS.LAST_FILL_REFUSED_LEVEL_TTL_MS);
         const mgr: any = {
             _lastRefusedFillLevels: [{ price: 0.44, type: ORDER_TYPES.SELL, at: Date.now() - ttl - 1000 }],
@@ -134,32 +133,31 @@ async function main() {
             _lastRefusedFillType: ORDER_TYPES.SELL,
             _lastRefusedFillAt: Date.now() - ttl - 1000,
         };
-        assert.strictEqual(resolveGuardGenerationKey(mgr), '', 'expired refused levels must not bind a generation');
+        assert.strictEqual(resolveGuardGenerationKey(mgr), '');
         mgr._lastRefusedFillAt = Date.now();
-        assert.strictEqual(resolveGuardGenerationKey(mgr), `refused:0.44|${ORDER_TYPES.SELL}`, 'scalar fallback');
+        assert.strictEqual(resolveGuardGenerationKey(mgr), '', 'the scalar fallback branch is retired');
     });
 
-    await test('GG-004 a cold-pivot guard generation reaches the bounded expiry heal', () => {
+    await test('GG-004 a cold generation has no marker to expire', () => {
         const now = Date.now();
         const bot = stubSpreadBot();
-        const key = `refused:0.44|${ORDER_TYPES.SELL}`;
-        bot.manager._lastRefusedFillLevels = [{ price: 0.44, type: ORDER_TYPES.SELL, at: now - 1000 }];
-        bot._lastGeometryResyncPivotKey = key; // the one re-center already happened
-        assert.strictEqual(resolveGuardGenerationKey(bot.manager), key);
+        const marker = { price: 0.44, type: ORDER_TYPES.SELL, at: now - 1000 };
+        bot.manager._lastRefusedFillLevels = [marker];
+        bot._lastGeometryResyncPivotKey = '';
+        assert.strictEqual(resolveGuardGenerationKey(bot.manager), '', 'cold key');
 
-        // Before the bounded window: marker intact, no escalation.
-        bot._outOfSpreadSince = now - (Number(TIMING.SPREAD_STALE_WARN_MS) + 60_000);
+        // A cold key has no watermark, so the ordinary geometry window applies.
+        bot._outOfSpreadSince = now - (Number(TIMING.SPREAD_STALE_WARN_MS) / 2);
         let r = trackOutOfSpreadStaleness(bot, true, 0);
         assert.strictEqual(r.escalated, false, 'premature escalation');
-        assert.strictEqual(bot.manager._lastRefusedFillLevels.length, 1, 'marker survives until expiry');
+        assert.deepStrictEqual(bot.manager._lastRefusedFillLevels, [marker], 'no marker is written or cleared');
 
-        // Past SPREAD_STALE_PIVOT_EXPIRE_MS: the SAME branch as an armed pivot fires.
-        bot._outOfSpreadSince = now - (Number(TIMING.SPREAD_STALE_PIVOT_EXPIRE_MS) + 60_000);
+        bot._outOfSpreadSince = now - (Number(TIMING.SPREAD_STALE_GEOMETRY_ESCALATE_MS) + 60_000);
         r = trackOutOfSpreadStaleness(bot, true, 0);
-        assert.strictEqual(r.escalated, true, 'cold-pivot generation must reach the expiry heal');
-        assert.strictEqual(bot.manager._lastRefusedFillLevels.length, 0, 'expiry clears the refused-level marker');
-        assert.strictEqual(bot.manager._lastMarketFillPrice, null, 'expiry clears the market-fill reference');
-        assert.strictEqual(resolveGuardGenerationKey(bot.manager), '', 'generation is cold after expiry');
+        assert.strictEqual(r.escalated, true, 'the cold generation still reaches the escalation window');
+        assert.deepStrictEqual(bot.manager._lastRefusedFillLevels, [marker],
+            'legacy marker fields are inert: a cold generation has no marker to expire');
+        assert.strictEqual(resolveGuardGenerationKey(bot.manager), '', 'generation stays cold');
     });
 
     await test('GG-005 all seven gates call the single liveness owner inside their own body', () => {

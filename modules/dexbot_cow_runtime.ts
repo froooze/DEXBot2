@@ -15,8 +15,7 @@ import { BroadcastUncertainError as BroadcastUncertainErrorBinding } from './dex
 const BroadcastUncertainError = BroadcastUncertainErrorBinding;
 import * as orderUtils from './order/utils/order.js';
 import { lazyShim } from './lazy_shim.js';
-import { getLazyBitSharesClient as guardMarketClient } from './lazy_client_access.js';
-import { sleep, setLastFillPivot, fireStructuralResync, evaluateSpreadCorrectionReadiness, resolveLastFillGuardReference, resolveSpreadCrossingFloor, isLastFillGuardBlocked, evaluateLastFillGuard, extractGoneOrderIds, extractUpdateTargetOrderIds, hasLiveRefusedFillLevels, verifyFillMarketReference, fillEvidenceFromEconomics } from './order/utils/system.js';
+import { sleep, setLastFillPivot, fireStructuralResync, evaluateSpreadCorrectionReadiness, resolveLastFillGuardReference, resolveSpreadCrossingFloor, isLastFillGuardBlocked, evaluateLastFillGuard, extractGoneOrderIds, extractUpdateTargetOrderIds, fillEvidenceFromEconomics } from './order/utils/system.js';
 const {
     buildCreateOrderArgs,
     buildCreateOpFingerprint,
@@ -2389,10 +2388,8 @@ function collectGapBandPlacementShadowSlots(actions: CowAction[] | null | undefi
  * proxy-case valve, not a licence to trade through the last real fill.
  *
  * Denied too when the snapshot is stale or has known-unmatched chain orders
- * (a stale edge can hide the real window edge), and while a refused-level
- * marker is live: a premium sweep that was refused from arming is still fill
- * evidence, and the bypass would skip the only guard that reads its levels.
- * Fail-closed on a gate throw.
+ * (a stale edge can hide the real window edge). No refused-level markers exist
+ * any more, so there is no marker-based denial. Fail-closed on a gate throw.
  *
  * Exported for tests.
  * @param {Object} bot
@@ -2406,14 +2403,11 @@ function isSpreadCorrectionBypassAllowed(bot: BotLike): boolean {
     // reference exists. The LAST-FILL-GUARD is fill-based, so a live market
     // price (which only strengthens the planner's crossing floor) must not
     // change this decision. A real fill denies it; a stale or known-unmatched
-    // snapshot denies it too (the guard applies instead). A REFUSED fill is
-    // still fill evidence: while a refused-level marker is live the bypass
-    // would skip the only guard that reads it, so deny it and let the guard
-    // block just those levels. Fail-closed (deny bypass) if the gate throws.
+    // snapshot denies it too (the guard applies instead). No refused-level
+    // markers exist any more. Fail-closed (deny bypass) if the gate throws.
     try {
         const readiness = evaluateSpreadCorrectionReadiness(mgr);
-        return readiness.snapshotTrusted && readiness.fillMarketRef == null
-            && !hasLiveRefusedFillLevels(mgr);
+        return readiness.snapshotTrusted && readiness.fillMarketRef == null;
     } catch {
         return false;
     }
@@ -2476,31 +2470,6 @@ function latestQueuedFillEvidence(bot: BotLike): { price: number; type: string }
 }
 
 /**
- * Verify the book mid BEFORE the broadcast-time queued pivot write. Called at
- * the async freeze and final-gate boundaries; the sync helpers themselves stay
- * sync and consume the already-verified cache.
- *
- * Resolve the client BEFORE peeking the queue. An early return on an empty
- * queue followed by `await` at the caller yields a microtask in which a newly
- * queued fill could reach refreshLastFillPivotFromQueue without verification.
- * With the client awaited first, every fill that arrives during that await is
- * included in the peek; fills arriving during the book read are judged against
- * the already-refreshed mid, so the subsequent write is still verified.
- */
-async function verifyQueuedFillMarket(bot: BotLike): Promise<void> {
-    let client: unknown = null;
-    try { client = await guardMarketClient(); } catch { client = null; }
-    // No client (e.g. a transient lazy-import failure): skip cleanly so the
-    // forced-read pacing clock is not stamped by an attempt that never ran.
-    if (!client) return;
-    const evidence = latestQueuedFillEvidence(bot);
-    if (!evidence) return;
-    try {
-        await verifyFillMarketReference(bot.manager, client, [evidence]);
-    } catch { /* best-effort: verification must never block a broadcast */ }
-}
-
-/**
  * Refresh the LAST-FILL guard pivot from fills that arrived while the current
  * batch was being planned or broadcast but have not been ingested yet.
  *
@@ -2524,7 +2493,7 @@ function refreshLastFillPivotFromQueue(bot: BotLike): boolean {
         // FILL ECONOMICS FIRST: the pays/receives amounts are the trade fact;
         // the grid slot is only an identity hint (live incident: slot-118
         // @1267 for an order that traded at 1345.73). Derived by the shared
-        // helper so verification and the pivot write judge the SAME evidence.
+        // helper so the queued pivot write uses the same evidence as the batch.
         const latest = latestQueuedFillEvidence(bot);
         if (!latest) return false;
         // Shared free writer (utils/system) — the same implementation the
@@ -3715,7 +3684,6 @@ async function replanStaleBatch(bot: BotLike, cowResult: CowResult, replanDepth:
     // Pre-plan snapshot of the per-batch absolute-anchor budget (see the restore
     // above). Kept at function scope so the fresh plan can carry it on for a
     // second re-plan.
-    const reanchorBudgetBefore = Number((cowResult as unknown as { _reanchorBudgetBeforePlan?: unknown })._reanchorBudgetBeforePlan);
     try {
         // Restore the boundary-shift budget consumed by the abandoned plan:
         // it was built from the same fills and never shipped, so the re-plan
@@ -3725,14 +3693,8 @@ async function replanStaleBatch(bot: BotLike, cowResult: CowResult, replanDepth:
         if (bot.manager?._boundaryShiftBudgetBase != null) {
             bot.manager._boundaryShiftBudget = bot.manager._boundaryShiftBudgetBase;
         }
-        // The absolute fill re-anchor is a per-batch BUDGET consumed at PLAN time
-        // (strategy.calculateTargetGrid). The abandoned plan's anchor was never
-        // committed, so hand it back: restore the value observed by the pre-plan
-        // snapshot carried on the plan. A static batch base would be wrong — an
-        // earlier chunk that legitimately committed its anchor must stay spent.
-        if (Number.isFinite(reanchorBudgetBefore)) {
-            (bot.manager as unknown as { _boundaryReanchorBudget?: number })._boundaryReanchorBudget = reanchorBudgetBefore;
-        }
+        // No re-anchor budget is tracked: each plan uses one batch-extremum
+        // move, so an abandoned plan simply re-derives from fresh master.
         if (typeof bot.manager.performSafeRebalance === 'function') {
             // skipBroadcastWait: this frame is itself inside the executor's
             // startBroadcasting() region — waiting on the flag we hold would
@@ -3763,11 +3725,6 @@ async function replanStaleBatch(bot: BotLike, cowResult: CowResult, replanDepth:
             // (duplicate orders). The recursion's guard will then abort +
             // reconcile instead.
             clearPendingBroadcastsForSlots(bot, cowResult.actions);
-            // Hand the same pre-plan snapshot to the fresh plan so a SECOND
-            // re-plan (its plan also goes stale) can restore the anchor again:
-            // the budget is per-batch, and every abandoned plan must give back
-            // only what IT spent.
-            (replanned as unknown as { _reanchorBudgetBeforePlan?: number })._reanchorBudgetBeforePlan = reanchorBudgetBefore;
             return {
                 handled: true,
                 placementTransferred: true,
@@ -4654,6 +4611,9 @@ async function updateOrdersOnChainBatchCOWBody(
     // stopBroadcasting() in the outer finally would underflow another
     // holder's region (grid reconcile / spread correction).
     let broadcastRegionHeld = false;
+    // Missing CREATEs normalized in place never landed on chain; their op
+    // contexts must not settle a stamped counter debt.
+    const phantomContexts = new Set<unknown>();
     const releaseBroadcastRegion = () => {
         if (!broadcastRegionHeld) return;
         broadcastRegionHeld = false;
@@ -4853,10 +4813,6 @@ async function updateOrdersOnChainBatchCOWBody(
                 ? bot._incomingFillQueue.length
                 : null;
         } catch { freezeQueueDepth = null; }
-        // Verify before the queued-fill pivot write: the freeze is an async
-        // boundary and a cached mid that is young but wrong in value must not
-        // veto (or arm) from a fill the fresh book says is in-window.
-        await verifyQueuedFillMarket(bot);
         try { if (refreshLastFillPivotFromQueue(bot)) lastFillGuardPivotRefreshed = true; } catch { /* best-effort */ }
         // Captured AFTER the freeze refresh, not before: the refresh is part
         // of the freeze, so the baseline must be the pivot the ops are about
@@ -4998,9 +4954,9 @@ async function updateOrdersOnChainBatchCOWBody(
                             if (check.blocked) {
                                 lastFillGuardStats.skipped++;
                                 bot.manager.logger.log(
-                                    (check as { refusedLevel?: boolean }).refusedLevel
-                                        ? `[LAST-FILL-GUARD] Skipping ${order.type} CREATE for ${order.id} at ${Format.formatPrice6(createPrice)}: same-level re-fill of the just-filled level ${Format.formatPrice6(Number(check.pivot))} (its pivot-arm was refused; the level stays blocked for the marker TTL, §9.12/P2 amended); re-planned after market moves`
-                                        : `[LAST-FILL-GUARD] Skipping ${order.type} CREATE for ${order.id} at ${Format.formatPrice6(createPrice)}: ${order.type === ORDER_TYPES.BUY ? 'above' : 'below'} last filled ${Format.formatPrice6(Number(check.pivot))} (direction rule: BUY must be below / SELL above the last fill); re-planned after market moves`,
+                                    `[LAST-FILL-GUARD] Skipping ${order.type} CREATE for ${order.id} at ${Format.formatPrice6(createPrice)}: `
+                                    + `${order.type === ORDER_TYPES.BUY ? 'above' : 'below'} last filled ${Format.formatPrice6(Number(check.pivot))} `
+                                    + '(direction rule: BUY must be below / SELL above the last fill); re-planned after market moves',
                                     'debug'
                                 );
                                 if (order.id) skippedCreateSlotIds.add(order.id);
@@ -5055,7 +5011,14 @@ async function updateOrdersOnChainBatchCOWBody(
                         continue;
                     }
                     operations.push(buildResult.op);
-                    opContexts.push({ kind: 'create', id: order.id, order: effectiveOrder, args, finalInts: buildResult.finalInts });
+                    opContexts.push({
+                        kind: 'create',
+                        id: order.id,
+                        order: effectiveOrder,
+                        args,
+                        finalInts: buildResult.finalInts,
+                        counterForFillKey: (order.metadata as { counterForFillKey?: unknown } | undefined)?.counterForFillKey
+                    });
                     intraBatchCandidates.push(effectiveOrder);
                     const recordedFp = recordPendingBroadcast(bot, {
                         opIndex: operations.length - 1,
@@ -5383,9 +5346,9 @@ async function updateOrdersOnChainBatchCOWBody(
                                 if (action.id) skippedUpdateSlotIds.add(action.id);
                                 if (action.newGridId) skippedUpdateSlotIds.add(action.newGridId);
                                 bot.manager.logger.log(
-                                    (check as { refusedLevel?: boolean }).refusedLevel
-                                        ? `[LAST-FILL-GUARD] Skipping ${orderType} UPDATE for ${action.id} -> ${action.newGridId} at ${Format.formatPrice6(newPrice)}: same-level re-fill of the just-filled level ${Format.formatPrice6(Number(check.pivot))} (its pivot-arm was refused; the level stays blocked for the marker TTL, §9.12/P2 amended)`
-                                        : `[LAST-FILL-GUARD] Skipping ${orderType} UPDATE for ${action.id} -> ${action.newGridId} at ${Format.formatPrice6(newPrice)}: ${orderType === ORDER_TYPES.BUY ? 'above' : 'below'} last filled ${Format.formatPrice6(Number(check.pivot))} (direction rule: BUY must be below / SELL above the last fill)`,
+                                    `[LAST-FILL-GUARD] Skipping ${orderType} UPDATE for ${action.id} -> ${action.newGridId} at ${Format.formatPrice6(newPrice)}: `
+                                    + `${orderType === ORDER_TYPES.BUY ? 'above' : 'below'} last filled ${Format.formatPrice6(Number(check.pivot))} `
+                                    + '(direction rule: BUY must be below / SELL above the last fill)',
                                     'debug'
                                 );
                                 continue;
@@ -5438,9 +5401,11 @@ async function updateOrdersOnChainBatchCOWBody(
                                 newGridId: action.newGridId,
                                 newPrice,
                                 newSize,
-                                type: orderType
+                                type: orderType,
+                                order: action.order
                             },
-                            finalInts: buildResult.finalInts
+                            finalInts: buildResult.finalInts,
+                            counterForFillKey: (action.order?.metadata as { counterForFillKey?: unknown } | undefined)?.counterForFillKey
                         });
                         intraBatchCandidates.push({ type: orderType, price: newPrice, orderId: action.orderId, id: action.newGridId || action.id });
                         continue;
@@ -5668,9 +5633,6 @@ async function updateOrdersOnChainBatchCOWBody(
         const skippedUpdateCountRef = { count: 0 };
         const finalGateStats = { checked: 0, passed: 0, skipped: 0, bypassed: 0, pivotOffGrid: 0 };
         let finalGate: { dropped: unknown[]; pivotChanged: boolean; refreshed: boolean } | null = null;
-        // Same verify-before-write contract as the freeze: the gate's internal
-        // peek-only refresh now consumes an already-verified market cache.
-        await verifyQueuedFillMarket(bot);
         try {
             finalGate = runFinalPivotGate(bot, operations, opContexts, {
                 actions,
@@ -6085,7 +6047,13 @@ async function updateOrdersOnChainBatchCOWBody(
                     for (const item of missingCreateResults) {
                         const slotId = String(item.ctx?.order?.id ?? item.ctx?.id ?? '');
                         const slot = workingGrid.get(slotId);
-                        if (!slot) continue;
+                        if (!slot) {
+                            // No working-grid slot means the CREATE never had a
+                            // placeable destination: treat its context as
+                            // phantom so it cannot settle a counter debt.
+                            if (item.ctx) phantomContexts.add(item.ctx);
+                            continue;
+                        }
                         const isConfirmed = confirmation.confirmed.some(
                             (c) => (c?.order?.id || c?.id) === slotId
                         );
@@ -6114,6 +6082,7 @@ async function updateOrdersOnChainBatchCOWBody(
                             state: ORDER_STATES.VIRTUAL
                         });
                         normalizedCount++;
+                        if (item.ctx) phantomContexts.add(item.ctx);
                     }
                     bot.manager.logger.log(
                         `[COW] Missing CREATEs resolved: ${adoptedCount} adopted from chain, ` +
@@ -6158,10 +6127,13 @@ async function updateOrdersOnChainBatchCOWBody(
                     // processed concurrently) so the commit was refused. The batch
                     // is on chain; adopt the placed orders from the chain so master
                     // converges instead of remaining divergent until a later sync.
+                    const confirmedContexts = filterPhantomCounterContexts(
+                        executedContexts as unknown[] | null | undefined, phantomContexts
+                    ) as typeof executedContexts;
                     return await recoverRefusedCommit(
                         bot, chainOrders, '[COW]',
-                        { placedResults: result, placedContexts: executedContexts },
-                        executedContexts, effectiveBoundary,
+                        { placedResults: result, placedContexts: confirmedContexts },
+                        confirmedContexts, effectiveBoundary,
                         {
                             failureResyncReason: 'commit refused after broadcast (chain adoption unavailable)',
                             failureLogMessage: 'Commit refused and chain adoption unavailable; keeping pending-broadcast protection pending structural resync',
@@ -6169,7 +6141,10 @@ async function updateOrdersOnChainBatchCOWBody(
                         }
                     );
                 }
-                
+                // Confirm this batch's stamped counter ops before any later
+                // cycle can re-derive the same debt.
+                clearCounterDebtsFromContexts(bot, filterPhantomCounterContexts(executedContexts as unknown[] | null | undefined, phantomContexts));
+
                 const batchResult = await processBatchResults(bot, result, executedContexts);
 
                 // A `suspended` persist result is a deliberate, temporary gate
@@ -6533,6 +6508,42 @@ async function defaultAdoptionNodeFailover(): Promise<boolean> {
  *   retry instead of the unguarded window fallback
  * @returns {Promise<boolean>} true if master was adopted from the chain
  */
+/**
+ * Clear counter-quota debts for ops whose placement is confirmed. The fill key
+ * travels from the target-grid order metadata into the CREATE/rotation op
+ * context; only that stamped op may settle its own debt. Ambiguous adoption
+ * never calls this, so the debt stays owed.
+ */
+export function filterPhantomCounterContexts(
+    contexts: readonly unknown[] | null | undefined,
+    phantomContexts: ReadonlySet<unknown>
+): unknown[] {
+    return (contexts ?? []).filter((ctx) => !phantomContexts.has(ctx));
+}
+
+function clearCounterDebtsFromContexts(bot: BotLike, contexts: unknown[] | null | undefined): void {
+    const debt = bot.manager?._counterDebt;
+    if (!(debt instanceof Map) || !Array.isArray(contexts)) return;
+    for (const raw of contexts) {
+        const ctx = raw as {
+            kind?: string;
+            order?: { metadata?: { counterForFillKey?: unknown } };
+            counterForFillKey?: unknown;
+            rotation?: { order?: { metadata?: { counterForFillKey?: unknown } } };
+        } | null;
+        const key = (typeof ctx?.counterForFillKey === 'string' ? ctx.counterForFillKey : null)
+            ?? (typeof ctx?.order?.metadata?.counterForFillKey === 'string' ? ctx.order.metadata.counterForFillKey : null)
+            ?? (typeof ctx?.rotation?.order?.metadata?.counterForFillKey === 'string' ? ctx.rotation.order.metadata.counterForFillKey : null);
+        if (key && debt.has(key)) {
+            debt.delete(key);
+            if (bot.manager._metrics) {
+                bot.manager._metrics.counterOrdersPlacedCount = (bot.manager._metrics.counterOrdersPlacedCount || 0) + 1;
+                bot.manager._metrics.counterDebtSlotsCount = debt.size;
+            }
+        }
+    }
+}
+
 async function adoptPlacedBatchFromChain(bot: BotLike, chainOrders: typeof chainOrdersModule, logPrefix: string, opts: JsonObj = {}): Promise<boolean> {
     const {
         placedResults = null, placedContexts = null, polledCreateIds = null, nodeFailover = null,
@@ -6721,6 +6732,7 @@ async function adoptPlacedBatchFromChain(bot: BotLike, chainOrders: typeof chain
             }
             if (fullChain.length > 0 && typeof mgr.syncFromOpenOrders === 'function') {
                 await mgr.syncFromOpenOrders(fullChain, { skipAccounting: false });
+                clearCounterDebtsFromContexts(bot, placedContexts as unknown[] | null | undefined);
                 bot.manager.logger.log(
                     `${logPrefix} Adopted ${fullChain.length} on-chain order(s) by id after refused/uncertain commit (truncation-immune)`,
                     'info'
@@ -6741,6 +6753,7 @@ async function adoptPlacedBatchFromChain(bot: BotLike, chainOrders: typeof chain
         const freshChain = freshRead.orders;
         if (freshChain.length > 0 && typeof bot.manager.syncFromOpenOrders === 'function') {
             await bot.manager.syncFromOpenOrders(freshChain, { skipAccounting: false });
+            clearCounterDebtsFromContexts(bot, placedContexts as unknown[] | null | undefined);
             return true;
         }
     } catch (syncErr) {
@@ -7331,14 +7344,9 @@ function runFinalPivotGate(bot: BotLike, operations: unknown[], opContexts: OpPh
             dropped.push({ index: i, kind: ctx.kind, slotId, price, type });
             try {
                 bot.manager?.logger?.log?.(
-                    (check as { refusedLevel?: boolean }).refusedLevel
-                        ? `[LAST-FILL-GUARD] Final gate dropping ${type} ${ctx.kind} for ${slotId ?? 'unknown'} at ` +
-                        `${Format.formatPrice6(price as number)}: same-level re-fill of the just-filled level ` +
-                        `${check.pivot != null ? Format.formatPrice6(Number(check.pivot)) : 'n/a'} ` +
-                        `(its pivot-arm was refused; the level stays blocked for the marker TTL, §9.12/P2 amended)`
-                        : `[LAST-FILL-GUARD] Final gate dropping ${type} ${ctx.kind} for ${slotId ?? 'unknown'} at ` +
-                        `${Format.formatPrice6(price as number)}: ${dir} last filled ${check.pivot != null ? Format.formatPrice6(Number(check.pivot)) : 'n/a'} ` +
-                        `(direction rule: BUY must be below / SELL above the last fill); re-planned after market moves`,
+                    `[LAST-FILL-GUARD] Final gate dropping ${type} ${ctx.kind} for ${slotId ?? 'unknown'} at ` +
+                    `${Format.formatPrice6(price as number)}: ${dir} last filled ${check.pivot != null ? Format.formatPrice6(Number(check.pivot)) : 'n/a'} ` +
+                    '(direction rule: BUY must be below / SELL above the last fill); re-planned after market moves',
                     'warn'
                 );
             } catch { /* logging is best-effort */ }

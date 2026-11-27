@@ -48,7 +48,7 @@ const NAMES = {
         'resolveLastFillGuardReference', 'resolveGuardGenerationKey', 'isLastFillGuardBlocked', 'evaluateLastFillGuard',
         'maybeRefreshLiveMarketPrice', 'refreshLiveMarketPrice',
         'resolveSpreadFreshnessMs', 'resolveSpreadCrossingFloor',
-        'setLastFillPivot', 'normalizeLastFillPivot', 'hasLiveRefusedFillLevels',
+        'setLastFillPivot', 'normalizeLastFillPivot',
         'rearmLastFillPivotFromMarketFill', 'reanchorBoundaryFromLastFill',
         'expireLastFillGuardReferences',
         'fireStructuralResync',
@@ -59,11 +59,13 @@ const NAMES = {
         'resolveGridUpdateBlockers', 'noteGridUpdateBlockers',
         // Newly consolidated single-source readers used by modules loaded
         // under this manifest (order.ts, maintenance/cow runtime, accounting).
-        'offMarketFill', 'readBotInFlightFlags', 'readFillPipelineState',
+        // The retired fill-veto family (offMarketFill, fillOutsideMarket,
+        // verifyFillMarketReference, resolveFillMidVerifyMs and the
+        // refused-level helpers) is NOT imported by any module any more.
+        'readBotInFlightFlags', 'readFillPipelineState',
         'extractGoneOrderIds', 'extractUpdateTargetOrderIds',
-        // Fill-pivot verification family (fill batch / queued refresh / orphans).
-        'fillEvidenceFromEconomics', 'verifyFillMarketReference',
-        'releaseRefutedRefusedLevels', 'resolveFillMidVerifyMs', 'fillOutsideMarket',
+        // Shared evidence derivation survives the fill-authoritative change.
+        'fillEvidenceFromEconomics',
     ],
     format: ['formatCurrency', 'formatMetric2', 'isValidNumber', 'toFiniteNumber', 'toKnownNumber', 'formatPrice6', 'formatPercent'],
     orderUtils: [
@@ -231,7 +233,6 @@ function installCoreResyncMocks({ snapshotMode = 'live', expireSpy = null, guard
         isLastFillPlacementBlocked: () => ({ blocked: false, pivot: null }),
         resolveGridUpdateBlockers: () => [],
         noteGridUpdateBlockers: () => ({ cycles: 0, escalate: false }),
-        offMarketFill: () => null,
         readBotInFlightFlags: () => ({
             ok: true, batchInFlight: false, recoveryInFlight: false, deferredRebalance: false,
         }),
@@ -350,6 +351,13 @@ function makeRefreshSelf(logs: any[] = []) {
             config: {
                 weightDistribution: { sell: 0.6, buy: 0.4 },
             },
+            // The counter-quota observability counters are in-memory manager
+            // state; a dynamic-weight refresh must not disturb them.
+            _metrics: {
+                counterOrdersOwedCount: 0,
+                counterOrdersPlacedCount: 0,
+                counterDebtSlotsCount: 0,
+            },
         },
         _log: (msg) => { if (logs) logs.push(msg); },
     };
@@ -366,6 +374,9 @@ async function testRefreshDynamicWeightDistributionAppliesAndFallsBack() {
         assert.strictEqual(applied.applied, true, 'ready dynamic weights should be applied');
         assert.deepStrictEqual(self.config.weightDistribution, { sell: 0.42, buy: 0.22 });
         assert.deepStrictEqual(self.manager.config.weightDistribution, { sell: 0.42, buy: 0.22 });
+        for (const key of ['counterOrdersOwedCount', 'counterOrdersPlacedCount', 'counterDebtSlotsCount']) {
+            assert.strictEqual(self.manager._metrics[key], 0, `${key} must stay at its seeded zero`);
+        }
     } finally {
         wl.cleanup();
     }
@@ -1044,7 +1055,6 @@ function installDivergenceMocks(opts) {
         isLastFillPlacementBlocked: () => ({ blocked: false, pivot: null }),
         resolveGridUpdateBlockers: () => [],
         noteGridUpdateBlockers: () => ({ cycles: 0, escalate: false }),
-        offMarketFill: () => null,
         readBotInFlightFlags: () => ({
             ok: true, batchInFlight: false, recoveryInFlight: false, deferredRebalance: false,
         }),
@@ -1352,7 +1362,6 @@ async function testDexbotClassPerformGridResyncForwardsOptions() {
         isLastFillPlacementBlocked: () => ({ blocked: false, pivot: null }),
         resolveGridUpdateBlockers: () => [],
         noteGridUpdateBlockers: () => ({ cycles: 0, escalate: false }),
-        offMarketFill: () => null,
         readBotInFlightFlags: () => ({
             ok: true, batchInFlight: false, recoveryInFlight: false, deferredRebalance: false,
         }),

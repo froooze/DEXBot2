@@ -13,8 +13,8 @@
  *  - SMR-4: restoreLastMarketFill shape + TTL gates.
  *  - SMR-5: rejectCorruptedGridSnapshot keeps a pre-reject snapshot copy.
  *  - SMR-6: the LAST-FILL-GUARD bypass gate shares the market-reference
- *           predicate (live fill pivot OR restored market row both deny it),
- *           and a live refused-level marker denies it too.
+ *           predicate (live fill pivot OR restored market row both deny it);
+ *           refused-level markers are gone and no longer deny anything.
  *  - SMR-7: the pure readiness gate: cold=refuse, stale/unmatched=degraded-ok,
  *           never-synced/fresh=trusted.
  *  - SMR-8: unmatched collision filter skips the covered price level but keeps
@@ -287,26 +287,36 @@ async function testSmr6BypassGate() {
         true,
         'fresh snapshot with a book pivot keeps the bypass'
     );
-    // A premium sweep refused from arming leaves a cold pivot and no market
-    // row, so the refused-level marker is the only fill evidence. The bypass
-    // must not skip the only guard that reads it (SMR-6 extension).
-    const refusedMarker = (at: number) => ({
+    // Refused-level markers are gone: seeding the legacy fields must not
+    // deny the bypass. The ordinary real-fill references above still do.
+    const legacyMarkerFields = (at: number) => ({
         lastFillPivotSource: null as string | null,
         _lastUnmatchedChainOrders: [] as unknown[],
         _lastSyncAt: Date.now(),
+        _lastRefusedFillPrice: 1050,
+        _lastRefusedFillType: ORDER_TYPES.SELL,
+        _lastRefusedFillAt: at,
         _lastRefusedFillLevels: [{ price: 1050, type: ORDER_TYPES.SELL, at }]
     });
     assert.strictEqual(
-        gate(refusedMarker(NOW)),
-        false,
-        'a live refused-level marker is fill evidence and denies the bypass'
+        gate(legacyMarkerFields(NOW)),
+        true,
+        'a live legacy marker no longer denies the bypass (no marker writer remains)'
     );
     assert.strictEqual(
-        gate(refusedMarker(NOW - Number(GRID_LIMITS.LAST_FILL_REFUSED_LEVEL_TTL_MS) - 1000)),
+        gate(legacyMarkerFields(NOW - Number(GRID_LIMITS.LAST_FILL_REFUSED_LEVEL_TTL_MS) - 1000)),
         true,
-        'an expired refused-level marker no longer denies the bypass'
+        'an expired legacy marker is equally inert'
     );
-    console.log('  \u2713 bypass withheld for real fill evidence (incl. refused markers) / stale snapshots, kept for fresh heuristics');
+    const { hasLiveRefusedFillLevels, liveRefusedFillLevels } = require('../modules/order/utils/system');
+    assert.strictEqual(hasLiveRefusedFillLevels(legacyMarkerFields(NOW)), false);
+    assert.deepStrictEqual(liveRefusedFillLevels(legacyMarkerFields(NOW)), []);
+    // The planner and the bypass gate no longer carry a refused-level branch.
+    const gridSrc = fs.readFileSync(path.join(__dirname, '../../modules/order/grid.ts'), 'utf8');
+    const cowSrc = fs.readFileSync(path.join(__dirname, '../../modules/dexbot_cow_runtime.ts'), 'utf8');
+    assert.ok(!/hasLiveRefusedFillLevels/.test(gridSrc), 'grid.ts must not read a refused marker');
+    assert.ok(!/hasLiveRefusedFillLevels/.test(cowSrc), 'the bypass gate must not read a refused marker');
+    console.log('  ✓ bypass withheld for real fill evidence / stale snapshots, kept for fresh heuristics; markers inert');
 }
 
 // --- SMR-7: pure readiness gate ---------------------------------------------
