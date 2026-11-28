@@ -26,6 +26,7 @@ Tools that inspect DEXBot trading behavior and the market data it operates on. O
 | [`analyze_risk_profile.ts`](#risk-profile-analyzer-analyze_risk_profilets) | "How wide should my Safe Range clamps be?" | `node dist/analysis/analyze_risk_profile.js --bot-key <bot-key>` |
 | [`analyze_trade_heatmap.ts`](#trade-heatmap-analyze_trade_heatmapts) | "Where did trade volume cluster vs the AMA?" | `node dist/analysis/analyze_trade_heatmap.js --bot-key <bot-key>` |
 | [`tradingview/analyze_tradingview.ts`](#tradingview-chart-tradingviewanalyze_tradingviewts) | "Just give me a candle chart" | `dexbot tv <bot-key>` |
+| [`compare_cex_dex_cross.ts`](#cex-vs-dex-cross-rate-overlay-compare_cex_dex_crossts) | "How does a DEX synthetic cross compare with a CEX cross built from two common-quote legs?" | `npx tsx analysis/compare_cex_dex_cross.ts --fetch` |
 | [`analyze_liquidity.ts`](#liquidity-depth-chart-analyze_liquidityts) | "Where is the pair's real liquidity — order book, AMM pool, or both?" | `npm run analysis:liquidity -- --pair TOKENA/TOKENB` |
 | [`analyze_dynamic_weight.ts`](#dynamic-weight-research-analyze_dynamic_weightts) | "Are buy/sell weights tuned for this regime?" | `dexbot dw <bot-key>` |
 | [`analyze_volatility.ts`](#volatility-analyze_volatilityts) | "Both weights clipped too hard / not enough?" | `node dist/analysis/analyze_volatility.js --bot-key <bot-key>` |
@@ -466,6 +467,30 @@ npm run analysis:tradingview -- --source market_adapter --bot-key <bot-key>
 node dist/analysis/tradingview/analyze_tradingview.js \
   --file market_adapter/data/market_adapter_<bot-key>_1h.json \
   --chart analysis/charts/<pair>_tradingview.html
+```
+
+### CEX vs DEX Cross-Rate Overlay (`compare_cex_dex_cross.ts`)
+
+Overlays a DEX synthetic cross (read from a generated TradingView chart's
+`<script id="payload">` candles, or a plain candles JSON) with a CEX synthetic
+cross built from two legs quoted against a common asset. The CEX side uses the
+same seed fetcher as the market adapter
+(`market_adapter/inputs/fetch_cex_synthetic_data.ts`); `--fetch` invokes it, or
+pass an already-generated seed with `--cex`. Only exact 1h bucket matches are
+compared. The output is one self-contained HTML with both prices on the same
+axis, a DEX−CEX percentage panel, and console summary stats (latest difference,
+mean/median over the window, and hourly return correlation — low correlation is
+expected when the DEX pool prints few nonzero-volume bars).
+
+```bash
+# Fetch a CEX seed, then render the overlay
+npx tsx analysis/compare_cex_dex_cross.ts --fetch \
+  --exchange <exchange> --base <base-asset> --quote <quote-asset> \
+  --common-quote <common-quote-asset>
+
+# Reuse an existing seed, custom DEX source and output
+npx tsx analysis/compare_cex_dex_cross.ts \
+  --cex <cex-seed.json> --dex <dex-chart.html> --chart <overlay.html>
 ```
 
 ## Trend & Price Analysis
