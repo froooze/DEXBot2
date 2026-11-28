@@ -17,9 +17,14 @@ const {
     fetchNativeMarketHistorySince,
     usesAmaGridPrice,
     applyRuntimeDefaultsFromGeneralSettings,
+    resolveBotCfg,
     __test: {
         resolveDeltaThresholdPercentFromGeneralSettings,
         resolveAmaSlopeDeltaThresholdPercentFromGeneralSettings,
+        resolveAmaSlopeEmaAlphaFromGeneralSettings,
+        resolveAmaSlopeLookbackBarsFromGeneralSettings,
+        resolveAmaMaxSlopePctFromGeneralSettings,
+        resolveMaxAsymmetryFactorFromGeneralSettings,
         _setBitsharesClientForTests,
     },
 } = require('../market_adapter/market_adapter');
@@ -286,6 +291,62 @@ assert.strictEqual(
         { MARKET_ADAPTER: {} }
     );
     assert.strictEqual(cfg.amaSlope.deltaThresholdPct, 8, 'absent slope setting leaves the factor untouched');
+}
+
+// General settings -> AMA-Slope signal shape (bot editor line 7). Bounds mirror
+// the DW research chart; per-market/bot overrides still win after this merge.
+{
+    const settings = { MARKET_ADAPTER: {
+        DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS: 32,
+        DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA: 0.1,
+        DYNAMIC_WEIGHT_AMA_MAX_SLOPE_PCT: 0.2,
+        ASYMMETRIC_BOUNDS_MAX_ASYMMETRY_FACTOR: 0.4,
+    } };
+    assert.strictEqual(resolveAmaSlopeLookbackBarsFromGeneralSettings(settings), 32, 'lookback from settings');
+    assert.strictEqual(resolveAmaSlopeEmaAlphaFromGeneralSettings(settings), 0.1, 'EMA alpha from settings');
+    assert.strictEqual(resolveAmaMaxSlopePctFromGeneralSettings(settings), 0.2, 'max slope has no upper cap');
+    assert.strictEqual(resolveMaxAsymmetryFactorFromGeneralSettings(settings), 0.4, 'max asymmetry from settings');
+
+    const cfg = applyRuntimeDefaultsFromGeneralSettings(
+        { amaSlope: { maxSlopePct: 0.1, neutralZonePct: 0 }, asymmetricBounds: { minScaleSlots: 10 } },
+        {},
+        settings
+    );
+    assert.strictEqual(cfg.amaSlope.lookbackBars, 32, 'settings lookback should reach cfg');
+    assert.strictEqual(cfg.amaSlope.emaAlpha, 0.1, 'settings EMA alpha should reach cfg');
+    assert.strictEqual(cfg.amaSlope.maxSlopePct, 0.2, 'settings max slope should reach cfg');
+    assert.strictEqual(cfg.asymmetricBounds.maxAsymmetryFactor, 0.4, 'settings max asymmetry should reach cfg');
+    assert.strictEqual(cfg.asymmetricBounds.minScaleSlots, 10, 'other asymmetricBounds fields must be preserved');
+    assert.strictEqual(cfg.amaSlope.neutralZonePct, 0, 'other amaSlope fields must be preserved');
+}
+
+assert.strictEqual(resolveAmaSlopeLookbackBarsFromGeneralSettings({ MARKET_ADAPTER: { DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS: 2 } }), MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS_MIN, 'lookback below DW chart min should clamp up');
+assert.strictEqual(resolveAmaSlopeLookbackBarsFromGeneralSettings({ MARKET_ADAPTER: { DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS: 500 } }), MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS_MAX, 'lookback above DW chart max should clamp down');
+assert.strictEqual(resolveAmaMaxSlopePctFromGeneralSettings({ MARKET_ADAPTER: { DYNAMIC_WEIGHT_AMA_MAX_SLOPE_PCT: 0.01 } }), null, 'max slope below DW chart min should be ignored');
+assert.strictEqual(resolveMaxAsymmetryFactorFromGeneralSettings({ MARKET_ADAPTER: { ASYMMETRIC_BOUNDS_MAX_ASYMMETRY_FACTOR: 2 } }), MARKET_ADAPTER.ASYMMETRIC_BOUNDS_MAX_ASYMMETRY_FACTOR_MAX, 'max asymmetry should clamp to the ceiling');
+
+// bots.json bot entry is the last word (beats general settings and the
+// advanced market_adapter_settings.json file); absent fields fall through.
+{
+    const globals = {
+        amaSlope: { lookbackBars: 16, emaAlpha: 0.2, maxSlopePct: 0.1 },
+        asymmetricBounds: { maxAsymmetryFactor: 0.33 },
+    };
+    const bot = {
+        name: 'ama-slope-override-test',
+        amaSlope: { lookbackBars: 32, emaAlpha: 0.1, maxSlopePct: 0.2 },
+        asymmetricBounds: { maxAsymmetryFactor: 0.4 },
+    };
+    const cfg = resolveBotCfg(bot, globals);
+    assert.strictEqual(cfg.amaSlope.lookbackBars, 32, 'bots.json lookback should win');
+    assert.strictEqual(cfg.amaSlope.emaAlpha, 0.1, 'bots.json EMA alpha should win');
+    assert.strictEqual(cfg.amaSlope.maxSlopePct, 0.2, 'bots.json max slope should win');
+    assert.strictEqual(cfg.asymmetricBounds.maxAsymmetryFactor, 0.4, 'bots.json max asymmetry should win');
+
+    const fallback = resolveBotCfg({ name: 'ama-slope-default-test' }, globals);
+    assert.strictEqual(fallback.amaSlope.lookbackBars, 16, 'absent bot lookback should fall back');
+    assert.strictEqual(fallback.amaSlope.emaAlpha, 0.2, 'absent bot EMA should fall back');
+    assert.strictEqual(fallback.asymmetricBounds.maxAsymmetryFactor, 0.33, 'absent bot max asymmetry should fall back');
 }
 
 // Bot AMA config behavior

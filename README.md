@@ -176,7 +176,7 @@ Keep the default settings first, and tune these:
 
    - `Price` — **on for AMA bots**; without it the adapter only dry-runs
    - `Weight` — dynamic buy/sell weights (opt-in)
-   - `Range` — AMA-slope range scaling (opt-in)
+   - `AMA-Slope` — AMA-slope range scaling (opt-in)
 
    To change how closely the grid center tracks the market, set `gridPrice`
    in `3) Price` to `"ama1"`–`"ama4"`: `"ama1"` reacts fastest, `"ama4"`
@@ -257,7 +257,18 @@ These three booleans are stored per bot in `market_adapter_whitelist.json`, **no
 | :--- | :--- |
 | `ama` (Price) | AMA pricing and live adapter writes. Turn on for AMA bots; without it the adapter only dry-runs |
 | `dynamicWeight` (Weight) | Dynamic buy/sell weights (opt-in; only takes effect while Price is on) |
-| `asymmetricBounds` (Range) | AMA-slope range scaling (opt-in; only takes effect while Price is on) |
+| `asymmetricBounds` (AMA-Slope) | AMA-slope range scaling (opt-in; only takes effect while Price is on) |
+
+**`7) AMA-Slope`**
+
+Optional per-bot overrides stored in this bot's `bots.json` entry. Leaving a field out falls back to the global setting, then the constants default. They take effect only while the `AMA-Slope` flag in `6) Adapter` is on; the editor dims this line while it is off.
+
+| Parameter | Type | Description |
+| :--- | :--- | :--- |
+| **`amaSlope.lookbackBars`** | number | `lb` — Huber slope window, `8`–`100` bars (default `16`) |
+| **`amaSlope.emaAlpha`** | number | `ema` — recursive EMA on the slope, `2/101`–`1`; `1` = off (default `0.2`) |
+| **`amaSlope.maxSlopePct`** | number | `maxS%` — per-bar slope that saturates the offset; minimum `0.06`, no upper cap (default `0.1`) |
+| **`asymmetricBounds.maxAsymmetryFactor`** | number | `maxAsym` — grid range tilt, `0`–`0.65`; values above the ceiling are capped with a warning (default `0.33`) |
 
 </details>
 
@@ -306,11 +317,20 @@ Grouped exactly as `dexbot bot` → `6) General settings` shows them:
 | Branch | `auto` | `main`, `dev`, `test`, or `auto` (detected current branch) |
 | Schedule | `1` at `00:00` | Cron schedule (`Interval` days, `Time` HH:mm, 24h) |
 
+**`7) AMA-Slope`**
+
+| Setting | Default | Description |
+| :--- | :--- | :--- |
+| AMA-Slope Lookback Bars | `16` | `lb` — slope window, `8`–`100` bars (same range as the dynamic-weight research chart) |
+| AMA-Slope EMA alpha | `0.2` | `ema` — `2/101`–`1`; `1` disables smoothing |
+| AMA Max Slope %/bar | `0.1` | `maxS%` — minimum `0.06`, no upper cap |
+| Max Asymmetry Factor | `0.33` | `maxAsym` — grid range tilt; hard ceiling `0.65`, above which input is capped with a warning |
+
 </details>
 
 ### Constants and Overrides
 
-Defaults in [`modules/constants.ts`](modules/constants.ts) are overridable at global, pair, and bot level via `general.settings.json`, `market_profiles.json`, and `market_adapter_settings.json` in the profiles directory. See [market_adapter/README.md](market_adapter/README.md#settings-and-overrides) for examples.
+Defaults in [`modules/constants.ts`](modules/constants.ts) are overridable at global, pair, and bot level via `general.settings.json`, `market_profiles.json`, and `market_adapter_settings.json` in the profiles directory. For the AMA-Slope settings above, a bot's own `bots.json` entry is applied last and wins over both general settings and `market_adapter_settings.json`. See [market_adapter/README.md](market_adapter/README.md#settings-and-overrides) for examples.
 
 ## 🎯 Zero-Dependency Process Management
 

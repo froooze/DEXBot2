@@ -791,6 +791,21 @@ async function askNumberWithBounds(promptText: string, defaultValue?: number, mi
 }
 
 /**
+ * Bounded number with a hard ceiling: values above `maxVal` are accepted and
+ * capped with a warning instead of being rejected/re-prompted. Mirrors the
+ * runtime normalizer so what the editor shows is what the bot will use.
+ */
+async function askNumberWithCeiling(promptText: string, defaultValue: number, minVal: number, maxVal: number): Promise<number | string | undefined> {
+    const value = await askNumberWithBounds(promptText, defaultValue, minVal, Number.MAX_SAFE_INTEGER);
+    if (typeof value !== 'number') return value;
+    if (value > maxVal) {
+        console.log(`${COLORS.yellow}${promptText} ${value} exceeds the ceiling; using ${maxVal}.${COLORS.reset}`);
+        return maxVal;
+    }
+    return value;
+}
+
+/**
  * Prompts the user for the target spread percentage.
  * Values are rounded to two decimal places: the displayed minimum, the
  * validation threshold, and the returned value all share cent precision.
@@ -1158,6 +1173,10 @@ interface BotDraft extends UnknownRecord {
     edgeOrders?: { sell?: number; buy?: number };
     startPrice?: number | string;
     targetSpreadPercent?: number;
+    /** Optional per-bot AMA-Slope signal settings; absent = global/default. */
+    amaSlope?: { lookbackBars?: number; emaAlpha?: number; maxSlopePct?: number };
+    /** Per-bot grid range asymmetry; absent = global/default. */
+    asymmetricBounds?: { maxAsymmetryFactor?: number; [key: string]: unknown };
     weightDistribution: { sell: number; buy: number };
 }
 
@@ -1339,6 +1358,8 @@ function sameAdapterFlags(a: AdapterFlags, b: AdapterFlags): boolean {
  */
 async function promptBotData(base: BotDraft = {} as BotDraft, index = 0, mode: BotEditorMode = 'new', sourceIndex = index) {
     const data = normalizeBotDraft(base);
+    // Display fallback for 7) AMA-Slope; absent bot fields mean "use global".
+    const globalAma = loadGeneralSettings().MARKET_ADAPTER;
 
     // Market-adapter flags (6) Adapter) live in
     // profiles/market_adapter_whitelist.json keyed by botKey — the same file
@@ -1374,8 +1395,8 @@ async function promptBotData(base: BotDraft = {} as BotDraft, index = 0, mode: B
              console.log(`${COLORS.yellowBold}3) Price:${COLORS.reset}     ${COLORS.orange}Range:${COLORS.reset} [${colorPriceRangeValue(data.minPrice)} - ${colorPriceRangeValue(data.maxPrice)}] | ${COLORS.orange}Start:${COLORS.reset} ${colorStartPriceValue(data.startPrice)}, ${COLORS.orange}Pool:${COLORS.reset} ${formatPoolRefLabel(data)} | ${COLORS.orange}GridPrice:${COLORS.reset} ${colorGridPriceValue(data.gridPrice)}`);
              console.log(`${COLORS.yellowBold}4) Grid:${COLORS.reset}      ${COLORS.orange}Weights:${COLORS.reset} (S:${data.weightDistribution.sell}, B:${data.weightDistribution.buy}) | ${COLORS.orange}Increment:${COLORS.reset} ${data.incrementPercent}%, ${COLORS.orange}Spread:${COLORS.reset} ${data.targetSpreadPercent}%`);
              console.log(`${COLORS.yellowBold}5) Inventory:${COLORS.reset} ${COLORS.orange}Sell:${COLORS.reset} ${colorPercentageInput(data.botFunds.sell)}, ${COLORS.orange}Buy:${COLORS.reset} ${colorPercentageInput(data.botFunds.buy)} | ${COLORS.orange}CoreOrder:${COLORS.reset} (S:${data.coreOrders.sell}, B:${data.coreOrders.buy}) | ${COLORS.orange}EdgeOrder:${COLORS.reset} (S:${data.edgeOrders?.sell ?? 0}, B:${data.edgeOrders?.buy ?? 0})`);
+             const flags = adapterFlags();
              {
-                 const flags = adapterFlags();
                  const inert = !isAmaGridPriceDraft() && (flags.ama || flags.dynamicWeight || flags.asymmetricBounds);
                  const hint = inert ? ` ${COLORS.red}(needs gridPrice=ama)${COLORS.reset}` : '';
                  // Adapter flags read as a health state, not a neutral toggle:
@@ -1383,7 +1404,18 @@ async function promptBotData(base: BotDraft = {} as BotDraft, index = 0, mode: B
                  // helper section 2 uses for Active). Price is the gate for the
                  // other two, so off stays red; Weight/Range are optional
                  // riders, so off is a bright-yellow warning rather than an error.
-                 console.log(`${COLORS.yellowBold}6) Adapter:${COLORS.reset}   ${COLORS.orange}Price:${COLORS.reset} ${colorBooleanFlag(flags.ama, true)}, ${COLORS.orange}Weight:${COLORS.reset} ${colorBooleanFlag(flags.dynamicWeight, true, COLORS.yellowBold)}, ${COLORS.orange}Range:${COLORS.reset} ${colorBooleanFlag(flags.asymmetricBounds, true, COLORS.yellowBold)}${hint}`);
+                 console.log(`${COLORS.yellowBold}6) Adapter:${COLORS.reset}   ${COLORS.orange}Price:${COLORS.reset} ${colorBooleanFlag(flags.ama, true)}, ${COLORS.orange}Weight:${COLORS.reset} ${colorBooleanFlag(flags.dynamicWeight, true, COLORS.yellowBold)}, ${COLORS.orange}AMA-Slope:${COLORS.reset} ${colorBooleanFlag(flags.asymmetricBounds, true, COLORS.yellowBold)}${hint}`);
+             }
+             {
+                 // AMA-Slope flag lives on 6) Adapter; don't repeat it here. When off,
+                 // these settings are inert, so dim the whole line (no color
+                 // resets inside it, or the grey would be cut short).
+                 const dim = !flags.asymmetricBounds;
+                 const sec = dim ? COLORS.gray : COLORS.yellowBold;
+                 const val = dim ? COLORS.gray : COLORS.orange;
+                 const r = dim ? '' : COLORS.reset;
+                 // (no boolean repeated here — see 6) Adapter)
+                 console.log(`${sec}7) AMA-Slope:${r} ${val}lb:${r} ${data.amaSlope?.lookbackBars ?? globalAma.DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS}, ${val}ema:${r} ${data.amaSlope?.emaAlpha ?? globalAma.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA}, ${val}maxS%:${r} ${data.amaSlope?.maxSlopePct ?? globalAma.DYNAMIC_WEIGHT_AMA_MAX_SLOPE_PCT}, ${val}maxAsym:${r} ${data.asymmetricBounds?.maxAsymmetryFactor ?? globalAma.ASYMMETRIC_BOUNDS_MAX_ASYMMETRY_FACTOR}`);
              }
              console.log('--------------------------------------------------');
              console.log(`${COLORS.greenBold}S) Save & Exit${COLORS.reset}`);
@@ -1392,7 +1424,7 @@ async function promptBotData(base: BotDraft = {} as BotDraft, index = 0, mode: B
         }
 
         const choice = (await readInput('Select section to edit or action: ', {
-            validate: (input: string) => ['1', '2', '3', '4', '5', '6', 's', 'c'].includes(input.toLowerCase())
+            validate: (input: string) => ['1', '2', '3', '4', '5', '6', '7', 's', 'c'].includes(input.toLowerCase())
         })).trim().toLowerCase();
 
         if (choice === '\x1b') {
@@ -1536,6 +1568,46 @@ async function promptBotData(base: BotDraft = {} as BotDraft, index = 0, mode: B
                 showMenu = true;
                 break;
             }
+            case '7': {
+                // Per-bot AMA-Slope signal shape. Saved into this bot's entry
+                // in profiles/bots.json and applied last by the runtime, so it
+                // overrides both general settings and market_adapter_settings.
+                const botAma = data.amaSlope || {};
+                const lb = await askIntegerInRange(
+                    'AMA-Slope Lookback Bars',
+                    botAma.lookbackBars ?? Number(globalAma.DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS),
+                    MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS_MIN,
+                    MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS_MAX
+                );
+                if (lb === '\x1b') break;
+                const ema = await askNumberWithBounds(
+                    'AMA-Slope EMA alpha (1 = off)',
+                    botAma.emaAlpha ?? Number(globalAma.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA),
+                    MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA_MIN,
+                    MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA_MAX
+                );
+                if (ema === '\x1b') break;
+                const mp = await askNumberWithBounds(
+                    'AMA Max Slope %/bar (minimum only)',
+                    botAma.maxSlopePct ?? Number(globalAma.DYNAMIC_WEIGHT_AMA_MAX_SLOPE_PCT),
+                    MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_MAX_SLOPE_PCT_MIN,
+                    Number.MAX_SAFE_INTEGER
+                );
+                if (mp === '\x1b') break;
+                const asym = await askNumberWithCeiling(
+                    'Max Asymmetry Factor',
+                    data.asymmetricBounds?.maxAsymmetryFactor ?? Number(globalAma.ASYMMETRIC_BOUNDS_MAX_ASYMMETRY_FACTOR),
+                    0,
+                    MARKET_ADAPTER.ASYMMETRIC_BOUNDS_MAX_ASYMMETRY_FACTOR_MAX
+                );
+                if (asym === '\x1b') break;
+                if (typeof lb !== 'number' || typeof ema !== 'number'
+                    || typeof mp !== 'number' || typeof asym !== 'number') break;
+                data.amaSlope = { ...botAma, lookbackBars: lb, emaAlpha: ema, maxSlopePct: mp };
+                data.asymmetricBounds = { ...(data.asymmetricBounds || {}), maxAsymmetryFactor: asym };
+                showMenu = true;
+                break;
+            }
             case 's':
                 // Final basic validation before saving
                 if (!data.name || !data.assetA || !data.assetB || !data.preferredAccount) {
@@ -1630,12 +1702,13 @@ async function promptGeneralSettings() {
           console.log(`${COLORS.yellowBold}5) Updater:${COLORS.reset}      [${updaterStatus}] ${COLORS.orange}Branch:${COLORS.reset} ${settings.UPDATER.BRANCH}, ${COLORS.orange}Interval:${COLORS.reset} ${currentSched.days}d, ${COLORS.orange}Time:${COLORS.reset} ${currentSched.time}`);
           const noticeStatus = settings.UPDATER.NOTICE_ENABLED !== false ? `${COLORS.green}ON${COLORS.reset}` : `${COLORS.red}OFF${COLORS.reset}`;
           console.log(`   ${COLORS.orange}New-version notice:${COLORS.reset} [${noticeStatus}] ${COLORS.gray}(startup hint only, never auto-updates)${COLORS.reset}`);
+          console.log(`${COLORS.yellowBold}7) AMA-Slope:${COLORS.reset}  ${COLORS.orange}lb:${COLORS.reset} ${settings.MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS} (${MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS_MIN}-${MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS_MAX}), ${COLORS.orange}ema:${COLORS.reset} ${settings.MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA} (${MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA_MIN.toFixed(3)}-1), ${COLORS.orange}maxS%:${COLORS.reset} ${settings.MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_MAX_SLOPE_PCT} (>= ${MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_MAX_SLOPE_PCT_MIN}), ${COLORS.orange}maxAsym:${COLORS.reset} ${settings.MARKET_ADAPTER.ASYMMETRIC_BOUNDS_MAX_ASYMMETRY_FACTOR}`);
           console.log('--------------------------------------------------');
           console.log(`${COLORS.greenBold}S) Save & Exit${COLORS.reset}`);
           console.log(`${COLORS.white}C) Cancel (Discard changes)${COLORS.reset}`);
 
          const choice = (await readInput('Select section to edit or action: ', {
-              validate: (input: string) => ['1', '2', '3', '4', '5', 's', 'c'].includes(input)
+              validate: (input: string) => ['1', '2', '3', '4', '5', '7', 's', 'c'].includes(input)
          })).trim().toLowerCase();
 
         if (choice === '\x1b') {
@@ -1658,6 +1731,45 @@ async function promptGeneralSettings() {
                 settings.GRID_LIMITS.GRID_COMPARISON.RMS_PERCENTAGE = rms;
                 settings.MARKET_ADAPTER.AMA_DELTA_THRESHOLD_PERCENT = amaDelta;
                 settings.MARKET_ADAPTER.AMA_SLOPE_DELTA_THRESHOLD_PERCENT = amaSlopeDelta;
+                break;
+            case '7':
+                // AMA-Slope signal shape. Bounds mirror the DW research chart
+                // sliders; max-ama-slope has a minimum only, max-asymmetry is
+                // capped at its ceiling with a warning instead of a re-prompt.
+                const slopeLb = await askIntegerInRange(
+                    'AMA-Slope Lookback Bars',
+                    Number(settings.MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS),
+                    MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS_MIN,
+                    MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS_MAX
+                );
+                if (slopeLb === '\x1b') break;
+                const slopeEma = await askNumberWithBounds(
+                    'AMA-Slope EMA alpha (1 = off)',
+                    Number(settings.MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA),
+                    MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA_MIN,
+                    MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA_MAX
+                );
+                if (slopeEma === '\x1b') break;
+                const slopeMaxPct = await askNumberWithBounds(
+                    'AMA Max Slope %/bar (minimum only)',
+                    Number(settings.MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_MAX_SLOPE_PCT),
+                    MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_MAX_SLOPE_PCT_MIN,
+                    Number.MAX_SAFE_INTEGER
+                );
+                if (slopeMaxPct === '\x1b') break;
+                const asymFactor = await askNumberWithCeiling(
+                    'Max Asymmetry Factor',
+                    Number(settings.MARKET_ADAPTER.ASYMMETRIC_BOUNDS_MAX_ASYMMETRY_FACTOR),
+                    0,
+                    MARKET_ADAPTER.ASYMMETRIC_BOUNDS_MAX_ASYMMETRY_FACTOR_MAX
+                );
+                if (asymFactor === '\x1b') break;
+                if (typeof slopeLb !== 'number' || typeof slopeEma !== 'number'
+                    || typeof slopeMaxPct !== 'number' || typeof asymFactor !== 'number') break;
+                settings.MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS = slopeLb;
+                settings.MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA = slopeEma;
+                settings.MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_MAX_SLOPE_PCT = slopeMaxPct;
+                settings.MARKET_ADAPTER.ASYMMETRIC_BOUNDS_MAX_ASYMMETRY_FACTOR = asymFactor;
                 break;
             case '2':
                 const dust = await askNumberWithBounds('Partial Dust Threshold %', settings.GRID_LIMITS.PARTIAL_DUST_THRESHOLD_PERCENTAGE, 0.1, 50);

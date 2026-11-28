@@ -16,7 +16,11 @@ import { Y_AXIS_SIZE, makeCursorConfig, bindHoverStateFn, wireChartEvents, zoomR
 
 // Lookback slider bounds, shared with the research runner so its precomputed
 // slope/percentile arrays are built with the same window the chart displays.
-const CHART_LOOKBACK_BARS_BOUNDS = { MIN: 8, MAX: 100 };
+// Same bounds the bot editor uses (single source of truth in constants).
+const CHART_LOOKBACK_BARS_BOUNDS = {
+    MIN: MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS_MIN,
+    MAX: MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS_MAX,
+};
 
 // Browser-embedded shared functions — the interactive chart runs the exact same
 // pure logic as the live market adapter service instead of a hand-copied copy.
@@ -106,7 +110,7 @@ function generateHTML(data: DynamicWeightChartInput, title = 'Dynamic Weight Res
     const LB_MIN = CHART_LOOKBACK_BARS_BOUNDS.MIN;
     const LB_MAX = CHART_LOOKBACK_BARS_BOUNDS.MAX;
     const GAIN_MIN = 0.5,     GAIN_MAX = 2.0;
-    const AMA_MS_MIN = 0.06,  AMA_MS_MAX = 0.12;
+    const AMA_MS_MIN = MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_MAX_SLOPE_PCT_MIN, AMA_MS_MAX = 0.12;
     const KAL_MS_MIN = 0.75,  KAL_MS_MAX = 1.5;
     const CLIP_PCT_MAX = 20;
     const TH_MIN = 0,         TH_MAX = 0.5;

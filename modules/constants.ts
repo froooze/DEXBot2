@@ -1466,14 +1466,23 @@ let MARKET_ADAPTER = {
     // matters: AMA group delay 10→8 bars, reversal lag 22→20, and range-tilt
     // wrong-way 13.7%→12.6%. Measured on the real 1h pools; see
     // docs/AMA_SLOPE_WINDOW.md.
-    // nob: lb (Lookback Bars)
+    // nob: lb (Lookback Bars). Editable in General Settings → 7) AMA-Slope
+    // or per bot in bots.json (amaSlope.lookbackBars); the bot entry wins.
     DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS: 16,
+    // Slider range shared with the DW research chart and the bot editor's
+    // AMA-Slope line, so both surfaces accept exactly the same lookback values.
+    DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS_MIN: 8,
+    DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS_MAX: 100,
 
     // DYNAMIC_WEIGHT_AMA_MAX_SLOPE_PCT: Average per-bar trend size that counts as "full strength" for AMA.
     // Lower values make the AMA channel reach maximum influence more easily.
     // Higher values require a stronger price move before AMA reaches full effect.
-    // nob: amaS% (AMA Max Slope %)
+    // nob: amaS% (AMA Max Slope %). Editable in General Settings → 7) AMA-Slope
+    // or per bot in bots.json (amaSlope.maxSlopePct); the bot entry wins.
     DYNAMIC_WEIGHT_AMA_MAX_SLOPE_PCT: 0.1,
+    // Lower bound of the DW research chart's amaMaxSlopePct slider. The bot
+    // editor checks only this minimum (no upper cap) for the global setting.
+    DYNAMIC_WEIGHT_AMA_MAX_SLOPE_PCT_MIN: 0.06,
 
     // DYNAMIC_WEIGHT_KALMAN_MAX_SLOPE_PCT: Trend size that counts as "full strength" for
     // the Kalman composite branch. Kept separate from the AMA slope knob so the two
@@ -1495,8 +1504,10 @@ let MARKET_ADAPTER = {
     // cuts the worst bar-to-bar slope jumps on sparse pools by ~60% at ~4 bars
     // of extra lag. The range matches the DW research slider: MIN is the
     // 100-bar variance-equivalent alpha 2/(100+1), MAX 1 disables the EMA.
-    // Overridable per market/bot via `amaSlope.emaAlpha` and per deployment via
-    // `MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA` in general.settings.json.
+    // Overridable per deployment in General Settings → 7) AMA-Slope
+    // (`MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA` in general.settings.json),
+    // per market/bot via `amaSlope.emaAlpha`, or per bot in bots.json; the bot
+    // entry wins.
     DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA: 0.2,
     DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA_MIN: 2 / 101,
     DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA_MAX: 1,
@@ -1660,9 +1671,11 @@ let MARKET_ADAPTER = {
     //   Downtrend: both bounds ÷ (1+factor)   Uptrend: both bounds × (1+factor)
     // This widens the bound in the trend direction and tightens the opposite side,
     // giving the grid more room when the AMA center trails price in a trend.
-    // 0 disables asymmetry. Recommended range: 0.15–0.35.
-    // Overridable per bot via market_adapter_settings.json.
+    // 0 disables asymmetry. Recommended range: 0.15–0.35; editor ceiling 0.65.
+    // Overridable per bot via market_adapter_settings.json or bots.json.
     ASYMMETRIC_BOUNDS_MAX_ASYMMETRY_FACTOR: 0.33,
+    // Hard ceiling for the editor prompts; the shipped default is 0.33.
+    ASYMMETRIC_BOUNDS_MAX_ASYMMETRY_FACTOR_MAX: 0.65,
 
     // ASYMMETRIC_BOUNDS_MIN_SCALE_SLOTS: Minimum number of price levels the
     // narrowed/tightened side of a range-scaled grid must keep between the grid

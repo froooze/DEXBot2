@@ -29,6 +29,7 @@ Tools that inspect DEXBot trading behavior and the market data it operates on. O
 | [`compare_cex_dex_cross.ts`](#cex-vs-dex-cross-rate-overlay-compare_cex_dex_crossts) | "How does a DEX synthetic cross compare with a CEX cross built from two common-quote legs?" | `npx tsx analysis/compare_cex_dex_cross.ts --fetch` |
 | [`analyze_liquidity.ts`](#liquidity-depth-chart-analyze_liquidityts) | "Where is the pair's real liquidity — order book, AMM pool, or both?" | `npm run analysis:liquidity -- --pair TOKENA/TOKENB` |
 | [`analyze_dynamic_weight.ts`](#dynamic-weight-research-analyze_dynamic_weightts) | "Are buy/sell weights tuned for this regime?" | `dexbot dw <bot-key>` |
+| [`trend_detection/benchmark_ama_slope_smoothing.ts`](#trend_detection) | "Which slope smoother gives the best noise/lag trade-off?" | `npm run analysis:smoothing-bench -- --chart <dw-chart.html>` |
 | [`analyze_volatility.ts`](#volatility-analyze_volatilityts) | "Both weights clipped too hard / not enough?" | `node dist/analysis/analyze_volatility.js --bot-key <bot-key>` |
 | [`analyze_regime.ts`](#supporting-sub-signals) | "Is the trend/chaos gate too aggressive?" | `node dist/analysis/analyze_regime.js --bot-key <bot-key>` |
 | [`analyze_kalman.ts`](#supporting-sub-signals) | "Is Kalman's contribution to the blend right?" | `node dist/analysis/analyze_kalman.js --bot-key <bot-key>` |

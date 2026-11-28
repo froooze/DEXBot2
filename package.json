@@ -94,6 +94,7 @@
     "lp:chart": "npm run build && node dist/scripts/generate_lp_chart.js",
     "market-adapter:fetch-cex-synthetic": "npm run build && node dist/market_adapter/inputs/fetch_cex_synthetic_data.js",
     "analysis:tradingview": "npm run build && node dist/analysis/tradingview/analyze_tradingview.js",
+    "analysis:smoothing-bench": "npm run build && node dist/analysis/trend_detection/benchmark_ama_slope_smoothing.js",
     "ama:chart:lp-local": "npm run build && node dist/analysis/ama_fitting/generate_unified_comparison_chart.js",
     "analysis:trade-pnl": "npm run build && node dist/analysis/trade_profitability.js",
     "analysis:grid-check": "npm run build && node dist/analysis/grid_correction_check.js",

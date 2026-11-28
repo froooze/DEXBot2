@@ -351,9 +351,11 @@ function applyMarketAdapterOverrides(target: AdapterTargetCfg, overrides: Adapte
 
 function resolveBotCfg(bot: Record<string, unknown>, globalCfg: AdapterTargetCfg): AdapterTargetCfg {
     const settings = loadMarketAdapterSettings();
-    if (!settings) return globalCfg;
 
-    let merged = {
+    // Always clone: even without market_adapter_settings.json the bot's own
+    // entry below must still be applied (an early return here would silently
+    // drop bots.json AMA-Slope overrides on installations without that file).
+    const merged: AdapterTargetCfg = {
         ...globalCfg,
         amaSlope: { ...(globalCfg.amaSlope || {}) },
         kalmanSlope: { ...(globalCfg.kalmanSlope || {}) },
@@ -362,22 +364,28 @@ function resolveBotCfg(bot: Record<string, unknown>, globalCfg: AdapterTargetCfg
             : globalCfg.kalman,
     };
 
-    applyMarketAdapterOverrides(merged, (settings.globals || {}) as AdapterOverrideCfg);
+    if (settings) {
+        applyMarketAdapterOverrides(merged, (settings.globals || {}) as AdapterOverrideCfg);
 
-    // Pair-level overrides
-    const pair = findPairForBot(bot, Array.isArray(settings.pairs) ? settings.pairs : []);
-    if (pair && (pair as Record<string, unknown>).marketAdapterSettings) {
-        applyMarketAdapterOverrides(merged, (pair as Record<string, unknown>).marketAdapterSettings as Record<string, unknown>);
+        // Pair-level overrides
+        const pair = findPairForBot(bot, Array.isArray(settings.pairs) ? settings.pairs : []);
+        if (pair && (pair as Record<string, unknown>).marketAdapterSettings) {
+            applyMarketAdapterOverrides(merged, (pair as Record<string, unknown>).marketAdapterSettings as Record<string, unknown>);
+        }
+
+        // Bot-level overrides
+        const pairObj = pair as Record<string, unknown> | null;
+        const botOverride = pairObj?.botOverrides
+            ? (pairObj.botOverrides as Record<string, unknown>)[String(bot.name)]
+            : undefined;
+        if (botOverride) {
+            applyMarketAdapterOverrides(merged, botOverride as AdapterOverrideCfg, { includeDefaultAmaKey: true });
+        }
     }
 
-    // Bot-level overrides
-    const pairObj = pair as Record<string, unknown> | null;
-    const botOverride = pairObj?.botOverrides
-        ? (pairObj.botOverrides as Record<string, unknown>)[String(bot.name)]
-        : undefined;
-    if (botOverride) {
-        applyMarketAdapterOverrides(merged, botOverride as AdapterOverrideCfg, { includeDefaultAmaKey: true });
-    }
+    // The bot's own bots.json entry is the last word: it can overwrite both the
+    // general-settings UI values and any market_adapter_settings.json override.
+    applyBotEntrySignalOverrides(merged, bot);
 
     return merged;
 }
@@ -812,6 +820,79 @@ function resolveAmaSlopeEmaAlphaFromGeneralSettings(settings: Record<string, unk
     return normalizeAmaSlopeEmaAlpha(raw);
 }
 
+/** Clamped lookback; null = invalid, so a 0/NaN never produces a zero window. */
+function normalizeAmaSlopeLookbackValue(raw: unknown): number | null {
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0) return null;
+    return Math.max(
+        MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS_MIN,
+        Math.min(MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS_MAX, Math.ceil(n))
+    );
+}
+
+/** Minimum-only check, no upper cap (DW research chart slider minimum). */
+function normalizeAmaMaxSlopePctValue(raw: unknown): number | null {
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n < MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_MAX_SLOPE_PCT_MIN) return null;
+    return n;
+}
+
+/** Grid max-asymmetry factor: 0 disables, hard ceiling from constants. */
+function normalizeMaxAsymmetryFactorValue(raw: unknown): number | null {
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n < 0) return null;
+    return Math.min(MARKET_ADAPTER.ASYMMETRIC_BOUNDS_MAX_ASYMMETRY_FACTOR_MAX, n);
+}
+
+/** AMA-Slope lookback from general settings, clamped to the DW chart range. */
+function resolveAmaSlopeLookbackBarsFromGeneralSettings(settings: Record<string, unknown> | null) {
+    return normalizeAmaSlopeLookbackValue((settings?.MARKET_ADAPTER as Record<string, unknown> | undefined)?.DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS);
+}
+
+/** AMA max slope %/bar from general settings. */
+function resolveAmaMaxSlopePctFromGeneralSettings(settings: Record<string, unknown> | null) {
+    return normalizeAmaMaxSlopePctValue((settings?.MARKET_ADAPTER as Record<string, unknown> | undefined)?.DYNAMIC_WEIGHT_AMA_MAX_SLOPE_PCT);
+}
+
+/** Grid max-asymmetry factor from general settings. */
+function resolveMaxAsymmetryFactorFromGeneralSettings(settings: Record<string, unknown> | null) {
+    return normalizeMaxAsymmetryFactorValue((settings?.MARKET_ADAPTER as Record<string, unknown> | undefined)?.ASYMMETRIC_BOUNDS_MAX_ASYMMETRY_FACTOR);
+}
+
+/**
+ * Bot entry (profiles/bots.json) AMA-Slope overrides. Applied last in
+ * resolveBotCfg so a bot's own values beat general settings AND
+ * market_adapter_settings.json; absent fields fall through to the values
+ * resolved from those earlier layers.
+ */
+function applyBotEntrySignalOverrides(merged: AdapterTargetCfg, bot: Record<string, unknown>) {
+    const ama = bot?.amaSlope;
+    if (ama && typeof ama === 'object') {
+        const a = ama as Record<string, unknown>;
+        const lb = normalizeAmaSlopeLookbackValue(a.lookbackBars);
+        const ema = a.emaAlpha == null || a.emaAlpha === '' ? null : normalizeAmaSlopeEmaAlpha(a.emaAlpha);
+        const maxSlope = normalizeAmaMaxSlopePctValue(a.maxSlopePct);
+        if (lb != null || ema != null || maxSlope != null) {
+            merged.amaSlope = {
+                ...(merged.amaSlope || {}),
+                ...(lb != null ? { lookbackBars: lb } : {}),
+                ...(ema != null ? { emaAlpha: ema } : {}),
+                ...(maxSlope != null ? { maxSlopePct: maxSlope } : {}),
+            };
+        }
+    }
+    const botBounds = bot?.asymmetricBounds;
+    if (botBounds && typeof botBounds === 'object') {
+        const factor = normalizeMaxAsymmetryFactorValue((botBounds as Record<string, unknown>).maxAsymmetryFactor);
+        if (factor != null) {
+            merged.asymmetricBounds = {
+                ...(merged.asymmetricBounds as Record<string, unknown> | undefined || {}),
+                maxAsymmetryFactor: factor,
+            };
+        }
+    }
+}
+
 function applyRuntimeDefaultsFromGeneralSettings(cfg: AdapterTargetCfg, provided: { deltaThresholdPercent?: boolean } = {}, settingsOverride?: Record<string, unknown>) {
     const out = { ...cfg };
     const settings = settingsOverride === undefined
@@ -825,13 +906,24 @@ function applyRuntimeDefaultsFromGeneralSettings(cfg: AdapterTargetCfg, provided
     }
     const slopeFromSettings = resolveAmaSlopeDeltaThresholdPercentFromGeneralSettings(settings);
     const emaFromSettings = resolveAmaSlopeEmaAlphaFromGeneralSettings(settings);
-    if (slopeFromSettings != null || emaFromSettings != null) {
+    const lbFromSettings = resolveAmaSlopeLookbackBarsFromGeneralSettings(settings);
+    const maxSlopeFromSettings = resolveAmaMaxSlopePctFromGeneralSettings(settings);
+    if (slopeFromSettings != null || emaFromSettings != null || lbFromSettings != null || maxSlopeFromSettings != null) {
         // Rebuild amaSlope instead of mutating it: `cfg` may be the shared
         // DEFAULTS object and must not be poisoned for later calls.
         out.amaSlope = {
             ...(out.amaSlope || {}),
             ...(slopeFromSettings != null ? { deltaThresholdPct: slopeFromSettings } : {}),
             ...(emaFromSettings != null ? { emaAlpha: emaFromSettings } : {}),
+            ...(lbFromSettings != null ? { lookbackBars: lbFromSettings } : {}),
+            ...(maxSlopeFromSettings != null ? { maxSlopePct: maxSlopeFromSettings } : {}),
+        };
+    }
+    const maxAsymmetryFromSettings = resolveMaxAsymmetryFactorFromGeneralSettings(settings);
+    if (maxAsymmetryFromSettings != null) {
+        out.asymmetricBounds = {
+            ...(out.asymmetricBounds as Record<string, unknown> | undefined || {}),
+            maxAsymmetryFactor: maxAsymmetryFromSettings,
         };
     }
     return out;
@@ -1782,6 +1874,10 @@ export { main, runOnceForAma, DEFAULT_AMA, DEFAULTS, calculateBotThreshold, buil
 export const __test = {
     resolveDeltaThresholdPercentFromGeneralSettings,
     resolveAmaSlopeDeltaThresholdPercentFromGeneralSettings,
+    resolveAmaSlopeEmaAlphaFromGeneralSettings,
+    resolveAmaSlopeLookbackBarsFromGeneralSettings,
+    resolveAmaMaxSlopePctFromGeneralSettings,
+    resolveMaxAsymmetryFactorFromGeneralSettings,
     _resetCycleCache,
     mergeGridResetMetadataFromDynamicGrid,
     _setBitsharesClientForTests: setBitsharesClientForTests,

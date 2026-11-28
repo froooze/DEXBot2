@@ -48,6 +48,28 @@ This folder contains the chart generators and re-export shims used by the analys
   `--truth-window` (default = max lookback), so compare it across runs only at a
   fixed truth window; `amaLag` (cross-correlation group delay) is reference-robust.
 
+- `benchmark_ama_slope_smoothing.ts` — compares candidate smoothers for the
+  per-bar Huber slope on the AMA data embedded in `dw_pool_*` research charts
+  (no candle download needed). Every candidate sees the same canonical Huber
+  slope; only the smoothing stage differs: current EMA (α=0.2), other EMA
+  alphas, double EMA, trailing median, KAMA on the slope, KAMA stacked on the
+  EMA, an exponential taper inside the Huber IRLS fit, a scalar Kalman filter
+  and a trend hysteresis latch. Reports **lag** (parabolic-interpolated
+  cross-correlation delay vs a centred reference, plus synthetic step response),
+  **total smoothing** (bar-to-bar wobble reduction, second-difference energy
+  reduction, zero-crossing rate) and synthetic step/noise-gain numbers.
+
+  ```bash
+  npm run build
+  node dist/analysis/trend_detection/benchmark_ama_slope_smoothing.js \
+    --chart analysis/charts/dw_pool_<id>_1h_12m.html
+  ```
+
+  At least one `--chart` is required; pass more flags to compare charts.
+  `--lookback` and `--out` are optional; the JSON lands under
+  `analysis/results/`. All smoothers are causal; the centred reference is used
+  for metrics only.
+
 The Kalman/Hurst/PE analyzers below are re-export shims; the implementations live in `market_adapter/core/signals/` and are shared with the live market adapter:
 
 - `hurst_analyzer.ts` → `market_adapter/core/signals/hurst_analyzer.ts`

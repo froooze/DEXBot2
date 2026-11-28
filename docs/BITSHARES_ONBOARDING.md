@@ -330,7 +330,7 @@ The three flags are stored per bot in `profiles/market_adapter_whitelist.json`:
 
 - **Price** — live grid files and recalc triggers (`ama: true`)
 - **Weight** — dynamic buy/sell weights (opt-in)
-- **Range** — range scaling (opt-in; stays off until enabled here)
+- **AMA-Slope** — range scaling (opt-in; stays off until enabled here)
 
 The adapter is started/stopped automatically when active AMA bots exist.
 

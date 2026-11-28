@@ -271,7 +271,7 @@ need a reset to move to the new asymmetric range and offset placement price.
 
 Range scaling is enabled by the whitelist's `asymmetricBounds: true` flag.
 Set it per bot in the editor: `dexbot bot` → `2) Modify bot` → pick the bot →
-`6) Adapter` → **Range** = yes. The flag is stored in
+`6) Adapter` → **AMA-Slope** = yes. The flag is stored in
 `profiles/market_adapter_whitelist.json` next to **Price** (AMA pricing) and
 **Weight** (dynamic weights); all three default to off until enabled.
 
@@ -321,6 +321,10 @@ persistence gate (`AMA_SLOPE_PERSIST_BARS`, default 3): a real reversal needs
 roughly 7 confirming bars to recenter instead of 3. Enabling the EMA on live
 bots therefore requires explicit sign-off on the slower reversal response; see
 `docs/AMA_SLOPE_WINDOW.md` for the trade-off and rollback (`emaAlpha: 1`).
+The window, EMA alpha, max slope and max asymmetry are editable in General
+Settings → `7) AMA-Slope` and per bot in `bots.json` (editor section `7`);
+a bot entry wins over both general settings and
+`profiles/market_adapter_settings.json`.
 Because the fit reports the log-return, a reading is ~`ln(1+r)` rather than the
 arithmetic `r`: negligible at the sub-0.1 %/bar magnitudes the defaults use, but
 ~3% lower at a 6%/bar saturation (`ln(1.06)*100 = 5.83`). A pre-existing user

@@ -91,9 +91,11 @@ Default `MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA = 0.2` adds
 the worst bar-to-bar slope jump by ~60% (0.076 → 0.032 %/bar) without changing
 the slope distribution's median or p90. Range `[2/101, 1]`: `2/101` is the
 100-bar variance-equivalent alpha (`2/(N+1)`), `1` disables smoothing.
-Override per deployment via `MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA`
-in `profiles/general.settings.json`, or per market/bot via
-`amaSlope.emaAlpha` in `profiles/market_adapter_settings.json`.
+Override per deployment in `dexbot bot` → General Settings → `7) AMA-Slope`
+(key `MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA` in
+`profiles/general.settings.json`), per market/bot via `amaSlope.emaAlpha` in
+`profiles/market_adapter_settings.json`, or per bot in that bot's `bots.json`
+entry (editor section `7`), which wins over the earlier layers.
 
 The clip threshold is intentionally still derived from the raw slope history,
 so adding EMA does not create a clip-feedback loop. Because the reset baseline

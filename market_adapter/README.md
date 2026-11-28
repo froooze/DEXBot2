@@ -26,8 +26,8 @@ The live signal layer for AMA-priced bots. It reads candles, computes the AMA ce
 | Enable AMA pricing for a bot | [Quick Start](#quick-start) | `dexbot bot` → `2) Modify bot` → `6) Adapter` |
 | Change how often the grid rebuilds | [Trigger Threshold](#trigger-threshold) | edit `AMA_DELTA_THRESHOLD_PERCENT` |
 | Tune buy/sell weight bias | [Asymmetric Weight Shift](#asymmetric-weight-shift) | `dexbot bot` → `2) Modify bot` → `6) Adapter` → Weight |
-| Widen/tighten grid bounds by trend | [Grid Range Scaling](#grid-range-scaling) | `dexbot bot` → `2) Modify bot` → `6) Adapter` → Range |
-| Override settings for one pair or bot | [Settings and Overrides](#settings-and-overrides) | edit `profiles/market_adapter_settings.json` |
+| Widen/tighten grid bounds by trend | [Grid Range Scaling](#grid-range-scaling) | `dexbot bot` → `2) Modify bot` → `6) Adapter` → AMA-Slope |
+| Override settings for one pair or bot | [Settings and Overrides](#settings-and-overrides) | edit `profiles/market_adapter_settings.json` or a bot's `bots.json` entry |
 | Run the adapter standalone or test dry-run | [Live Writes and Dry-Run](#live-writes-and-dry-run) | `node dist/market_adapter/market_adapter.js --dryRun` |
 | Debug a bot not being processed | [Troubleshooting](#troubleshooting) | `dexbot bot` → `2) Modify bot` → `6) Adapter` flags |
 | Understand the signal pipeline or module layout | [Technical Reference](#technical-reference) | — |
@@ -76,7 +76,7 @@ Open the bot editor — `dexbot bot` → `2) Modify bot` → pick the bot →
 |------|---------------|--------|
 | **Price** | `ama` | Allows live `dynamicgrid.json` and recalc-trigger writes. Without it the adapter still computes state, but live output stays in dry-run. |
 | **Weight** | `dynamicWeight` | Opt-in dynamic buy/sell weights. |
-| **Range** | `asymmetricBounds` | Opt-in AMA-slope range scaling. |
+| **AMA-Slope** | `asymmetricBounds` | Opt-in AMA-slope range scaling. |
 
 The flags are stored per bot in `profiles/market_adapter_whitelist.json`;
 re-open the section any time to inspect or change them. Boolean prompts
@@ -130,7 +130,7 @@ whitelist gate:
 This is separate from dynamic buy/sell weighting. Both grid-range effects are
 enabled only when `asymmetricBounds: true` is set in
 `profiles/market_adapter_whitelist.json`. Range scaling is opt-in: enable it
-per bot with `dexbot bot` → `2) Modify bot` → `6) Adapter` → **Range**.
+per bot with `dexbot bot` → `2) Modify bot` → `6) Adapter` → **AMA-Slope**.
 
 Technical formula and tuning details are in
 [Grid Range Scaling Model](#grid-range-scaling-model).
@@ -186,6 +186,8 @@ Market-adapter settings resolve in this order:
 2. Global overrides in `profiles/general.settings.json` or `dexbot bot`
 3. Pair-specific overrides in `profiles/market_profiles.json`
 4. Bot-specific overrides in `profiles/market_adapter_settings.json`
+5. For the AMA-Slope settings, the bot's own entry in `profiles/bots.json`
+   (editor section `7`), applied last so it wins over all earlier layers
 
 ### Data and State Location
 
@@ -276,7 +278,7 @@ Pair-specific AMA profiles live in `profiles/market_profiles.json`:
 
 ### Per-Bot Overrides
 
-`botOverrides` is a general per-bot override within each pair entry. It applies at the highest priority and can hold any supported field:
+`botOverrides` is a general per-bot override within each pair entry. It applies at the highest priority of `market_adapter_settings.json` and can hold any supported field; the AMA-Slope fields in the bot's own `bots.json` entry are applied after it:
 
 ```json
 {
@@ -337,7 +339,7 @@ Dry-run log lines include `[DRY RUN]` or `[suppressed, dry-run]`.
 
 | Task | Command |
 |------|---------|
-| Enable/inspect Price, Weight, Range for a bot | `dexbot bot` → `2) Modify bot` → `6) Adapter` |
+| Enable/inspect Price, Weight, AMA-Slope for a bot | `dexbot bot` → `2) Modify bot` → `6) Adapter` |
 | Remove a deleted bot's entry | Automatic — `dexbot bot` → `3) Delete bot` also drops its whitelist key |
 | Probe public CEX availability | `node dist/market_adapter/inputs/fetch_cex_synthetic_data.js --exchange auto --check-only` |
 | Seed synthetic cross candles | `node dist/market_adapter/inputs/fetch_cex_synthetic_data.js --exchange auto --bot-key <bot-key>` |
@@ -503,7 +505,7 @@ Per cycle, per processed bot, the adapter can produce:
 
 | File | Purpose |
 |------|---------|
-| `profiles/bots.json` | Active bots, symbols, pool IDs, and `gridPrice` settings |
+| `profiles/bots.json` | Active bots, symbols, pool IDs, `gridPrice` and per-bot AMA-Slope settings |
 | `profiles/market_profiles.json` | Pair AMA profiles and defaults |
 | `profiles/market_adapter_whitelist.json` | Per-bot live-write permissions |
 | `profiles/market_adapter_settings.json` | Advanced adapter and dynamic-weight tuning |
@@ -725,7 +727,8 @@ sliver with few or no active orders.
 
 Both are configurable per bot or per market via
 `profiles/market_adapter_settings.json` (see the layering in
-[Per-Bot Overrides](#per-bot-overrides)):
+[Per-Bot Overrides](#per-bot-overrides)). `maxAsymmetryFactor` can also be set
+per bot in `bots.json` under `asymmetricBounds`, which wins over those layers:
 
 ```json
 {
@@ -746,8 +749,9 @@ Both are configurable per bot or per market via
 ```
 
 `asymmetricBounds` is merged per-field across the `globals` → `pairs[].marketAdapterSettings` →
-`pairs[].botOverrides.<bot>` layers, so overriding one field (e.g. a market-level
-`minScaleSlots`) does not wipe another (e.g. a bot-level `maxAsymmetryFactor`).
+`pairs[].botOverrides.<bot>` → `bots.json` layers, so overriding one field
+(e.g. a market-level `minScaleSlots`) does not wipe another (e.g. a bot-level
+`maxAsymmetryFactor`).
 
 ### Trigger Files
 
@@ -849,6 +853,20 @@ Main override knobs live in `profiles/market_adapter_settings.json`:
 | `kibanaRequestTimeoutMs` | Kibana request timeout in milliseconds |
 | `staleTailThreshold` | Stale-tail pruning threshold in candles |
 | `maxNativeGapFillCandles` | Max missing-candle gaps auto-filled without a Kibana query |
+
+**Global UI:** the bot editor's General Settings → `7) AMA-Slope` edits
+`DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS` (8–100 bars, same range as the DW research
+chart), `DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA` (`2/101`–`1`, `1` = off),
+`DYNAMIC_WEIGHT_AMA_MAX_SLOPE_PCT` (minimum `0.06`, no upper cap) and
+`ASYMMETRIC_BOUNDS_MAX_ASYMMETRY_FACTOR` (default `0.33`, ceiling `0.65`;
+values above the ceiling are capped with a warning). The runtime reads those
+four keys back from general settings. A bot's own entry in `profiles/bots.json`
+can carry `amaSlope: { lookbackBars, emaAlpha, maxSlopePct }` and
+`asymmetricBounds: { maxAsymmetryFactor }` (bot editor section `7`), with the
+same bounds. Those values are applied **last**, so they override both the
+general-settings UI and `market_adapter_settings.json`. Absent fields fall back
+through those layers to the constants defaults. All four apply only while the
+flag on `6) Adapter` (whitelist key `asymmetricBounds`) is on.
 
 </details>
 
