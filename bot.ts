@@ -51,6 +51,7 @@
 // 0o600 (owner-only) unless explicitly opened with a wider mode.  Protects
 // keys.json and daemon-policies.json from world-readable exposure.
 import { createRequire } from 'node:module';
+import type { BotEntry } from './modules/bot_settings.js';
 const require = createRequire(import.meta.url);
 
 const { setUmask } = require('./modules/config');
@@ -180,9 +181,9 @@ async function getSigningSecretForAccount(accountName: string) {
          // Normalized entries carry botKey and the default active=true that
          // raw profile entries omit. Both the warnings and the prune below
          // must use the same canonical definition of an active bot.
-         let normalizedAll: any[] = [];
+         let normalizedAll: BotEntry[] = [];
          try {
-             normalizedAll = allBotsConfig.map((entry: any, idx: number) => normalizeBotEntry(entry, idx));
+             normalizedAll = allBotsConfig.map((entry: BotEntry, idx: number) => normalizeBotEntry(entry, idx));
          } catch { /* fall back to raw keys below */ }
 
          // Surface shared-account allocation warnings that the monolithic
@@ -190,7 +191,7 @@ async function getSigningSecretForAccount(accountName: string) {
          // is optional when bot_settings is stubbed in startup tests.
          if (typeof collectValidationIssues === 'function') {
              try {
-                 const validation = collectValidationIssues(normalizedAll.filter((b: any) => b.active !== false), 'bots.json');
+                 const validation = collectValidationIssues(normalizedAll.filter((b: BotEntry) => b.active !== false), 'bots.json');
                  for (const warning of validation.warnings || []) launcherLogger.warn(warning);
              } catch { /* non-fatal: profile validation already ran */ }
          }
@@ -212,8 +213,8 @@ async function getSigningSecretForAccount(accountName: string) {
         if (typeof fundRegistry?.pruneAccount === 'function') {
             try {
                 const activeKeys = (normalizedAll.length ? normalizedAll : allBotsConfig)
-                    .filter((entry: any) => entry.active !== false && entry.preferredAccount === preferredAccount)
-                    .map((entry: any) => entry.botKey || entry.name)
+                    .filter((entry: BotEntry) => entry.active !== false && entry.preferredAccount === preferredAccount)
+                    .map((entry: BotEntry) => entry.botKey || entry.name)
                     .map((key: unknown) => typeof key === 'string' ? require('./modules/utils/sanitize_key').sanitizeKey(key) : null)
                     .filter((key: string | null): key is string => !!key);
                 await fundRegistry.pruneAccount(String(preferredAccount), activeKeys);

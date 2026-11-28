@@ -6,7 +6,7 @@ DEXBot2 is a sophisticated decentralized exchange trading bot for the BitShares 
 
 ### Key Milestones
 - **Project Inception**: December 2, 2025
-- **Growth Phase**: 2,547 commits over ~11 active months
+- **Growth Phase**: 2,555 commits over ~11 active months
 - **Code Maturity**: Evolution from basic utilities to a ~100,000+ LoC intelligent TypeScript system
 - **Stability**: Progression from manual testing to a suite of 366 automated test files (live tests included in `test:live`)
 - **Releases**: 156 changelog entries (v0.1.0 to v1.7.5)
@@ -149,7 +149,7 @@ Evolved from a basic README to a comprehensive framework (50+ docs entries, 80%+
 
 ## Version History
 
-Compact, era-level view; commit counts are `git rev-list --count <tag>..<tag>` over the current history (2026-11-27). The 107 commits up to and including the `v0.1.0` tag are not attributed to an era, so the current totals are 2,440 (`v0.1.0..HEAD`) and 2,547 (`HEAD`); the `v1.4.x` era rows overlap slightly because `v1.4.13` is not an ancestor of `v1.4.25` in the current history. Per-release detail lives in [CHANGELOG.md](../CHANGELOG.md); the thematic post-1.0.0 story in [ORDER_ENGINE_POST_1.0_RETROSPECTIVE.md](ORDER_ENGINE_POST_1.0_RETROSPECTIVE.md).
+Compact, era-level view; commit counts are `git rev-list --count <tag>..<tag>` over the current history (2026-11-28). The 107 commits up to and including the `v0.1.0` tag are not attributed to an era, so the current totals are 2,448 (`v0.1.0..HEAD`) and 2,555 (`HEAD`); the `v1.4.x` era rows overlap slightly because `v1.4.13` is not an ancestor of `v1.4.25` in the current history. Per-release detail lives in [CHANGELOG.md](../CHANGELOG.md); the thematic post-1.0.0 story in [ORDER_ENGINE_POST_1.0_RETROSPECTIVE.md](ORDER_ENGINE_POST_1.0_RETROSPECTIVE.md).
 
 | Era | Commits | Theme |
 |-----|--------:|-------|
@@ -181,12 +181,12 @@ Compact, era-level view; commit counts are `git rev-list --count <tag>..<tag>` o
 | v1.7.1 → v1.7.2 | 14 | One fill contract + fill-pipeline ratchet, fail-closed grid-update blockers with bounded escalation, single fill identity (`fill_ledger`), credit-time fill-key claim with all-or-nothing balance credits, single-winner concurrent claim, removal of the duplicate applied-amount channel and the second grace-stamp writer, COW broadcast-region leak repair, chain-observed wrong-side cancel exemptions, fill side derived from the paid asset + rail-geometry repair check, fill-anchored rebuild/load boundary, spread rotation into orphaned rail slots, consecutive grid-blocked escalation counter, live-suite env fix |
 | v1.7.2 → v1.7.3 | 10 | Plan-region serialization (`plan → broadcast → commit`), per-account single-controller lock & cross-runtime start guards, market-bounded last-fill pivot + stale pivot expiry, refused-fill same-level refill guard & policy-aware audit mirror, in-place missing UPDATE target repair, settled-pipeline structural resync gate, snapshot reload absence-grace preservation, clamped PARTIAL-growth update skip |
 | v1.7.3 → v1.7.4 | 20 | Live-log audit closures: fill-eligible boundary crawl & re-anchor, refused-sweep level blocking, recovery/cancel verification, in-place size-drift repair, fail-closed liveness & gate ownership, quiet B2/reconcile visibility, dead-code purge, test-speedup |
-| v1.7.4 → v1.7.5 | 8 | Shared-account operation (in-process instance-lock sharing, duplicate account/pair guard, end-to-end fund accounting, clean-slate operator resets, 3% size gate against update churn) and fill-market verification (live mid before a cached veto, pivot-writer alignment and pacing) |
+| v1.7.4 → v1.7.5 | 15 | Shared-account operation (in-process instance-lock sharing, duplicate account/pair guard, end-to-end fund accounting, clean-slate operator resets, 3% size gate against update churn), fill-market verification subsequently reversed into fill-authoritative counters (one chain-keyed counter debt per full fill, gap+1 per-cycle cap, confirmation-gated settlement, inert verification surface removed), whole-side ladder resizing including virtual rungs, interactive fill-to-counter walkthrough, centralized AMA-slope EMA with TradingView/backtest parity, and a ratcheted `any` budget |
 
 ---
 
 **Report Originally Generated**: February 19, 2026
-**Last Updated**: November 27, 2026
-**Total Commits**: 2,547
-**Date Range**: December 2, 2025 – November 27, 2026
+**Last Updated**: November 28, 2026
+**Total Commits**: 2,555
+**Date Range**: December 2, 2025 – November 28, 2026
 **Repository**: DEXBot2 (BitShares DEX Trading Bot)
