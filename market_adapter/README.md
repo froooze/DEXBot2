@@ -548,7 +548,8 @@ Typical fields:
   "amaSlope": {
     "trend": "UP",
     "slopePct": 0.04,
-    "slopeOffset": 0.16
+    "slopeOffset": 0.16,
+    "emaAlpha": 0.2
   },
   "gridPriceOffsetPct": 0.8,
   "amaSlopeDeltaPercent": 0.015,
@@ -572,6 +573,7 @@ Typical fields:
 - `amaSlopeDeltaPercent` records the change from the last grid-reset slope baseline.
 - `amaSlopeThresholdPercent` is the configured slope-reset threshold.
 - `amaSlope.trend` records the current direction; direction changes do not trigger resets unless the slope delta threshold is crossed.
+- `amaSlope.emaAlpha` is the applied EMA smoothing of `slopePct` (1 = raw Huber). The same shaped slope feeds the offset channel and the reset delta.
 - During a full grid reset, the bot refreshes `gridCenterPrice` from the latest
   `amaCenterPrice` before rebuilding the grid.
 - `dynamicWeights` is present only when live dynamic weights were computed and
@@ -713,7 +715,7 @@ Uptrend:   maxPrice = center × (M × (1 + asymmetry))
 Neutral:   symmetric bounds (asymmetry = 0)
 ```
 
-`ASYMMETRIC_BOUNDS_MAX_ASYMMETRY_FACTOR` defaults to `0.333`; `0` disables the
+`ASYMMETRIC_BOUNDS_MAX_ASYMMETRY_FACTOR` defaults to `0.33`; `0` disables the
 tilt. `ASYMMETRIC_BOUNDS_MIN_SCALE_SLOTS` defaults to `10` and sets the minimum
 number of price levels the *tightened* side of a range-scaled grid must keep
 between the grid center and its bound (measured in `incrementPercent` steps);
@@ -729,7 +731,7 @@ Both are configurable per bot or per market via
 {
   "globals": {
     "asymmetricBounds": {
-      "maxAsymmetryFactor": 0.333,
+      "maxAsymmetryFactor": 0.33,
       "minScaleSlots": 10
     }
   },
@@ -822,6 +824,7 @@ Main override knobs live in `profiles/market_adapter_settings.json`:
 | `amaSlope.persistBars` | Slope-delta persistence gate: consecutive confirming bars required before the slope reset fires (default `MARKET_ADAPTER.AMA_SLOPE_PERSIST_BARS`, 3). `1` = legacy fire-on-first-crossing; `0` = disable. Negative/absent values fall through to the global flag |
 | `amaSlope.persistEnabled` | Per-bot tri-state override of the master switch: `false` disables the gate for this bot/market even when `AMA_SLOPE_PERSIST_ENABLED` is on, `true` forces it on, unset follows the global flag |
 | `amaSlope.neutralZonePct` | Dead band around flat average AMA slope |
+| `amaSlope.emaAlpha` | Recursive EMA alpha applied to the per-bar Huber AMA slope (default `0.2`; `1` = off, `2/101` ≈ 0.0198 = strongest). Adds `(1-alpha)/alpha` bars of lag, e.g. ~4 bars at the default. Unitless — not converted by `amaSlopePercentMode`. Also settable via `MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA` in general settings |
 | `amaSlope.maxSlopePct` | Average AMA slope saturation |
 | `amaSlopeDeltaThresholdPercent` | Average AMA slope delta threshold for slope-based resets |
 | `minOutputThreshold` | Minimum trend output before directional shift applies |

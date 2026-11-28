@@ -47,7 +47,7 @@ function testBuildDynamicWeightInputsLogFormatsFields() {
 
 function testBuildDynamicWeightTuningLogFormatsKnobs() {
     const text = buildDynamicWeightTuningLog({
-        amaSlope: { maxSlopePct: 0.9 },
+        amaSlope: { maxSlopePct: 0.9, emaAlpha: 0.2 },
         kalmanSlope: { maxSlopePct: 1.8 },
         alpha: 0.35,
         dw: 0.7,
@@ -67,6 +67,7 @@ function testBuildDynamicWeightTuningLogFormatsKnobs() {
     });
 
     assert.ok(text.includes('slopeMax=0.90'), 'AMA slope max should be formatted');
+    assert.ok(text.includes('ema=0.20'), 'AMA slope EMA alpha should be formatted');
     assert.ok(text.includes('kalmanMax=1.80'), 'Kalman slope max should be formatted');
     assert.ok(text.includes('vol(thr/exp/x)=0.10/0.50/10.00'), 'volatility tuning tuple should be formatted');
     assert.ok(text.includes('reg(sens/abs)=1.00/0.03'), 'regime tuning tuple should be formatted');

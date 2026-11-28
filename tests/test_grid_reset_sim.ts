@@ -39,6 +39,9 @@ const PRICE_CFG = {
     neutralZonePct: 0,
     maxSlopeOffset: 0.5,
     clipPercentile: 0,
+    // These fixtures assert raw-Huber numbers; keep the EMA off. Production
+    // charts supply the resolved 0.2 through payload.gridSim.emaAlpha.
+    emaAlpha: 1,
 };
 
 function reasonsAt(sim: any, indices: number[]) {
@@ -252,6 +255,40 @@ check('a slope inside the neutral zone stays NEUTRAL with zero offset', () => {
     const sim = simulateGridResetSeries(geometric(100, 0.2, 6), cfg);
     assert.strictEqual(sim.acceptedTrend[2], null);
     assert.strictEqual(sim.acceptedSlopeOffset[2], 0);
+});
+
+check('EMA alpha shapes the replayed slope series', () => {
+    const cfg = { ...SLOPE_CFG, maxSlopePct: 0.09, lookbackBars: 1, erPeriod: 1, warmupBars: 2 };
+    // A spike in the middle of a calm ramp: raw slope jumps, EMA damps it.
+    const calm = geometric(100, 0.05, 9);
+    const spiked = calm.slice();
+    spiked[5] = spiked[4] * 1.02;
+    const raw = simulateGridResetSeries(spiked, { ...cfg, emaAlpha: 1 });
+    const smooth = simulateGridResetSeries(spiked, { ...cfg, emaAlpha: 0.2 });
+    assert.strictEqual(raw.stats.emaAlpha, 1);
+    assert.strictEqual(smooth.stats.emaAlpha, 0.2);
+    assert.ok(
+        Math.abs(smooth.slopePct[6]) < Math.abs(raw.slopePct[6]),
+        'EMA should reduce the spike-induced slope excursion'
+    );
+});
+
+check('EMA alpha below the live minimum is clamped before replay and reporting', () => {
+    const cfg = { ...SLOPE_CFG, maxSlopePct: 0.09, lookbackBars: 1, erPeriod: 1, warmupBars: 2 };
+    const series = geometric(100, 0.05, 12);
+    const { MARKET_ADAPTER } = require('../modules/constants');
+    const min = MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA_MIN;
+    const max = MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA_MAX;
+    const tooLow = simulateGridResetSeries(series, { ...cfg, emaAlpha: 0.001 });
+    assert.strictEqual(tooLow.stats.emaAlpha, min, 'replay must clamp alpha up to the live minimum');
+    const { computeAmaSlopeEmaSeries } = require('../market_adapter/core/strategies/dynamic_weight_series');
+    assert.deepStrictEqual(
+        tooLow.slopePct,
+        computeAmaSlopeEmaSeries(series, cfg.erPeriod, cfg.lookbackBars, min),
+        'the replay must actually apply the clamped alpha, not just report it'
+    );
+    const tooHigh = simulateGridResetSeries(series, { ...cfg, emaAlpha: 2 });
+    assert.strictEqual(tooHigh.stats.emaAlpha, max, 'replay must clamp alpha down to the live maximum');
 });
 
 check('gridSimSlopeSignal clamps to the configured max slope offset', () => {

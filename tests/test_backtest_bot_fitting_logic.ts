@@ -176,6 +176,28 @@ function simParams(extra = {}) {
     assert.strictEqual(r.offsetAppliedCount, 2, 'both crossings apply the asymmetric offset: unlike the old step, the smooth fit reads a non-neutral slope at the decay bar');
 }
 
+// ── Trigger B mirrors production's EMA-shaped slope (not raw Huber) ──────────
+{
+    const n = 120, rampFrom = 30, rampTo = 70, perBarPct = 1;
+    const candles = Array.from({ length: n }, () => makeCandle(100));
+    const amaValues = new Array(n).fill(100);
+    for (let i = rampFrom; i <= rampTo; i++) amaValues[i] = 100 * Math.pow(1 + perBarPct / 100, i - rampFrom + 1);
+    for (let i = rampTo + 1; i < n; i++) amaValues[i] = amaValues[rampTo];
+    const params = simParams({
+        repositionThresholdPct: 50,
+        asymmetricBounds: true,
+        slopePersistBars: 1,
+    });
+    const raw = simulateForParams(candles, amaValues, { ...params, slopeEmaAlpha: 1 });
+    const shaped = simulateForParams(candles, amaValues, params);
+    assert.ok(raw.slopeTriggerCount > 0, 'the fixture should cross the slope gate');
+    assert.notStrictEqual(
+        shaped.slopeTriggerCount,
+        raw.slopeTriggerCount,
+        'production EMA smoothing must change the slope-reset cadence vs raw Huber'
+    );
+}
+
 // ── Trigger B stays OFF without the whitelist gate (production default) ─────
 {
     const n = 80;

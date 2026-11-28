@@ -12,6 +12,7 @@ import { computeVolatilityShift } from './volatility_shift.js';
 // chart generators can embed its exact source); re-exported here for compat.
 import {
     computeAverageAmaSlopePct,
+    computeAmaSlopeEmaSeries,
     computeHuberWindowSlopePct,
     computeAmaSlopeClipThreshold,
     createAmaSlopeClipTracker,
@@ -42,6 +43,8 @@ const DEFAULT_ER_PERIOD = MARKET_ADAPTER.AMAS[_DEFAULT_AMA_KEY].erPeriod;
  * @param {number}   [opts.maxSlopeOffset=MARKET_ADAPTER.DYNAMIC_WEIGHT_ASYMMETRIC_OFFSET_CLAMP]  Per-bot cap on buy/sell asymmetry offset
  * @param {number}   [opts.maxVolatilityOffset=MARKET_ADAPTER.DYNAMIC_WEIGHT_SYMMETRIC_SHIFT_CLAMP]  Per-bot cap on volatility shift
  * @param {number}   [opts.clipThreshold=Infinity]      Pre-computed clip threshold from slope history (percentile clipping is done by the caller)
+ * @param {number[]} [opts.slopePctSeries]              Optional EMA-shaped slope series, index-aligned with amaValues; when set, its last value replaces the raw Huber reading
+ * @param {number}   [opts.currentSlopePct]             Explicit current-bar slope %; overrides slopePctSeries. Use this when amaValues is a rolling slice whose indices no longer line up with the full series.
  * @returns {{ slopeOffset, rawSlopeOffset, symmetricDelta, slopePct, clippedSlopePct, confidence, trend, isReady }}
  */
 interface AmaSlopeOpts {
@@ -55,6 +58,18 @@ interface AmaSlopeOpts {
     maxSlopeOffset?: unknown;
     maxVolatilityOffset?: unknown;
     clipThreshold?: unknown;
+    /** Optional pre-computed (EMA-shaped) slope series from computeAmaSlopeEmaSeries.
+     *  Must be index-aligned with amaValues: the element at N-1 is used for a
+     *  full-length call. When supplied, the last element replaces the raw Huber
+     *  reading so the published slope, offset and grid-reset delta all see the
+     *  same signal. */
+    slopePctSeries?: Array<number | null> | null;
+    /** Explicit current-bar slope %. Takes precedence over slopePctSeries.
+     *  Prefer this for rolling AMA slices, where indexing a full-length series
+     *  by the slice's last position would silently read the warm-up bar.
+     *  Named `currentSlopePct` rather than `slopePct` because live callers
+     *  spread `cfg.amaSlope` (open-ended config) into these options. */
+    currentSlopePct?: number | null;
     [key: string]: unknown;
 }
 
@@ -111,11 +126,21 @@ function computeAmaSlopeWeights(amaValues: unknown, weightVariance: number, opts
     // reference definition, but it gives the window-edge bar full weight: a
     // single-bar impulse moves it 7x-70x the reset gate while the robust fit
     // bounds that influence without the lag of a rank-based estimator.
+    // Live callers pass the canonical EMA-shaped slope in opts.slopePctSeries;
+    // without it this stays the raw Huber reading (e.g. legacy research calls).
+    // A rolling AMA slice cannot use the series form: its last index N-1 is the
+    // first ready bar of the full history, not the current bar. Those callers
+    // pass the aligned value explicitly via opts.currentSlopePct instead.
     // lookback stays a smoothing/lag knob rather than adding gain in sustained
     // trends. The estimator validates every bar in the window (both ends
     // strictly positive), so it subsumes the old two-endpoint guard here.
-    const slopePct = computeHuberWindowSlopePct(amaValues, N - 1, lookbackBars);
-    if (!Number.isFinite(slopePct)) {
+    const series = opts.slopePctSeries;
+    const slopePct = opts.currentSlopePct !== undefined
+        ? opts.currentSlopePct
+        : (Array.isArray(series) && series.length >= N
+            ? series[N - 1]
+            : computeHuberWindowSlopePct(amaValues, N - 1, lookbackBars));
+    if (slopePct == null || !Number.isFinite(slopePct)) {
         return notReady;
     }
 
@@ -172,6 +197,7 @@ function computeAmaSlopeWeights(amaValues: unknown, weightVariance: number, opts
 export {
     computeAmaSlopeWeights,
     computeAverageAmaSlopePct,
+    computeAmaSlopeEmaSeries,
     computeHuberWindowSlopePct,
     computeAmaSlopeClipThreshold,
     createAmaSlopeClipTracker,

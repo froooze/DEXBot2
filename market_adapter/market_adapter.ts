@@ -27,6 +27,7 @@ import {
     normalizeAtrPeriod,
     normalizeMaxVolatilityOffset,
     normalizeVolatilityThreshold,
+    normalizeAmaSlopeEmaAlpha,
 } from './core/config_normalizers.js';
 import {
     resetMarketAdapterWhitelistCache,
@@ -112,6 +113,7 @@ const DEFAULTS = {
         lookbackBars:     MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS,
         maxSlopePct:      MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_MAX_SLOPE_PCT,
         neutralZonePct:   MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_NEUTRAL_ZONE_PCT,
+        emaAlpha:         MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA,
         deltaThresholdPct: MARKET_ADAPTER.AMA_SLOPE_DELTA_THRESHOLD_PERCENT,
     },
     kalmanSlope: {
@@ -181,6 +183,7 @@ interface AmaSlopeCfg {
     maxSlopePct?: unknown;
     neutralZonePct?: unknown;
     lookbackBars?: unknown;
+    emaAlpha?: unknown;
     [key: string]: unknown;
 }
 
@@ -269,6 +272,12 @@ function applyAmaSlopeOverrides(target: AdapterTargetCfg, overrides: AdapterOver
         }
         if (neutralZonePct != null) {
             target.amaSlope.neutralZonePct = convertSlopePercentToPerBar(neutralZonePct, lookbackBars, mode);
+        }
+        // Alpha is unitless — do NOT apply percent-to-per-bar conversion.
+        // Clamp at merge time so effective config, applied value and payload
+        // agree; the service repeats the same normalization when reading it.
+        if (target.amaSlope.emaAlpha != null) {
+            target.amaSlope.emaAlpha = normalizeAmaSlopeEmaAlpha(target.amaSlope.emaAlpha);
         }
     }
     return target;
@@ -796,6 +805,13 @@ function resolveAmaSlopeDeltaThresholdPercentFromGeneralSettings(settings: Recor
     return null;
 }
 
+/** EMA alpha from general settings; null when absent so DEFAULTS wins. */
+function resolveAmaSlopeEmaAlphaFromGeneralSettings(settings: Record<string, unknown> | null) {
+    const raw = (settings?.MARKET_ADAPTER as Record<string, unknown> | undefined)?.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA;
+    if (raw == null || raw === '') return null;
+    return normalizeAmaSlopeEmaAlpha(raw);
+}
+
 function applyRuntimeDefaultsFromGeneralSettings(cfg: AdapterTargetCfg, provided: { deltaThresholdPercent?: boolean } = {}, settingsOverride?: Record<string, unknown>) {
     const out = { ...cfg };
     const settings = settingsOverride === undefined
@@ -808,10 +824,15 @@ function applyRuntimeDefaultsFromGeneralSettings(cfg: AdapterTargetCfg, provided
         }
     }
     const slopeFromSettings = resolveAmaSlopeDeltaThresholdPercentFromGeneralSettings(settings);
-    if (slopeFromSettings != null) {
+    const emaFromSettings = resolveAmaSlopeEmaAlphaFromGeneralSettings(settings);
+    if (slopeFromSettings != null || emaFromSettings != null) {
         // Rebuild amaSlope instead of mutating it: `cfg` may be the shared
         // DEFAULTS object and must not be poisoned for later calls.
-        out.amaSlope = { ...(out.amaSlope || {}), deltaThresholdPct: slopeFromSettings };
+        out.amaSlope = {
+            ...(out.amaSlope || {}),
+            ...(slopeFromSettings != null ? { deltaThresholdPct: slopeFromSettings } : {}),
+            ...(emaFromSettings != null ? { emaAlpha: emaFromSettings } : {}),
+        };
     }
     return out;
 }

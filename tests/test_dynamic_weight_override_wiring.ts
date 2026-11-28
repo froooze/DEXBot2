@@ -50,6 +50,7 @@ function testResolveBotCfgWiresMissingPairAndBotOverrides() {
                     amaSlopeDeltaThresholdPercent: 0.22,
                     amaSlope: {
                         maxSlopePct: 1.2,
+                        emaAlpha: 0.05,
                     },
                     kalmanSlope: {
                         maxSlopePct: 1.2,
@@ -64,6 +65,7 @@ function testResolveBotCfgWiresMissingPairAndBotOverrides() {
                         amaSlopeDeltaThresholdPercent: 0.33,
                         amaSlope: {
                             maxSlopePct: 1.6,
+                            emaAlpha: 0.1,
                         },
                         kalmanSlope: {
                             maxSlopePct: 1.6,
@@ -98,6 +100,7 @@ function testResolveBotCfgWiresMissingPairAndBotOverrides() {
         'bot override should win for amaSlopeDeltaThresholdPercent'
     );
     assert.strictEqual(merged.amaSlope.maxSlopePct, 1.6, 'bot override should win for amaSlope.maxSlopePct');
+    assert.strictEqual(merged.amaSlope.emaAlpha, 0.1, 'bot override should win for amaSlope.emaAlpha');
     assert.strictEqual(merged.kalmanSlope.maxSlopePct, 1.6, 'bot override should win for kalmanSlope.maxSlopePct');
 }
 
@@ -117,6 +120,7 @@ function testResolveBotCfgWiresMissingPairOverridesWithoutBotOverride() {
                     amaSlopeDeltaThresholdPercent: 0.21,
                     amaSlope: {
                         maxSlopePct: 1.15,
+                        emaAlpha: 0.05,
                     },
                     kalmanSlope: {
                         maxSlopePct: 1.15,
@@ -150,6 +154,7 @@ function testResolveBotCfgWiresMissingPairOverridesWithoutBotOverride() {
         'pair override should apply for amaSlopeDeltaThresholdPercent'
     );
     assert.strictEqual(merged.amaSlope.maxSlopePct, 1.15, 'pair override should apply for amaSlope.maxSlopePct');
+    assert.strictEqual(merged.amaSlope.emaAlpha, 0.05, 'pair override should apply for amaSlope.emaAlpha');
     assert.strictEqual(merged.kalmanSlope.maxSlopePct, 1.15, 'pair override should apply for kalmanSlope.maxSlopePct');
 }
 

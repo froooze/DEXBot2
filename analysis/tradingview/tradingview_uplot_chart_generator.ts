@@ -11,7 +11,8 @@ import { getStorage } from '../../modules/storage/index.js';
 const { readJSON } = getStorage();
 import { getErrorMessage } from '../../modules/utils/errors.js';
 import { parseRelativeMultiplier } from '../../modules/order/utils/math.js';
-import { computeAverageAmaSlopePct, computeHuberWindowSlopePct, computeAmaSlopeClipThreshold, createAmaSlopeClipTracker, percentileFromSorted } from '../../market_adapter/core/strategies/dynamic_weight_series.js';
+import { computeAverageAmaSlopePct, computeHuberWindowSlopePct, computeAmaSlopeEmaSeries, computeAmaSlopeClipThreshold, createAmaSlopeClipTracker, percentileFromSorted } from '../../market_adapter/core/strategies/dynamic_weight_series.js';
+import { normalizeAmaSlopeEmaAlpha } from '../../market_adapter/core/config_normalizers.js';
 import {
     resolveBaseBounds,
     computeAsymmetricBoundsMetrics,
@@ -217,6 +218,9 @@ function generateHTML(data: TvChartInput, title: string = 'TradingView Style Res
 
     const marketProfiles = data.marketProfiles || loadMarketProfiles();
     const defaultAmaConfig = resolveAmaDefaults({ meta, data, marketProfiles });
+    // Normalize once so a bad deployment setting cannot make the chart fall
+    // back to an alpha the live service would have rejected.
+    const defaultEmaAlpha = normalizeAmaSlopeEmaAlpha(MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA);
     const rangeSlope = {
         lookbackBars: MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS,
         maxSlopePct: MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_MAX_SLOPE_PCT,
@@ -225,6 +229,7 @@ function generateHTML(data: TvChartInput, title: string = 'TradingView Style Res
         maxAsymmetryFactor: MARKET_ADAPTER.ASYMMETRIC_BOUNDS_MAX_ASYMMETRY_FACTOR,
         minScaleSlots: MARKET_ADAPTER.ASYMMETRIC_BOUNDS_MIN_SCALE_SLOTS,
         clipPercentile: MARKET_ADAPTER.DYNAMIC_WEIGHT_CLIP_PERCENTILE,
+        emaAlpha: defaultEmaAlpha,
     };
     // Slider bounds for the x-range around AMA live in RANGE_SPAN_MIN/MAX above
     // and are interpolated into the generated page; the clamps here and there
@@ -1622,7 +1627,10 @@ function generateHTML(data: TvChartInput, title: string = 'TradingView Style Res
         // Canonical Huber-slope parameters, injected from MARKET_ADAPTER so the
         // embedded estimator runs the same values as the live adapter.
         const AMA_SLOPE_HUBER = ${serializeJsonForScript(MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_HUBER)};
-        ${embedFunctionSources([computeAverageAmaSlopePct, computeAmaSlopeClipThreshold, resolveBaseBounds, computeAsymmetricBoundsMetrics, applyAsymmetricBounds, applyNarrowingSideGuard, parseRelativeMultiplier, percentileFromSorted, createAmaSlopeClipTracker, gridSimPositiveNumber, gridSimNonNegativeInt, gridSimSlopeSignal, gridSimResolveSlopeEstimator, computeHuberWindowSlopePct, simulateGridResetSeries])}
+        // Injected under the same name grid_reset_sim.ts reads at module scope,
+        // so the embedded replay clamps alpha to the live service's range.
+        const GRID_SIM_EMA_ALPHA_BOUNDS = ${serializeJsonForScript({ MIN: MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA_MIN, MAX: MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA_MAX })};
+        ${embedFunctionSources([computeAverageAmaSlopePct, computeAmaSlopeClipThreshold, resolveBaseBounds, computeAsymmetricBoundsMetrics, applyAsymmetricBounds, applyNarrowingSideGuard, parseRelativeMultiplier, percentileFromSorted, createAmaSlopeClipTracker, gridSimPositiveNumber, gridSimNonNegativeInt, gridSimSlopeSignal, gridSimResolveSlopeEstimator, computeHuberWindowSlopePct, computeAmaSlopeEmaSeries, simulateGridResetSeries])}
         // One slope window for every consumer on this page. The band must not
         // stay pinned to the shared constant while the replay honours a
         // bot-configured lookbackBars: that split let the plotted range and the
@@ -1637,6 +1645,30 @@ function generateHTML(data: TvChartInput, title: string = 'TradingView Style Res
                 ? Math.max(1, Math.round(value))
                 : ${MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS};
         }
+        // Same alpha the live adapter resolves after normalization. The replay
+        // config wins; the range-slope payload and the centralized constant are
+        // fallbacks for pool/pair charts with no bot gridSim data. Any incoming
+        // value is clamped to MARKET_ADAPTER's bounds (the same ones the
+        // embedded replay uses), so an unnormalized payload cannot plot an
+        // alpha the bot would have replaced at read time.
+        function resolveSlopeEmaAlpha() {
+            const fromGridSim = Number(gridSimCfg && gridSimCfg.emaAlpha);
+            const fromRangeSlope = Number(payload.rangeSlope && payload.rangeSlope.emaAlpha);
+            const value = Number.isFinite(fromGridSim) && fromGridSim > 0 ? fromGridSim : fromRangeSlope;
+            return Number.isFinite(value) && value > 0
+                ? Math.max(GRID_SIM_EMA_ALPHA_BOUNDS.MIN, Math.min(GRID_SIM_EMA_ALPHA_BOUNDS.MAX, value))
+                : ${JSON.stringify(defaultEmaAlpha)};
+        }
+        // One ER window for the band and the replay. The bot's configured ER
+        // wins when gridSim is present, matching the live adapter; otherwise
+        // the chart's own ER control is used.
+        function resolveSlopeErPeriod() {
+            const fromGridSim = Number(gridSimCfg && gridSimCfg.erPeriod);
+            if (Number.isFinite(fromGridSim) && fromGridSim > 0) return Math.ceil(fromGridSim);
+            return Number.isFinite(currentAmaErPeriod) && currentAmaErPeriod > 0
+                ? Math.ceil(currentAmaErPeriod)
+                : Math.ceil(Number(payload.amaDefaults?.erPeriod) || 781);
+        }
         // ── Grid-reset simulation ──
         // Replays the two market-adapter recentering triggers (docs/GRID_RECALCULATION.md
         // §3 AMA Δ / §4 AMA-Slope Δ) over the 1h AMA series: the accepted grid center
@@ -1644,12 +1676,12 @@ function generateHTML(data: TvChartInput, title: string = 'TradingView Style Res
         // reset (the advanceTriggeredBotState chain). Thresholds arrive pre-resolved
         // through the live config chain in payload.gridSim. The replay itself is the
         // canonical simulateGridResetSeries() embedded above — not a hand copy.
-        // The chart plots the SAME slope the live adapter computes: the embedded
-        // canonical estimator (computeHuberWindowSlopePct), used for BOTH the
-        // replayed delta-s reset trigger and the plotted band tilt, so the chart
-        // cannot diverge from the runtime or from itself. 'endpoint' (the old
-        // two-point difference: same magnitude, far jitterier) remains a
-        // chart-only comparison mode.
+        // The chart replays the SAME slope the live adapter publishes: the
+        // canonical Huber -> EMA series (computeAmaSlopeEmaSeries, embedded
+        // above), used for BOTH the delta-s reset trigger and the plotted band
+        // tilt. The alpha is resolved from the same config chain as production.
+        // 'endpoint' (the old two-point difference: same magnitude, far
+        // jitterier) remains a chart-only comparison mode.
         const CHART_SLOPE_ESTIMATOR = 'canonical';
         function resolveChartSlopeEstimator() {
             if (CHART_SLOPE_ESTIMATOR === 'endpoint') {
@@ -1699,8 +1731,10 @@ function generateHTML(data: TvChartInput, title: string = 'TradingView Style Res
             // consumers sample the identical window.
             const cfg = Object.assign({}, gridSimCfg, {
                 warmupBars: warmupBars,
-                // Same averaging model as the band above, so the replayed Δs
-                // trigger and the plotted tilt keep measuring one quantity.
+                // Same averaging model AND EMA alpha as the band above, so the
+                // replayed Δs trigger and the plotted tilt keep measuring one
+                // quantity — the one the live adapter publishes.
+                emaAlpha: resolveSlopeEmaAlpha(),
                 slopeEstimator: resolveChartSlopeEstimator(),
             });
             return simulateGridResetSeries(baseAma, cfg);
@@ -1727,7 +1761,7 @@ function generateHTML(data: TvChartInput, title: string = 'TradingView Style Res
             const minSlots = Math.floor(Number(gridCfg && gridCfg.minScaleSlots) > 0 ? Number(gridCfg.minScaleSlots) : (Number(gridSimCfg.minScaleSlots) || 0));
             const maxAsym = gridCfg && Number(gridCfg.maxAsymmetryFactor) > 0
                 ? Number(gridCfg.maxAsymmetryFactor)
-                : (Number(gridSimCfg.maxAsymmetryFactor) > 0 ? Number(gridSimCfg.maxAsymmetryFactor) : 0.333);
+                : (Number(gridSimCfg.maxAsymmetryFactor) > 0 ? Number(gridSimCfg.maxAsymmetryFactor) : 0.33);
             const maxSlopeOffset = gridSimPositiveNumber(gridSimCfg.maxSlopeOffset, 0.5);
             const span = Math.min(${RANGE_SPAN_MAX}, Math.max(${RANGE_SPAN_MIN}, Number(currentRangeSpan) > 0 ? Number(currentRangeSpan) : ${RANGE_SPAN_DEFAULT}));
             // Absolute bot bounds are fixed price levels; relative ("Nx") bounds
@@ -1784,7 +1818,7 @@ function generateHTML(data: TvChartInput, title: string = 'TradingView Style Res
             const maxSlopeOffset = Number(slopeCfg.maxSlopeOffset) > 0 ? Number(slopeCfg.maxSlopeOffset) : 0.5;
             const maxAsym = gridCfg && Number(gridCfg.maxAsymmetryFactor) > 0
                 ? Number(gridCfg.maxAsymmetryFactor)
-                : (Number(slopeCfg.maxAsymmetryFactor) > 0 ? Number(slopeCfg.maxAsymmetryFactor) : 0.333);
+                : (Number(slopeCfg.maxAsymmetryFactor) > 0 ? Number(slopeCfg.maxAsymmetryFactor) : 0.33);
             const inc = gridCfg && Number(gridCfg.incrementPercent) > 0 ? Number(gridCfg.incrementPercent) : null;
             const minSlots = Math.floor(Number(gridCfg && gridCfg.minScaleSlots) > 0 ? Number(gridCfg.minScaleSlots) : (Number(slopeCfg.minScaleSlots) || 0));
             // User x-range span (slider ${RANGE_SPAN_MIN}x–${RANGE_SPAN_MAX}x, default ${RANGE_SPAN_DEFAULT}x): the only
@@ -1794,20 +1828,20 @@ function generateHTML(data: TvChartInput, title: string = 'TradingView Style Res
             // clip over the AMA history, then offset + trend — the same numbers
             // the live grid build feeds into applyAsymmetricBounds.
             const clipPct = Number(slopeCfg.clipPercentile) >= 0 ? Number(slopeCfg.clipPercentile) : 10;
-            const clipEr = Number.isFinite(currentAmaErPeriod) && currentAmaErPeriod > 0
-                ? Math.ceil(currentAmaErPeriod)
-                : Math.ceil(Number(payload.amaDefaults?.erPeriod) || 781);
+            const clipEr = resolveSlopeErPeriod();
             const clipThreshold = computeAmaSlopeClipThreshold(baseAma, clipEr, lookback, clipPct);
             const slopeScaling = !!currentRangeScaleEnabled;
             if (!currentAmaEnabled || n === 0) return { upper, lower, trend };
             const bandSlopeEstimator = resolveChartSlopeEstimator();
+            // Same canonical Huber -> EMA series the live adapter and the replay
+            // use. The clip threshold above stays on raw Huber by design.
+            const bandSlopeSeries = computeAmaSlopeEmaSeries(baseAma, clipEr, lookback, resolveSlopeEmaAlpha(), bandSlopeEstimator);
             for (let i = 0; i < n; i++) {
                 const ama = baseAma[i];
                 if (!Number.isFinite(ama) || ama <= 0) continue;
-                // Same estimator object the replay uses, so the band and the
-                // delta-s trigger measure one quantity. The endpoint wrapper and
-                // the windowed estimators both return null on an unusable window.
-                const slopePct = bandSlopeEstimator(baseAma, i, lookback);
+                // Same shaped slope series the replay uses, so the band and the
+                // delta-s trigger measure one quantity. Pre-warmup bars stay null.
+                const slopePct = bandSlopeSeries[i];
                 if (slopePct == null || !Number.isFinite(slopePct)) continue;
                 const csp = Math.max(-clipThreshold, Math.min(clipThreshold, slopePct));
                 const dir = Math.abs(csp) <= neutral ? 0 : (csp > 0 ? 1 : -1);
@@ -3828,7 +3862,8 @@ function generateHTML(data: TvChartInput, title: string = 'TradingView Style Res
             html += '<div style="color:#e8eef5">AMA \u0394 ' + (Number.isFinite(priceThr) ? Number(priceThr).toFixed(2) + '%' : '-') + ' <span style="color:#8b949e">(' + fmtSimSource(gridSimCfg.priceSource) + ')</span></div>';
             html += '<div style="color:#e8eef5">Slope \u0394 ' + (Number.isFinite(slopeThr) ? Number(slopeThr).toFixed(4) + '%/bar' : '-')
                 + ' <span style="color:#8b949e">(' + fmtSimSource(gridSimCfg.slopeSource) + (st.slopeTriggerArmed ? '' : ', off')
-                + (Number(gridSimCfg.slopePersistBars) > 1 ? ', persist ' + Number(gridSimCfg.slopePersistBars) : '') + ')</span></div>';
+                + (Number(gridSimCfg.slopePersistBars) > 1 ? ', persist ' + Number(gridSimCfg.slopePersistBars) : '')
+                + (Number.isFinite(Number(st.emaAlpha)) && Number(st.emaAlpha) < 1 ? ', ema ' + Number(st.emaAlpha).toFixed(3) : '') + ')</span></div>';
             if (st.lastResetIndex != null) {
                 const last = currentCandles[Math.max(0, Math.min(currentCandles.length - 1, currentSimLastIdx ?? 0))];
                 html += '<div style="color:#8b949e">last ' + (last ? fmtTime(last.time) : '-') + ' (' + st.barsSinceLastReset + ' bars ago)</div>';

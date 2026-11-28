@@ -311,6 +311,16 @@ is a **Huber-robust linear regression of `ln(AMA)` over the lookback window**
 `MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_HUBER`) — a smooth, robust fit whose influence
 function is bounded, so one outlier bar cannot drag it, which is what a plain
 mean (and the older two-point endpoint difference it is equivalent to) would do.
+A recursive EMA is then applied to those per-bar values
+(`computeAmaSlopeEmaSeries`, default alpha `0.2` via
+`DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA` / `amaSlope.emaAlpha`; `1` = raw Huber),
+trimming sparse-trade spikes at ~`(1-alpha)/alpha` bars of extra lag. The
+TradingView grid-reset replay and range band use the same shaped series.
+Operationally, that lag (~4 bars at the default) adds to the slope-delta
+persistence gate (`AMA_SLOPE_PERSIST_BARS`, default 3): a real reversal needs
+roughly 7 confirming bars to recenter instead of 3. Enabling the EMA on live
+bots therefore requires explicit sign-off on the slower reversal response; see
+`docs/AMA_SLOPE_WINDOW.md` for the trade-off and rollback (`emaAlpha: 1`).
 Because the fit reports the log-return, a reading is ~`ln(1+r)` rather than the
 arithmetic `r`: negligible at the sub-0.1 %/bar magnitudes the defaults use, but
 ~3% lower at a 6%/bar saturation (`ln(1.06)*100 = 5.83`). A pre-existing user

@@ -19,9 +19,10 @@ import path from 'node:path';
 import { KalmanTrendAnalyzer } from './trend_detection/kalman_trend_analyzer.js';
 import { HurstAnalyzer } from './trend_detection/hurst_analyzer.js';
 import { PermutationEntropyAnalyzer } from './trend_detection/permutation_entropy_analyzer.js';
-import { generateHTML } from './trend_detection/dynamic_weight_chart_generator.js';
+import { generateHTML, CHART_LOOKBACK_BARS_BOUNDS } from './trend_detection/dynamic_weight_chart_generator.js';
+import { normalizeAmaSlopeEmaAlpha } from '../market_adapter/core/config_normalizers.js';
 import { calculateAMA } from '../market_adapter/core/strategies/ama.js';
-import { computeAmaSlopeWeights, createAmaSlopeClipTracker } from '../market_adapter/core/strategies/ama_slope_model.js';
+import { computeAmaSlopeWeights, computeAmaSlopeEmaSeries, createAmaSlopeClipTracker } from '../market_adapter/core/strategies/ama_slope_model.js';
 import { MARKET_ADAPTER } from '../modules/constants.js';
 import { PATHS } from '../modules/paths.js';
 import { writeChartFile, toFileUrl } from './chart_utils.js';
@@ -37,6 +38,7 @@ const AMA_WEIGHT_CONFIG = {
     amaMaxSlopePct:         MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_MAX_SLOPE_PCT,
     kalmanMaxSlopePct:      MARKET_ADAPTER.DYNAMIC_WEIGHT_KALMAN_MAX_SLOPE_PCT,
     neutralZonePct:         MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_NEUTRAL_ZONE_PCT,
+    emaAlpha:               MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA,
     volatilityExponent:     MARKET_ADAPTER.DYNAMIC_WEIGHT_VOLATILITY_EXPONENT,
     volatilityScaleX:       MARKET_ADAPTER.DYNAMIC_WEIGHT_VOLATILITY_SCALE_X_DEFAULT,
     volatilityThreshold:    MARKET_ADAPTER.DYNAMIC_WEIGHT_SYMMETRIC_SHIFT_THRESHOLD,
@@ -161,8 +163,18 @@ async function main() {
         // ── AMA weight calculation ───────────────────────────────────────────
         const closes = candles.map(c => getCandleClose(c) ?? 0);
         const amaValues = calculateAMA(closes, AMA_CONFIG);
-        const lbBars = config.lookbackBars ?? AMA_WEIGHT_CONFIG.lookbackBars;
+        // Precompute with the same window the chart will display: --lb outside
+        // the slider range is clamped there, so it must be clamped here too or
+        // the shipped percentile payload describes a different window.
+        const requestedLb = Number(config.lookbackBars ?? AMA_WEIGHT_CONFIG.lookbackBars);
+        const safeLb = Number.isFinite(requestedLb) ? requestedLb : CHART_LOOKBACK_BARS_BOUNDS.MIN;
+        const lbBars = Math.ceil(Math.max(CHART_LOOKBACK_BARS_BOUNDS.MIN, Math.min(CHART_LOOKBACK_BARS_BOUNDS.MAX, safeLb)));
         const clipPercentile = config.clipPct ?? MARKET_ADAPTER.DYNAMIC_WEIGHT_CLIP_PERCENTILE;
+        // General settings are deep-merged without numeric validation; clamp
+        // here just like the live service and the chart do.
+        const emaAlpha = normalizeAmaSlopeEmaAlpha(AMA_WEIGHT_CONFIG.emaAlpha);
+        // Same canonical Huber -> EMA replay the live adapter and DW chart use.
+        const emaSlopeSeries = computeAmaSlopeEmaSeries(amaValues, AMA_CONFIG.erPeriod, lbBars, emaAlpha);
 
         // Incremental percentile clip threshold (shared with the market adapter)
         // so the research offset matches the live asymmetry. Feeding bar-by-bar
@@ -193,6 +205,11 @@ async function main() {
                 maxSlopeOffset: AMA_WEIGHT_CONFIG.maxSlopeOffset,
                 maxVolatilityOffset: AMA_WEIGHT_CONFIG.maxVolatilityOffset,
                 clipThreshold: amaClipThreshold,
+                // The AMA window above is a rolling slice, so its last index is
+                // NOT the full-series index. Pass the current bar's shaped slope
+                // explicitly; indexing the full series by N-1 would read the
+                // first ready bar forever and publish a constant signal.
+                currentSlopePct: emaSlopeSeries[i],
             });
 
             allResults[i].ama3Price = amaValues[i] ?? null;
@@ -211,12 +228,13 @@ async function main() {
             amaKey,
             amaWeightConfig: {
                 ...AMA_WEIGHT_CONFIG,
-                lookbackBars: config.lookbackBars ?? AMA_WEIGHT_CONFIG.lookbackBars,
+                lookbackBars: lbBars,
             },
             alpha: config.alpha,
             gain: config.gain,
             dispWeight: config.dispWeight,
             clipPct: config.clipPct,
+            amaSlopeEmaAlpha: emaAlpha,
             regimeSensitivity: MARKET_ADAPTER.DYNAMIC_WEIGHT_REGIME_SENSITIVITY,
             dispScaleMinPct:  config.dispScaleMinPct  ?? MARKET_ADAPTER.DYNAMIC_WEIGHT_DISP_SCALE_MIN_PCT,
             minOutputThreshold: MARKET_ADAPTER.DYNAMIC_WEIGHT_ASYMMETRIC_TREND_THRESHOLD,

@@ -35,5 +35,21 @@ function normalizeVolatilityThreshold(value: unknown, defaultValue = MARKET_ADAP
     return normalizeNonNegative(value, defaultValue);
 }
 
-export { normalizeAtrPeriod, normalizeMaxVolatilityOffset, normalizeVolatilityThreshold }
+/**
+ * AMA-slope EMA alpha. 1 = off; finite positive values are clamped to
+ * [2/101, 1] (2/101 = 100-bar variance-equivalent). Null, empty, non-finite
+ * and non-positive values fall back to the centralized default. Kept here so
+ * config, applied value and reported payload agree.
+ */
+function normalizeAmaSlopeEmaAlpha(value: unknown, defaultValue = MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA) {
+    if (value == null || value === '') return defaultValue;
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric) || numeric <= 0) return defaultValue;
+    return Math.max(
+        MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA_MIN,
+        Math.min(MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA_MAX, numeric)
+    );
+}
+
+export { normalizeAtrPeriod, normalizeMaxVolatilityOffset, normalizeVolatilityThreshold, normalizeAmaSlopeEmaAlpha }
 

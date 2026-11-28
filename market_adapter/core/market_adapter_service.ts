@@ -7,7 +7,7 @@ import { computeRegimeMultiplier } from './strategies/regime_gate.js';
 import { noteJsonWritten, readCachedJson } from '../utils/file_json_cache.js';
 import type { AmaParams } from './strategies/ama.js';
 import { calculateAMA, getAmaWarmupBars } from './strategies/ama.js';
-import { computeDynamicWeightSeries } from './strategies/dynamic_weight_series.js';
+import { computeDynamicWeightSeries, computeAmaSlopeEmaSeries } from './strategies/dynamic_weight_series.js';
 import { KalmanTrendAnalyzer } from './signals/kalman_trend_analyzer.js';
 import { adjustCollateralRatio } from './strategies/collateral_manager.js';
 import { DEFAULT_CONFIG, MARKET_ADAPTER } from '../../modules/constants.js';
@@ -24,6 +24,7 @@ import {
     normalizeAtrPeriod,
     normalizeMaxVolatilityOffset,
     normalizeVolatilityThreshold,
+    normalizeAmaSlopeEmaAlpha,
 } from './config_normalizers.js';
 import {
     buildKalmanVelocitySeries,
@@ -50,7 +51,7 @@ export interface ContextCacheEntry {
 
 /** Dynamic-weight config subset with structured sub-objects and numeric knobs. */
 interface DynamicWeightsCfg extends JsonObj {
-    amaSlope?: { neutralZonePct?: number; maxSlopePct?: number; persistBars?: number; persistEnabled?: boolean; deltaThresholdPct?: number; lookbackBars?: number; [key: string]: unknown };
+    amaSlope?: { neutralZonePct?: number; maxSlopePct?: number; emaAlpha?: number; persistBars?: number; persistEnabled?: boolean; deltaThresholdPct?: number; lookbackBars?: number; [key: string]: unknown };
     kalmanSlope?: { maxSlopePct?: number; [key: string]: unknown };
     kalman?: { rNoise?: number; qTactical?: number; qModal?: number; warmupBars?: number; [key: string]: unknown };
     asymmetricBounds?: JsonObj;
@@ -931,6 +932,9 @@ class MarketAdapterService {
             : MARKET_ADAPTER.DYNAMIC_WEIGHT_CLIP_PERCENTILE;
         const nz = cfg.amaSlope?.neutralZonePct ?? MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_NEUTRAL_ZONE_PCT;
         const amaMaxS = cfg.amaSlope?.maxSlopePct ?? MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_MAX_SLOPE_PCT;
+        // EMA on the Huber slope: one normalized read point shared by the slope
+        // result, both dynamic-weight series and the reported diagnostics.
+        const emaAlpha = normalizeAmaSlopeEmaAlpha(cfg.amaSlope?.emaAlpha ?? cfg.amaSlopeEmaAlpha);
         const kalMaxS = cfg.kalmanSlope?.maxSlopePct
             ?? MARKET_ADAPTER.DYNAMIC_WEIGHT_KALMAN_MAX_SLOPE_PCT;
         const mo = cfg.maxSlopeOffset ?? MARKET_ADAPTER.DYNAMIC_WEIGHT_ASYMMETRIC_OFFSET_CLAMP;
@@ -958,6 +962,12 @@ class MarketAdapterService {
         let amaClipThreshold = computeAmaSlopeClipThreshold(amaValues, botAma.erPeriod, lookbackBars, clipPercentile);
         let kalClipThreshold = Infinity;
 
+        // Stateless replay of the canonical Huber -> EMA slope series (the same
+        // helper the DW research chart embeds). alpha=1 keeps raw Huber behavior.
+        // The clip threshold intentionally stays based on the raw slope history,
+        // matching the research chart and avoiding a feedback loop.
+        const amaSlopePctSeries = computeAmaSlopeEmaSeries(amaValues, botAma.erPeriod, lookbackBars, emaAlpha);
+
         const slopeCfg = {
             ...(cfg.amaSlope || {}),
             erPeriod:              botAma.erPeriod,
@@ -968,6 +978,7 @@ class MarketAdapterService {
             volatilityThreshold,
             neutralZonePct:        nz,
             clipThreshold:         amaClipThreshold,
+            slopePctSeries:        amaSlopePctSeries,
         };
 
         const slopeResult = computeAmaSlopeWeights(amaValues, weightVariance, slopeCfg);
@@ -1064,6 +1075,9 @@ class MarketAdapterService {
         // diagnostic; only the Kalman inputs and clip threshold differ.
         const seriesBaseInputs = {
             amaValues,
+            // Shaped slope series: offsets use the same EMA-smoothed signal that
+            // is published as amaSlope.slopePct and compared for grid resets.
+            amaSlopePctSeries,
             regimeMultipliers,
             lookbackBars,
             amaErPeriod: botAma.erPeriod,
@@ -1132,6 +1146,7 @@ class MarketAdapterService {
         const slopeConfigReport = {
             amaSlope: {
                 maxSlopePct: amaMaxS,
+                emaAlpha,
             },
             kalmanSlope: {
                 maxSlopePct: kalMaxS,

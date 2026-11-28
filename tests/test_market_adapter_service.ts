@@ -9,9 +9,10 @@ const { calculateATR } = require('../market_adapter/core/strategies/atr/calculat
 const { getErrorMessage } = require('../modules/utils/errors');
 const {
     computeAmaSlopeWeights,
+    computeAmaSlopeEmaSeries,
     computeHuberWindowSlopePct,
 } = require('../market_adapter/core/strategies/ama_slope_model');
-const { normalizeAtrPeriod, normalizeMaxVolatilityOffset, normalizeVolatilityThreshold } = require('../market_adapter/core/config_normalizers');
+const { normalizeAtrPeriod, normalizeMaxVolatilityOffset, normalizeVolatilityThreshold, normalizeAmaSlopeEmaAlpha } = require('../market_adapter/core/config_normalizers');
 const { computeRegimeMultiplier } = require('../market_adapter/core/strategies/regime_gate');
 const { MARKET_ADAPTER } = require('../modules/constants');
 const { calculateAMA, getAmaWarmupBars } = require('../market_adapter/core/strategies/ama');
@@ -134,6 +135,8 @@ function buildDynamicWeightParityInputs(candles, cfg, botAma) {
         amaFastPeriod
     );
     const amaSlopeReadyBars = Math.ceil(amaErPeriod) + lookbackBars;
+    const emaAlpha = normalizeAmaSlopeEmaAlpha(cfg.amaSlope?.emaAlpha ?? cfg.amaSlopeEmaAlpha);
+    const amaSlopePctSeries = computeAmaSlopeEmaSeries(amaValues, amaErPeriod, lookbackBars, emaAlpha);
 
     let amaClipThreshold = Infinity;
     if (clipPercentile > 0 && amaValues.length > amaSlopeReadyBars) {
@@ -162,6 +165,7 @@ function buildDynamicWeightParityInputs(candles, cfg, botAma) {
         neutralZonePct: nz,
         clipPercentile,
         clipThreshold: amaClipThreshold,
+        slopePctSeries: amaSlopePctSeries,
     };
 
     const slopeResult = computeAmaSlopeWeights(amaValues, weightVariance, slopeCfg);
@@ -223,6 +227,7 @@ function buildDynamicWeightParityInputs(candles, cfg, botAma) {
     // the raw inputs so callers can re-run with a different clamp mode.
     const seriesResult = computeDynamicWeightSeries({
         amaValues,
+        amaSlopePctSeries,
         kalmanVelocityPct: kalmanSmoothedVelocityPct,
         kalmanDisplacementPct: kalmanHistory.map((point) => point.displacementRawPct),
         kalmanIsReady: kalmanHistory.map((point) => point.isReady),
@@ -250,6 +255,8 @@ function buildDynamicWeightParityInputs(candles, cfg, botAma) {
         minOutputThreshold,
         signalConfirmBars,
         offsetClamp,
+        emaAlpha,
+        amaSlopePctSeries,
         amaValues,
         kalmanVelocityPct: kalmanSmoothedVelocityPct,
         kalmanDisplacementPct: kalmanHistory.map((point) => point.displacementRawPct),
@@ -2321,6 +2328,115 @@ async function testCenterStableButSlopeDeltaTriggersReset() {
     assert.strictEqual((state.bots['aaa-bbb-slope'] as any).amaSlope.trend, 'DOWN', 'state should retain current slope direction');
     assert.strictEqual((state.bots['aaa-bbb-slope'] as any).gridRangeScalingAmaSlope.trend, 'DOWN', 'reset baseline should advance only after the slope reset');
     assert.ok(Number.isFinite((state.bots['aaa-bbb-slope'] as any).amaSlopeDeltaPercent), 'state should retain the slope delta');
+}
+
+// The published slope was already covered by the parity test; this closes the
+// remaining gap: the SAME shaped slope must reach amaSlopeDeltaPercent and the
+// reset-trigger payload, not a parallel raw-Huber computation.
+async function testAmaSlopeEmaAlphaDrivesLiveResetDelta() {
+    const candles = generateUpThenDownCandles(160, 160, 100, 0.55, 0.75);
+    const botAma = { enabled: true, erPeriod: 10, fastPeriod: 2, slowPeriod: 5 };
+    const baseline = { trend: 'UP', slopePct: 1.0, slopeOffset: 0.5, isReady: true };
+
+    async function runWithAlpha(emaAlpha: number) {
+        let trigger: any = null;
+        let snapshot: any = null;
+        const cfg = {
+            intervalSeconds: 3600,
+            bootstrapLookbackHours: 100,
+            nativeBackfillHours: 6,
+            pageLimit: 100,
+            maxPages: 80,
+            sourceRetries: 1,
+            retryDelayMs: 0,
+            maxStaleHours: 6,
+            amaSlopeDeltaThresholdPercent: 0.12,
+            amaSlopePersistBars: 1,
+            amaSlope: { emaAlpha },
+        };
+        const service = new MarketAdapterService({
+            resolveBotContext: async () => ({
+                assetA: { id: '1.3.1', precision: 4, symbol: 'IOB.XRP' },
+                assetB: { id: '1.3.0', precision: 5, symbol: 'BTS' },
+                poolId: '1.19.133',
+            }),
+            resolveAmaForBot: () => botAma,
+            candleFileForBot: (botKey) => path.join('/tmp', `market_adapter_${botKey}_1h.json`),
+            loadJson: () => ({ candles }),
+            saveJson: () => {},
+            calculateBotThreshold: () => 9999,
+            computeCandleStaleness: () => ({ staleData: false, staleAgeHours: 1.0 }),
+            withRetries: async (fn) => fn(),
+            kibanaSource: { getLpCandlesForPool: async () => [] },
+            fetchNativeTradesSince: async () => ({ trades: [], truncated: false, pages: 1 }),
+            tradesToCandles: () => [],
+            mergeCandles: (existing, incoming) => [...existing, ...incoming],
+            pruneCandles: (series) => series,
+            buildAmaRecord: () => [],
+            writeGridResetTrigger: (_, payload) => {
+                trigger = payload;
+                return '/tmp/recalculate.aaa-bbb-slope-ema.trigger';
+            },
+            writeBotDynamicGrid: (_key, _center, payload) => {
+                snapshot = payload;
+                return true;
+            },
+            isBotDynamicWeightWhitelisted: () => false,
+            isBotAsymmetricBoundsWhitelisted: () => true,
+            root: process.cwd(),
+            path,
+        });
+        const bot = {
+            name: 'AAA-BBB',
+            botKey: 'aaa-bbb-slope-ema',
+            assetA: 'IOB.XRP',
+            assetB: 'BTS',
+            gridPrice: 'ama',
+            incrementPercent: 0.4,
+            weightDistribution: { sell: 0.6, buy: 0.4 },
+        };
+        const state = {
+            bots: {
+                [bot.botKey]: {
+                    centerPrice: 100,
+                    amaCenterPrice: 100,
+                    // Keep the baseline in per-bar units so the expected delta
+                    // is a direct slope difference, not a legacy window divide.
+                    amaSlopePercentMode: 'perBar',
+                    amaSlope: { ...baseline },
+                    gridRangeScalingAmaSlope: { ...baseline },
+                },
+            },
+        };
+        const result = await service.processBot(bot, state, cfg, new Map(), {});
+        // Independently replay the same config through the canonical parity
+        // helper so the expected slope is not taken from the service output.
+        const expectedSlopePct = buildDynamicWeightParityInputs(candles, cfg, botAma).slopeResult.slopePct;
+        return { result, trigger, snapshot, expectedSlopePct };
+    }
+
+    const raw = await runWithAlpha(1);
+    const smooth = await runWithAlpha(0.2);
+    for (const run of [raw, smooth]) {
+        assert.strictEqual(run.result.ok, true, 'processBot should succeed');
+        assert.ok(run.snapshot?.amaSlope, 'live snapshot must publish the slope');
+        assert.strictEqual(run.snapshot.amaSlope.slopePct, run.expectedSlopePct,
+            'reset-delta path must read the shaped slope the live service published');
+        const expectedDelta = Math.abs(run.expectedSlopePct - baseline.slopePct);
+        assert.ok(Math.abs(run.result.amaSlopeDeltaPercent - expectedDelta) < 1e-12,
+            'result slope delta must be computed from the shaped slope');
+        assert.ok(run.trigger, 'the slope-delta reset must actually fire');
+        assert.ok(Math.abs(run.trigger.deltaPercent - expectedDelta) < 1e-12,
+            'reset trigger payload must carry the delta of the shaped slope');
+    }
+    const closes = candles.map((c) => Number(c[4])).filter((v) => Number.isFinite(v) && v > 0);
+    const amaValues = calculateAMA(closes, botAma);
+    assert.strictEqual(raw.expectedSlopePct, computeHuberWindowSlopePct(amaValues, amaValues.length - 1, MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS),
+        'alpha=1 must keep the raw Huber reading on the reset path');
+    assert.notStrictEqual(smooth.expectedSlopePct, raw.expectedSlopePct,
+        'alpha must change the slope the reset path measures');
+    assert.notStrictEqual(smooth.result.amaSlopeDeltaPercent, raw.result.amaSlopeDeltaPercent,
+        'alpha must change the actual amaSlopeDeltaPercent, not just diagnostics');
 }
 
 async function testSlopeTriggerRecoversBaselineFromDynamicGridAfterStateClear() {
@@ -5183,6 +5299,9 @@ async function testDynamicWeightSignalConfirmBarsCanLatchFlatState() {
             lookbackBars: 1,
             maxSlopePct: 1,
             neutralZonePct: 0,
+            // This scenario tests the signal-confirm latch on raw Huber; keep
+            // the EMA off so the flat tail really is a zero slope.
+            emaAlpha: 1,
         },
     };
 
@@ -5379,6 +5498,25 @@ async function testDynamicWeightChartParityMatchesLiveService() {
         wideKalInputs.kalmanOffsets,
         'Kalman offsets should respond to the separate Kalman slope knob'
     );
+
+    // Non-default EMA alpha must reach the service, be published, and change
+    // the slope the parity model computes (config layering is covered elsewhere).
+    assert.strictEqual(dw.amaSlope.emaAlpha, 0.2, 'default EMA alpha should be reported in the persisted payload');
+    assert.strictEqual(result.weights.meta.amaSlope.emaAlpha, 0.2, 'default EMA alpha should be reported in service metadata');
+    const emaCfg = { ...cfg, amaSlope: { ...cfg.amaSlope, emaAlpha: 0.05 } };
+    const emaInputs = buildDynamicWeightParityInputs(candles, emaCfg, botAma);
+    assert.strictEqual(emaInputs.emaAlpha, 0.05, 'parity model should honour a non-default EMA alpha');
+    assert.notStrictEqual(
+        emaInputs.slopeResult.slopePct,
+        parityInputs.slopeResult.slopePct,
+        'non-default EMA alpha should change the published slope input'
+    );
+    const emaResult = await service.processBot(bot, { bots: { 'aaa-bbb-dw-parity': { centerPrice: 100 } } }, emaCfg, new Map(), {});
+    assert.strictEqual(emaResult.ok, true);
+    assert.strictEqual(writtenPayload.dynamicWeights.amaSlope.emaAlpha, 0.05,
+        'service should publish the applied non-default EMA alpha');
+    assert.strictEqual(emaResult.weights.meta.amaSlope.emaAlpha, 0.05,
+        'service metadata should expose the applied non-default EMA alpha');
 }
 
 async function testDynamicWeightVolatilityOnlyPathRemainsReady() {
@@ -6815,6 +6953,7 @@ async function run() {
     await testFractionalAmaLookbackIsNormalizedBeforeSeriesLoops();
     await testDynamicWeightSignalConfirmBarsCanLatchFlatState();
     await testCenterStableButSlopeDeltaTriggersReset();
+    await testAmaSlopeEmaAlphaDrivesLiveResetDelta();
     await testAmaSlopePersistenceGate();
     await testSlopeTriggerRecoversBaselineFromDynamicGridAfterStateClear();
     testSlopeDirectionChangeDoesNotTriggerBelowDeltaThreshold();

@@ -219,8 +219,12 @@ function testDynamicWeightChartUsesErPlusLookbackWarmup() {
             { timestamp: '2026-01-01T02:00:00Z', price: 102, ama3Price: 102, amaSlopePct: 999, velocityPct: null, displacementPct: null, isReady: false, signal: 'NEUTRAL' },
             { timestamp: '2026-01-01T03:00:00Z', price: 103, ama3Price: 103, amaSlopePct: 999, velocityPct: null, displacementPct: null, isReady: false, signal: 'NEUTRAL' },
             { timestamp: '2026-01-01T04:00:00Z', price: 104, ama3Price: 104, amaSlopePct: 999, velocityPct: null, displacementPct: null, isReady: false, signal: 'NEUTRAL' },
-            { timestamp: '2026-01-01T05:00:00Z', price: 105, ama3Price: 105, amaSlopePct: 1, velocityPct: null, displacementPct: null, isReady: true, signal: 'NEUTRAL' },
-            { timestamp: '2026-01-01T06:00:00Z', price: 106, ama3Price: 106, amaSlopePct: 2, velocityPct: null, displacementPct: null, isReady: true, signal: 'NEUTRAL' },
+            { timestamp: '2026-01-01T05:00:00Z', price: 105, ama3Price: 105, amaSlopePct: 999, velocityPct: null, displacementPct: null, isReady: false, signal: 'NEUTRAL' },
+            { timestamp: '2026-01-01T06:00:00Z', price: 106, ama3Price: 106, amaSlopePct: 999, velocityPct: null, displacementPct: null, isReady: false, signal: 'NEUTRAL' },
+            { timestamp: '2026-01-01T07:00:00Z', price: 107, ama3Price: 107, amaSlopePct: 999, velocityPct: null, displacementPct: null, isReady: false, signal: 'NEUTRAL' },
+            { timestamp: '2026-01-01T08:00:00Z', price: 108, ama3Price: 108, amaSlopePct: 1, velocityPct: null, displacementPct: null, isReady: true, signal: 'NEUTRAL' },
+            { timestamp: '2026-01-01T09:00:00Z', price: 109, ama3Price: 109, amaSlopePct: 2, velocityPct: null, displacementPct: null, isReady: true, signal: 'NEUTRAL' },
+            { timestamp: '2026-01-01T10:00:00Z', price: 110, ama3Price: 110, amaSlopePct: 3, velocityPct: null, displacementPct: null, isReady: true, signal: 'NEUTRAL' },
         ],
         amaConfig: { erPeriod: 1, slowPeriod: 1 },
         amaWeightConfig: { lookbackBars: 1 },
@@ -237,9 +241,13 @@ function testDynamicWeightChartUsesErPlusLookbackWarmup() {
         'chart payload should expose the full AMA warmup window'
     );
     assert.strictEqual(payload.amaSlopeReadyBars, 1 + payload.lookbackBars, 'chart payload should expose the ER-plus-lookback readiness gate');
-    assert.strictEqual(payload.amaPercentiles[100], 2, 'AMA clip percentiles should start once ER-plus-lookback bars are available');
+    assert.strictEqual(payload.amaPercentiles[100], 3, 'AMA clip percentiles should start once ER-plus-lookback bars are available');
     assert.match(html, /data\.amaErPeriod/, 'interactive chart should use the AMA ER period in its readiness gate');
-    assert.match(html, /const amaReadyBar = Math\.max\(lb, amaErWarmup \+ lb\);/, 'interactive clip-threshold recompute should start at ER-plus-lookback readiness');
+    assert.match(
+        html,
+        /computeAmaSlopeEmaSeries\(currentAmaSource, amaErWarmup, lb, currentAmaSlopeEmaAlpha\)/,
+        'interactive chart should use the canonical Huber -> EMA slope helper'
+    );
 }
 
 function testDynamicWeightChartDisablesAmaClipWithoutStaleCap() {
@@ -315,6 +323,11 @@ function testDynamicWeightChartKeepsGainLinearAtEnd() {
         /function computeDynamicWeightSeries\(/,
         'chart should embed the canonical dynamic weight pipeline'
     );
+    assert.match(
+        html,
+        /function computeAmaSlopeEmaSeries\(/,
+        'chart should embed the canonical Huber -> EMA slope helper'
+    );
     assert.ok(
         html.includes(`const AMA_SLOPE_HUBER = ${JSON.stringify(MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_HUBER)};`),
         'chart should inject the centralized Huber params from constants'
@@ -375,6 +388,30 @@ function testDynamicWeightChartKeepsGainLinearAtEnd() {
     assert.ok(
         saturated.combinedOffSeries.some((value) => Math.abs(value) > offsetClamp),
         'chart should allow the blended shape to exceed the runtime clamp before gain'
+    );
+}
+
+function testDynamicWeightChartWiresEmaThroughCopyPasteReset() {
+    const html = generateHTML({
+        allResults: [
+            { timestamp: '2026-01-01T00:00:00Z', price: 100, ama3Price: 100, isReady: false, signal: 'NEUTRAL' },
+        ],
+    }, 'Dynamic Weight Test');
+    assert.ok(
+        html.includes('amaSlopeEmaAlpha:  currentAmaSlopeEmaAlpha,'),
+        'copy should serialize the applied EMA alpha at full precision (2/101 must not round to 0.020)'
+    );
+    assert.ok(
+        html.includes('if (p.amaSlopeEmaAlpha != null)'),
+        'paste should accept a copied EMA alpha'
+    );
+    assert.ok(
+        html.includes(`"amaSlopeEmaAlpha":${JSON.stringify(MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA)}`),
+        'reset should restore the centralized EMA default'
+    );
+    assert.ok(
+        html.includes("document.getElementById('ema-slider').addEventListener('input'"),
+        'the EMA slider should trigger a recompute'
     );
 }
 
@@ -490,7 +527,7 @@ function evalEmbeddedSharedFunctions(html) {
     // the eval scope must define it too (empty when a chart omits it).
     const hubMatch = /const AMA_SLOPE_HUBER = (\{[^;]*\});/.exec(html);
     const hubPrefix = hubMatch ? `const AMA_SLOPE_HUBER = ${hubMatch[1]};\n` : '';
-    const f = new Function(hubPrefix + block + '\nreturn { computeDynamicWeightSeries, echoLatchSeries, bilinearInterpolate, buildKalmanVelocitySeries, computeHuberWindowSlopePct };');
+    const f = new Function(hubPrefix + block + '\nreturn { computeDynamicWeightSeries, echoLatchSeries, bilinearInterpolate, buildKalmanVelocitySeries, computeHuberWindowSlopePct, computeAmaSlopeEmaSeries };');
     return f();
 }
 
@@ -586,6 +623,7 @@ function main() {
     testDynamicWeightChartDisablesAmaClipWithoutStaleCap();
     testDynamicWeightChartRegimeParityWithLiveGate();
     testDynamicWeightChartKeepsGainLinearAtEnd();
+    testDynamicWeightChartWiresEmaThroughCopyPasteReset();
     testDynamicWeightChartShowsOutputClampGuide();
     testVolatilityChartEmbedsCanonicalFunctions();
     testLiveServiceMatchesChartGainStructure();

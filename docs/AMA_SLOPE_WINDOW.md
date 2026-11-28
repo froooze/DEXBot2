@@ -71,6 +71,50 @@ node dist/analysis/trend_detection/backtest_ama_slope_huber.js \
 ```
 (`none` == production; see `analysis/trend_detection/huber_scale_variants.ts`.)
 
+## EMA on the slope — default alpha 0.2
+
+The published `slopePct` (and therefore the offset channel and the grid-reset
+delta) is now a recursive EMA over the per-bar Huber slope, not the raw Huber
+reading:
+
+```
+ema[i] = ema[i-1] + alpha * (huberSlope[i] - ema[i-1])
+```
+
+`computeAmaSlopeEmaSeries` in
+`market_adapter/core/strategies/dynamic_weight_series.ts` is the single
+definition, embedded verbatim into the DW research chart via
+`embedFunctionSources`. `alpha = 1` reproduces raw Huber bit-for-bit.
+
+Default `MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA = 0.2` adds
+`(1-alpha)/alpha ≈ 4` bars of lag and, on the sparse 12-month pool sample, cuts
+the worst bar-to-bar slope jump by ~60% (0.076 → 0.032 %/bar) without changing
+the slope distribution's median or p90. Range `[2/101, 1]`: `2/101` is the
+100-bar variance-equivalent alpha (`2/(N+1)`), `1` disables smoothing.
+Override per deployment via `MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA`
+in `profiles/general.settings.json`, or per market/bot via
+`amaSlope.emaAlpha` in `profiles/market_adapter_settings.json`.
+
+The clip threshold is intentionally still derived from the raw slope history,
+so adding EMA does not create a clip-feedback loop. Because the reset baseline
+is persisted, the first cycle after enabling EMA compares a smoothed reading
+with the previously stored raw baseline; magnitudes are close and the gate is
+direction-aware, so this normally costs at most one recenter. Rollback: set
+`amaSlope.emaAlpha: 1` (or the global constant to `1`) — no schema change.
+
+**Operational sign-off — slower reversal response.** Smoothing is bought with
+lag: at the default `alpha = 0.2` the EMA mean lag is `(1-alpha)/alpha ≈ 4`
+bars. The slope-delta reset then still needs `AMA_SLOPE_PERSIST_BARS`
+consecutive confirming bars (default `3`), so a genuine trend reversal needs
+roughly **7 confirming bars** before the grid recenters, versus about `3` on
+raw Huber. Sparse pools trade fewer bars per day, so that delay can be material
+in wall-clock time. Enabling the default (any `alpha < 1`) on live bots is an
+explicit operational decision: accept the slower reversal in exchange for
+one-trade spike suppression, or tune `amaSlope.emaAlpha` toward `1` and/or
+`amaSlope.persistBars` down where fast recentering matters more. Setting
+`amaSlope.emaAlpha: 1` restores the original confirmation count without
+touching any other setting.
+
 ## Fill-model drawdown — the window effect is pool-dependent
 
 Paired persistent-grid runs (`simulatePersistentGrid`, geometry fixed,
@@ -118,7 +162,12 @@ So it was removed completely in favour of the zero-migration window change.
   (`resolveAmaSlopePersistBars` / `advanceAmaSlopePersistence`, state persisted in
   `botState.amaSlopePersistCount` / `amaSlopePersistDir`).
 - `analysis/bot_fitting/backtest_bot_fitting.ts` — gate + `bandTilt` fill-model
-  hooks (used by the comparison harness).
+  hooks (used by the comparison harness). Trigger B and the grid price offset
+  now replay the canonical Huber → EMA slope instead of raw Huber, so their
+  reset cadence matches the live published slope; `--slope-ema-alpha` pins a
+  what-if alpha (`1` = raw Huber). The same replay is used by
+  `backtest_ama_sweep.ts` (which also exposes the flag) and by
+  `backtest_lookback_drawdown.ts` (production default, no flag).
 - Docs: `docs/GRID_RECALCULATION.md`, `market_adapter/README.md`,
   `analysis/trend_detection/README.md`, `analysis/tradingview/README.md`.
 - Research (new): `analysis/trend_detection/huber_scale_variants.ts` and

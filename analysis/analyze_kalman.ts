@@ -18,7 +18,8 @@ import { KalmanTrendAnalyzer } from './trend_detection/kalman_trend_analyzer.js'
 import { generateHTML } from './trend_detection/kalman_chart_generator.js';
 import type { KalmanRow } from './trend_detection/kalman_chart_generator.js';
 import { calculateAMA } from '../market_adapter/core/strategies/ama.js';
-import { computeAmaSlopeWeights, createAmaSlopeClipTracker } from '../market_adapter/core/strategies/ama_slope_model.js';
+import { computeAmaSlopeWeights, computeAmaSlopeEmaSeries, createAmaSlopeClipTracker } from '../market_adapter/core/strategies/ama_slope_model.js';
+import { normalizeAmaSlopeEmaAlpha } from '../market_adapter/core/config_normalizers.js';
 import { MARKET_ADAPTER } from '../modules/constants.js';
 import { getCandleClose } from './math_utils.js';
 import { writeChartFile, toFileUrl } from './chart_utils.js';
@@ -103,21 +104,28 @@ async function main() {
         }
 
         // ── AMA weight offset (for comparison panel) ─────────────────────────
-        // Runs the production path (computeAmaSlopeWeights + percentile clip)
-        // so this panel is directly comparable to the live amaSlopeOffset.
+        // Runs the production path (canonical Huber -> EMA slope fed into
+        // computeAmaSlopeWeights + percentile clip) so this panel is directly
+        // comparable to the live amaSlopeOffset. Without the EMA this panel
+        // reads raw Huber and drifts from production by the smoothing lag.
         const closes    = candles.map(c => getCandleClose(c) ?? 0);
         const amaValues = calculateAMA(closes, amaConfig);
         const amaLb     = MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS;
         const clipPct   = MARKET_ADAPTER.DYNAMIC_WEIGHT_CLIP_PERCENTILE;
-        // Ceil to match the readiness guard in computeAmaSlopeWeights
-        // (it uses Math.ceil(opts.erPeriod)), so fractional ER periods don't
-        // leave a 1-bar window that computes a weight where the model is not ready.
-        const warmup    = Math.ceil(amaConfig.erPeriod) + amaLb + 1;
+        // First ready bar: computeAmaSlopeEmaSeries emits from ceil(er)+lb and a
+        // rolling slice of that length satisfies computeAmaSlopeWeights' guard
+        // (er + lookback + 1 bars). Skipping one bar further would drop the
+        // first valid offset from the comparison panel.
+        const warmup    = Math.ceil(amaConfig.erPeriod) + amaLb;
 
         // Incremental, prefix-only clip pool (no look-ahead) — same thresholds
         // the live service would have seen at each point in time.
         const clipTracker = createAmaSlopeClipTracker(amaConfig.erPeriod, amaLb, clipPct);
         const weightWindowBars = Math.ceil(amaConfig.erPeriod) + amaLb + 1;
+        // Same normalized alpha and canonical replay the live service uses.
+        // The clip pool intentionally stays on raw Huber (no feedback loop).
+        const emaAlpha = normalizeAmaSlopeEmaAlpha(MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA);
+        const emaSlopeSeries = computeAmaSlopeEmaSeries(amaValues, amaConfig.erPeriod, amaLb, emaAlpha);
 
         for (let i = 0; i < allResults.length; i++) {
             const amaClipThreshold = clipTracker.push(amaValues[i] ?? NaN);
@@ -134,6 +142,9 @@ async function main() {
                 maxSlopeOffset:        MARKET_ADAPTER.DYNAMIC_WEIGHT_ASYMMETRIC_OFFSET_CLAMP,
                 maxVolatilityOffset:   MARKET_ADAPTER.DYNAMIC_WEIGHT_SYMMETRIC_SHIFT_CLAMP,
                 clipThreshold:         amaClipThreshold,
+                // Rolling window: pass the aligned current-bar value, not the
+                // full series indexed by the slice's last position.
+                currentSlopePct:       emaSlopeSeries[i],
             });
             allResults[i].amaWeightOffset = weights.rawSlopeOffset;
         }

@@ -1489,6 +1489,18 @@ let MARKET_ADAPTER = {
     // nob: nz% (Neutral Zone %)
     DYNAMIC_WEIGHT_AMA_NEUTRAL_ZONE_PCT: 0,
 
+    // DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA: Recursive EMA applied to the per-bar
+    // Huber AMA slope (not to price). 1 = off (raw Huber), lower = heavier
+    // smoothing; mean lag is (1-alpha)/alpha bars (0.2 ~= 4 bars). Default 0.2
+    // cuts the worst bar-to-bar slope jumps on sparse pools by ~60% at ~4 bars
+    // of extra lag. The range matches the DW research slider: MIN is the
+    // 100-bar variance-equivalent alpha 2/(100+1), MAX 1 disables the EMA.
+    // Overridable per market/bot via `amaSlope.emaAlpha` and per deployment via
+    // `MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA` in general.settings.json.
+    DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA: 0.2,
+    DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA_MIN: 2 / 101,
+    DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA_MAX: 1,
+
     // DYNAMIC_WEIGHT_AMA_HUBER: Single source of truth for the canonical AMA-slope
     // estimator (computeHuberWindowSlopePct in
     // market_adapter/core/strategies/dynamic_weight_series.ts).
@@ -1650,7 +1662,7 @@ let MARKET_ADAPTER = {
     // giving the grid more room when the AMA center trails price in a trend.
     // 0 disables asymmetry. Recommended range: 0.15–0.35.
     // Overridable per bot via market_adapter_settings.json.
-    ASYMMETRIC_BOUNDS_MAX_ASYMMETRY_FACTOR: 0.333,
+    ASYMMETRIC_BOUNDS_MAX_ASYMMETRY_FACTOR: 0.33,
 
     // ASYMMETRIC_BOUNDS_MIN_SCALE_SLOTS: Minimum number of price levels the
     // narrowed/tightened side of a range-scaled grid must keep between the grid

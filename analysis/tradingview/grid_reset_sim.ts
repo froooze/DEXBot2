@@ -41,15 +41,31 @@
  *
  * The functions below are embedded verbatim into the generated HTML via
  * `embedFunctionSources`, so they may only reference module imports that are
- * embedded alongside them (`computeAverageAmaSlopePct`,
- * `createAmaSlopeClipTracker`, `percentileFromSorted`, `clamp`).
+ * embedded alongside them (`computeHuberWindowSlopePct`,
+ * `computeAmaSlopeEmaSeries`, `createAmaSlopeClipTracker`,
+ * `percentileFromSorted`, `clamp`) or the centralized constant injected under
+ * the same name into the page (`GRID_SIM_EMA_ALPHA_BOUNDS`).
  */
 
 import {
     computeHuberWindowSlopePct,
+    computeAmaSlopeEmaSeries,
     createAmaSlopeClipTracker,
 } from '../../market_adapter/core/strategies/dynamic_weight_series.js';
 import { clamp } from '../../modules/order/utils/math.js';
+import { MARKET_ADAPTER } from '../../modules/constants.js';
+
+/**
+ * Same range the live service applies via normalizeAmaSlopeEmaAlpha. The chart
+ * generator injects this const into the generated page next to AMA_SLOPE_HUBER,
+ * so the embedded replay and the browser-side alpha resolver cannot drift from
+ * the runtime. Keep the injection in tradingview_uplot_chart_generator.ts in
+ * sync with this definition.
+ */
+const GRID_SIM_EMA_ALPHA_BOUNDS = {
+    MIN: MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA_MIN,
+    MAX: MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA_MAX,
+};
 
 
 // Reset reason codes. NONE = the accepted center is carried over unchanged
@@ -67,6 +83,7 @@ interface GridSimCfg {
     clampMin?: number | null;
     clampMax?: number | null;
     clipPercentile?: number | null;
+    emaAlpha?: number;
     erPeriod?: number;
     lookbackBars?: number;
     maxSlopeOffset?: number;
@@ -168,6 +185,15 @@ function simulateGridResetSeries(amaSeries: unknown, cfg: GridSimCfg) {
     const lookbackBars = gridSimNonNegativeInt(cfg?.lookbackBars, 0);
     const warmupBars = gridSimNonNegativeInt(cfg?.warmupBars, 0);
     const clipPercentile = Number(cfg?.clipPercentile);
+    // 1 = off (legacy raw Huber); resolved charts always supply the
+    // centralized alpha through payload.gridSim.emaAlpha. Clamp to the same
+    // [MIN, MAX] range the live service uses before reporting it in stats, so
+    // an unnormalized payload cannot make the panel show an alpha the bot would
+    // have replaced at read time.
+    const emaAlpha = Math.max(
+        GRID_SIM_EMA_ALPHA_BOUNDS.MIN,
+        Math.min(GRID_SIM_EMA_ALPHA_BOUNDS.MAX, gridSimPositiveNumber(cfg?.emaAlpha, 1))
+    );
     const clampMinValue = Number(cfg?.clampMin);
     const clampMaxValue = Number(cfg?.clampMax);
     // Persistence gate on the slope-delta trigger (trigger B): consecutive
@@ -217,12 +243,16 @@ function simulateGridResetSeries(amaSeries: unknown, cfg: GridSimCfg) {
                 slopeDeltaThresholdPercent: slopeTriggerArmed ? slopeThreshold : null,
                 slopePersistBars,
                 slopeTriggerArmed,
+                emaAlpha,
             },
         };
     }
 
     const clipTracker = createAmaSlopeClipTracker(erPeriod, lookbackBars, clipPercentile);
     const estimateSlope = gridSimResolveSlopeEstimator(cfg);
+    // Same canonical Huber -> EMA replay the live adapter and the DW chart use,
+    // with this sim's estimator injected so 'endpoint' comparison mode works.
+    const shapedSlopePct = computeAmaSlopeEmaSeries(amaArr, erPeriod, lookbackBars, emaAlpha, estimateSlope);
     const readyBars = erPeriod + lookbackBars;
     let acceptedCenter: number | null = null;
     let acceptedSlope: number | null = null;
@@ -249,7 +279,7 @@ function simulateGridResetSeries(amaSeries: unknown, cfg: GridSimCfg) {
         const clipThreshold = clipTracker.push(hasAma ? ama : NaN);
         let slopePct: number | null = null;
         if (hasAma && i >= readyBars) {
-            const s = estimateSlope(amaArr, i, lookbackBars);
+            const s = shapedSlopePct[i];
             if (Number.isFinite(s)) slopePct = s as number;
         }
         slopePctSeries[i] = slopePct;
@@ -385,6 +415,7 @@ function simulateGridResetSeries(amaSeries: unknown, cfg: GridSimCfg) {
             slopeDeltaThresholdPercent: slopeTriggerArmed ? slopeThreshold : null,
             slopePersistBars,
             slopeTriggerArmed,
+            emaAlpha,
         },
     };
 }

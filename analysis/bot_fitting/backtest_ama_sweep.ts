@@ -5,7 +5,8 @@ import os from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { isMainThread, parentPort, workerData } from 'node:worker_threads';
 import { calculateAMA, getAmaWarmupBars } from '../../market_adapter/core/strategies/ama.js';
-import { computeHuberWindowSlopePct } from '../../market_adapter/core/strategies/ama_slope_model.js';
+import { computeAmaSlopeEmaSeries } from '../../market_adapter/core/strategies/ama_slope_model.js';
+import { normalizeAmaSlopeEmaAlpha } from '../../market_adapter/core/config_normalizers.js';
 import { range } from '../math_utils.js';
 import { runModuleWorker } from '../worker_pool.js';
 import { loadLpData, fmt, loadAmaStrategies, consumeBacktestArg, slopeResetThresholdPct, DEFAULT_FEE_ROUNDTRIP_PCT, DEFAULT_MIN_SPREAD_FACTOR, DEFAULT_BTS_CREATE_FEE, DEFAULT_BTS_CANCEL_FEE, DEFAULT_BTS_MAKER_CREATE_FACTOR, DEFAULT_TX_FEE_PRICE, DEFAULT_REPOSITION_PCT, SLOPE_LOOKBACK_BARS } from './shared_utils.js';
@@ -77,6 +78,7 @@ function parseArgs() {
         txFeePrice: number;
         topN: number;
         lookbackBars: number | null;
+        slopeEmaAlpha: number;
     } = {
         dataPath: null,
         resultsPath: null,
@@ -95,6 +97,7 @@ function parseArgs() {
         txFeePrice: DEFAULT_TX_FEE_PRICE,
         topN: 15,
         lookbackBars: null,
+        slopeEmaAlpha: MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA,
     };
 
     for (let i = 0; i < args.length; i++) {
@@ -113,6 +116,7 @@ function parseArgs() {
             case '--capital': out.capital = Number(val); i++; break;
             case '--top': out.topN = Number(val); i++; break;
             case '--lookback': out.lookbackBars = Math.max(1, Math.round(Number(val))); i++; break;
+            case '--slope-ema-alpha': out.slopeEmaAlpha = Number(val); i++; break;
         }
     }
     if (!out.dataPath) {
@@ -148,6 +152,7 @@ function printHelp() {
     console.log('  --tx-fee-price <n>      Convert BTS fees into backtest units (default: 1.0)');
     console.log('  --top <n>               Show top N results (default: 15)');
     console.log(`  --lookback <bars>       Huber slope lookback override (default: ${SLOPE_LOOKBACK_BARS})`);
+    console.log(`  --slope-ema-alpha <a>   Slope EMA alpha (default: ${MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA}, 1 = raw Huber)`);
 }
 
 interface AmaStrategy {
@@ -339,16 +344,21 @@ function simulatePersistentGrid(candles: SimCandle[], amaValues: number[], param
         if (Number.isFinite(v) && v > 0) { gridCenter = v; startIdx = j; break; }
     }
 
-    // Production AMA slope series (%/bar averaged over the lookback window) —
-    // feeds trigger B and the grid price offset when asymmetricBounds is on.
-    // Lookback is overridable for research (params.lookbackBars); production
-    // callers leave it unset and get the centralized constant.
+    // Production AMA slope series (%/bar) — feeds trigger B and the grid price
+    // offset when asymmetricBounds is on. The canonical Huber -> EMA replay
+    // mirrors the slope the live adapter publishes; raw Huber diverges from
+    // the live reset cadence. Lookback is overridable for research (params.lookbackBars);
+    // production callers leave it unset and get the centralized constant.
     const slopeLookbackBars = Number.isFinite(params.lookbackBars) && params.lookbackBars >= 1
         ? Math.round(params.lookbackBars)
         : SLOPE_LOOKBACK_BARS;
+    const erRaw = Number(params.erPeriod);
+    const erPeriod = Number.isFinite(erRaw) && erRaw > 0 ? Math.ceil(erRaw) : 0;
+    const slopeEmaAlpha = normalizeAmaSlopeEmaAlpha(params.slopeEmaAlpha ?? MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA);
+    const shapedSlopes = computeAmaSlopeEmaSeries(amaValues, erPeriod, slopeLookbackBars, slopeEmaAlpha);
     const slopeAt: (number | null)[] = new Array(candles.length).fill(null);
     for (let j = slopeLookbackBars; j < candles.length; j++) {
-        const s = computeHuberWindowSlopePct(amaValues, j, slopeLookbackBars);
+        const s = shapedSlopes[j];
         if (s != null && Number.isFinite(s)) slopeAt[j] = s;
     }
 
@@ -708,6 +718,8 @@ function sweepOneAma(strategy: AmaStrategy, candles: SimCandle[], closes: number
                         capital: cfg.capital,
                         repositionThreshold: cfg.repositionPct / 100,
                         asymmetricBounds: cfg.asymmetricBounds,
+                        erPeriod: strategy.er,
+                        slopeEmaAlpha: cfg.slopeEmaAlpha,
                         btsCreateFee: cfg.btsCreateFee,
                         btsCancelFee: cfg.btsCancelFee,
                         makerCreateFactor: cfg.makerCreateFactor,
@@ -788,7 +800,7 @@ async function run() {
     console.log(`  Spread floor: > fee (${cfg.feeRoundtripPct}%)`);
     console.log(`  Reset (A):    ${cfg.repositionPct}% AMA drift from grid center (ratchet)`);
     console.log(`  Asym. bounds: ${cfg.asymmetricBounds ? 'ON — slope reset (B) + grid price offset enabled (whitelist semantics)' : 'OFF — typical non-whitelisted bot (production default)'}`);
-    console.log(`  Reset (B):    |slope - slope@lastReset| >= ${fmt(slopeResetThresholdPct(), 4)}% (lookback ${cfg.lookbackBars ?? SLOPE_LOOKBACK_BARS})${cfg.asymmetricBounds ? '' : ' [gated off]'}`);
+    console.log(`  Reset (B):    |slope - slope@lastReset| >= ${fmt(slopeResetThresholdPct(), 4)}% (lookback ${cfg.lookbackBars ?? SLOPE_LOOKBACK_BARS}, ema ${normalizeAmaSlopeEmaAlpha(cfg.slopeEmaAlpha)})${cfg.asymmetricBounds ? '' : ' [gated off]'}`);
     console.log(`  Tx model:     create=${fmt(cfg.btsCreateFee, 5)} BTS, cancel=${fmt(cfg.btsCancelFee, 5)} BTS, maker=${fmt(cfg.makerCreateFactor * 100, 1)}%, 1 BTS=${fmt(cfg.txFeePrice, 2)} units`);
     console.log(`  Combos/AMA:   ${totalCombos}  |  Total: ${totalCombos * strategies.length}\n`);
 

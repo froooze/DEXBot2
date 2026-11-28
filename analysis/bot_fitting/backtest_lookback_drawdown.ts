@@ -179,6 +179,9 @@ function run() {
                 makerCreateFactor: cfg.makerCreateFactor,
                 txFeePrice: cfg.txFeePrice,
                 warmupBars,
+                // Mirror the other two callers: seed the EMA at ceil(er)+lb so
+                // the trigger-B slope uses the live readiness guard.
+                erPeriod: amaDef.er,
                 lookbackBars: lb,
             }, c.weightName, c.weightFactor);
             perGeom[`${c.spreadPct}|${c.incrementPct}|${c.maxMinRatio}|${c.weightName}`] = sim;

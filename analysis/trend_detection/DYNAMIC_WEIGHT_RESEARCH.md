@@ -165,7 +165,8 @@ All panels share aligned vertical time grid lines, and the bottom output panel s
 | Knob | Range | Default | Purpose |
 |------|-------|---------|---------|
 | **nz%** | 0–1 | 0.00 | Neutral zone: dead-band below which offset is forced to 0 |
-| **lb** | 4–32 | 16 | Logarithmic. Lookback bars for AMA slope calculation |
+| **lb** | 8–100 | 16 | Logarithmic. Lookback bars for the Huber AMA slope fit |
+| **ema** | 0.0198–1 | 0.2 | Logarithmic. EMA alpha on the slope series: left = 1 (off), right = 100-bar equivalent (`2/(N+1)`). Same helper/default as the live adapter |
 | **amaS%** | 0.06–0.12 | 0.1 | Logarithmic. Gear ratio for per-bar AMA slope saturation |
 | **kalS%** | 0.75–1.5 | 1.2 | Logarithmic. Gear ratio for Kalman composite saturation |
 | **clip%** | 0–20 | 10 | Percentile clip: filters extreme inputs (0 = off) |
@@ -179,7 +180,7 @@ All panels share aligned vertical time grid lines, and the bottom output panel s
 
 ## Copy / Paste Parameters
 
-The **copy** button serializes all knob values (α, dw, kf, kfd, dsp, kdt, kfs, cf, lb, amaS%, kalS%, th%, gain, clip%, nz%, regi) to JSON and writes them to both the clipboard and `localStorage`.
+The **copy** button serializes all knob values (α, dw, kf, kfd, dsp, kdt, kfs, cf, lb, ema, amaS%, kalS%, th%, gain, clip%, nz%, regi) to JSON and writes them to both the clipboard and `localStorage`.
 
 The **paste** button first checks `localStorage` for parameters from a previous copy in the same browser session. If none found, it prompts for Ctrl+V input. A confirmation popup shows the parsed values before applying them. Click **Apply** to set the knobs, **Cancel** or press **Escape** to dismiss.
 
@@ -189,7 +190,7 @@ The **paste** button first checks `localStorage` for parameters from a previous 
 
 ### AMA slope
 
-Taking the slope of the AMA produces a signal that is already noise-filtered at the source — a near-zero slope genuinely means sideways, not oscillation that happened to average out. The canonical slope is a Huber-robust linear regression of `ln(AMA)` over the lookback window (per-bar log-return ×100, `MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_HUBER`), so a single outlier bar is discounted instead of getting full endpoint weight; the same estimator runs in the live adapter, both research charts, and the reset replay. The neutral zone (`nz%` knob) dead-bands any remaining micro-slope residuals.
+Taking the slope of the AMA produces a signal that is already noise-filtered at the source — a near-zero slope genuinely means sideways, not oscillation that happened to average out. The canonical slope is a Huber-robust linear regression of `ln(AMA)` over the lookback window (per-bar log-return ×100, `MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_HUBER`), so a single outlier bar is discounted instead of getting full endpoint weight; the same estimator runs in the live adapter, both research charts, and the reset replay. The **ema** knob then applies a recursive EMA to those per-bar slopes (`computeAmaSlopeEmaSeries`, embedded in this chart and called by the live adapter): it trims single-trade spikes with ~`(1-alpha)/alpha` bars of lag instead of lengthening the Huber window. The neutral zone (`nz%` knob) dead-bands any remaining micro-slope residuals.
 
 ### Kalman filter
 

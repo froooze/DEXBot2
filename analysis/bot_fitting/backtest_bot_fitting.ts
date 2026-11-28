@@ -3,7 +3,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { calculateAMA, getAmaWarmupBars } from '../../market_adapter/core/strategies/ama.js';
-import { computeHuberWindowSlopePct } from '../../market_adapter/core/strategies/ama_slope_model.js';
+import { computeAmaSlopeEmaSeries } from '../../market_adapter/core/strategies/ama_slope_model.js';
+import { normalizeAmaSlopeEmaAlpha } from '../../market_adapter/core/config_normalizers.js';
 import { applyAsymmetricBounds } from '../../market_adapter/core/asymmetric_bounds.js';
 import { range } from '../math_utils.js';
 import { loadLpData, fmt, loadAmaStrategies, consumeBacktestArg, slopeResetThresholdPct, DEFAULT_FEE_ROUNDTRIP_PCT, DEFAULT_MIN_SPREAD_FACTOR, DEFAULT_BTS_CREATE_FEE, DEFAULT_BTS_CANCEL_FEE, DEFAULT_BTS_MAKER_CREATE_FACTOR, DEFAULT_TX_FEE_PRICE, DEFAULT_REPOSITION_PCT, SLOPE_TRIGGER_FACTOR, SLOPE_MAX_PCT, SLOPE_LOOKBACK_BARS } from './shared_utils.js';
@@ -45,9 +46,11 @@ const DEFAULT_BTS_FEE_CAPITAL = 10000;
 // bot): --asymmetric-bounds enables slope-delta resets AND slope-ratio offset.
 // Trigger B fires when |slopePct_now − baseline| reaches
 // (AMA_SLOPE_DELTA_THRESHOLD_PERCENT / 100) × DYNAMIC_WEIGHT_AMA_MAX_SLOPE_PCT,
-// where slopePct is the Huber-robust per-bar AMA slope over
-// DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS (computeHuberWindowSlopePct) and the
+// where slopePct is the production Huber-robust per-bar AMA slope over
+// DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS with the canonical EMA applied
+// (computeAmaSlopeEmaSeries), matching the live published slope, and the
 // baseline mirrors botState.gridRangeScalingAmaSlope (re-seeded every reset).
+// --slope-ema-alpha can pin the smoothing (1 = raw Huber) for what-if runs.
 const SLOPE_NEUTRAL_ZONE_PCT = MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_NEUTRAL_ZONE_PCT;
 
 const RISK_W_DURATION = 1.0;   // avg open bars
@@ -81,6 +84,7 @@ function parseArgs() {
         riskWPeakOpen: number;
         riskWImbalance: number;
         riskWCancel: number;
+        slopeEmaAlpha: number;
     } = {
         dataPath: null,
         resultsPath: null,
@@ -101,6 +105,7 @@ function parseArgs() {
         riskWPeakOpen: RISK_W_PEAK_OPEN,
         riskWImbalance: RISK_W_IMBALANCE,
         riskWCancel: RISK_W_CANCEL,
+        slopeEmaAlpha: MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA,
     };
 
     for (let i = 0; i < args.length; i++) {
@@ -138,6 +143,10 @@ function parseArgs() {
                 break;
             case '--risk-cancel':
                 out.riskWCancel = Number(val);
+                i++;
+                break;
+            case '--slope-ema-alpha':
+                out.slopeEmaAlpha = Number(val);
                 i++;
                 break;
         }
@@ -425,11 +434,17 @@ function simulateForParams(candles: SimCandle[], amaValues: number[], params: Si
         if (Number.isFinite(v) && v > 0) { gridCenter = v; startIdx = j; break; }
     }
 
-    // Production AMA slope series (%/bar averaged over the lookback window).
-    // Evaluated over full history like the live adapter (only bar-index guards).
+    // Production AMA slope series (%/bar): the canonical Huber -> EMA replay
+    // the live adapter publishes. Raw Huber would make trigger B diverge from
+    // the live reset cadence. erPeriod mirrors the live readiness guard; callers
+    // without one (unit fixtures) start at the Huber window like before.
+    const erRaw = Number(params.erPeriod);
+    const erPeriod = Number.isFinite(erRaw) && erRaw > 0 ? Math.ceil(erRaw) : 0;
+    const slopeEmaAlpha = normalizeAmaSlopeEmaAlpha(params.slopeEmaAlpha ?? MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_SLOPE_EMA_ALPHA);
+    const shapedSlopes = computeAmaSlopeEmaSeries(amaValues, erPeriod, slopeLookbackBars, slopeEmaAlpha);
     const slopeAt: (number | null)[] = new Array(candles.length).fill(null);
     for (let j = slopeLookbackBars; j < candles.length; j++) {
-        const s = computeHuberWindowSlopePct(amaValues, j, slopeLookbackBars);
+        const s = shapedSlopes[j];
         if (s != null && Number.isFinite(s)) slopeAt[j] = s;
     }
 
@@ -760,7 +775,7 @@ function run() {
     console.log(`  Spread floor: spread >= ${cfg.minSpreadFactor} x increment`);
     console.log(`  Reset (A):    AMA drift >= ${cfg.repositionPct}% from recorded center${cfg.repositionPct === DEFAULT_REPOSITION_PCT ? ' (AMA_DELTA_THRESHOLD_PERCENT)' : ''}`);
     console.log(`  Asym. bounds: ${cfg.asymmetricBounds ? 'ON — slope reset (B) + grid price offset enabled (whitelist semantics)' : 'OFF — typical non-whitelisted bot (production default)'}`);
-    console.log(`  Reset (B):    |slope - slope@lastReset| >= ${slopeResetThresholdPct()}% (${SLOPE_TRIGGER_FACTOR}% x ${SLOPE_MAX_PCT}, lookback ${SLOPE_LOOKBACK_BARS})${cfg.asymmetricBounds ? '' : ' [gated off]'}`);
+    console.log(`  Reset (B):    |slope - slope@lastReset| >= ${slopeResetThresholdPct()}% (${SLOPE_TRIGGER_FACTOR}% x ${SLOPE_MAX_PCT}, lookback ${SLOPE_LOOKBACK_BARS}, ema ${normalizeAmaSlopeEmaAlpha(cfg.slopeEmaAlpha)})${cfg.asymmetricBounds ? '' : ' [gated off]'}`);
     console.log(`  Tx fees:      create=${fmt(cfg.btsCreateFee * cfg.makerCreateFactor, 5)} BTS, cancel=${fmt(cfg.btsCancelFee, 5)} BTS, 1 BTS=${fmt(cfg.txFeePrice, 2)} units, capital=${fmt(cfg.btsFeeCapital, 0)}`);
     console.log(`  Risk W:       duration=${cfg.riskWDuration}, peakOpen=${cfg.riskWPeakOpen}, imbalance=${cfg.riskWImbalance}, cancel=${cfg.riskWCancel}`);
     console.log(`  Combos/AMA:   ${totalCombos}\n`);
@@ -788,6 +803,8 @@ function run() {
                         feeRoundtripPct: cfg.feeRoundtripPct,
                         repositionThresholdPct: cfg.repositionPct,
                         asymmetricBounds: cfg.asymmetricBounds,
+                        erPeriod: s.er,
+                        slopeEmaAlpha: cfg.slopeEmaAlpha,
                         btsCreateFee: cfg.btsCreateFee,
                         btsCancelFee: cfg.btsCancelFee,
                         makerCreateFactor: cfg.makerCreateFactor,

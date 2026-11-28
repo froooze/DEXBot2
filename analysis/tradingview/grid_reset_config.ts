@@ -34,6 +34,7 @@ import { resolveConfiguredPriceBound } from '../../modules/order/utils/order.js'
 import { parseRelativeMultiplier } from '../../modules/order/utils/math.js';
 import { getAmaWarmupBars } from '../../market_adapter/core/strategies/ama.js';
 import { MarketAdapterService } from '../../market_adapter/core/market_adapter_service.js';
+import { normalizeAmaSlopeEmaAlpha } from '../../market_adapter/core/config_normalizers.js';
 import {
     DEFAULTS,
     applyRuntimeDefaultsFromGeneralSettings,
@@ -178,6 +179,9 @@ function resolveGridResetSimConfig({ botKey, bot, ama, overrides }: {
 
     const erPeriod = firstPositive([ama?.erPeriod, botCfg?.erPeriod], MARKET_ADAPTER.AMAS.AMA3.erPeriod);
     const lookbackBars = firstPositive([botCfg?.amaSlope?.lookbackBars], MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS);
+    // EMA on the slope must match the live service's normalized read so the
+    // replayed delta-s resets and band tilt use the same signal the bot runs.
+    const emaAlpha = normalizeAmaSlopeEmaAlpha(botCfg?.amaSlope?.emaAlpha ?? botCfg?.amaSlopeEmaAlpha);
     // Slope-delta persistence gate: mirror resolveAmaSlopePersistBars in the
     // adapter service so the chart replay fires the same Δs resets production
     // does. Per-bot override wins; else the global enable + value; else legacy 1.
@@ -240,6 +244,7 @@ function resolveGridResetSimConfig({ botKey, bot, ama, overrides }: {
         slopeEnabled,
         dynamicWeightEnabled,
         lookbackBars,
+        emaAlpha,
         slopePersistBars: resolveSlopePersistBars(),
         maxSlopePct: firstPositive([botCfg?.amaSlope?.maxSlopePct], MARKET_ADAPTER.DYNAMIC_WEIGHT_AMA_MAX_SLOPE_PCT),
         neutralZonePct: Number.isFinite(Number(botCfg?.amaSlope?.neutralZonePct))
@@ -286,6 +291,7 @@ function toGridSimPayload(cfg: Record<string, unknown> | null) {
         slopeEnabled: cfg.slopeEnabled === true,
         dynamicWeightEnabled: cfg.dynamicWeightEnabled === true,
         lookbackBars: cfg.lookbackBars,
+        emaAlpha: cfg.emaAlpha,
         slopePersistBars: cfg.slopePersistBars,
         maxSlopePct: cfg.maxSlopePct,
         neutralZonePct: cfg.neutralZonePct,

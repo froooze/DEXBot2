@@ -49,6 +49,7 @@ function buildDynamicWeightTuningLog(meta: unknown) {
     const m = meta as Record<string, unknown> | null | undefined;
     return [
         `slopeMax=${formatAdaptiveLogNumber((m?.amaSlope as { maxSlopePct?: unknown } | null | undefined)?.maxSlopePct, 2, 4)}`,
+        `ema=${formatAdaptiveLogNumber((m?.amaSlope as { emaAlpha?: unknown } | null | undefined)?.emaAlpha, 2, 3)}`,
         `kalmanMax=${formatLogNumber((m?.kalmanSlope as { maxSlopePct?: unknown } | null | undefined)?.maxSlopePct, 2)}`,
         `alpha=${formatLogNumber(m?.alpha, 2)}`,
         `dw=${formatLogNumber(m?.dw, 2)}`,

@@ -166,5 +166,26 @@ function baseParams(extra = {}) {
     assert.deepStrictEqual(result.allSims, [], 'skipped combinations should not produce results');
 }
 
+// ── Trigger B mirrors production's EMA-shaped slope (not raw Huber) ──────────
+{
+    const n = 120, rampFrom = 30, rampTo = 70, perBarPct = 1;
+    const candles = Array.from({ length: n }, () => quiet());
+    const amaValues = new Array(n).fill(100);
+    for (let i = rampFrom; i <= rampTo; i++) amaValues[i] = 100 * Math.pow(1 + perBarPct / 100, i - rampFrom + 1);
+    for (let i = rampTo + 1; i < n; i++) amaValues[i] = amaValues[rampTo];
+    const params = baseParams({
+        asymmetricBounds: true,
+        slopePersistBars: 1,
+    });
+    const raw = simulatePersistentGrid(candles, amaValues, { ...params, slopeEmaAlpha: 1 }, 'neutral', 0);
+    const shaped = simulatePersistentGrid(candles, amaValues, params, 'neutral', 0);
+    assert.ok(raw.slopeTriggerCount > 0, 'the fixture should cross the slope gate');
+    assert.notStrictEqual(
+        shaped.slopeTriggerCount,
+        raw.slopeTriggerCount,
+        'production EMA smoothing must change the slope-reset cadence vs raw Huber'
+    );
+}
+
 console.log('backtest AMA sweep logic tests passed');
 process.exit(0);

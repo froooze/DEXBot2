@@ -53,7 +53,8 @@ Both simulators port the live bot lifecycle end to end:
     center, ratchet semantics — always on.
   - Trigger B: slope-delta reset (`|slope − baseline| ≥
     AMA_SLOPE_DELTA_THRESHOLD_PERCENT/100 × DYNAMIC_WEIGHT_AMA_MAX_SLOPE_PCT`
-    over the `DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS` average-slope series, baseline
+    over the `DYNAMIC_WEIGHT_AMA_LOOKBACK_BARS` Huber average-slope series with
+    the production EMA applied (default alpha `0.2`, `1` = raw Huber), baseline
     re-seeded every reset) plus the slope-ratio grid price offset
     (`direction × min(|slope|/maxSlopePct,1) × targetSpread/2`, applied to the
     placement center). Both are gated behind `--asymmetric-bounds`, mirroring
@@ -192,6 +193,7 @@ All parameters above are tunable via CLI flags. Additional tuning flags:
 | `--capital <n>` | 10000 | Notional capital per side |
 | `--reposition <pct>` | 1 | AMA drift % to trigger re-center |
 | `--asymmetric-bounds` | off | Enable slope-delta reset (B) + grid price offset |
+| `--slope-ema-alpha <a>` | 0.2 | EMA alpha on the trigger-B slope (`1` = raw Huber); production-mirroring by default |
 | `--bts-create-fee <n>` | 0.48260 | BTS create order fee |
 | `--bts-cancel-fee <n>` | 0.00482 | BTS cancel order fee |
 | `--maker-create-factor <n>` | 0.10 | Maker share of create fee |

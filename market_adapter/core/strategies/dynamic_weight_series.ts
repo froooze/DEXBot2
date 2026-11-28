@@ -35,6 +35,11 @@ interface DynamicWeightSeriesInputs {
     kalmanDisplacementPct?: Array<number | null> | null;
     kalmanIsReady?: Array<boolean | null> | null;
     regimeMultipliers?: Array<number | null> | null;
+    /** Optional pre-computed AMA slope series (%/bar). When supplied, the AMA
+     *  offset channel uses these values instead of re-fitting the Huber window;
+     *  null entries are skipped. The live adapter passes its EMA-shaped series;
+     *  callers that omit it keep the raw Huber estimator. */
+    amaSlopePctSeries?: Array<number | null> | null;
     lookbackBars: number;
     amaErPeriod: number;
     amaClipThreshold: number;
@@ -60,6 +65,54 @@ function computeAverageAmaSlopePct(current: number, past: number, lookbackBars: 
         return null;
     }
     return ((current - past) / past * 100) / safeLookbackBars;
+}
+
+/**
+ * Canonical AMA slope series with an optional recursive EMA applied to the
+ * Huber slope values (one step per bar). This is the single definition used by
+ * the live market adapter, the DW research chart, the TradingView grid-reset
+ * replay and range band (all embedded verbatim via embedFunctionSources), and
+ * the research runner.
+ *
+ * Stateless replay over the full AMA history: alpha=1 returns the raw Huber
+ * slope bit-for-bit; lower alpha adds (1-alpha)/alpha bars of lag. Output is
+ * index-aligned with `amaValues`, with nulls before er+lookback readiness and
+ * for any unusable window. No module-scope references so fn.toString()
+ * embedding stays valid — computeHuberWindowSlopePct is embedded alongside it.
+ *
+ * @param amaValues Full AMA series (index-addressable).
+ * @param erPeriod  AMA ER period (defines the warmup window with lookbackBars).
+ * @param lookbackBars Huber window length in bars.
+ * @param alpha     EMA alpha in (0, 1]; 1 disables smoothing.
+ * @param estimator Optional per-bar slope estimator (defaults to the canonical
+ *                  Huber fit). Grid-reset research can pass its own estimator
+ *                  while still sharing this single EMA recursion.
+ */
+function computeAmaSlopeEmaSeries(
+    amaValues: unknown[] | null | undefined,
+    erPeriod: number,
+    lookbackBars: number,
+    alpha: number,
+    estimator: (values: unknown[] | null | undefined, index: number, bars: unknown) => number | null = computeHuberWindowSlopePct,
+): Array<number | null> {
+    const n = Array.isArray(amaValues) ? amaValues.length : 0;
+    const out: Array<number | null> = new Array(n).fill(null);
+    const bars = Number.isFinite(lookbackBars) && lookbackBars > 0 ? Math.ceil(lookbackBars) : 0;
+    // A zero window is unusable for Huber, but research can script a custom
+    // estimator (e.g. grid_reset_sim gate tests) that ignores the window.
+    if (bars < 1 && estimator === computeHuberWindowSlopePct) return out;
+    const er = Number.isFinite(erPeriod) && erPeriod > 0 ? Math.ceil(erPeriod) : 0;
+    const a = Number.isFinite(alpha) && alpha > 0 && alpha <= 1 ? alpha : 1;
+    let prev: number | null = null;
+    for (let i = er + bars; i < n; i++) {
+        const raw = estimator(amaValues, i, bars);
+        if (raw == null || !Number.isFinite(raw)) continue;
+        // Keep alpha=1 bit-for-bit identical to the raw estimator: the
+        // recurrence algebra (prev + 1*(raw-prev)) can differ by one ulp.
+        prev = a === 1 || prev === null ? raw : prev + a * (raw - prev);
+        out[i] = prev;
+    }
+    return out;
 }
 
 /**
@@ -247,6 +300,7 @@ function computeDynamicWeightSeries(inputs: DynamicWeightSeriesInputs) {
         kalmanDisplacementPct,
         kalmanIsReady,
         regimeMultipliers,
+        amaSlopePctSeries = null,
         lookbackBars,
         amaErPeriod,
         amaClipThreshold,
@@ -272,8 +326,12 @@ function computeDynamicWeightSeries(inputs: DynamicWeightSeriesInputs) {
 
     for (let i = 0; i < n; i++) {
         if (i < amaReadyBar) continue;
-        const sp = computeHuberWindowSlopePct(amaValues, i, lookbackBars);
-        if (sp == null) continue;
+        // Research charts can supply an EMA-smoothed slope series; without it,
+        // use the canonical Huber fit as before.
+        const sp = amaSlopePctSeries
+            ? (amaSlopePctSeries[i] ?? null)
+            : computeHuberWindowSlopePct(amaValues, i, lookbackBars);
+        if (sp == null || !Number.isFinite(sp)) continue;
         const csp = Math.max(-amaClipThreshold, Math.min(amaClipThreshold, sp));
         // Inclusive dead-band boundary (matches computeAmaSlopeWeights): a
         // slope exactly at neutralZonePct counts as neutral. With the default
@@ -427,6 +485,7 @@ function createAmaSlopeClipTracker(erPeriod: number, lookbackBars: number, clipP
 export {
     computeDynamicWeightSeries,
     computeAverageAmaSlopePct,
+    computeAmaSlopeEmaSeries,
     computeHuberWindowSlopePct,
     echoLatchSeries,
     roundToN,
