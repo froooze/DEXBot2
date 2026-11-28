@@ -14,7 +14,7 @@ dexbot tv <bot>
 dexbot tv 133
 dexbot tv 1.19.133
 
-# Any pair (pool-first, order-book fallback)
+# Any pair (pool → order book → pool-cross fallback)
 dexbot tv TOKENA/TOKENB
 
 # MPA price-feed history instead of market candles (opt-in; MPA/MPA pairs
@@ -27,7 +27,9 @@ dexbot tv <bot> --chart analysis/charts/custom.html
 dexbot tv BTS/HONEST.USD --book # override: order-book fills instead of the pool
 ```
 
-Output: `analysis/charts/tv_<bot|pool_<id>|<a>_<b>>_1h_<N>m.html`, with a clickable `file://` link printed on completion. Unknown targets fail fast with the list of known bot keys.
+Output: `analysis/charts/tv_<bot|pool_<id>|<a>_<b>>_1h_<N>m.html` (plus `_cross` when the candles were synthesized from two bridge pools), with a clickable `file://` link printed on completion. Unknown targets fail fast with the list of known bot keys.
+
+For a synthesized chart, the temp candle file's `meta.cross` records the bridge asset and both pool ids; volume is the numerator leg's base volume and the chart label names the bridge.
 
 The sections below cover manual usage (explicit candle files, direct runner flags).
 

@@ -59,6 +59,8 @@ import { normalizeAssetSymbol, splitPairTarget } from '../modules/utils/asset_sy
 import { fetchCandlesSequentially, outputPath } from '../market_adapter/inputs/fetch_lp_data.js';
 import { fetchMarketCandlesSequentially } from '../market_adapter/inputs/fetch_book_data.js';
 import { fetchFeedCandlesSequentially } from '../market_adapter/inputs/kibana_feed_source.js';
+import { fetchCrossPoolCandlesForPair } from '../market_adapter/inputs/cross_pool_candles.js';
+import type { CrossRoute } from '../market_adapter/inputs/cross_pool_candles.js';
 import { muteChainLogs } from '../modules/utils/chain_logs.js';
 import { sanitizeKey } from '../modules/utils/sanitize_key.js';
 import { slugPart, parseChainTimeToMs } from '../market_adapter/interval_utils.js';
@@ -359,6 +361,7 @@ async function run(cmd: ChartCmd): Promise<void> {
         let assetB: AssetMeta = {};
         let poolId: string | null = null;
         let feedCtx: FeedCtx | null = null;
+        let crossCtx: CrossRoute | null = null;
         let sourceLabel = '';
         let botKey: string | null = null;
         let botMeta: BotEntry | null = null;
@@ -440,6 +443,24 @@ async function run(cmd: ChartCmd): Promise<void> {
                 timeRange,
                 chunkMonths: CHUNK_MONTHS,
             });
+            // Pairs with no direct fills (or no direct pool) can still be
+            // charted when both legs swap against a common bridge asset.
+            // Keep the direct market authoritative: the cross is only tried
+            // when --book was not requested and the direct fetch came back empty.
+            if (candles.length === 0 && source !== 'book') {
+                const cross = await fetchCrossPoolCandlesForPair(assetA, assetB, {
+                    intervalSeconds: INTERVAL_SECONDS,
+                    timeRange,
+                    chunkMonths: CHUNK_MONTHS,
+                }, bitsharesClient);
+                if (cross) {
+                    const quoteLabel = cross.route.quote.symbol || String(cross.route.quote.id);
+                    const poolLabels = cross.route.legs.map((leg) => String(leg.pool.id ?? '?').replace(/^1\.19\./, '')).join(' + ');
+                    console.log(`[${cmd}] No direct candles; synthesizing ${assetA.symbol}/${assetB.symbol} from pool cross via ${quoteLabel} (${poolLabels})`);
+                    crossCtx = cross.route;
+                    candles = cross.candles;
+                }
+            }
         }
         if (!Array.isArray(candles) || candles.length === 0) throw new Error('No candles returned for the requested range');
 
@@ -449,6 +470,13 @@ async function run(cmd: ChartCmd): Promise<void> {
                 fetchedAt: new Date().toISOString(),
                 feed: feedCtx ? feedName(feedCtx) : null,
                 pool: poolId,
+                cross: crossCtx ? {
+                    quote: { id: crossCtx.quote.id, symbol: crossCtx.quote.symbol || crossCtx.quote.id },
+                    legs: crossCtx.legs.map((leg) => ({
+                        pool: leg.pool.id,
+                        assets: [leg.pool.asset_a, leg.pool.asset_b].filter(Boolean),
+                    })),
+                } : null,
                 assetA: { id: assetA.id, precision: assetA.precision, symbol: assetA.symbol },
                 assetB: { id: assetB.id, precision: assetB.precision, symbol: assetB.symbol },
                 intervalSeconds: INTERVAL_SECONDS,
@@ -465,17 +493,22 @@ async function run(cmd: ChartCmd): Promise<void> {
         // RENDERERS entry below differs.
         const renderer = RENDERERS[cmd];
         const feedSuffix = feedCtx ? '_feed' : '';
+        const crossSuffix = crossCtx ? '_cross' : '';
         const baseName = botKey
-            ? `${cmd}_${sanitizeKey(botKey)}${feedSuffix}`
+            ? `${cmd}_${sanitizeKey(botKey)}${feedSuffix}${crossSuffix}`
             : poolId
-                ? `${cmd}_pool_${String(poolId).replace(/^1\.19\./, '')}`
-                : `${cmd}_${slugPart(assetA.symbol)}_${slugPart(assetB.symbol)}${feedSuffix}`;
+                ? `${cmd}_pool_${String(poolId).replace(/^1\.19\./, '')}${crossSuffix}`
+                : `${cmd}_${slugPart(assetA.symbol)}_${slugPart(assetB.symbol)}${feedSuffix}${crossSuffix}`;
         const chartFile = chart
             ? path.resolve(chart)
             : path.join(PATHS.ANALYSIS.CHARTS_DIR, `${baseName}_1h_${monthsLabel(months)}.html`);
+        const crossLabel = crossCtx
+            ? `${assetA.symbol}/${assetB.symbol} (cross via ${crossCtx.quote.symbol || String(crossCtx.quote.id)})`
+            : null;
         const label = feedCtx
             ? `Feed ${feedName(feedCtx)} (${assetA.symbol}/${assetB.symbol})`
-            : poolId ? `Pool ${String(poolId).replace(/^1\.19\./, '')}` : `${assetA.symbol}/${assetB.symbol}`;
+            : poolId ? `Pool ${String(poolId).replace(/^1\.19\./, '')}`
+                : crossLabel ? crossLabel : `${assetA.symbol}/${assetB.symbol}`;
         const title = botKey && botMeta?.name ? `${botMeta.name} · ${label} · 1h · ${renderer.titleLabel}` : `${label} · 1h · ${renderer.titleLabel}`;
         const analyzerArgs = ['--file', tmpFile, '--chart', chartFile, '--title', title];
         // Both renderers resolve bot-scoped config themselves from the SAME

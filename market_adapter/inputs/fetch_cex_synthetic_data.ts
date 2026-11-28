@@ -47,6 +47,7 @@ import {
     OHLC_KRAKEN,
 } from './cex_candle_parsing.js';
 import type { CandleRow } from './cex_candle_parsing.js';
+import { synthesizeCrossCandles } from '../utils/cross_candles.js';
 
 interface MarketRow {
     base: string;
@@ -766,35 +767,6 @@ function findMarketId(markets: MarketRow[], base: unknown, quote: unknown): Mark
     const targetQuote = upper(quote);
     const market = markets.find((row) => upper(row.base) === targetBase && upper(row.quote) === targetQuote);
     return market || null;
-}
-
-function buildSyntheticCandle(left: unknown, right: unknown): CandleRow | null {
-    // Guard against degenerate zero/negative leg prices: dividing by them
-    // would produce Infinity/NaN OHLC rows in the seed file.
-    const l = asArray(left).map(Number);
-    const r = asArray(right).map(Number);
-    const leftPrices = [l[1], l[2], l[3], l[4]];
-    const rightPrices = [r[1], r[2], r[3], r[4]];
-    if (!leftPrices.every((v) => Number.isFinite(v) && v > 0)
-        || !rightPrices.every((v) => Number.isFinite(v) && v > 0)) {
-        return null;
-    }
-    const open = l[1] / r[1];
-    const close = l[4] / r[4];
-    const high = Math.max(l[2] / r[3], open, close);
-    const low = Math.min(l[3] / r[2], open, close);
-    if (![open, high, low, close].every(Number.isFinite)) return null;
-    const volume = Number(l[5] || 0);
-    return [l[0], open, high, low, close, Number.isFinite(volume) ? volume : 0];
-}
-
-function synthesizeCrossCandles(leftCandles: CandleRow[], rightCandles: CandleRow[]): CandleRow[] {
-    const leftMap = new Map<number, CandleRow>(leftCandles.map((row) => [row[0], row] as [number, CandleRow]));
-    const rightMap = new Map<number, CandleRow>(rightCandles.map((row) => [row[0], row] as [number, CandleRow]));
-    const timestamps = Array.from(leftMap.keys()).filter((ts) => rightMap.has(ts)).sort((a, b) => a - b);
-    return timestamps
-        .map((ts) => buildSyntheticCandle(leftMap.get(ts), rightMap.get(ts)))
-        .filter((row): row is CandleRow => row != null);
 }
 
 function chooseOutputPath(config: CexConfig, intervalLabel: string): string {

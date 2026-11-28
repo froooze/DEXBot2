@@ -417,6 +417,12 @@ dexbot tv TOKENA/TOKENB --month 1 --chart analysis/charts/custom.html
 dexbot tv TOKENA/BTS --feed --month 1            # MPA price feed
 ```
 
+When a pair has no direct pool and no direct order-book fills, `tv`/`dw`
+automatically look for two pools sharing a common bridge asset (core asset
+preferred) and synthesize the pair's candles as `(bridge/A) / (bridge/B)`.
+Synthetic charts get a `_cross` filename suffix and the bridge/pools are
+printed on the terminal. An explicit `--book` disables this fallback.
+
 ### Dynamic Weight (`dexbot dw`)
 **File:** `dw.ts`
 Same pipeline and flags as `tv`; renders the dynamic-weight research chart
